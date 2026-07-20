@@ -1,0 +1,2609 @@
+"""
+Trade Manager - Position Lifecycle with Smart Exits
+===============================================================
+
+Handles:
+1. Trade open/close with full audit trail
+2. 1-min trailing stop updates
+3. Automatic trailing stop exit detection
+4. Session-end auto-exit
+5. P&L tracking
+"""
+
+import uuid
+import re
+import threading
+import time
+import json
+from pathlib import Path
+from datetime import date, datetime, time as dtime, timedelta
+import pytz
+IST = pytz.timezone('Asia/Kolkata')
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from loguru import logger
+from data.sqlite_db import db
+from trading.performance_metrics import annualize_sharpe, format_sharpe_pair
+from trading.trade_dashboard import build_dashboard_rows
+from trading.order_retry import execute_order_with_retry
+
+
+def _setting_enabled(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(value)
+
+
+@dataclass
+class Trade:
+    id: str
+    instrument: str
+    timeframe: str
+    direction: str          # LONG or SHORT
+    entry_price: float
+    entry_time: datetime
+    trailing_stop: float    # Initial trailing stop at entry
+    current_stop: float     # Current trailing stop (1-min updated)
+    lots: int
+    lot_size: int
+    grade: str
+    # ═══ Execution Details ═══
+    broker_order_id: str = ""
+    pending_execution: bool = False
+    signal_time: Optional[datetime] = None
+    entry_submitted_at: Optional[datetime] = None
+    entry_replace_count: int = 0
+    exit_order_id: str = ""
+    protective_order_id: str = ""
+    protective_trigger: float = 0.0
+    protective_quantity: int = 0
+    protective_updated_at: Optional[datetime] = None
+    recovery_required_since: Optional[datetime] = None
+    execution_status: str = "OPEN"
+    execution_error: str = ""
+    pending_exit: bool = False
+    broker_quantity: int = 0
+    trading_symbol: str = ""
+    symbol_token: str = ""
+    # ═══ NEW: Instrument & signal details ═══
+    atm_strike: float = 0.0
+    option_type: str = ""   # CE or PE
+    target: float = 0.0     # Target price (1.5× risk)
+    rr_ratio: float = 1.5   # Risk-reward ratio
+    confidence: float = 0.0 # Signal confidence 0.0-1.0
+    inst_type: str = "FUT"  # FUT or OPT
+    instrument_multiplier: float = 1.0 # 1.0 for FUT, Delta (~0.5) for OPT
+    exec_type: str = "A"    # A for Auto, M for Manual
+    status: str = "OPEN"    # OPEN / CLOSED
+    current_price: float = 0.0
+    entry_spot: float = 0.0  # Spot price at entry (for option tracking)
+    spot_stop: float = 0.0   # Original index/spot stop for premium-led option trades
+    spot_target: float = 0.0 # Original index/spot target for premium-led option trades
+    exit_price: float = 0.0
+    exit_time: Optional[datetime] = None
+    exit_reason: str = ""
+    pnl: float = 0.0
+    charges: float = 0.0
+    peak_pnl: float = 0.0
+    max_drawdown: float = 0.0
+    is_ghost: bool = False
+    is_reversion_scalp: bool = False
+    signal_fire_mode: str = "INTRACANDLE"
+    entered_intracandle: bool = True
+    market_regime: str = ""   # Regime at entry (for post-hoc attribution)
+    data_provenance: str = "" # LIVE / HISTORICAL / RECOVERY / EOD — data source of the entry
+    price_action_verdict: str = "" # FAVORABLE/NEUTRAL/ADVERSE from the price-action patch (advisory)
+    intelligence_score: float = 0.0
+    strategy_revision: str = ""
+    strategy_direction_mode: str = ""
+    market_wide_reversal_entry: bool = False
+    volume_spike_entry: bool = False
+    power_move: bool = False
+    source_engine: str = ""
+    source_engines: List[str] = field(default_factory=list)
+    source_lane: str = ""
+    quad_union_entry: bool = False
+    raw_union_entry: bool = False
+    initial_stop: float = 0.0
+    scalp_lock_mode: bool = False
+    # ═══ Realized slippage (REAL broker fills only) ═══
+    signal_entry_price: float = 0.0  # pre-fill signal/decision price (slippage reference)
+    entry_slippage: float = 0.0      # adverse ₹/unit paid vs signal at entry fill
+    exit_slippage: float = 0.0       # adverse ₹/unit vs exit decision price at exit fill
+    execution_bid_price: float = 0.0
+    execution_ask_price: float = 0.0
+    execution_touch_source: str = ""
+    execution_touch_age_seconds: float = 0.0
+    execution_touch_usable: bool = False
+    execution_touch_reason: str = ""
+
+    @property
+    def stop_loss(self) -> float:
+        """Alias used by UI/risk helpers: prefer live stop, then trail, then initial."""
+        for attr in ("current_stop", "trailing_stop", "initial_stop", "spot_stop"):
+            try:
+                val = float(getattr(self, attr, 0.0) or 0.0)
+            except Exception:
+                val = 0.0
+            if val > 0:
+                return val
+        return 0.0
+
+    @stop_loss.setter
+    def stop_loss(self, value: float) -> None:
+        try:
+            v = float(value or 0.0)
+        except Exception:
+            return
+        if v <= 0:
+            return
+        self.current_stop = v
+        if not float(getattr(self, "trailing_stop", 0.0) or 0.0):
+            self.trailing_stop = v
+
+    # (deduped 2026-07-10: a second `quantity` property later in the class
+    # shadowed a clamped copy here — the ACTIVE definition lives next to
+    # unrealized_pnl; behavior unchanged by removing the dead one.)
+
+    def to_dict(self) -> Dict:
+        """Convert trade to dictionary for dashboard sync"""
+        display_name = self.instrument
+        if self.inst_type == "OPT" and self.atm_strike is not None and self.atm_strike > 0:
+            display_name = f"{self.instrument} {int(self.atm_strike)} {self.option_type}"
+            
+        current_display_price = self.current_price
+        if self.status == "CLOSED":
+            current_display_price = (
+                self.current_price
+                if self.current_price is not None and self.current_price > 0 and abs(self.current_price - self.exit_price) > 1e-9
+                else 0.0
+            )
+            
+        return {
+            "id": self.id,
+            "status": self.status,
+            "is_ghost": getattr(self, 'is_ghost', False),
+            "execution_status": self.execution_status,
+            "execution_error": self.execution_error,
+            "pending_execution": self.pending_execution,
+            "signal_time": self.signal_time.isoformat() if self.signal_time else "",
+            "signal_timestamp": self.signal_time.isoformat() if self.signal_time else "",
+            "entry_submitted_at": self.entry_submitted_at.isoformat() if self.entry_submitted_at else "",
+            "entry_replace_count": self.entry_replace_count,
+            "pending_exit": self.pending_exit,
+            "broker_order_id": self.broker_order_id,
+            "exit_order_id": self.exit_order_id,
+            "protective_order_id": self.protective_order_id,
+            "protective_trigger": self.protective_trigger,
+            "protective_quantity": self.protective_quantity,
+            "protective_updated_at": self.protective_updated_at.isoformat() if self.protective_updated_at else "",
+            "recovery_required_since": self.recovery_required_since.isoformat() if self.recovery_required_since else "",
+            "broker_quantity": self.broker_quantity,
+            "instrument": display_name,
+            "direction": self.direction,
+            "entry_price": self.entry_price,
+            "current_price": current_display_price,
+            "exit_price": self.exit_price if self.status == "CLOSED" else 0.0,
+            "trailing_stop": self.trailing_stop if self.trailing_stop is not None else 0.0,
+            "current_stop": self.current_stop if self.current_stop is not None else 0.0,
+            "target": self.target if self.target is not None else 0.0,
+            "pnl": round((self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0, 0),
+            "charges": self.charges,
+            "lots": self.lots,
+            "lot_size": self.lot_size,
+            "grade": self.grade,
+            "confidence": round(self.confidence or 0.0, 2),
+            "rr_ratio": self.rr_ratio,
+            "atm_strike": self.atm_strike,
+            "option_type": self.option_type,
+            "inst_type": self.inst_type,
+            "timeframe": self.timeframe,
+            "entry_time": self.entry_time.strftime("%d %b %H:%M:%S") if self.entry_time else "--",
+            "exit_time": self.exit_time.strftime("%d %b %H:%M:%S") if self.exit_time else "--",
+            "entry_timestamp": self.entry_time.timestamp() if self.entry_time else 0,
+            "exit_timestamp": self.exit_time.isoformat() if self.exit_time else "",
+            "exit_reason": self.exit_reason,
+            "exec_type": self.exec_type,
+            "entry_spot": self.entry_spot,
+            "spot_stop": self.spot_stop,
+            "spot_target": self.spot_target,
+            "instrument_multiplier": self.instrument_multiplier,
+            "peak_pnl": self.peak_pnl,
+            "max_drawdown": self.max_drawdown,
+            "signal_fire_mode": self.signal_fire_mode,
+            "entered_intracandle": self.entered_intracandle,
+            "market_regime": self.market_regime,
+            "data_provenance": self.data_provenance,
+            "price_action_verdict": self.price_action_verdict,
+            "intelligence_score": self.intelligence_score,
+            "strategy_revision": self.strategy_revision,
+            "strategy_direction_mode": self.strategy_direction_mode,
+            "market_wide_reversal_entry": self.market_wide_reversal_entry,
+            "volume_spike_entry": self.volume_spike_entry,
+            "power_move": self.power_move,
+            "source_engine": self.source_engine,
+            "source_engines": list(self.source_engines or []),
+            "source_lane": self.source_lane,
+            "quad_union_entry": self.quad_union_entry,
+            "raw_union_entry": self.raw_union_entry,
+            "initial_stop": self.initial_stop if self.initial_stop is not None else 0.0,
+            "scalp_lock_mode": bool(self.scalp_lock_mode),
+            "signal_entry_price": self.signal_entry_price,
+            "entry_slippage": self.entry_slippage,
+            "exit_slippage": self.exit_slippage,
+            "execution_bid_price": self.execution_bid_price,
+            "execution_ask_price": self.execution_ask_price,
+            "execution_touch_source": self.execution_touch_source,
+            "execution_touch_age_seconds": self.execution_touch_age_seconds,
+            "execution_touch_usable": self.execution_touch_usable,
+            "execution_touch_reason": self.execution_touch_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Trade':
+        """Reconstruct a Trade from a serialized dictionary with IST awareness"""
+        import pytz
+        ist = pytz.timezone('Asia/Kolkata')
+        
+        ts = data.get("entry_timestamp", 0)
+        entry_time = datetime.fromtimestamp(ts, ist) if ts else datetime.now(ist)
+        
+        exit_time = None
+        if data.get("exit_timestamp"):
+            try:
+                exit_time = datetime.fromisoformat(str(data["exit_timestamp"]))
+                if exit_time.tzinfo is None:
+                    exit_time = ist.localize(exit_time)
+                else:
+                    exit_time = exit_time.astimezone(ist)
+            except Exception as e:
+                logger.debug(f"Failed to parse canonical exit timestamp: {e}")
+                exit_time = None
+        if exit_time is None and data.get("exit_time") and data["exit_time"] != "--":
+            try:
+                # Parse display string but force IST context
+                exit_year = datetime.now(ist).year
+                exit_time = datetime.strptime(f"{exit_year} {data['exit_time']}", "%Y %d %b %H:%M:%S")
+                exit_time = ist.localize(exit_time)
+            except Exception as e:
+
+                logger.debug(f"Caught bare exception: {e}")
+                exit_time = None
+
+        entry_submitted_at = None
+        if data.get("entry_submitted_at"):
+            try:
+                entry_submitted_at = datetime.fromisoformat(
+                    str(data["entry_submitted_at"])
+                )
+                if entry_submitted_at.tzinfo is None:
+                    entry_submitted_at = ist.localize(entry_submitted_at)
+                else:
+                    entry_submitted_at = entry_submitted_at.astimezone(ist)
+            except (TypeError, ValueError):
+                entry_submitted_at = None
+
+        def parse_ist_datetime(value):
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value))
+                return ist.localize(parsed) if parsed.tzinfo is None else parsed.astimezone(ist)
+            except (TypeError, ValueError):
+                return None
+        
+        # Extract base instrument name (strip strike info like "NIFTY 24100 CE" -> "NIFTY")
+        raw_instrument = data.get("instrument", "")
+        base_instrument = raw_instrument.split()[0] if raw_instrument else ""
+        
+        return cls(
+            id=data.get("id", ""),
+            instrument=base_instrument,
+            timeframe=data.get("timeframe", "5min"),
+            direction=data.get("direction", "LONG"),
+            entry_price=data.get("entry_price", 0.0),
+            entry_time=entry_time,
+            trailing_stop=data.get("trailing_stop", 0.0),
+            current_stop=data.get("current_stop", data.get("trailing_stop", 0.0)),
+            lots=data.get("lots", 1),
+            lot_size=data.get("lot_size", 1),
+            grade=data.get("grade", "B"),
+            atm_strike=data.get("atm_strike", 0.0),
+            option_type=data.get("option_type", ""),
+            target=data.get("target", 0.0),
+            rr_ratio=data.get("rr_ratio", 1.5),
+            confidence=data.get("confidence", 0.0),
+            inst_type=data.get("inst_type", "FUT"),
+            instrument_multiplier=data.get("instrument_multiplier", 1.0),
+            exec_type=data.get("exec_type", "A"),
+            status=data.get("status", "CLOSED"),
+            broker_order_id=data.get("broker_order_id", ""),
+            exit_order_id=data.get("exit_order_id", ""),
+            protective_order_id=data.get("protective_order_id", ""),
+            protective_trigger=float(data.get("protective_trigger", 0.0) or 0.0),
+            protective_quantity=int(data.get("protective_quantity", 0) or 0),
+            protective_updated_at=parse_ist_datetime(data.get("protective_updated_at")),
+            recovery_required_since=parse_ist_datetime(data.get("recovery_required_since")),
+            execution_status=data.get("execution_status") or data.get("status", "CLOSED"),
+            execution_error=data.get("execution_error", ""),
+            pending_execution=bool(data.get("pending_execution", False)),
+            signal_time=parse_ist_datetime(data.get("signal_time") or data.get("signal_timestamp")),
+            entry_submitted_at=entry_submitted_at,
+            entry_replace_count=int(data.get("entry_replace_count", 0) or 0),
+            pending_exit=bool(data.get("pending_exit", False)),
+            broker_quantity=int(data.get("broker_quantity", 0) or 0),
+            trading_symbol=data.get("trading_symbol", ""),
+            symbol_token=data.get("symbol_token", ""),
+            current_price=data.get("current_price", 0.0),
+            entry_spot=data.get("entry_spot", 0.0),
+            spot_stop=data.get("spot_stop", 0.0),
+            spot_target=data.get("spot_target", 0.0),
+            exit_price=data.get("exit_price", data.get("current_price", 0.0)),
+            exit_time=exit_time,
+            exit_reason=data.get("exit_reason", ""),
+            pnl=data.get("pnl", 0.0),
+            peak_pnl=data.get("peak_pnl", 0.0),
+            max_drawdown=data.get("max_drawdown", 0.0),
+            is_ghost=bool(data.get("is_ghost", False)),
+            signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
+            entered_intracandle=bool(data.get("entered_intracandle", True)),
+            market_regime=str(data.get("market_regime") or ""),
+            data_provenance=str(data.get("data_provenance") or ""),
+            price_action_verdict=str(data.get("price_action_verdict") or ""),
+            intelligence_score=float(data.get("intelligence_score") or 0.0),
+            strategy_revision=str(data.get("strategy_revision") or ""),
+            strategy_direction_mode=str(data.get("strategy_direction_mode") or ""),
+            market_wide_reversal_entry=bool(data.get("market_wide_reversal_entry", False)),
+            volume_spike_entry=bool(data.get("volume_spike_entry", False)),
+            power_move=bool(data.get("power_move", False)),
+            source_engine=str(data.get("source_engine") or ""),
+            source_engines=list(data.get("source_engines") or []),
+            source_lane=str(data.get("source_lane") or ""),
+            quad_union_entry=bool(data.get("quad_union_entry", False)),
+            raw_union_entry=bool(data.get("raw_union_entry", False)),
+            initial_stop=float(data.get("initial_stop") or data.get("trailing_stop") or 0.0),
+            scalp_lock_mode=bool(data.get("scalp_lock_mode", False)),
+            signal_entry_price=float(data.get("signal_entry_price") or 0.0),
+            entry_slippage=float(data.get("entry_slippage") or 0.0),
+            exit_slippage=float(data.get("exit_slippage") or 0.0),
+            execution_bid_price=float(data.get("execution_bid_price") or 0.0),
+            execution_ask_price=float(data.get("execution_ask_price") or 0.0),
+            execution_touch_source=str(data.get("execution_touch_source") or ""),
+            execution_touch_age_seconds=float(data.get("execution_touch_age_seconds") or 0.0),
+            execution_touch_usable=bool(data.get("execution_touch_usable", False)),
+            execution_touch_reason=str(data.get("execution_touch_reason") or ""),
+        )
+
+    @property
+    def quantity(self) -> int:
+        return self.lots * self.lot_size
+
+    @property
+    def unrealized_pnl(self) -> float:
+        """Net P&L including estimated charges and instrument multipliers"""
+        if self.status != "OPEN":
+            return 0.0
+        
+        from config.settings import get_settings
+        settings = get_settings()
+        from engine.trade_accounting import estimate_trade_charges
+        est_charges = estimate_trade_charges(
+            self.entry_price,
+            self.current_price,
+            self.quantity,
+            self.inst_type,
+            settings,
+            self.instrument_multiplier,
+            instrument=self.instrument,
+        )
+        
+        # NOTE: self.current_price is ALREADY adjusted for Delta in update_trade()
+        # For Options, we are always LONG (buying CE or PE).
+        if self.inst_type == "OPT":
+            gross = (self.current_price - self.entry_price) * self.quantity
+        else:
+            # For Futures, it depends on direction
+            if self.direction == "LONG":
+                gross = (self.current_price - self.entry_price) * self.quantity
+            else:
+                gross = (self.entry_price - self.current_price) * self.quantity
+            
+        return gross - est_charges
+
+
+class TradeManager:
+    """Full trade lifecycle management with persistence"""
+
+    def _log_ui(self, message: str, level: str = "info"):
+        if self.ui_logger:
+            try:
+                self.ui_logger(message, level)
+            except Exception as e:
+                logger.error(f"Failed to dispatch UI log: {e}")
+
+    def __init__(
+        self,
+        broker=None,
+        max_positions: int = 3,
+        session_end: str = "15:25",
+        product_type: str = "CARRYFORWARD",
+    ):
+        self.broker = broker
+        self.ui_logger = None
+        self.max_positions = max_positions
+        self.session_end = self._parse_time(session_end)
+        self.product_type = str(product_type or "CARRYFORWARD").upper()
+        self.open_trades: Dict[str, Trade] = {}
+        self.closed_trades: List[Trade] = []
+        self._trade_counter = 0
+        self._lock = threading.RLock()
+        self._state_file = "data_store/trade_state.json"
+        self._last_mark_to_market_save = 0.0
+        self._last_protective_sync = {}
+        self._last_protective_status_poll = {}
+        self._last_recovery_alert = {}
+        self.orphan_positions: Dict[str, Dict] = {}
+        
+        # Risk settings (updated via Scanner.configure)
+        self.futures_sl_pct = 0.30
+        self.options_sl_pct = 15.0
+        
+        # Load state on init
+        self.load_state()
+        
+        # Start background broker position sync
+        self._sync_active = True
+        self._sync_thread = threading.Thread(target=self._position_sync_loop, daemon=True, name="PositionSync")
+        self._sync_thread.start()
+
+    def _position_sync_loop(self):
+        """Background loop to sync internal open_trades with broker positions.
+
+        Adaptive cadence so a rate-limited/slow broker API isn't hammered:
+          * base interval while positions are OPEN (need close-reconciliation),
+          * slower idle interval when FLAT (nothing to reconcile),
+          * exponential backoff on a FAILED reconcile (rate-limit/timeout),
+            resetting to base on the next success.
+        Previously a flat every-5s get_positions() that spammed the broker even
+        when flat and even while being rate-limited.
+        """
+        import time
+        from config.settings import get_settings
+        backoff = 0.0
+        while getattr(self, "_sync_active", True):
+            interval = 5.0
+            try:
+                s = get_settings()
+                base = max(1.0, float(getattr(s, "position_sync_interval_seconds", 5.0) or 5.0))
+                idle = max(base, float(getattr(s, "position_sync_idle_interval_seconds", 30.0) or 30.0))
+                max_backoff = max(base, float(getattr(s, "position_sync_max_backoff_seconds", 60.0) or 60.0))
+                result = self.reconcile_broker_positions()
+                ok = isinstance(result, dict) and bool(result.get("checked", False))
+                has_open = bool(getattr(self, "open_trades", {}))
+                if ok:
+                    backoff = 0.0
+                    interval = base if has_open else idle
+                else:
+                    # Reconcile could not complete (rate-limit / timeout / no broker):
+                    # back off instead of retrying into the same wall every 5s.
+                    backoff = min(base if backoff <= 0 else backoff * 2.0, max_backoff)
+                    interval = max(backoff, base if has_open else idle)
+            except Exception as exc:
+                logger.error(f"Error in position sync loop: {exc}")
+                backoff = min(5.0 if backoff <= 0 else backoff * 2.0, 60.0)
+                interval = backoff
+            time.sleep(interval)
+
+    @staticmethod
+    def _position_quantity(position: Dict) -> int:
+        try:
+            return int(float(position.get("netqty", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _position_exit_price(trade: Trade, position: Dict) -> float:
+        value = (
+            position.get("sellavgprice", 0.0)
+            if trade.direction in {"LONG", "BUY"} or trade.inst_type == "OPT"
+            else position.get("buyavgprice", 0.0)
+        )
+        try:
+            price = float(value or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        return price if price > 0 else (trade.current_price or trade.entry_price)
+
+    @staticmethod
+    def _confirmed_broker_quantity(trade: Trade) -> int:
+        try:
+            return max(0, int(getattr(trade, "broker_quantity", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _entry_still_confirming(trade: Trade) -> bool:
+        status = str(getattr(trade, "execution_status", "") or "").upper()
+        return bool(getattr(trade, "pending_execution", False)) or status in {
+            "ENTRY_PENDING",
+            "ENTRY_SUBMITTED",
+            "PARTIAL",
+        }
+
+    @staticmethod
+    def _reconciliation_symbol_prefixes() -> Tuple[str, ...]:
+        fallback = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+        prefixes = set(fallback)
+        try:
+            payload = json.loads(Path("config/instruments.json").read_text(encoding="utf-8"))
+            indices = payload.get("indices", {}) if isinstance(payload, dict) else {}
+            if isinstance(indices, dict):
+                for name, cfg in indices.items():
+                    if name:
+                        prefixes.add(str(name).upper())
+                    if isinstance(cfg, dict):
+                        for key in ("symbol", "option_symbol_prefix"):
+                            value = str(cfg.get(key) or "").strip().upper()
+                            if value:
+                                prefixes.add(value)
+        except Exception as exc:
+            logger.debug(f"Using fallback reconciliation prefixes: {exc}")
+        return tuple(sorted(prefixes, key=len, reverse=True))
+
+    def _maybe_auto_flatten_unprotected(self, trade: Trade, reason: str) -> bool:
+        if getattr(self, "mode", "HISTORICAL") != "REAL" or getattr(trade, "is_ghost", False):
+            return False
+        if self._confirmed_broker_quantity(trade) <= 0:
+            return False
+        if getattr(trade, "protective_order_id", ""):
+            return False
+        if str(getattr(trade, "execution_status", "") or "").upper() != "RECOVERY_REQUIRED":
+            return False
+
+        from config.settings import get_settings
+
+        recovery_since = self._aware_ist(trade.recovery_required_since)
+        grace = max(
+            0.0,
+            float(getattr(get_settings(), "recovery_auto_flatten_seconds", 5.0) or 0.0),
+        )
+        if (datetime.now(IST) - recovery_since).total_seconds() < grace:
+            return False
+        return self.emergency_flatten_trade(
+            trade,
+            f"{reason} for at least {grace:.0f}s",
+        )
+
+    def _finalize_closed_trade(
+        self,
+        trade_id: str,
+        trade: Trade,
+        exit_price: float,
+        reason: str,
+        exit_time: Optional[datetime] = None,
+        realised_pnl: Optional[float] = None,
+    ) -> bool:
+        from config.settings import get_settings
+        from engine.trade_accounting import estimate_trade_charges
+
+        with self._lock:
+            if trade_id not in self.open_trades:
+                return False
+            # The decision price was stamped into exit_price by close_trade before the
+            # broker exit was requested; the incoming exit_price is the real fill.
+            exit_decision_price = float(trade.exit_price or 0.0)
+            trade.status = "CLOSED"
+            trade.execution_status = "CLOSED"
+            trade.pending_execution = False
+            trade.pending_exit = False
+            trade.execution_error = ""
+            trade.exit_price = float(exit_price or trade.current_price or trade.entry_price)
+            trade.current_price = trade.exit_price
+            trade.exit_time = exit_time or datetime.now(IST)
+            trade.exit_reason = reason
+            if getattr(trade, "exit_order_id", ""):
+                self._record_exit_slippage(trade, exit_decision_price, trade.exit_price)
+            if trade.inst_type == "OPT":
+                gross = (trade.exit_price - trade.entry_price) * trade.quantity
+            elif trade.direction == "LONG":
+                gross = (trade.exit_price - trade.entry_price) * trade.quantity
+            else:
+                gross = (trade.entry_price - trade.exit_price) * trade.quantity
+            trade.charges = estimate_trade_charges(
+                trade.entry_price,
+                trade.exit_price,
+                trade.quantity,
+                trade.inst_type,
+                get_settings(),
+                trade.instrument_multiplier,
+                instrument=trade.instrument,
+            )
+            trade.pnl = float(realised_pnl) if realised_pnl is not None else gross - trade.charges
+            self.closed_trades.append(trade)
+            del self.open_trades[trade_id]
+        self.save_state()
+        
+        profit_str = f"+₹{trade.pnl:.2f}" if trade.pnl >= 0 else f"-₹{abs(trade.pnl):.2f}"
+        msg = f"✅ Trade Closed: {trade.instrument} @ {trade.exit_price:.2f} (Reason: {reason}) | PnL: {profit_str}"
+        logger.info(msg)
+        self._log_ui(msg, "trade")
+        
+        return True
+
+    @staticmethod
+    def _expected_position_sign(trade: Trade) -> int:
+        if trade.inst_type == "OPT":
+            return 1
+        return 1 if trade.direction in {"LONG", "BUY"} else -1
+
+    @staticmethod
+    def _record_entry_slippage(trade: Trade, fill_price: float) -> None:
+        """Measure the real entry fill against the signal price that triggered it.
+
+        Adverse is signed positive when the fill was worse than the signal:
+        entries are BUYs for all options and LONG futures; SHORT futures enter
+        by SELLING, so worse = lower fill.
+        """
+        try:
+            reference = float(getattr(trade, "signal_entry_price", 0.0) or 0.0)
+            fill = float(fill_price or 0.0)
+            if reference <= 0 or fill <= 0:
+                return
+            if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}:
+                adverse = fill - reference
+            else:
+                adverse = reference - fill
+            trade.entry_slippage = round(adverse, 4)
+            from engine.slippage_tracker import get_slippage_tracker
+
+            get_slippage_tracker().record(
+                inst_type=trade.inst_type,
+                instrument=trade.instrument,
+                reference_price=reference,
+                adverse_points=adverse,
+                leg="ENTRY",
+            )
+        except Exception as exc:
+            logger.debug(f"Entry slippage recording skipped: {exc}")
+
+    @staticmethod
+    def _record_exit_slippage(trade: Trade, decision_price: float, fill_price: float) -> None:
+        """Measure the real exit fill against the price at the exit decision.
+
+        Exits reverse the entry side: options and LONG futures exit by SELLING
+        (worse = lower fill); SHORT futures exit by BUYING (worse = higher fill).
+        """
+        try:
+            reference = float(decision_price or 0.0)
+            fill = float(fill_price or 0.0)
+            if reference <= 0 or fill <= 0 or abs(fill - reference) < 1e-9:
+                return
+            if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}:
+                adverse = reference - fill
+            else:
+                adverse = fill - reference
+            trade.exit_slippage = round(adverse, 4)
+            from engine.slippage_tracker import get_slippage_tracker
+
+            get_slippage_tracker().record(
+                inst_type=trade.inst_type,
+                instrument=trade.instrument,
+                reference_price=reference,
+                adverse_points=adverse,
+                leg="EXIT",
+            )
+        except Exception as exc:
+            logger.debug(f"Exit slippage recording skipped: {exc}")
+
+    @staticmethod
+    def _order_status_text(order: Optional[Dict]) -> str:
+        if not isinstance(order, dict):
+            return ""
+        return str(
+            order.get("orderstatus")
+            or order.get("status")
+            or order.get("orderStatus")
+            or ""
+        ).strip().lower().replace("_", " ")
+
+    @staticmethod
+    def _aware_ist(value: Optional[datetime]) -> datetime:
+        value = value or datetime.now(IST)
+        return IST.localize(value) if value.tzinfo is None else value.astimezone(IST)
+
+    def _mark_recovery(self, trade: Trade, reason: str) -> None:
+        trade.execution_status = "RECOVERY_REQUIRED"
+        trade.execution_error = str(reason or "Broker reconciliation required")
+        if trade.recovery_required_since is None:
+            trade.recovery_required_since = datetime.now(IST)
+        self._alert_recovery(trade)
+
+    def _alert_recovery(self, trade: Trade) -> None:
+        if not hasattr(self, "_last_recovery_alert"):
+            self._last_recovery_alert = {}
+        now = time.monotonic()
+        last = float(self._last_recovery_alert.get(trade.id, 0.0) or 0.0)
+        if now - last < 30.0:
+            return
+        self._last_recovery_alert[trade.id] = now
+        message = (
+            f"RECOVERY REQUIRED: {trade.trading_symbol or trade.instrument}. "
+            f"{trade.execution_error or 'Broker state is ambiguous.'}"
+        )
+        logger.critical(message)
+        self._log_ui(message, "error")
+        try:
+            from notifications import send_desktop_notification
+            send_desktop_notification(message, "error")
+        except Exception as exc:
+            logger.debug(f"Recovery desktop alert unavailable: {exc}")
+
+    def _protective_exit_side(self, trade: Trade) -> str:
+        return "SELL" if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"} else "BUY"
+
+    def _protective_trigger_for(self, trade: Trade) -> float:
+        stop = float(getattr(trade, "current_stop", 0.0) or getattr(trade, "trailing_stop", 0.0) or 0.0)
+        if stop > 0:
+            return stop
+        if trade.inst_type == "OPT":
+            pct = self.options_sl_pct
+        else:
+            from engine.market_regime import futures_stop_tolerance_pct
+
+            pct = futures_stop_tolerance_pct(
+                self.futures_sl_pct,
+                getattr(trade, "market_regime", "UNKNOWN"),
+            )
+        if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}:
+            return max(0.05, trade.entry_price * (1.0 - pct / 100.0))
+        return trade.entry_price * (1.0 + pct / 100.0)
+
+    def ensure_broker_protection(self, trade: Trade, quantity: Optional[int] = None) -> bool:
+        """Create or tighten the exchange-side SL-M for a confirmed REAL position."""
+        if getattr(self, "mode", "HISTORICAL") != "REAL" or getattr(trade, "is_ghost", False):
+            return True
+        if not self.broker or not trade.symbol_token or not trade.trading_symbol:
+            self._mark_recovery(trade, "Cannot establish broker protection without broker contract details")
+            return False
+        qty = int(quantity or trade.broker_quantity or trade.quantity)
+        if qty <= 0:
+            return False
+        trigger = self._protective_trigger_for(trade)
+        side = self._protective_exit_side(trade)
+        if trigger <= 0:
+            self._mark_recovery(trade, "Protective stop trigger is invalid")
+            return False
+
+        now = time.monotonic()
+        if not hasattr(self, "_last_protective_sync"):
+            self._last_protective_sync = {}
+        if not hasattr(self, "_last_protective_status_poll"):
+            self._last_protective_status_poll = {}
+        if not hasattr(self, "_last_recovery_alert"):
+            self._last_recovery_alert = {}
+        last_sync = float(self._last_protective_sync.get(trade.id, 0.0) or 0.0)
+        existing = str(getattr(trade, "protective_order_id", "") or "")
+        last_status_poll = float(self._last_protective_status_poll.get(trade.id, 0.0) or 0.0)
+        if existing and now - last_status_poll >= 15.0:
+            getter = getattr(self.broker, "get_order_status", None)
+            stop_status = self._order_status_text(getter(existing)) if callable(getter) else ""
+            self._last_protective_status_poll[trade.id] = now
+            if stop_status in {"rejected", "cancelled", "canceled"}:
+                trade.protective_order_id = ""
+                existing = ""
+            elif stop_status in {"complete", "filled"}:
+                self._mark_recovery(
+                    trade,
+                    "Protective stop reports filled while broker position is still open",
+                )
+                return False
+        if existing:
+            tighter = (
+                trigger > float(trade.protective_trigger or 0.0)
+                if side == "SELL"
+                else trigger < float(trade.protective_trigger or float("inf"))
+            )
+            qty_changed = qty != int(trade.protective_quantity or 0)
+            if not tighter and not qty_changed:
+                return True
+            if now - last_sync < 2.0:
+                return True
+            ok = self.broker.modify_protective_stop(
+                existing, trade.trading_symbol, trade.symbol_token, qty, side,
+                trigger, self.product_type,
+            )
+            self._last_protective_sync[trade.id] = now
+            if ok:
+                trade.protective_trigger = trigger
+                trade.protective_quantity = qty
+                trade.protective_updated_at = datetime.now(IST)
+                self.save_state()
+                return True
+            self._mark_recovery(trade, "Broker protective stop could not be tightened")
+            self.save_state()
+            return False
+
+        order_id = self.broker.place_protective_stop(
+            trade.trading_symbol, trade.symbol_token, qty, side, trigger, self.product_type,
+        )
+        self._last_protective_sync[trade.id] = now
+        if order_id:
+            trade.protective_order_id = str(order_id)
+            trade.protective_trigger = trigger
+            trade.protective_quantity = qty
+            trade.protective_updated_at = datetime.now(IST)
+            trade.recovery_required_since = None
+            self.save_state()
+            logger.info(
+                f"Broker SL-M armed for {trade.trading_symbol}: {order_id} "
+                f"qty={qty} trigger={trigger:.2f}"
+            )
+            return True
+        self._mark_recovery(trade, "Confirmed broker position has no exchange-side protective stop")
+        self.save_state()
+        return False
+
+    def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
+        """Flatten a confirmed recovery position after safely cancelling its SL-M."""
+        if not self.broker or not trade.symbol_token or not trade.trading_symbol:
+            self._mark_recovery(trade, f"{reason}; emergency flatten unavailable")
+            return False
+        if trade.protective_order_id:
+            if not self.broker.cancel_order(trade.protective_order_id, "STOPLOSS"):
+                self._mark_recovery(
+                    trade,
+                    f"{reason}; protective stop cancellation unconfirmed, market flatten withheld to avoid over-exit",
+                )
+                return False
+            trade.protective_order_id = ""
+        qty = int(trade.broker_quantity or trade.quantity)
+        side = self._protective_exit_side(trade)
+        order_id = self.broker.close_order(
+            trade.trading_symbol, trade.symbol_token, qty, side, self.product_type,
+        )
+        if not order_id:
+            self._mark_recovery(trade, f"{reason}; emergency flatten order failed")
+            return False
+        trade.exit_order_id = str(order_id)
+        trade.pending_exit = True
+        trade.pending_execution = False
+        trade.execution_status = "EXIT_PENDING"
+        trade.execution_error = reason
+        trade.exit_reason = "RECOVERY_AUTO_FLATTEN"
+        self.save_state()
+        logger.critical(f"Recovery fallback flatten submitted for {trade.trading_symbol}: {order_id}")
+        return True
+
+    def reconcile_broker_positions(self, positions_resp: Optional[Dict] = None) -> Dict:
+        """Reconcile local trades and broker-only positions in both directions."""
+        if not self.broker:
+            return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
+        get_positions = getattr(self.broker, "get_positions", None)
+        if positions_resp is None:
+            if not callable(get_positions):
+                return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
+            positions_resp = get_positions()
+        if not isinstance(positions_resp, dict):
+            return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
+        rows = positions_resp.get("data", [])
+        if not isinstance(rows, list):
+            return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
+
+        allowed_prefixes = self._reconciliation_symbol_prefixes()
+        broker_pos = {
+            str(row.get("tradingsymbol") or ""): row
+            for row in rows
+            if str(row.get("tradingsymbol") or "") and str(row.get("tradingsymbol") or "").upper().startswith(allowed_prefixes)
+        }
+        closed = 0
+        confirmed = 0
+        changed = False
+        with self._lock:
+            local_snapshot = list(self.open_trades.items())
+        local_symbols = set()
+        for trade_id, trade in local_snapshot:
+            symbol = str(trade.trading_symbol or trade.instrument)
+            local_symbols.add(symbol)
+            position = broker_pos.get(symbol)
+            order_status = None
+            if trade.execution_status == "ENTRY_SUBMITTED" and trade.broker_order_id:
+                getter = getattr(self.broker, "get_order_status", None)
+                if callable(getter):
+                    order_status = getter(trade.broker_order_id)
+            if position is None:
+                if (
+                    trade.execution_status == "ENTRY_SUBMITTED"
+                    and trade.entry_submitted_at is not None
+                ):
+                    submitted_at = trade.entry_submitted_at
+                    if submitted_at.tzinfo is None:
+                        submitted_at = IST.localize(submitted_at)
+                    age_seconds = (
+                        datetime.now(IST) - submitted_at.astimezone(IST)
+                    ).total_seconds()
+                    status_text = self._order_status_text(order_status)
+                    if status_text in {"rejected", "cancelled", "canceled"}:
+                        trade.status = "CLOSED"
+                        trade.pending_execution = False
+                        trade.execution_status = "REJECTED"
+                        trade.execution_error = (
+                            str((order_status or {}).get("text") or status_text)
+                        )
+                        trade.exit_reason = "BROKER_REJECTED"
+                        trade.exit_time = datetime.now(IST)
+                        trade.exit_price = trade.entry_price
+                        with self._lock:
+                            if self.open_trades.pop(trade_id, None) is trade:
+                                self.closed_trades.append(trade)
+                        changed = True
+                        continue
+
+                    from config.settings import get_settings
+                    settings = get_settings()
+                    timeout = max(
+                        2.0,
+                        float(getattr(settings, "broker_fill_confirmation_timeout_seconds", 12.0) or 12.0),
+                    )
+                    working = status_text in {
+                        "open", "pending", "put order req received", "validation pending",
+                        "after market order req received", "modify pending",
+                    }
+                    if (
+                        working
+                        and age_seconds >= timeout
+                        and trade.entry_replace_count < 1
+                        and _setting_enabled(getattr(settings, "broker_cancel_replace_enabled", True), True)
+                    ):
+                        cancelled = self.broker.cancel_order(trade.broker_order_id, "NORMAL")
+                        if cancelled:
+                            entry_side = (
+                                "BUY"
+                                if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}
+                                else "SELL"
+                            )
+                            replacement = self.broker.place_order(
+                                trade.trading_symbol,
+                                trade.symbol_token,
+                                trade.quantity,
+                                entry_side,
+                                self.product_type,
+                                price=0.0,
+                            )
+                            if replacement:
+                                trade.broker_order_id = str(replacement)
+                                trade.entry_submitted_at = datetime.now(IST)
+                                trade.entry_replace_count += 1
+                                trade.execution_error = "Stale limit cancelled and replaced with MARKET"
+                                changed = True
+                                continue
+                        self._mark_recovery(trade, "Stale entry could not be safely cancelled/replaced")
+                        trade.pending_execution = True
+                        changed = True
+                    elif age_seconds >= timeout * 2.0:
+                        self._mark_recovery(
+                            trade,
+                            f"Submitted entry was not confirmed by order book or positions within {timeout * 2.0:.0f}s",
+                        )
+                        trade.pending_execution = True
+                        changed = True
+                continue
+            net_qty = self._position_quantity(position)
+            expected_sign = self._expected_position_sign(trade)
+            if net_qty and (1 if net_qty > 0 else -1) != expected_sign:
+                trade.broker_quantity = abs(net_qty)
+                trade.pending_execution = True
+                self._mark_recovery(
+                    trade,
+                    f"Broker position direction mismatch: netqty={net_qty}, "
+                    f"expected {'LONG' if expected_sign > 0 else 'SHORT'}",
+                )
+                changed = True
+                continue
+            trade.broker_quantity = abs(net_qty)
+            expected_qty = max(1, trade.quantity)
+            if net_qty == 0:
+                if trade.protective_order_id:
+                    self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
+                    trade.protective_order_id = ""
+                reason = (
+                    trade.exit_reason
+                    if trade.execution_status == "EXIT_PENDING" and trade.exit_reason
+                    else "MANUAL_SYNC"
+                )
+                realised = position.get("realised")
+                try:
+                    realised_pnl = float(realised) if realised not in (None, "") else None
+                except (TypeError, ValueError):
+                    realised_pnl = None
+                if self._finalize_closed_trade(
+                    trade_id,
+                    trade,
+                    self._position_exit_price(trade, position),
+                    reason,
+                    realised_pnl=realised_pnl,
+                ):
+                    closed += 1
+                continue
+            if (
+                trade.execution_status in {
+                    "ENTRY_PENDING",
+                    "ENTRY_SUBMITTED",
+                    "PARTIAL",
+                    "RECOVERY_REQUIRED",
+                }
+                and not trade.pending_exit
+            ):
+                filled_qty = abs(net_qty)
+                trade.pending_execution = filled_qty != expected_qty
+                trade.execution_status = "OPEN" if filled_qty == expected_qty else "PARTIAL"
+                
+                # ACTUAL BROKER FILL PRICE SYNC
+                fill_price = float(position.get("buyavgprice", 0.0) if trade.direction in {"LONG", "BUY"} or trade.inst_type == "OPT" else position.get("sellavgprice", 0.0))
+                if fill_price > 0.1:
+                    if trade.inst_type != "OPT" or self._option_premium_quote_plausible(
+                        trade,
+                        fill_price,
+                        getattr(trade, "entry_spot", 0.0),
+                    ):
+                        self._record_entry_slippage(trade, fill_price)
+                        trade.entry_price = fill_price
+                    else:
+                        logger.warning(
+                            f"Ignored implausible broker fill {fill_price:.2f} "
+                            f"for {trade.trading_symbol or trade.instrument}; "
+                            f"kept local entry {trade.entry_price:.2f}"
+                        )
+                
+                trade.execution_error = (
+                    ""
+                    if filled_qty == expected_qty
+                    else f"Broker entry partially filled; {filled_qty} of {expected_qty} quantity confirmed"
+                )
+                confirmed += 1
+                changed = True
+                protected = self.ensure_broker_protection(trade, filled_qty)
+                if not protected:
+                    self._maybe_auto_flatten_unprotected(
+                        trade,
+                        "Broker protection unavailable",
+                    )
+            elif trade.execution_status == "EXIT_PENDING" and abs(net_qty) < expected_qty:
+                trade.pending_exit = True
+                trade.execution_status = "PARTIAL_EXIT"
+                trade.execution_error = (
+                    f"Broker exit partially filled; {abs(net_qty)} of "
+                    f"{expected_qty} quantity remains; awaiting broker completion"
+                )
+                changed = True
+            elif (
+                abs(net_qty) != expected_qty
+                and trade.execution_status not in {"EXIT_PENDING", "PARTIAL_EXIT"}
+            ):
+                trade.execution_status = "PARTIAL"
+                self.ensure_broker_protection(trade, abs(net_qty))
+                changed = True
+
+        orphans = {}
+        for symbol, position in broker_pos.items():
+            if self._position_quantity(position) != 0 and symbol not in local_symbols:
+                orphan = dict(position)
+                orphan["execution_status"] = "ORPHANED"
+                orphan["status"] = "ORPHANED"
+                orphans[symbol] = orphan
+        if orphans != self.orphan_positions:
+            self.orphan_positions = orphans
+            changed = True
+            if orphans:
+                logger.critical(
+                    "Broker-only positions require reconciliation: "
+                    + ", ".join(sorted(orphans))
+                )
+        if changed:
+            self.save_state()
+        return {
+            "checked": True,
+            "orphans": len(orphans),
+            "closed": closed,
+            "confirmed": confirmed,
+        }
+
+    def update_risk_settings(self, futures_sl_pct: float = None, options_sl_pct: float = None):
+        """Update settings and re-calibrate open trades if needed"""
+        if futures_sl_pct is not None:
+            self.futures_sl_pct = futures_sl_pct
+        if options_sl_pct is not None:
+            self.options_sl_pct = options_sl_pct
+            
+        # Optional: Sync open trades to new settings (Aggressive approach)
+        # For now, we just update the manager state so NEW trades get the correct SL.
+        # If we want to move EXISTING stops, we would loop through self.open_trades here.
+        logger.info(f"🛡️ Risk Settings Synced: FUT SL={self.futures_sl_pct}%, OPT SL={self.options_sl_pct}%")
+
+    def save_state(self):
+        """Save active and recent closed trades to SQLite for crash recovery"""
+        try:
+            with self._lock:
+                open_tr = list(self.open_trades.values())
+                self.closed_trades = self.closed_trades[-500:]
+                closed = list(self.closed_trades)
+                snapshot = [t.to_dict() for t in open_tr + closed]
+                db.save_trades(snapshot)
+        except Exception as e:
+            logger.error(f"Failed to save trade state to DB: {e}")
+
+    def load_state(self):
+        """Load state from SQLite on startup"""
+        try:
+            open_records = db.load_open_trades()
+            closed_records = db.load_closed_trades()
+            
+            stale_ghosts = 0
+            for data in open_records:
+                tid = data.get("id", "")
+                if not tid: continue
+                t = Trade.from_dict(data)
+                t.status = "OPEN"
+                if t.entry_time.date() < datetime.now(IST).date():
+                    # Ghost/shadow rows (engine-lab, tests) never had broker
+                    # orders — there is nothing to reconcile. Retaining them as
+                    # RECOVERY_REQUIRED spammed CRITICAL alerts + strategy-exit
+                    # loops on every restart (2026-07-10: 111 stale ghosts).
+                    if bool(getattr(t, "is_ghost", False)):
+                        t.status = "CLOSED"
+                        t.pending_exit = False
+                        t.execution_status = "CLOSED"
+                        t.exit_reason = getattr(t, "exit_reason", "") or "STALE_SESSION_END"
+                        t.exit_time = getattr(t, "exit_time", None) or t.entry_time
+                        t.exit_price = float(
+                            getattr(t, "exit_price", 0.0)
+                            or getattr(t, "current_price", 0.0)
+                            or getattr(t, "entry_price", 0.0)
+                            or 0.0
+                        )
+                        self.closed_trades.append(t)
+                        stale_ghosts += 1
+                        continue
+                    t.execution_status = "RECOVERY_REQUIRED"
+                    t.execution_error = "Previous-session trade requires broker reconciliation"
+                    logger.critical(f"Previous-session active trade retained for reconciliation: {tid}")
+                elif not t.execution_status:
+                    t.execution_status = "OPEN"
+                self.open_trades[tid] = t
+            if stale_ghosts:
+                logger.info(
+                    f"Closed {stale_ghosts} stale previous-session ghost trade(s) as "
+                    "STALE_SESSION_END on load (no broker reconciliation applies)."
+                )
+                try:
+                    self.save_state()
+                except Exception:
+                    pass
+
+            for data in closed_records:
+                try:
+                    t = Trade.from_dict(data)
+                    t.status = "CLOSED"
+                    self.closed_trades.append(t)
+                except Exception as e:
+                    logger.warning(f"Failed to parse historical trade: {e}")
+            
+            self._recover_trade_counter()
+            if self.open_trades or self.closed_trades:
+                logger.success(f"♻️ Recovered {len(self.open_trades)} active and {len(self.closed_trades)} historical trades from DB.")
+        except Exception as e:
+            logger.error(f"Failed to load trade state from DB: {e}")
+
+    def _recover_trade_counter(self) -> None:
+        """Continue generated trade IDs above every persisted T-number."""
+        persisted = list(self.open_trades.values()) + list(self.closed_trades)
+        for trade in persisted:
+            match = re.match(r"^T(\d+)_", str(getattr(trade, "id", "") or ""))
+            if match:
+                self._trade_counter = max(self._trade_counter, int(match.group(1)))
+
+    def reset_pnl(self):
+        """Reset all trades and P&L for a fresh simulation"""
+        if getattr(self, "mode", "HISTORICAL") == "REAL" and self.has_live_exposure():
+            logger.critical("Blocked P&L reset while REAL broker exposure is still active.")
+            return False
+        try:
+            backup_path = ""
+            with self._lock:
+                existing_rows = db.load_all_trades()
+                if existing_rows:
+                    backup_dir = Path("data_store/reset_backups")
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    backup_path = str(
+                        backup_dir
+                        / f"trades_reset_backup_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.json"
+                    )
+                    Path(backup_path).write_text(
+                        json.dumps(existing_rows, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                with db.write_lock:
+                    db.conn.execute("DELETE FROM trades")
+                    db.conn.commit()
+                self.open_trades.clear()
+                self.closed_trades.clear()
+        except Exception as exc:
+            logger.error(f"Failed to clear persisted trades during P&L reset: {exc}")
+            return False
+        backup_note = f" Backup: {backup_path}" if backup_path else ""
+        logger.info(f"🧹 Trade Manager: Cleared all trades and P&L from DB.{backup_note}")
+        return True
+
+    def has_live_exposure(self) -> bool:
+        """Return True while broker-backed or broker-only positions need protection."""
+        with self._lock:
+            active = any(
+                trade.status == "OPEN" and not getattr(trade, "is_ghost", False)
+                for trade in self.open_trades.values()
+            )
+            return active or bool(self.orphan_positions)
+
+    def reset_session(self, session_date: date) -> Dict[str, int]:
+        """Start a new accounting session without deleting active broker state.
+
+        Ghost/shadow trades (engine-lab, premarket HISTORICAL replays) never had
+        broker orders — at rollover they are closed as STALE_SESSION_END instead
+        of being retained for a "reconciliation" that can never happen
+        (2026-07-10: 24 premarket ghosts raised a false CRITICAL at 09:00).
+        """
+        stale_ghosts: List[Trade] = []
+        with self._lock:
+            closed = len(self.closed_trades)
+            for tid, trade in list(self.open_trades.items()):
+                if bool(getattr(trade, "is_ghost", False)):
+                    trade.status = "CLOSED"
+                    trade.pending_exit = False
+                    trade.execution_status = "CLOSED"
+                    trade.exit_reason = getattr(trade, "exit_reason", "") or "STALE_SESSION_END"
+                    trade.exit_time = getattr(trade, "exit_time", None) or datetime.now(IST)
+                    trade.exit_price = float(
+                        getattr(trade, "exit_price", 0.0)
+                        or getattr(trade, "current_price", 0.0)
+                        or getattr(trade, "entry_price", 0.0)
+                        or 0.0
+                    )
+                    self.closed_trades.append(trade)
+                    self.open_trades.pop(tid, None)
+                    stale_ghosts.append(trade)
+                    continue
+                if trade.entry_time.date() < session_date:
+                    trade.execution_status = "RECOVERY_REQUIRED"
+                    trade.execution_error = "Previous-session trade requires broker reconciliation"
+            active = len(self.open_trades)
+        self.save_state()
+        if stale_ghosts:
+            logger.info(
+                f"Session rollover closed {len(stale_ghosts)} ghost/shadow trade(s) as "
+                "STALE_SESSION_END (no broker reconciliation applies)."
+            )
+        if active:
+            logger.critical(
+                f"Session rollover retained {active} active trade(s); broker reconciliation required."
+            )
+        return {"active_retained": active, "closed_history_retained": closed}
+
+    def _parse_time(self, t: str) -> dtime:
+        parts = t.split(":")
+        return dtime(int(parts[0]), int(parts[1]))
+
+    def _effective_max_positions(self) -> int:
+        """Base max_positions, raised during cascade multi-TF waves (R4)."""
+        base = max(1, int(getattr(self, "max_positions", 12) or 12))
+        try:
+            from config.settings import get_settings
+
+            s = get_settings()
+            casc_cap = max(
+                0, int(getattr(s, "cascade_max_concurrent_positions", 0) or 0)
+            )
+            if casc_cap <= base:
+                return base
+            # Any live cascade entry or sticky wave flag unlocks cascade ceiling
+            has_cascade = any(
+                bool(getattr(t, "one_way_cascade_entry", False))
+                for t in (getattr(self, "open_trades", {}) or {}).values()
+                if not getattr(t, "is_ghost", False)
+            )
+            if has_cascade or bool(getattr(self, "_cascade_wave_capacity", False)):
+                return casc_cap
+        except Exception:
+            pass
+        return base
+
+    def arm_cascade_wave_capacity(self, enabled: bool = True) -> None:
+        """Scanner arms this before opening a multi-signal cascade batch."""
+        setattr(self, "_cascade_wave_capacity", bool(enabled))
+
+    def can_open_trade(self, is_recovery: bool = False) -> Tuple[bool, str]:
+        """Check if we can open a new trade"""
+        with self._lock:
+            if not is_recovery and self.orphan_positions:
+                return False, "Broker-only orphan position requires reconciliation"
+            active_positions = sum(
+                1
+                for trade in self.open_trades.values()
+                if not getattr(trade, "is_ghost", False)
+            )
+            cap = self._effective_max_positions()
+            if not is_recovery and active_positions >= cap:
+                return False, f"Max positions ({cap}) reached"
+        return True, ""
+
+    @staticmethod
+    def _extract_order_id(result) -> str:
+        if not result:
+            return ""
+        if isinstance(result, dict):
+            if result.get("status") is False or result.get("errorcode"):
+                return ""
+            data = result.get("data", result)
+            if isinstance(data, dict):
+                return str(data.get("orderid") or data.get("uniqueorderid") or "")
+            return str(data or "")
+        return str(result)
+
+    def open_trade(
+        self,
+        instrument: str,
+        timeframe: str,
+        direction: str,
+        price: float,
+        trailing_stop: float,
+        lots: int,
+        lot_size: int,
+        grade: str,
+        atm_strike: float = 0.0,
+        option_type: str = "",
+        target: float = 0.0,
+        rr_ratio: float = 1.5,
+        confidence: float = 0.0,
+        instrument_multiplier: float = 1.0,
+        trading_symbol: str = "",
+        symbol_token: str = "",
+        inst_type: str = "FUT",
+        exec_type: str = "A",
+        entry_spot: float = 0.0,
+        spot_stop: float = 0.0,
+        spot_target: float = 0.0,
+        is_recovery: bool = False,
+        is_ghost: bool = False,
+        is_reversion_scalp: bool = False,
+        is_explosive_bypass: bool = False,
+        entry_time: Optional[datetime] = None,
+        signal_time: Optional[datetime] = None,
+        signal_fire_mode: str = "INTRACANDLE",
+        entered_intracandle: bool = True,
+        market_regime: str = "",
+        data_provenance: str = "",
+        price_action_verdict: str = "",
+        intelligence_score: float = 0.0,
+        strategy_revision: str = "",
+        strategy_direction_mode: str = "",
+        market_wide_reversal_entry: bool = False,
+        volume_spike_entry: bool = False,
+        power_move: bool = False,
+        source_engine: str = "",
+        source_engines: Optional[List[str]] = None,
+        source_lane: str = "",
+        quad_union_entry: bool = False,
+        raw_union_entry: bool = False,
+        initial_stop: float = 0.0,
+        scalp_lock_mode: bool = False,
+        execution_touch_quote: Optional[Dict[str, Any]] = None,
+        on_execution_result: Optional[Callable[[Trade, bool], None]] = None,
+    ) -> Optional[Trade]:
+        """Open a new trade and execute via broker"""
+        if entry_time is not None:
+            now = entry_time
+        elif is_recovery and signal_time is not None:
+            now = signal_time
+        else:
+            now = datetime.now(IST)
+        with self._lock:
+            can, reason = self.can_open_trade(is_recovery)
+            if not can:
+                logger.warning(f"Cannot open trade: {reason}")
+                return None
+            known_ids = set(self.open_trades)
+            known_ids.update(str(trade.id) for trade in self.closed_trades)
+            while True:
+                self._trade_counter += 1
+                trade_id = f"T{self._trade_counter:04d}_{instrument}_{now.strftime('%m%d%H%M')}"
+                if trade_id not in known_ids:
+                    break
+
+        trade = Trade(
+            id=trade_id,
+            instrument=instrument,
+            timeframe=timeframe,
+            direction=direction,
+            entry_price=price,
+            entry_time=now,
+            signal_time=signal_time,
+            trailing_stop=trailing_stop,
+            current_stop=trailing_stop,
+            lots=lots,
+            lot_size=lot_size,
+            grade=grade,
+            atm_strike=atm_strike,
+            option_type=option_type,
+            target=target,
+            rr_ratio=rr_ratio,
+            confidence=confidence,
+            inst_type=inst_type,
+            instrument_multiplier=instrument_multiplier,
+            current_price=price,
+            trading_symbol=trading_symbol,
+            symbol_token=symbol_token,
+            exec_type=exec_type,
+            entry_spot=entry_spot or price,
+            spot_stop=spot_stop,
+            spot_target=spot_target,
+            is_ghost=is_ghost,
+            is_reversion_scalp=is_reversion_scalp,
+            signal_fire_mode=str(signal_fire_mode or "INTRACANDLE"),
+            entered_intracandle=bool(entered_intracandle),
+            market_regime=str(market_regime or ""),
+            data_provenance=str(data_provenance or ""),
+            price_action_verdict=str(price_action_verdict or ""),
+            intelligence_score=float(intelligence_score or 0.0),
+            strategy_revision=str(strategy_revision or ""),
+            strategy_direction_mode=str(strategy_direction_mode or ""),
+            market_wide_reversal_entry=market_wide_reversal_entry,
+            volume_spike_entry=volume_spike_entry,
+            power_move=power_move,
+            source_engine=str(source_engine or ""),
+            source_engines=list(source_engines or []),
+            source_lane=str(source_lane or ""),
+            quad_union_entry=bool(quad_union_entry),
+            raw_union_entry=bool(raw_union_entry),
+            initial_stop=float(initial_stop or trailing_stop or 0.0),
+            scalp_lock_mode=bool(scalp_lock_mode),
+            signal_entry_price=float(price or 0.0),
+            execution_bid_price=float((execution_touch_quote or {}).get("bid") or 0.0),
+            execution_ask_price=float((execution_touch_quote or {}).get("ask") or 0.0),
+            execution_touch_source=str((execution_touch_quote or {}).get("source") or ""),
+            execution_touch_age_seconds=float((execution_touch_quote or {}).get("age_seconds") or 0.0),
+            execution_touch_usable=bool((execution_touch_quote or {}).get("usable", False)),
+            execution_touch_reason=str((execution_touch_quote or {}).get("reason") or ""),
+        )
+
+        trade.pending_execution = not is_recovery
+        trade.execution_status = "OPEN" if (is_recovery or is_ghost) else "ENTRY_PENDING"
+        with self._lock:
+            can, reason = self.can_open_trade(is_recovery)
+            if not can:
+                logger.warning(f"Cannot reserve trade after concurrent update: {reason}")
+                return None
+            self.open_trades[trade_id] = trade
+        self.save_state()
+
+        qty = lots * lot_size
+        logger.info(
+            f"🟢 TRADE LOGGED: {trade_id} | {direction} {trading_symbol or instrument} @ {price:.2f} | "
+            f"Stop: {trailing_stop:.2f} | {lots}×{lot_size}={qty}{' [GHOST]' if is_ghost else ''}"
+        )
+
+        # ⚡ REAL BROKER ENTRY (Background Thread) ⚡ 
+        is_warmup = getattr(self, "is_warmup", False)
+        if self.broker and trading_symbol and symbol_token and not is_warmup and not is_ghost:
+            order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
+            
+            def place_bg():
+                def place_order():
+                    try:
+                        return self.broker.place_order(
+                            symbol=trading_symbol,
+                            token=symbol_token,
+                            qty=trade.quantity,
+                            side=order_side,
+                            product_type=self.product_type,
+                            price=price,
+                            touch_quote=execution_touch_quote,
+                        )
+                    except TypeError as exc:
+                        if "touch_quote" not in str(exc):
+                            raise
+                        return self.broker.place_order(
+                            symbol=trading_symbol,
+                            token=symbol_token,
+                            qty=trade.quantity,
+                            side=order_side,
+                            product_type=self.product_type,
+                            price=price,
+                        )
+
+                order_id, error, attempts = execute_order_with_retry(
+                    place_order,
+                    self._extract_order_id,
+                    f"Entry order {trading_symbol}",
+                )
+                if order_id:
+                    with self._lock:
+                        if trade.id in self.open_trades:
+                            trade.broker_order_id = order_id
+                            trade.pending_execution = True
+                            trade.entry_submitted_at = datetime.now(IST)
+                            trade.execution_status = "ENTRY_SUBMITTED"
+                            trade.execution_error = ""
+                    self.save_state()
+                    if on_execution_result:
+                        on_execution_result(trade, True)
+                    msg = (
+                        f"✅ Broker order placed successfully for {trading_symbol}: "
+                        f"{order_id} (attempt {attempts})"
+                    )
+                    logger.info(msg)
+                    self._log_ui(msg, "trade")
+                    return
+
+                ambiguous_ack = "ambiguous" in str(error or "").lower()
+                if ambiguous_ack:
+                    msg = (
+                        f"⚠️ Broker entry acknowledgement ambiguous for {trading_symbol}; "
+                        "trade requires broker position reconciliation before any new action."
+                    )
+                    logger.critical(msg)
+                    self._log_ui(msg, "error")
+                    with self._lock:
+                        if trade.id in self.open_trades:
+                            trade.pending_execution = True
+                            trade.entry_submitted_at = datetime.now(IST)
+                            trade.execution_status = "RECOVERY_REQUIRED"
+                            trade.execution_error = error or "Broker entry acknowledgement ambiguous"
+                    self.save_state()
+                    if on_execution_result:
+                        on_execution_result(trade, False)
+                    return
+
+                msg = (
+                    f"❌ Broker entry failed for {trading_symbol} after "
+                    f"{attempts} attempts: {error}"
+                )
+                logger.error(msg)
+                self._log_ui(msg, "error")
+                with self._lock:
+                    if trade.id in self.open_trades:
+                        trade.status = "CLOSED"
+                        trade.exit_reason = "BROKER_ERROR"
+                        trade.exit_time = datetime.now(IST)
+                        trade.exit_price = trade.entry_price
+                        trade.pending_execution = False
+                        trade.execution_status = "REJECTED"
+                        trade.execution_error = error
+                        self.closed_trades.append(trade)
+                        del self.open_trades[trade.id]
+                self.save_state()
+                if on_execution_result:
+                    on_execution_result(trade, False)
+            
+            from engine.async_queue import execution_queue
+            execution_queue.submit(f"PlaceOrder_{trading_symbol}", place_bg)
+        else:
+            if (
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and not is_recovery
+                and not is_ghost
+            ):
+                with self._lock:
+                    trade.status = "CLOSED"
+                    trade.pending_execution = False
+                    trade.execution_status = "REJECTED"
+                    trade.execution_error = "REAL broker or executable contract details unavailable"
+                    trade.exit_reason = "BROKER_UNAVAILABLE"
+                    trade.exit_time = datetime.now(IST)
+                    trade.exit_price = trade.entry_price
+                    self.closed_trades.append(trade)
+                    self.open_trades.pop(trade.id, None)
+                self.save_state()
+                if on_execution_result:
+                    on_execution_result(trade, False)
+            else:
+                trade.pending_execution = False
+                trade.execution_status = "OPEN"
+                if on_execution_result:
+                    on_execution_result(trade, True)
+
+        return trade
+
+    def update_trade(
+        self, 
+        trade_id: str, 
+        current_spot: float, 
+        new_trailing_stop: float = None,
+        current_time: Optional[datetime] = None,
+        real_premium: Optional[float] = None,
+        real_fut_price: Optional[float] = None,
+    ):
+        """
+        Update trade with latest price and trailing stop from 1-min data.
+        Automatically closes trade if trailing stop is hit.
+        """
+        trade = self.open_trades.get(trade_id)
+        if not trade or trade.status != "OPEN":
+            return
+        recovery_required = (
+            str(getattr(trade, "execution_status", "") or "").upper()
+            == "RECOVERY_REQUIRED"
+        )
+        if (
+            getattr(trade, "pending_execution", False)
+            and not getattr(trade, "pending_exit", False)
+            and not recovery_required
+            and self._confirmed_broker_quantity(trade) <= 0
+        ):
+            return  # Wait for broker confirmation before triggering stops
+
+        # If it's an option, current_price is the synthetic premium. 
+        # Premium change = (Spot Change * Signed Delta)
+        is_option = trade.inst_type == "OPT" or "CE" in getattr(trade, 'trading_symbol', '') or "PE" in getattr(trade, 'trading_symbol', '')
+        
+        if is_option:
+            if (
+                real_premium is not None
+                and real_premium > 0
+                and self._option_premium_quote_plausible(trade, real_premium, current_spot)
+            ):
+                trade.current_price = float(real_premium)
+            elif real_premium is not None and real_premium > 0:
+                logger.warning(
+                    f"Ignored implausible option premium {float(real_premium):.2f} "
+                    f"for {trade.instrument} {trade.trading_symbol}; using synthetic premium fallback."
+                )
+                if trade.entry_spot > 0:
+                    spot_change = current_spot - trade.entry_spot
+                    premium_move = spot_change * trade.instrument_multiplier
+                    trade.current_price = trade.entry_price + premium_move
+                else:
+                    trade.current_price = trade.entry_price
+            elif trade.entry_spot > 0:
+                spot_change = current_spot - trade.entry_spot
+                
+                # Premium Move = Spot Move * Signed Delta (instrument_multiplier)
+                # PE has negative delta, so spot down (-100) * delta (-0.5) = +50 premium.
+                premium_move = spot_change * trade.instrument_multiplier
+                trade.current_price = trade.entry_price + premium_move
+            else:
+                # Fallback: If entry_spot is missing, do NOT use spot price as option price!
+                # Keep it at entry_price to avoid massive fake P&L.
+                trade.current_price = trade.entry_price
+                
+            # Ensure premium doesn't go below 1.0 (option value floor)
+            trade.current_price = max(0.05, trade.current_price)
+        else:
+            if real_fut_price is not None and real_fut_price > 0:
+                trade.current_price = float(real_fut_price)
+            elif trade.entry_spot > 0:
+                trade.current_price = trade.entry_price + (current_spot - trade.entry_spot)
+            else:
+                trade.current_price = current_spot
+
+        logger.debug(f"💓 Heartbeat {trade.id}: Price {trade.current_price:.2f} | Stop {trade.current_stop:.2f} | PnL ₹{trade.pnl:.0f}")
+
+        # Update trailing stop (only ratchet — never move against trade).
+        # Audit #9: single source of truth for units —
+        #   * OPT: new_trailing_stop is PREMIUM space (scanner converts spot→prem)
+        #   * FUT: new_trailing_stop is CONTRACT price space
+        # Dual spot*delta math was removed; scanner owns spot→premium mapping.
+        if new_trailing_stop is not None:
+            try:
+                incoming_stop = float(new_trailing_stop)
+            except (TypeError, ValueError):
+                incoming_stop = 0.0
+            if incoming_stop > 0:
+                if is_option:
+                    # Options are always long premium: only tighten (raise) the stop.
+                    if incoming_stop > float(trade.current_stop or 0.0):
+                        trade.current_stop = incoming_stop
+                elif trade.direction == "LONG":
+                    if incoming_stop > float(trade.current_stop or 0.0):
+                        trade.current_stop = incoming_stop
+                elif trade.direction == "SHORT":
+                    current = float(trade.current_stop or 0.0)
+                    if current <= 0 or incoming_stop < current:
+                        trade.current_stop = incoming_stop
+
+        if int(getattr(trade, "broker_quantity", 0) or 0) > 0:
+            self.ensure_broker_protection(trade, trade.broker_quantity)
+            if recovery_required:
+                self._maybe_auto_flatten_unprotected(
+                    trade,
+                    "Broker protection unavailable",
+                )
+
+        # Keep open-trade mark-to-market consistent with risk-manager net P&L.
+        trade.pnl = trade.unrealized_pnl
+
+        # Track peak and drawdown
+        trade.peak_pnl = max(trade.peak_pnl, trade.pnl)
+        trade.max_drawdown = max(trade.max_drawdown, trade.peak_pnl - trade.pnl)
+
+        if recovery_required or getattr(trade, "pending_exit", False):
+            now = time.monotonic()
+            if now - self._last_mark_to_market_save >= 1.0:
+                self._last_mark_to_market_save = now
+                self.save_state()
+            return
+
+        # ── EXIT CHECKS (Stop Loss, Target, Early Loss-Guard) ──
+        # Symmetric for FUT and OPT:
+        #   * trailing stop / target trail on winners
+        #   * early loss-cut on losers (mirror of profit lock on the loss side)
+        # Option trades are premium-led; futures are contract-price-led.
+        runner_mode = bool(getattr(trade, "runner_mode", False))
+        target = float(getattr(trade, "target", 0.0) or 0.0)
+
+        # Early loss-guard backstop (R2): use scanner-published loss_guard_cut_r
+        # when present (intel-accelerated); else base 0.8R settings.
+        cut_override = getattr(trade, "loss_guard_cut_r", None)
+        if self._early_loss_cut_hit(trade, cut_r_override=cut_override):
+            self.close_trade(
+                trade_id, trade.current_price, "EARLY_LOSS_CUT", exit_time=current_time
+            )
+        elif trade.inst_type == "OPT":
+            if trade.current_price <= trade.current_stop:
+                self.close_trade(trade_id, trade.current_price, "TRAILING_STOP", exit_time=current_time)
+            elif (not runner_mode) and target > 0 and trade.current_price >= target:
+                self.close_trade(trade_id, trade.current_price, "TARGET_HIT", exit_time=current_time)
+        elif trade.direction == "LONG":
+            if trade.current_price <= trade.current_stop:
+                self.close_trade(trade_id, trade.current_price, "TRAILING_STOP", exit_time=current_time)
+            elif (not runner_mode) and target > 0 and trade.current_price >= target:
+                self.close_trade(trade_id, trade.current_price, "TARGET_HIT", exit_time=current_time)
+        else:  # SHORT FUT
+            if trade.current_price >= trade.current_stop:
+                self.close_trade(trade_id, trade.current_price, "TRAILING_STOP", exit_time=current_time)
+            elif (not runner_mode) and target > 0 and trade.current_price <= target:
+                self.close_trade(trade_id, trade.current_price, "TARGET_HIT", exit_time=current_time)
+        
+        if trade_id in self.open_trades:
+            from config.settings import get_settings
+            checkpoint = max(
+                0.25,
+                float(getattr(get_settings(), "trade_state_checkpoint_seconds", 1.0) or 1.0),
+            )
+            now = time.monotonic()
+            if now - self._last_mark_to_market_save >= checkpoint:
+                self._last_mark_to_market_save = now
+                self.save_state()
+
+    @staticmethod
+    def _option_premium_quote_plausible(trade: Trade, premium: float, current_spot: float = 0.0) -> bool:
+        """Reject option LTPs that are obviously index/futures prices."""
+        try:
+            premium = float(premium or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if premium <= 0:
+            return False
+
+        entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+        target = float(getattr(trade, "target", 0.0) or 0.0)
+        spot = float(current_spot or getattr(trade, "entry_spot", 0.0) or 0.0)
+        strike = float(getattr(trade, "atm_strike", 0.0) or 0.0)
+        opt_type = str(getattr(trade, "option_type", "") or "").upper()
+        intrinsic = 0.0
+        if spot > 0 and strike > 0:
+            intrinsic = max(0.0, spot - strike) if opt_type == "CE" else max(0.0, strike - spot)
+
+        bounds = [1000.0]
+        if entry > 0:
+            bounds.append(entry * 4.0)
+        if target > 0:
+            bounds.append(target * 3.0)
+        if spot > 0:
+            bounds.append(intrinsic + spot * 0.05)
+            bounds.append(spot * 0.12)
+        return premium <= max(bounds)
+
+    @staticmethod
+    def _early_loss_cut_hit(trade: "Trade", cut_r_override: Optional[float] = None) -> bool:
+        """True when unrealized loss reaches the early loss-cut R.
+
+        Base threshold is settings fut/opt_loss_cut_r (default 0.8R). Scanner may
+        pass a lower cut_r_override when intel confirms a big reversal (0.55 / 0.35).
+        """
+        try:
+            from config.settings import get_settings
+
+            settings = get_settings()
+        except Exception:
+            return False
+
+        is_opt = str(getattr(trade, "inst_type", "FUT") or "FUT").upper() == "OPT"
+        if is_opt:
+            if not bool(getattr(settings, "opt_early_loss_cut_enabled", True)):
+                return False
+            cut_r = float(getattr(settings, "opt_loss_cut_r", 0.8) or 0.8)
+        else:
+            if not bool(getattr(settings, "fut_early_loss_cut_enabled", True)):
+                return False
+            cut_r = float(getattr(settings, "fut_loss_cut_r", 0.8) or 0.8)
+        if cut_r_override is not None:
+            try:
+                cut_r = float(cut_r_override)
+            except (TypeError, ValueError):
+                pass
+        cut_r = max(0.05, min(1.0, cut_r))
+
+        entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+        current = float(getattr(trade, "current_price", 0.0) or 0.0)
+        if entry <= 0 or current <= 0:
+            return False
+
+        initial_stop = float(
+            getattr(trade, "initial_stop", 0.0)
+            or getattr(trade, "trailing_stop", 0.0)
+            or 0.0
+        )
+        if initial_stop <= 0:
+            return False
+
+        qty = max(1, int(getattr(trade, "lots", 1) or 1) * int(getattr(trade, "lot_size", 1) or 1))
+        # OPT is always long-premium; FUT uses direction.
+        if is_opt:
+            risk_pts = max(0.0, entry - initial_stop)
+            pnl_pts = current - entry
+        elif str(getattr(trade, "direction", "LONG") or "LONG").upper() == "LONG":
+            risk_pts = max(0.0, entry - initial_stop)
+            pnl_pts = current - entry
+        else:
+            risk_pts = max(0.0, initial_stop - entry)
+            pnl_pts = entry - current
+
+        if risk_pts <= 0:
+            return False
+        risk_rs = risk_pts * qty
+        pnl_rs = pnl_pts * qty
+        # Only cut losers; winners are handled by profit-lock / trail.
+        if pnl_rs >= 0:
+            return False
+        return abs(pnl_rs) >= (cut_r * risk_rs) - 1e-9
+
+    def _request_broker_exit(
+        self,
+        trade: Trade,
+        on_exit_result: Optional[Callable[[Trade, bool], None]] = None,
+    ) -> None:
+        broker = self.broker
+        product_type = self.product_type
+
+        def close_bg():
+            with self._lock:
+                current = self.open_trades.get(trade.id)
+                if (
+                    current is not trade
+                    or trade.status != "OPEN"
+                    or not trade.pending_exit
+                ):
+                    logger.warning(
+                        f"Skipped stale queued exit for {trade.id}; "
+                        "the position is no longer pending locally."
+                    )
+                    if on_exit_result:
+                        on_exit_result(trade, False)
+                    return
+
+            exit_side = "SELL" if trade.direction == "LONG" or trade.inst_type == "OPT" else "BUY"
+            exit_quantity = (
+                int(trade.broker_quantity)
+                if int(getattr(trade, "broker_quantity", 0) or 0) > 0
+                else trade.quantity
+            )
+
+            if trade.protective_order_id:
+                if not broker.cancel_order(trade.protective_order_id, "STOPLOSS"):
+                    self._mark_recovery(
+                        trade,
+                        "Protective stop cancellation unconfirmed; market exit withheld to avoid over-exit",
+                    )
+                    trade.pending_exit = False
+                    self.save_state()
+                    if on_exit_result:
+                        on_exit_result(trade, False)
+                    return
+                trade.protective_order_id = ""
+                self.save_state()
+
+            def close_order():
+                return broker.close_order(
+                        symbol=trade.trading_symbol,
+                        token=trade.symbol_token,
+                        qty=exit_quantity,
+                        side=exit_side,
+                        product_type=product_type,
+                    )
+
+            order_id, last_error, attempts = execute_order_with_retry(
+                close_order,
+                self._extract_order_id,
+                f"Exit order {trade.trading_symbol}",
+            )
+
+            if order_id:
+                with self._lock:
+                    if self.open_trades.get(trade.id) is not trade:
+                        logger.critical(
+                            f"Exit order {order_id} acknowledged after {trade.id} "
+                            "left local open state; broker reconciliation is required."
+                        )
+                        return
+                    trade.exit_order_id = order_id
+                    trade.execution_status = "EXIT_PENDING"
+                    trade.execution_error = ""
+                self.save_state()
+                if getattr(self, "mode", "HISTORICAL") != "REAL":
+                    self._finalize_closed_trade(
+                        trade.id,
+                        trade,
+                        trade.exit_price,
+                        trade.exit_reason,
+                        exit_time=trade.exit_time,
+                    )
+                if on_exit_result:
+                    on_exit_result(trade, True)
+                return
+
+            ambiguous_ack = "ambiguous" in str(last_error or "").lower()
+            if ambiguous_ack:
+                trade.pending_exit = True
+                trade.execution_status = "RECOVERY_REQUIRED"
+                trade.execution_error = last_error or "Broker exit acknowledgement ambiguous"
+            else:
+                trade.pending_exit = False
+                trade.execution_status = "EXIT_FAILED"
+                trade.execution_error = last_error or "Unknown broker exit failure"
+            self.save_state()
+            logger.critical(
+                f"[BROKER CLOSE FAILED] Position remains active for "
+                f"{trade.trading_symbol} after {attempts} attempts: "
+                f"{trade.execution_error}"
+            )
+            if on_exit_result:
+                on_exit_result(trade, False)
+
+        from engine.async_queue import execution_queue
+        execution_queue.submit(f"CloseOrder_{trade.trading_symbol}", close_bg)
+
+    def close_trade(
+        self,
+        trade_id: str,
+        exit_price: float,
+        reason: str = "MANUAL",
+        exit_time: Optional[datetime] = None,
+        on_exit_result: Optional[Callable[[Trade, bool], None]] = None,
+    ):
+        """Close a trade with IST aware timestamping"""
+        needs_entry_sync = False
+        with self._lock:
+            trade = self.open_trades.get(trade_id)
+            if not trade or trade.status != "OPEN":
+                return False
+            if trade.pending_exit or trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}:
+                return False
+            requires_broker_exit = (
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and not getattr(trade, "is_ghost", False)
+            )
+            if (
+                self._entry_still_confirming(trade)
+                and requires_broker_exit
+                and self._confirmed_broker_quantity(trade) <= 0
+                and self.broker
+            ):
+                needs_entry_sync = True
+            elif self._entry_still_confirming(trade) and (
+                not requires_broker_exit or self._confirmed_broker_quantity(trade) <= 0
+            ):
+                return False
+            if requires_broker_exit and (not self.broker or not trade.symbol_token):
+                trade.execution_status = "RECOVERY_REQUIRED"
+                trade.execution_error = (
+                    "REAL position cannot be closed without broker access and symbol token"
+                )
+                trade.pending_exit = False
+                self.save_state()
+                if on_exit_result:
+                    on_exit_result(trade, False)
+                return False
+
+        if needs_entry_sync:
+            try:
+                self.reconcile_broker_positions()
+            except Exception as exc:
+                logger.error(f"Broker reconciliation before close failed: {exc}")
+
+        with self._lock:
+            trade = self.open_trades.get(trade_id)
+            if not trade or trade.status != "OPEN":
+                return False
+            if trade.pending_exit or trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}:
+                return False
+            requires_broker_exit = (
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and not getattr(trade, "is_ghost", False)
+            )
+            if self._entry_still_confirming(trade):
+                if not requires_broker_exit or self._confirmed_broker_quantity(trade) <= 0:
+                    return False
+            if requires_broker_exit and (not self.broker or not trade.symbol_token):
+                trade.execution_status = "RECOVERY_REQUIRED"
+                trade.execution_error = (
+                    "REAL position cannot be closed without broker access and symbol token"
+                )
+                trade.pending_exit = False
+                self.save_state()
+                if on_exit_result:
+                    on_exit_result(trade, False)
+                return False
+            trade.exit_price = float(exit_price or trade.current_price or trade.entry_price)
+            trade.current_price = trade.exit_price
+            trade.exit_time = exit_time or datetime.now(IST)
+            trade.exit_reason = reason
+            trade.pending_exit = True
+            trade.execution_status = "EXIT_PENDING"
+            trade.execution_error = ""
+        self.save_state()
+
+        if self.broker and trade.symbol_token and not getattr(trade, 'is_ghost', False):
+            self._request_broker_exit(trade, on_exit_result=on_exit_result)
+        else:
+            self._finalize_closed_trade(
+                trade_id,
+                trade,
+                trade.exit_price,
+                reason,
+                exit_time=trade.exit_time,
+            )
+            if on_exit_result:
+                on_exit_result(trade, True)
+        return True
+
+    def check_session_end(self, current_time: Optional[datetime] = None):
+        """
+        Simple & Robust EOD Exit (Strict Session Bound)
+        """
+        if current_time:
+            now = IST.localize(current_time) if current_time.tzinfo is None else current_time
+        else:
+            now = datetime.now(IST)
+        now_t = now.time()
+        
+        from config.settings import get_settings
+        force_exit_label = str(getattr(get_settings(), "ut_force_exit_time", "15:25") or "15:25")
+        kill_threshold = self._parse_time(force_exit_label)
+        
+        if now_t < kill_threshold:
+            return
+
+        with self._lock:
+            snapshot = list(self.open_trades.items())
+            
+        for tid, trade in snapshot:
+            # Strategy-owned square-off. CARRYFORWARD avoids broker intraday auto-squareoff.
+            if str(getattr(trade, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
+                self.emergency_flatten_trade(trade, "FORCE_EOD_KILL")
+            else:
+                self.close_trade(tid, trade.current_price, "FORCE_EOD_KILL", exit_time=now)
+
+    def check_expiry_gamma_time_exit(self, current_time: Optional[datetime] = None):
+        """Square off expiry-day current-expiry (gamma) OPTION trades at the configured
+        gamma time-exit, so an expiring ATM never bleeds into the afternoon theta crush.
+        Gated behind expiry_day_trade_current_week (default off) and only touches OPT
+        trades ENTERED before the cutoff on an expiry day (i.e. genuine gamma trades)."""
+        from config.settings import get_settings
+        s = get_settings()
+        if not bool(getattr(s, "expiry_day_trade_current_week", False)):
+            return
+        now = current_time or datetime.now(IST)
+        now = IST.localize(now) if now.tzinfo is None else now.astimezone(IST)
+        time_exit = self._parse_time(str(getattr(s, "expiry_day_gamma_time_exit", "13:30") or "13:30"))
+        if now.time() < time_exit:
+            return
+        cutoff = self._parse_time(str(getattr(s, "expiry_day_gamma_cutoff", "13:00") or "13:00"))
+        try:
+            from engine.expiry_manager import expiry_manager
+        except Exception:
+            return
+        with self._lock:
+            snapshot = list(self.open_trades.items())
+        for tid, trade in snapshot:
+            if str(getattr(trade, "inst_type", "") or "").upper() != "OPT":
+                continue
+            et = getattr(trade, "entry_time", None)
+            if et is None:
+                continue
+            et_ist = IST.localize(et) if et.tzinfo is None else et.astimezone(IST)
+            try:
+                is_exp = expiry_manager.is_expiry_day(trade.instrument, et_ist.date())
+            except Exception:
+                is_exp = False
+            # genuine T-0 gamma trade: entered on expiry day, before the morning cutoff
+            if not is_exp or et_ist.time() >= cutoff:
+                continue
+            self.close_trade(tid, trade.current_price, "EXPIRY_GAMMA_TIME_EXIT", exit_time=now)
+
+    def expire_stale_open_trades(self, now: Optional[datetime] = None, reason: str = "STALE_SESSION_END") -> int:
+        """Retain previous-session trades until broker reconciliation proves closure."""
+        now = now or datetime.now(IST)
+        if now.tzinfo is None:
+            now = IST.localize(now)
+        marked = 0
+        with self._lock:
+            for trade in self.open_trades.values():
+                entry_time = trade.entry_time
+                if entry_time.tzinfo is None:
+                    entry_time = IST.localize(entry_time)
+                else:
+                    entry_time = entry_time.astimezone(IST)
+                if entry_time.date() >= now.date():
+                    continue
+                trade.execution_status = "RECOVERY_REQUIRED"
+                trade.execution_error = "Previous-session trade requires broker reconciliation"
+                marked += 1
+        if marked:
+            self.save_state()
+            try:
+                self.reconcile_broker_positions()
+            except Exception as exc:
+                logger.error(f"Stale-position reconciliation failed: {exc}")
+        return marked
+
+    def update_stops(self, prices: Dict[str, float]):
+        """Update trailing stops for all open trades based on favor-movements"""
+        with self._lock:
+            trades_snapshot = list(self.open_trades.items())
+            
+        for tid, trade in trades_snapshot:
+            spot = prices.get(trade.instrument.split(' ')[0])
+            if not spot: continue
+            
+            # Update current price for real-time PnL tracking
+            self.update_trade(tid, spot)
+            
+            # Simple Trailing logic: if price moves in favor, trail the stop
+            # Note: This is a backup; MTF usually manages this, but we keep it for safety.
+            pass
+
+    def get_dashboard_payload(self, is_historical: bool = False, backtest_days: int = 1, inst_pref: str = "AUTO") -> Dict:
+        """Get filtered trades and summary based on active mode"""
+        now_ist = datetime.now(IST)
+        # If it's before 9:00 AM IST, we are likely reviewing the PREVIOUS day's session
+        if now_ist.hour < 9:
+            today = (now_ist - timedelta(days=1)).date()
+        else:
+            today = now_ist.date()
+        
+        # 1. Unified Session Identification
+        today_str = today.strftime('%Y-%m-%d')
+        
+        def trade_session_date(trade: Trade) -> Optional[date]:
+            value = getattr(trade, "entry_time", None)
+            if value is None:
+                return None
+            try:
+                import pandas as pd
+                ts = pd.Timestamp(value)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_convert(IST).tz_localize(None)
+                return ts.date()
+            except Exception:
+                return None
+
+        with self._lock:
+            # Watch-only ghost records are represented by the scanner's session
+            # signal ledger. They are not broker trades and must not affect the
+            # trade-manager table, P&L, W/L, or trade count.
+            snapshot_open = [
+                trade for trade in self.open_trades.values()
+                if not getattr(trade, "is_ghost", False)
+            ]
+            snapshot_closed = [
+                trade for trade in self.closed_trades
+                if not getattr(trade, "is_ghost", False)
+            ]
+
+        if not is_historical:
+            # Live/manual mode must not project older sessions as current trades.
+            session_closed = [t for t in snapshot_closed if trade_session_date(t) == today]
+        else:
+            all_trades = snapshot_closed + snapshot_open
+            unique_dates = sorted({d for d in (trade_session_date(t) for t in all_trades) if d is not None})
+            if unique_dates:
+                cutoff_date = unique_dates[-min(len(unique_dates), backtest_days)]
+                session_closed = [t for t in snapshot_closed if (trade_session_date(t) or date.min) >= cutoff_date]
+            else:
+                session_closed = []
+            
+        # 2. Get Open Trades
+        if not is_historical:
+            open_trades = [t for t in snapshot_open if trade_session_date(t) == today]
+        else:
+            def close_intraday_projection(trade: Trade) -> Trade:
+                entry_time = trade.entry_time
+                if entry_time.tzinfo is None:
+                    entry_time = IST.localize(entry_time)
+                else:
+                    entry_time = entry_time.astimezone(IST)
+
+                exit_price = trade.current_price if trade.current_price > 0 else trade.entry_price
+                from config.settings import get_settings
+                settings = get_settings()
+                from engine.trade_accounting import estimate_trade_charges
+                charges = trade.charges or estimate_trade_charges(
+                    trade.entry_price,
+                    exit_price,
+                    trade.quantity,
+                    trade.inst_type,
+                    settings,
+                    trade.instrument_multiplier,
+                    instrument=trade.instrument,
+                )
+                if trade.inst_type == "OPT" or trade.direction == "LONG":
+                    gross = (exit_price - trade.entry_price) * trade.quantity
+                else:
+                    gross = (trade.entry_price - exit_price) * trade.quantity
+
+                projected = replace(trade)
+                projected.status = "CLOSED"
+                from config.settings import get_settings
+                force_exit = self._parse_time(
+                    str(getattr(get_settings(), "ut_force_exit_time", "15:25") or "15:25")
+                )
+                projected.exit_time = IST.localize(datetime.combine(entry_time.date(), force_exit))
+                projected.exit_reason = "SESSION_END"
+                projected.exit_price = exit_price
+                projected.current_price = exit_price
+                projected.charges = charges
+                projected.pnl = gross - charges
+                return projected
+
+            filtered_open = []
+            try:
+                if 'unique_dates' in locals() and unique_dates:
+                    filtered_open = [t for t in snapshot_open if (trade_session_date(t) or date.min) >= cutoff_date]
+                else:
+                    filtered_open = snapshot_open
+            except Exception:
+                filtered_open = snapshot_open
+                
+            session_closed = session_closed + [close_intraday_projection(t) for t in filtered_open]
+            open_trades = []
+
+        pref = (inst_pref or "AUTO").upper()
+        if pref in {"FUT", "OPT"}:
+            session_closed = [t for t in session_closed if (getattr(t, "inst_type", "FUT") or "FUT").upper() == pref]
+            open_trades = [t for t in open_trades if (getattr(t, "inst_type", "FUT") or "FUT").upper() == pref]
+
+        display_closed = self._filter_concurrency_compliant_closed(session_closed)
+        display_closed = [t for t in display_closed if self._valid_closed_chronology(t)]
+        display_closed = [t for t in display_closed if t.status == "CLOSED"]
+
+        # Headline table = shadow-free + deduped (same set as get_summary).
+        # Shadows remain only in summary.futures_shadow telemetry.
+        from engine.trade_row_adapter import hygiene_closed_rows
+
+        headline_closed, _ = hygiene_closed_rows(display_closed)
+
+        # 3. Calculate Summary based on the EXACT same session pool
+        summary = self.get_summary(filtered_trades=display_closed, open_trades=open_trades)
+
+        # 4. Format already-filtered trades for UI.
+        all_formatted = build_dashboard_rows(
+            self,
+            open_trades,
+            headline_closed,
+            include_orphans=not is_historical,
+        )
+        
+        return {
+            "open": [t for t in all_formatted if t["status"] in {"OPEN", "ORPHANED"}],
+            "closed": [t for t in all_formatted if t["status"] == "CLOSED"],
+            "summary": summary,
+            "analytics": self._build_session_analytics(display_closed, open_trades),
+        }
+
+    def get_open_trades_list(self) -> List[Dict]:
+        """Backward compatibility for existing API calls"""
+        payload = self.get_dashboard_payload(is_historical=False)
+        return payload["open"] + payload["closed"]
+
+
+
+    def _grade_rank(self, grade: str) -> int:
+        base = str(grade or "C").split()[0]
+        return {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4, "Recovered": 4}.get(base, 0)
+
+    def _is_aplus_setup(self, trade: Trade) -> bool:
+        return self._grade_rank(getattr(trade, "grade", "")) >= 4 or float(getattr(trade, "confidence", 0.0) or 0.0) >= 0.90
+
+    def _valid_closed_chronology(self, trade: Trade) -> bool:
+        if trade.status != "CLOSED" or not trade.entry_time or not trade.exit_time:
+            return True
+        entry_ts = trade.entry_time.replace(tzinfo=None) if trade.entry_time.tzinfo else trade.entry_time
+        exit_ts = trade.exit_time.replace(tzinfo=None) if trade.exit_time.tzinfo else trade.exit_time
+        return exit_ts > entry_ts
+
+    def _filter_concurrency_compliant_closed(self, trades: List[Trade]) -> List[Trade]:
+        """Apply live-style overlap rules to historical/session display metrics."""
+        try:
+            from config.settings import get_settings
+            if not _setting_enabled(getattr(get_settings(), "ut_concurrency_guard", True), True):
+                return sorted(
+                    trades,
+                    key=lambda t: (
+                        t.entry_time.replace(tzinfo=None) if getattr(t.entry_time, "tzinfo", None) else t.entry_time,
+                        str(getattr(t, "id", "") or ""),
+                    ),
+                    reverse=True,
+                )
+        except Exception:
+            pass
+
+        accepted: List[Trade] = []
+        removed = {"same_index_cap": 0, "same_index_overlap": 0, "correlated_cap": 0}
+        try:
+            settings = get_settings()
+            adaptive_dual_lanes = (
+                str(getattr(settings, "scanner_engine", "") or "").lower() == "adaptive_dual"
+                and _setting_enabled(getattr(settings, "dual_lane_enabled", True), True)
+            )
+        except Exception:
+            adaptive_dual_lanes = False
+
+        def is_futures_shadow(trade: Trade) -> bool:
+            return (
+                str(getattr(trade, "trading_symbol", "") or "").upper() == "FUT_SHADOW"
+                or "FUT SHADOW" in str(getattr(trade, "grade", "") or "").upper()
+            )
+
+        def is_dual_lane_pair(left: Trade, right: Trade) -> bool:
+            if not adaptive_dual_lanes:
+                return False
+            lanes = {
+                str(getattr(left, "source_lane", "") or "").upper(),
+                str(getattr(right, "source_lane", "") or "").upper(),
+            }
+            return lanes == {"A", "B"}
+
+        ordered = sorted(
+            trades,
+            key=lambda t: (
+                t.entry_time.replace(tzinfo=None) if getattr(t.entry_time, "tzinfo", None) else t.entry_time,
+                -float(getattr(t, "confidence", 0.0) or 0.0),
+                1 if is_futures_shadow(t) else 0,
+                str(getattr(t, "instrument", "") or ""),
+                str(getattr(t, "timeframe", "") or ""),
+                str(getattr(t, "inst_type", "") or ""),
+                str(getattr(t, "id", "") or ""),
+            ),
+        )
+
+        for trade in ordered:
+            entry = trade.entry_time.replace(tzinfo=None) if getattr(trade.entry_time, "tzinfo", None) else trade.entry_time
+            active = []
+            for existing in accepted:
+                exit_time = existing.exit_time or existing.entry_time
+                ex_entry = existing.entry_time.replace(tzinfo=None) if getattr(existing.entry_time, "tzinfo", None) else existing.entry_time
+                ex_exit = exit_time.replace(tzinfo=None) if getattr(exit_time, "tzinfo", None) else exit_time
+                if ex_entry <= entry < ex_exit:
+                    active.append(existing)
+
+            same_index = [t for t in active if t.instrument.split()[0] == trade.instrument.split()[0]]
+            if len(same_index) >= 2:
+                removed["same_index_cap"] += 1
+                continue
+            if same_index:
+                existing = same_index[0]
+                same_tf = getattr(existing, "timeframe", "") == getattr(trade, "timeframe", "")
+                same_type = getattr(existing, "inst_type", "FUT") == getattr(trade, "inst_type", "FUT")
+                higher_grade = self._grade_rank(trade.grade) > self._grade_rank(existing.grade) or self._is_aplus_setup(trade)
+                if same_tf or same_type or not higher_grade:
+                    if not is_dual_lane_pair(existing, trade):
+                        removed["same_index_overlap"] += 1
+                        continue
+
+            same_dir = [t for t in active if t.direction == trade.direction]
+            if len(same_dir) >= 2:
+                all_aplus = all(self._is_aplus_setup(t) for t in same_dir) and self._is_aplus_setup(trade)
+                if not all_aplus:
+                    removed["correlated_cap"] += 1
+                    continue
+
+            accepted.append(trade)
+
+        summary_key = (len(trades), len(accepted), tuple(removed.values()))
+        now = time.time()
+        if (
+            summary_key != getattr(self, "_last_concurrency_filter_log_key", None)
+            or now - getattr(self, "_last_concurrency_filter_log_time", 0.0) >= 60.0
+        ):
+            logger.info(
+                "Historical Concurrency Guard: "
+                f"accepted={len(accepted)}/{len(trades)}, removed={sum(removed.values())} "
+                f"(index_cap={removed['same_index_cap']}, "
+                f"overlap={removed['same_index_overlap']}, "
+                f"correlated_cap={removed['correlated_cap']})."
+            )
+            self._last_concurrency_filter_log_key = summary_key
+            self._last_concurrency_filter_log_time = now
+
+        return sorted(
+            accepted,
+            key=lambda t: (
+                t.entry_time.replace(tzinfo=None) if getattr(t.entry_time, "tzinfo", None) else t.entry_time,
+                str(getattr(t, "id", "") or ""),
+            ),
+            reverse=True,
+        )
+
+    def _build_session_analytics(self, closed_trades: List[Trade], open_trades: List[Trade]) -> Dict:
+        def bucketize(trades, key_fn):
+            buckets = {}
+            for t in trades:
+                key = key_fn(t) or "--"
+                bucket = buckets.setdefault(key, {"count": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+                pnl = float(getattr(t, "pnl", 0.0) or 0.0)
+                bucket["count"] += 1
+                bucket["pnl"] += pnl
+                if pnl > 0:
+                    bucket["wins"] += 1
+                elif pnl < 0:
+                    bucket["losses"] += 1
+            for bucket in buckets.values():
+                bucket["pnl"] = round(bucket["pnl"], 0)
+                closed_count = bucket["wins"] + bucket["losses"]
+                bucket["win_rate"] = round((bucket["wins"] / closed_count) * 100, 1) if closed_count else 0.0
+            return dict(sorted(buckets.items(), key=lambda item: abs(item[1]["pnl"]), reverse=True))
+
+        closed = list(closed_trades or [])
+        return {
+            "by_timeframe": bucketize(closed, lambda t: getattr(t, "timeframe", "--")),
+            "by_grade": bucketize(closed, lambda t: str(getattr(t, "grade", "--")).split()[0]),
+            "by_instrument": bucketize(closed, lambda t: str(getattr(t, "instrument", "--")).split()[0]),
+            "by_type": bucketize(closed, lambda t: getattr(t, "inst_type", "--")),
+            "by_exit_reason": bucketize(closed, lambda t: getattr(t, "exit_reason", "--")),
+            # Price-action advisory: ADVERSE bucket's pnl = what blocking them would change.
+            "by_price_action": bucketize(closed, lambda t: getattr(t, "price_action_verdict", "") or "--"),
+            "open_by_type": bucketize(list(open_trades or []), lambda t: getattr(t, "inst_type", "--")),
+        }
+
+    def get_summary(self, filtered_trades: Optional[List] = None, open_trades: Optional[List] = None) -> Dict:
+        """Get comprehensive performance analytics for dashboard"""
+        closed = list(filtered_trades) if filtered_trades is not None else list(self.closed_trades)
+        closed = [
+            trade for trade in closed
+            if getattr(trade, "execution_status", "") != "REJECTED"
+        ]
+
+        # ── Backtest-sweep hygiene (2026-07-09 FUT-vs-OPT audit) ──
+        # Shared with dashboard rebuild so headline P&L never re-includes
+        # FUT_SHADOW companions or multi-engine exact replay dups.
+        from engine.trade_row_adapter import hygiene_closed_rows
+
+        closed, _hygiene = hygiene_closed_rows(closed)
+        shadow_pnl = float((_hygiene.get("futures_shadow") or {}).get("pnl") or 0.0)
+        replay_excess_rows = int((_hygiene.get("engine_replay") or {}).get("excess_rows") or 0)
+        replay_excess_pnl = float((_hygiene.get("engine_replay") or {}).get("excess_pnl") or 0.0)
+        shadow_rows_n = int((_hygiene.get("futures_shadow") or {}).get("rows") or 0)
+        raw_rows_n = int((_hygiene.get("engine_replay") or {}).get("raw_rows") or 0)
+
+        open_for_summary = list(open_trades) if open_trades is not None else list(self.open_trades.values())
+        closed_total = len(closed)
+        total = closed_total + len(open_for_summary)
+        
+        wins = sum(1 for t in closed if t.pnl > 0)
+        losses = sum(1 for t in closed if t.pnl < 0)
+        
+        win_rate = (wins / closed_total * 100) if closed_total > 0 else 0.0
+        
+        # Profit Factor
+        total_profit = sum(t.pnl for t in closed if t.pnl > 0)
+        total_loss = abs(sum(t.pnl for t in closed if t.pnl < 0))
+        profit_factor = (total_profit / total_loss) if total_loss > 0 else (total_profit if total_profit > 0 else 1.0)
+        
+        # Daily/base Sharpe uses sample std; yearly is annualized for display.
+        sharpe = 0.0
+        if closed_total > 2:
+            import numpy as np
+            pnl_list = [t.pnl for t in closed]
+            avg = np.mean(pnl_list)
+            std = np.std(pnl_list, ddof=1)
+            sharpe = (avg / std) if std > 0 else 0.0
+        sharpe_yearly = annualize_sharpe(sharpe)
+            
+        # Max Drawdown
+        max_dd = 0.0
+        peak = 0.0
+        running_equity = 0.0
+        for t in closed:
+            running_equity += t.pnl
+            peak = max(peak, running_equity)
+            max_dd = max(max_dd, peak - running_equity)
+
+        # Calculate P&L dynamically (Closed + Open Unrealized)
+        now_ist = datetime.now(IST)
+        if now_ist.hour < 9:
+            today_str = (now_ist - timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            today_str = now_ist.strftime('%Y-%m-%d')
+        
+        def is_option_trade(trade) -> bool:
+            trading_symbol = str(getattr(trade, "trading_symbol", "") or "").upper()
+            instrument = str(getattr(trade, "instrument", "") or "").upper()
+            return (
+                str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
+                or "CE" in trading_symbol
+                or "PE" in trading_symbol
+                or "CE" in instrument
+                or "PE" in instrument
+            )
+
+        total_pnl = sum(t.pnl for t in closed)
+        fut_pnl = sum(t.pnl for t in closed if not is_option_trade(t))
+        opt_pnl = sum(t.pnl for t in closed if is_option_trade(t))
+        
+        fut_trades = sum(1 for t in closed if not is_option_trade(t))
+        opt_trades = sum(1 for t in closed if is_option_trade(t))
+
+        for ot in open_for_summary:
+            try:
+                is_opt = is_option_trade(ot)
+                if is_opt:
+                    opt_trades += 1
+                else:
+                    fut_trades += 1
+
+                if ot.entry_time.strftime('%Y-%m-%d') == today_str:
+                    unrealized = getattr(ot, "unrealized_pnl", 0.0) or 0.0
+                    total_pnl += unrealized
+                    if is_opt:
+                        opt_pnl += unrealized
+                    else:
+                        fut_pnl += unrealized
+            except Exception:
+                pass
+        
+        return {
+            "daily_pnl": round(total_pnl, 0),
+            "fut_pnl": round(fut_pnl, 0),
+            "opt_pnl": round(opt_pnl, 0),
+            "total_trades": total,
+            "fut_trades": fut_trades,
+            "opt_trades": opt_trades,
+            "open_count": len(open_for_summary),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "sharpe_ratio": sharpe,
+            "sharpe_ratio_daily": sharpe,
+            "sharpe_ratio_yearly": sharpe_yearly,
+            "sharpe_ratio_display": format_sharpe_pair(sharpe, sharpe_yearly),
+            "max_drawdown": max_dd,
+            # Sweep hygiene telemetry (headline above is shadow-free + deduped):
+            "futures_shadow": {
+                "rows": shadow_rows_n,
+                "pnl": round(shadow_pnl, 0),
+            },
+            "engine_replay": {
+                "raw_rows": raw_rows_n,
+                "unique_rows": len(closed),
+                "excess_rows": replay_excess_rows,
+                "excess_pnl": round(replay_excess_pnl, 0),
+            },
+        }
+

@@ -1,0 +1,135 @@
+{
+  "date": "2026-07-17",
+  "settings": {
+    "live_filter_leniency_pct": 0.0,
+    "live_choppy_gate_confidence": 0.72,
+    "ut_5min_option_min_confidence": 0.6,
+    "ut_timeframe_entry_policy": "INCLUDE_5MIN",
+    "signal_grade_preference": "B"
+  },
+  "raw_signal_counts": {
+    "NIFTY": {
+      "5min": 5,
+      "15min": 0
+    },
+    "BANKNIFTY": {
+      "5min": 0,
+      "15min": 0
+    },
+    "SENSEX": {
+      "5min": 0,
+      "15min": 0
+    },
+    "MIDCPNIFTY": {
+      "5min": 0,
+      "15min": 0
+    }
+  },
+  "decision_counts": {
+    "strict_0pct": {
+      "REJECT": 3,
+      "ACCEPT": 2
+    },
+    "current_0pct": {
+      "REJECT": 3,
+      "ACCEPT": 2
+    },
+    "max_20pct": {
+      "REJECT": 3,
+      "ACCEPT": 2
+    }
+  },
+  "reject_reasons_current": {
+    "C grade blocked": 3
+  },
+  "accepted_current": [
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "time": "10:10",
+      "signal": "BUY",
+      "price": 24239.85,
+      "grade": "A+",
+      "confidence": 0.955,
+      "adx": 37.1,
+      "regime": "BREAKOUT_UP",
+      "confluence": 1.0,
+      "direction_15m": 1,
+      "current": "ACCEPT",
+      "strict": "ACCEPT",
+      "max_relaxed": "ACCEPT",
+      "reason": "passed replay gates"
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "time": "11:35",
+      "signal": "BUY",
+      "price": 24257.05,
+      "grade": "A+",
+      "confidence": 0.947,
+      "adx": 30.5,
+      "regime": "TRENDING_UP",
+      "confluence": 1.0,
+      "direction_15m": 1,
+      "current": "ACCEPT",
+      "strict": "ACCEPT",
+      "max_relaxed": "ACCEPT",
+      "reason": "passed replay gates"
+    }
+  ],
+  "would_pass_only_at_20pct": [],
+  "nearest_rejected_current": [
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "time": "10:00",
+      "signal": "SELL",
+      "price": 24214.5,
+      "grade": "C",
+      "confidence": 0.325,
+      "adx": 35.8,
+      "regime": "TRENDING_UP",
+      "confluence": -0.106,
+      "direction_15m": 1,
+      "current": "REJECT",
+      "strict": "REJECT",
+      "max_relaxed": "REJECT",
+      "reason": "C grade blocked"
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "time": "12:50",
+      "signal": "SELL",
+      "price": 24273.9,
+      "grade": "C",
+      "confidence": 0.287,
+      "adx": 28.6,
+      "regime": "TRENDING_UP",
+      "confluence": -0.106,
+      "direction_15m": 1,
+      "current": "REJECT",
+      "strict": "REJECT",
+      "max_relaxed": "REJECT",
+      "reason": "C grade blocked"
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "time": "10:40",
+      "signal": "SELL",
+      "price": 24259.1,
+      "grade": "C",
+      "confidence": 0.254,
+      "adx": 41.8,
+      "regime": "TRENDING_UP",
+      "confluence": -0.106,
+      "direction_15m": 1,
+      "current": "REJECT",
+      "strict": "REJECT",
+      "max_relaxed": "REJECT",
+      "reason": "C grade blocked"
+    }
+  ]
+}

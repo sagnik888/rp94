@@ -1,0 +1,7 @@
+Latest restore point: restore_point_46
+Updated: 2026-07-10 16:35:28 +05:30
+Source workspace: C:\Users\sagnik\Desktop\ut index 2
+Restore folder: C:\Users\sagnik\Desktop\ut index 2\restore_point_46
+
+Checkpoint summary:
+- Built restore point 46 with full system updated and fixed (removed equity curve, expanded signal panel, updated start script branding).

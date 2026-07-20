@@ -1,0 +1,317 @@
+"""Compatibility adapters for persisted trade and dashboard signal rows."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import pytz
+
+from config.settings import get_settings
+
+
+# Keep this low-level adapter side-effect free. Importing TradeManager here used
+# to construct the global production SQLite singleton, which made read-only audit
+# scripts run cleanup/VACUUM merely by importing the shared hygiene helpers.
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def trade_row_id(row: Dict[str, Any]) -> str:
+    return str(row.get("id") or row.get("trade_id") or "")
+
+
+def is_simulated_history_row(row: Dict[str, Any]) -> bool:
+    return trade_row_id(row).startswith(("H_", "EOD_"))
+
+
+def is_futures_shadow_row(row: Any) -> bool:
+    """True for hypothetical FUT companion rows (must not enter headline P&L)."""
+    if isinstance(row, dict):
+        symbol = str(row.get("trading_symbol") or "").upper()
+        grade = str(row.get("grade") or "").upper()
+        tid = str(row.get("id") or row.get("trade_id") or "").upper()
+    else:
+        symbol = str(getattr(row, "trading_symbol", "") or "").upper()
+        grade = str(getattr(row, "grade", "") or "").upper()
+        tid = str(getattr(row, "id", "") or "").upper()
+    if symbol == "FUT_SHADOW":
+        return True
+    if "FUT SHADOW" in grade or "FUT_SHADOW" in grade:
+        return True
+    # Historical shadow ids are "{opt_id}_FUT"
+    if tid.endswith("_FUT") and ("SHADOW" in grade or symbol in {"", "FUT_SHADOW"}):
+        return True
+    return False
+
+
+def _row_attr(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _normalized_text(value: Any, *, upper: bool = False) -> str:
+    text = str(value or "").strip()
+    return text.upper() if upper else text
+
+
+def _normalized_number(value: Any, digits: int = 6) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def replay_dedup_key(row: Any) -> Tuple:
+    """Collapse only materially identical multi-engine historical replays.
+
+    IDs intentionally stay out of the signature because each engine may persist
+    the same replay with a different ID. Contract-defining trade fields remain in
+    the signature so separate strikes/symbols/fills in the same second are not
+    accidentally discarded.
+    """
+    stamp = (
+        _row_attr(row, "signal_time")
+        or _row_attr(row, "signal_timestamp")
+        or _row_attr(row, "entry_time")
+        or _row_attr(row, "entry_timestamp")
+        or _row_attr(row, "timestamp")
+    )
+    instrument = _normalized_text(_row_attr(row, "instrument", ""), upper=True)
+    instrument_root = instrument.split()[0] if instrument.split() else ""
+    return (
+        instrument_root,
+        _normalized_text(_row_attr(row, "timeframe", "")),
+        _normalized_text(_row_attr(row, "direction", ""), upper=True),
+        _normalized_text(_row_attr(row, "inst_type", ""), upper=True),
+        _normalized_text(_row_attr(row, "trading_symbol", ""), upper=True),
+        _normalized_text(_row_attr(row, "option_type", ""), upper=True),
+        _normalized_number(_row_attr(row, "atm_strike"), 2),
+        _normalized_number(_row_attr(row, "entry_price"), 6),
+        _normalized_number(_row_attr(row, "exit_price"), 6),
+        _normalized_number(_row_attr(row, "pnl", 0.0), 2),
+        _normalized_number(_row_attr(row, "lots"), 0),
+        _normalized_number(_row_attr(row, "lot_size"), 0),
+        _normalized_text(_row_attr(row, "exit_reason", ""), upper=True),
+        _normalized_text(stamp),
+    )
+
+
+def hygiene_closed_rows(
+    rows: Iterable[Any],
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Shadow-free + exact-dedup closed set for dashboard/TM headline accounting.
+
+    Returns (headline_rows, telemetry). Telemetry keeps shadow/replay counts for UI.
+    """
+    closed = list(rows or [])
+    shadow_rows = [r for r in closed if is_futures_shadow_row(r)]
+    real_rows = [r for r in closed if not is_futures_shadow_row(r)]
+    seen: Dict[Tuple, Any] = {}
+    for r in real_rows:
+        seen.setdefault(replay_dedup_key(r), r)
+    headline = list(seen.values())
+
+    def _pnl(r: Any) -> float:
+        try:
+            return float(_row_attr(r, "pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    shadow_pnl = sum(_pnl(r) for r in shadow_rows)
+    real_pnl = sum(_pnl(r) for r in real_rows)
+    head_pnl = sum(_pnl(r) for r in headline)
+    telemetry = {
+        "futures_shadow": {
+            "rows": len(shadow_rows),
+            "pnl": round(shadow_pnl, 2),
+        },
+        "engine_replay": {
+            "raw_rows": len(real_rows) + len(shadow_rows),
+            "unique_rows": len(headline),
+            "excess_rows": max(0, len(real_rows) - len(headline)),
+            "excess_pnl": round(real_pnl - head_pnl, 2),
+        },
+    }
+    return headline, telemetry
+
+
+def normalized_exit_reason(row: Dict[str, Any]) -> str:
+    raw = row.get("exit_reason") or row.get("status") or ""
+    return str(raw).upper().replace(" ", "_")
+
+
+def is_quote_invalid_row(row: Dict[str, Any]) -> bool:
+    return "QUOTE_INVALID" in normalized_exit_reason(row)
+
+
+def accounting_pnl(row: Dict[str, Any]) -> float:
+    if is_quote_invalid_row(row):
+        return 0.0
+    try:
+        return float(row.get("accounting_pnl", row.get("pnl", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalize_dashboard_accounting_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(row)
+    if is_quote_invalid_row(row):
+        row.setdefault("raw_pnl", row.get("pnl", 0.0))
+        row["pnl"] = 0.0
+        row["accounting_pnl"] = 0.0
+        row["quote_invalid"] = True
+        if not row.get("exit_reason"):
+            row["exit_reason"] = "QUOTE_INVALID"
+    return row
+
+
+def is_option_dashboard_row(row: Dict[str, Any]) -> bool:
+    inst_type = str(row.get("inst_type") or "").upper()
+    trading_symbol = str(row.get("trading_symbol") or "").upper()
+    instrument = str(row.get("instrument") or "").upper()
+    return inst_type == "OPT" or "CE" in trading_symbol or "PE" in trading_symbol or "CE" in instrument or "PE" in instrument
+
+
+def trade_row_session_date(row: Dict[str, Any]):
+    try:
+        timestamp = row.get("entry_timestamp") or 0
+        if timestamp:
+            return datetime.fromtimestamp(float(timestamp), tz=IST).date()
+    except Exception:
+        pass
+    for key in ("timestamp", "signal_timestamp", "entry_time"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(IST).replace(tzinfo=None)
+            return parsed.date()
+        except Exception:
+            continue
+    return None
+
+
+def trade_row_event_seconds(row: Dict[str, Any], prefer_exit: bool = False) -> float:
+    keys = (
+        ("exit_timestamp", "entry_timestamp", "timestamp", "signal_timestamp", "entry_time")
+        if prefer_exit
+        else ("entry_timestamp", "timestamp", "signal_timestamp", "exit_timestamp", "entry_time")
+    )
+    for key in keys:
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+            return value / 1000.0 if value > 1e12 else value
+        except (TypeError, ValueError):
+            pass
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            if parsed.tzinfo is None:
+                parsed = IST.localize(parsed)
+            else:
+                parsed = parsed.astimezone(IST)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply final accounting guards to persisted rows before dashboard display."""
+    row = normalize_dashboard_accounting_row(row)
+    if is_quote_invalid_row(row):
+        return row
+
+    inst_type = str(row.get("inst_type") or "FUT").upper()
+    direction = str(row.get("direction") or "LONG").upper()
+    entry_price = float(row.get("entry_price") or row.get("price") or 0.0)
+    if entry_price <= 0:
+        return row
+    stop = float(row.get("current_stop") or row.get("trailing_stop") or row.get("stop") or 0.0)
+    target = float(row.get("current_target") or row.get("target") or 0.0)
+    exit_reason = str(row.get("exit_reason") or "").upper()
+    exit_price = float(row.get("exit_price") or row.get("current_price") or 0.0)
+    if exit_reason == "TARGET_HIT" and target > 0:
+        exit_price = target
+    elif exit_reason in {"STOP_HIT", "TRAILING_STOP", "SL HIT", "SL_HIT"} and stop > 0:
+        exit_price = stop
+    if exit_price <= 0:
+        return row
+
+    quantity = int(row.get("lots") or 1) * int(row.get("lot_size") or 1)
+    settings = get_settings()
+    charges = float(settings.fut_cost) if inst_type == "FUT" else float(settings.opt_cost)
+    gross = (
+        (exit_price - entry_price) * quantity
+        if inst_type == "OPT" or direction == "LONG"
+        else (entry_price - exit_price) * quantity
+    )
+    row["exit_price"] = exit_price
+    row["current_price"] = exit_price
+    row["pnl"] = round(gross - charges, 2)
+    return row
+
+
+def trade_row_to_signal(row: Dict[str, Any]) -> Dict[str, Any]:
+    row = normalize_dashboard_accounting_row(row)
+    entry_timestamp = row.get("entry_timestamp", 0)
+    entry_iso = ""
+    if entry_timestamp:
+        try:
+            entry_iso = datetime.fromtimestamp(entry_timestamp, tz=IST).isoformat()
+        except Exception:
+            pass
+
+    exit_timestamp = row.get("exit_timestamp", 0)
+    exit_iso = ""
+    if exit_timestamp:
+        try:
+            exit_iso = datetime.fromtimestamp(exit_timestamp, tz=IST).isoformat()
+        except Exception:
+            pass
+
+    is_closed = row.get("status") == "CLOSED" or row.get("exit_price", 0.0) > 0
+    return {
+        "instrument": row.get("instrument", ""),
+        "direction": row.get("direction", ""),
+        "price": row.get("entry_price", 0.0),
+        "current_price": row.get("exit_price", 0.0) or row.get("current_price", 0.0),
+        "pnl": row.get("pnl", 0.0),
+        "stop": row.get("trailing_stop", 0.0),
+        "target": row.get("target", 0.0),
+        "lots": row.get("lots", 1),
+        "lot_size": row.get("lot_size", 1),
+        "grade": row.get("grade", ""),
+        "confidence": row.get("confidence", 0.0),
+        "timeframe": row.get("timeframe", ""),
+        "inst_type": row.get("inst_type", "FUT"),
+        "option_type": row.get("option_type", ""),
+        "atm_strike": row.get("atm_strike", 0.0),
+        "timestamp": entry_iso or row.get("entry_time", ""),
+        "entry_date": row.get("entry_date", ""),
+        "exit_price": row.get("exit_price", 0.0),
+        "status": "EXIT SIGNAL" if is_closed else "TRADE SIGNAL",
+        "action": "EXIT" if is_closed else "ENTRY",
+        "exit_reason": row.get("exit_reason", ""),
+        "exit_timestamp": exit_iso or row.get("exit_time", ""),
+        "rr": row.get("rr_ratio", 1.5),
+        "trading_symbol": "",
+        "symbol_token": "",
+        "exec_type": row.get("exec_type", "A"),
+        "market_regime": row.get("market_regime", ""),
+        "data_provenance": row.get("data_provenance", ""),
+        "price_action_verdict": row.get("price_action_verdict", ""),
+        "intelligence_score": row.get("intelligence_score", 0.0),
+        "strategy_revision": row.get("strategy_revision", ""),
+        "strategy_direction_mode": row.get("strategy_direction_mode", ""),
+        "market_wide_reversal_entry": bool(row.get("market_wide_reversal_entry")),
+        "volume_spike_entry": bool(row.get("volume_spike_entry")),
+        "power_move": bool(row.get("power_move")),
+    }

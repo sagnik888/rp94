@@ -1,0 +1,54 @@
+venv/
+__pycache__/
+*.pyc
+logs/
+.env
+fyers_token.json
+runtime_*.log
+runtime_logs/
+data_store/*.db
+data_store/*.db.bak*
+data_store/*.json
+data_store/*.json.*.tmp
+data_store/*.csv
+data_store/*.csv.bak
+data_store/**/*.csv
+data_store/**/*.csv.bak
+data_store/candles/
+data_store/recalculation_jobs/
+data_store/reports/
+data_store/rtracker/
+data_store/warm_memory/
+data_store/option_history_bundle.parquet
+data_store/option_history_bundle.parquet.manifest.json
+data/*.db
+RESTORE_POINT_*
+*.log
+scanner_old.py
+scanner_frictionless.py
+data/market_data.py_fixed_func.py
+.benchmarks/
+
+# Local restore points, backups, screenshots, and patch scratch files
+restore_point_*/
+RESTOREPOINT_*/
+dashboard/static_backup/
+experiments/
+reports/*.png
+check_step.py
+extract_diffs.py
+extract_server_diffs.py
+patch*.py
+recovered_js.txt
+test_save.py
+
+# Never track env backups (2026-07-10: credential leak scrub)
+.env.bak*
+*.env.bak*
+
+# Scratch/verify workspace stays local
+scratch/
+
+# Orphaned pytest temp (permission noise)
+pytest-tmp-base/
+pytest-tmp-base.*/

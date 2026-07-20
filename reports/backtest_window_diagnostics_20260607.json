@@ -1,0 +1,61 @@
+[
+  {
+    "days": 7,
+    "simulation_id": 1783024063912,
+    "diagnostic_days": 7,
+    "is_calculating": true,
+    "scan_count": 7,
+    "closed_rows": 0,
+    "summary": {
+      "daily_pnl": 0.0,
+      "fut_pnl": 0.0,
+      "opt_pnl": 0.0,
+      "total_trades": 0,
+      "open_count": 0,
+      "wins": 0,
+      "losses": 0,
+      "win_rate": 0.0
+    },
+    "row_pnl": 0,
+    "by_type": {},
+    "rejects": {
+      "C grade blocked": 174,
+      "Quality gate blocked": 128,
+      "Choppy market blocked": 91,
+      "Confidence below 50%": 48,
+      "Grade rank below required 2": 13,
+      "Counter-session-bias SHORT (session 9L/6S) needs >= 60%, got 53%": 1,
+      "Counter-session-bias SHORT (session 10L/6S) needs >= 60%, got 42%": 1,
+      "Counter-session-bias SHORT (session 19L/8S) needs >= 60%, got 48%": 1,
+      "Counter-session-bias SHORT (session 18L/11S) needs >= 60%, got 48%": 1,
+      "Counter-session-bias SHORT (session 9L/4S) needs >= 60%, got 53%": 1
+    },
+    "instrument_selection": {
+      "OPT": 339,
+      "FUT": 0
+    },
+    "option_history": {
+      "attempts": 2,
+      "hits": 0,
+      "misses": 82,
+      "synthetic": 0,
+      "fallback_to_fut": 82,
+      "archived_hits": 635
+    },
+    "sources": {
+      "angel": true,
+      "angel_tick_age_seconds": 173.84,
+      "fyers": true,
+      "fyers_tick_age_seconds": 143.27,
+      "broker_degraded": false,
+      "all_brokers_unavailable": false,
+      "fyers_auth_required": false,
+      "fyers_auth_reason": "",
+      "fyers_refresh_disabled": false,
+      "yahoo": true,
+      "yahoo_mode": "idle_standby",
+      "yahoo_request_count": 0,
+      "yahoo_last_used_at": null
+    }
+  }
+]

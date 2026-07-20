@@ -1,0 +1,567 @@
+"""Prebuilt dashboard/API snapshots for the scanner."""
+
+from __future__ import annotations
+
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+
+from config.settings import get_settings
+from engine.scanner_historical_results import build_historical_trade_result
+from engine.trade_row_adapter import (
+    accounting_pnl,
+    hygiene_closed_rows,
+    is_option_dashboard_row,
+    is_simulated_history_row,
+    normalize_dashboard_accounting_row,
+    reconcile_legacy_trade_row,
+    trade_row_event_seconds,
+    trade_row_session_date,
+)
+from trading.performance_metrics import annualize_sharpe, format_sharpe_pair
+from trading.trade_manager import IST
+
+
+class ScannerDashboardCache:
+    """Store lightweight snapshots so REST APIs do not rebuild heavy payloads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._state: Dict[str, Any] = {}
+        self._trades: Dict[str, Any] = {"open": [], "closed": [], "signals": [], "summary": {}}
+        self._diagnostics: Dict[str, Any] = {}
+        self._updated_at = 0.0
+
+    def update(self, results: Dict[str, Any] | None) -> None:
+        if not isinstance(results, dict):
+            return
+        with self._lock:
+            self._state = results
+            if isinstance(results.get("trades"), dict):
+                self._trades = results["trades"]
+            if isinstance(results.get("diagnostics"), dict):
+                self._diagnostics = results["diagnostics"]
+            self._updated_at = time.time()
+
+    def state(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._state or {}
+
+    def trades(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._trades or {"open": [], "closed": [], "signals": [], "summary": {}}
+
+    def diagnostics(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._diagnostics or {}
+
+    def cache_age_ms(self) -> int | None:
+        with self._lock:
+            if not self._updated_at:
+                return None
+            return round(max(0.0, time.time() - self._updated_at) * 1000.0)
+
+    def status(self, scanner: Any, connected_clients: int) -> Dict[str, Any]:
+        with self._lock:
+            state = self._state or {}
+            gateway_status = state.get("gateway_status") or {}
+            config = state.get("config") or {}
+            latency = state.get("latency")
+        fyers_auth = {}
+        data = getattr(scanner, "data", None)
+        if data is not None and hasattr(data, "get_fyers_auth_status"):
+            try:
+                fyers_auth = data.get_fyers_auth_status()
+            except Exception:
+                fyers_auth = {}
+        last_scan = getattr(scanner, "last_scan_time", None)
+        freshness = {}
+        if scanner is not None and hasattr(scanner, "_scanner_freshness_payload"):
+            try:
+                freshness = scanner._scanner_freshness_payload()
+            except Exception:
+                freshness = {}
+        return {
+            "status": "running",
+            "connected_clients": int(connected_clients),
+            "scanner_running": bool(getattr(scanner, "is_running", False)),
+            "mode": getattr(scanner, "mode", None),
+            "config": config or (
+                scanner.get_broadcast_config()
+                if scanner is not None and hasattr(scanner, "get_broadcast_config")
+                else {}
+            ),
+            "last_scan": last_scan.isoformat() if last_scan else None,
+            "scan_count": int(getattr(scanner, "scan_count", 0) or 0),
+            "latency": latency,
+            "pid": __import__("os").getpid(),
+            "gateway_status": gateway_status,
+            "fyers_auth": fyers_auth,
+            "cache_age_ms": self.cache_age_ms(),
+            "scanner_freshness": freshness,
+            "calibration": (
+                scanner.outcome_calibration.validation_status()
+                if scanner is not None and hasattr(scanner, "outcome_calibration")
+                else {}
+            ),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+
+class ScannerTradePayloadBuilder:
+    """Build dashboard trade payloads from scanner-owned state."""
+
+    def __init__(self, scanner: Any) -> None:
+        self.scanner = scanner
+
+    def build(self) -> Dict[str, Any]:
+        """Return trade-manager rows plus the persisted manual/live signal ledger."""
+        scanner = self.scanner
+        payload = scanner.trades.get_dashboard_payload(
+            is_historical=(scanner.mode == "HISTORICAL"),
+            backtest_days=scanner.backtest_days,
+            inst_pref=getattr(scanner, "inst_pref", "AUTO"),
+        )
+        recalc_status = str(
+            (getattr(scanner, "_recalculation_status", {}) or {}).get("status", "idle")
+            or "idle"
+        )
+        historical_complete = (
+            scanner.mode != "HISTORICAL"
+            or (
+                int(getattr(scanner, "scan_count", 0) or 0) > 0
+                and not bool(getattr(scanner, "_calculation_lock", False))
+                and not bool(getattr(scanner, "is_calculating", False))
+                and not bool(getattr(scanner, "_historical_rebuild_pending", True))
+                and int(getattr(scanner, "_historical_completed_simulation_id", 0) or 0)
+                == int(getattr(scanner, "simulation_id", 0) or 0)
+                and recalc_status not in {
+                    "queued",
+                    "waiting_initial_setup",
+                    "worker_running",
+                    "applying",
+                    "running",
+                    "awaiting_scan",
+                }
+            )
+        )
+        payload["meta"] = {
+            "mode": scanner.mode,
+            "backtest_days": int(getattr(scanner, "backtest_days", 1) or 1),
+            "simulation_id": int(getattr(scanner, "simulation_id", 0) or 0),
+            "complete": bool(historical_complete),
+            "recalculation_status": recalc_status,
+            "inst_pref": str(getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper(),
+            "scanner_engine": str(getattr(get_settings(), "scanner_engine", "utbot") or "utbot").lower(),
+            "ut_concurrency_guard": scanner._setting_enabled(getattr(get_settings(), "ut_concurrency_guard", True), True),
+            "futures_shadow_enabled": scanner._setting_enabled(
+                getattr(get_settings(), "futures_shadow_enabled", False),
+                False,
+            ),
+            "grade_preference": str(getattr(get_settings(), "signal_grade_preference", "auto") or "auto"),
+            "timeframe_entry_policy": str(getattr(get_settings(), "ut_timeframe_entry_policy", "PRIMARY_15") or "PRIMARY_15").upper(),
+            "open_rows": len(payload.get("open", []) or []),
+            "closed_rows": len(payload.get("closed", []) or []),
+            "restored_signal_rows": 0,
+            "source": "trade_manager",
+        }
+
+        def inst_pref_match(c) -> bool:
+            pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
+            if pref in ("AUTO", "HYBRID"): return True
+            inst_type = getattr(c, "inst_type", "FUT") if not isinstance(c, dict) else c.get("inst_type", "FUT")
+            if pref == "FUT" and inst_type == "FUT": return True
+            if pref == "OPT" and inst_type in ("OPT", "CE", "PE"): return True
+            return False
+
+        def real_payload_row_allowed(row: Dict[str, Any]) -> bool:
+            if is_simulated_history_row(row):
+                return False
+            day = trade_row_session_date(row)
+            if day is None:
+                return True
+            session_day = datetime.fromisoformat(str(scanner._get_current_session_day())).date()
+            return day == session_day
+
+        def historical_payload_row_allowed(row: Dict[str, Any]) -> bool:
+            day = trade_row_session_date(row)
+            if day is None:
+                return True
+            return day <= scanner.historical_session_cutoff_date()
+
+        payload["closed"] = [reconcile_legacy_trade_row(r) for r in payload.get("closed", []) or []]
+        if scanner.mode == "REAL":
+            payload["open"] = [r for r in payload.get("open", []) or [] if real_payload_row_allowed(r)]
+            payload["closed"] = [r for r in payload.get("closed", []) or [] if real_payload_row_allowed(r)]
+        elif scanner.mode == "HISTORICAL":
+            payload["open"] = [r for r in payload.get("open", []) or [] if historical_payload_row_allowed(r)]
+            payload["closed"] = [r for r in payload.get("closed", []) or [] if historical_payload_row_allowed(r)]
+
+        def rebuild_display_accounting() -> None:
+            """Keep headline metrics identical to the final reconciled dashboard rows.
+
+            Always apply shared shadow-free + exact-dedup hygiene so a prior
+            TradeManager.get_summary() cannot be overwritten with inflated
+            historical FUT_SHADOW / multi-engine replay totals.
+            """
+            raw_closed = [
+                normalize_dashboard_accounting_row(row)
+                for row in payload.get("closed", []) or []
+            ]
+            open_rows = [
+                normalize_dashboard_accounting_row(row)
+                for row in payload.get("open", []) or []
+            ]
+            closed_rows, hygiene = hygiene_closed_rows(raw_closed)
+            payload["closed"] = closed_rows
+            payload["open"] = open_rows
+            closed_pnls = [accounting_pnl(row) for row in closed_rows]
+            open_pnls = [accounting_pnl(row) for row in open_rows]
+            total_pnl = sum(closed_pnls) + sum(open_pnls)
+            vector_backend = "cpu"
+            vector_stats = None
+            try:
+                from engine.gpu_accelerator import get_gpu_accelerator
+                vector_stats = get_gpu_accelerator().vector_stats(closed_pnls)
+                vector_backend = vector_stats.backend
+            except Exception:
+                vector_stats = None
+            wins = sum(1 for value in closed_pnls if value > 0)
+            losses = sum(1 for value in closed_pnls if value < 0)
+            profits = sum(value for value in closed_pnls if value > 0)
+            losses_abs = abs(sum(value for value in closed_pnls if value < 0))
+            profit_factor = profits / losses_abs if losses_abs > 0 else (profits if profits > 0 else 1.0)
+
+            sharpe = 0.0
+            if len(closed_pnls) > 2:
+                if vector_stats is not None:
+                    std = float(vector_stats.std)
+                    mean = float(vector_stats.mean)
+                else:
+                    pnl_array = np.asarray(closed_pnls, dtype=float)
+                    std = float(np.std(pnl_array, ddof=1)) if len(pnl_array) > 1 else 0.0
+                    mean = float(np.mean(pnl_array))
+                sharpe = float(mean / std) if std > 0 else 0.0
+            sharpe_yearly = annualize_sharpe(sharpe)
+            sharpe_display = format_sharpe_pair(sharpe, sharpe_yearly)
+
+            chronological = sorted(
+                closed_rows,
+                key=trade_row_event_seconds,
+            )
+            running = 0.0
+            peak = 0.0
+            max_drawdown = 0.0
+            current_drawdown = 0.0
+            for row in chronological:
+                running += accounting_pnl(row)
+                peak = max(peak, running)
+                max_drawdown = max(max_drawdown, peak - running)
+            current_drawdown = max(0.0, peak - running)
+
+            def parse_event_seconds(row: Dict[str, Any], prefer_exit: bool = False) -> float:
+                keys = ("exit_timestamp", "entry_timestamp") if prefer_exit else ("entry_timestamp", "exit_timestamp")
+                for key in keys:
+                    raw = row.get(key)
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        value = float(raw)
+                        return value / 1000.0 if value > 1e12 else value
+                    except Exception:
+                        pass
+                    try:
+                        parsed = datetime.fromisoformat(str(raw))
+                        if parsed.tzinfo is None:
+                            parsed = IST.localize(parsed)
+                        else:
+                            parsed = parsed.astimezone(IST)
+                        return parsed.timestamp()
+                    except Exception:
+                        continue
+                return 0.0
+
+            capital_total = float(getattr(scanner, "capital_total", 0.0) or getattr(get_settings(), "capital_total", 0.0) or 0.0)
+            capital_fut = float(getattr(scanner, "capital_fut", 0.0) or getattr(get_settings(), "capital_fut", 0.0) or 0.0)
+            capital_opt = float(getattr(scanner, "capital_opt", 0.0) or getattr(get_settings(), "capital_opt", 0.0) or 0.0)
+
+            def trade_allocation(row: Dict[str, Any]) -> float:
+                qty = int(row.get("lots") or 0) * int(row.get("lot_size") or 0)
+                entry = float(row.get("entry_price") or 0.0)
+                return max(0.0, entry * qty)
+
+            active_allocation = sum(trade_allocation(row) for row in open_rows)
+
+            def compact_trade(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+                if not row:
+                    return {}
+                return {
+                    "id": row.get("id", ""),
+                    "instrument": row.get("instrument", "--"),
+                    "inst_type": row.get("inst_type", "--"),
+                    "timeframe": row.get("timeframe", "--"),
+                    "direction": row.get("direction", "--"),
+                    "pnl": round(accounting_pnl(row), 2),
+                    "entry_time": row.get("entry_time", "--"),
+                    "exit_time": row.get("exit_time", "--"),
+                    "exit_reason": row.get("exit_reason", "--"),
+                }
+
+            def bucketize_detail(rows: List[Dict[str, Any]], key_fn: Callable[[Dict[str, Any]], str]) -> Dict[str, Any]:
+                buckets: Dict[str, Dict[str, Any]] = {}
+                for row in rows:
+                    name = key_fn(row) or "--"
+                    value = accounting_pnl(row)
+                    bucket = buckets.setdefault(name, {"count": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+                    bucket["count"] += 1
+                    bucket["pnl"] += value
+                    if value > 0:
+                        bucket["wins"] += 1
+                    elif value < 0:
+                        bucket["losses"] += 1
+                for bucket in buckets.values():
+                    count = int(bucket["count"] or 0)
+                    bucket["pnl"] = round(float(bucket["pnl"] or 0.0), 2)
+                    bucket["win_rate"] = round((bucket["wins"] / count) * 100.0, 1) if count else 0.0
+                    bucket["avg_pnl"] = round(bucket["pnl"] / count, 2) if count else 0.0
+                return dict(sorted(buckets.items(), key=lambda item: abs(item[1]["pnl"]), reverse=True))
+
+            def period_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+                today = datetime.now(IST).date()
+                week_start = today - timedelta(days=today.weekday())
+                month_start = today.replace(day=1)
+                totals = {"daily": 0.0, "weekly": 0.0, "monthly": 0.0}
+                for row in rows:
+                    ts = parse_event_seconds(row, prefer_exit=True) or parse_event_seconds(row)
+                    if not ts:
+                        continue
+                    day = datetime.fromtimestamp(ts, tz=IST).date()
+                    value = accounting_pnl(row)
+                    if day == today:
+                        totals["daily"] += value
+                    if day >= week_start:
+                        totals["weekly"] += value
+                    if day >= month_start:
+                        totals["monthly"] += value
+                return {key: round(value, 2) for key, value in totals.items()}
+
+            hold_minutes = []
+            for row in closed_rows:
+                entry_ts = parse_event_seconds(row)
+                exit_ts = parse_event_seconds(row, prefer_exit=True)
+                if entry_ts and exit_ts and exit_ts > entry_ts:
+                    hold_minutes.append((exit_ts - entry_ts) / 60.0)
+            avg_hold = sum(hold_minutes) / len(hold_minutes) if hold_minutes else 0.0
+
+            largest_winner = max(closed_rows, key=accounting_pnl, default=None)
+            largest_loser = min(closed_rows, key=accounting_pnl, default=None)
+            max_dd_pct = round((max_drawdown / capital_total) * 100.0, 2) if capital_total > 0 else 0.0
+            current_dd_pct = round((current_drawdown / capital_total) * 100.0, 2) if capital_total > 0 else 0.0
+
+            monetary = {
+                "capital": {
+                    "configured_demat_capital": round(capital_total, 2),
+                    "futures_allocation": round(capital_fut, 2),
+                    "options_allocation": round(capital_opt, 2),
+                    "active_trade_allocation": round(active_allocation, 2),
+                    "free_configured_capital": round(max(0.0, capital_total - active_allocation), 2),
+                    "source": "configured_settings",
+                },
+                "headline": {
+                    "win_rate": round((wins / len(closed_rows) * 100.0) if closed_rows else 0.0, 1),
+                    "profit_factor": round(profit_factor, 2),
+                    "sharpe_ratio": round(sharpe, 2),
+                    "sharpe_ratio_daily": round(sharpe, 2),
+                    "sharpe_ratio_yearly": round(sharpe_yearly, 2),
+                    "sharpe_ratio_display": sharpe_display,
+                    "max_drawdown": round(max_drawdown, 2),
+                    "max_drawdown_pct": max_dd_pct,
+                    "current_drawdown": round(current_drawdown, 2),
+                    "current_drawdown_pct": current_dd_pct,
+                    "avg_hold_minutes": round(avg_hold, 1),
+                },
+                "period_pnl": period_totals(closed_rows),
+                "largest_winner": compact_trade(largest_winner if largest_winner and accounting_pnl(largest_winner) > 0 else None),
+                "largest_loser": compact_trade(largest_loser if largest_loser and accounting_pnl(largest_loser) < 0 else None),
+                "breakdowns": {
+                    "index": bucketize_detail(closed_rows, lambda row: str(row.get("instrument") or "--").split()[0]),
+                    "instrument_type": bucketize_detail(closed_rows, lambda row: str(row.get("inst_type") or "--").upper()),
+                    "timeframe": bucketize_detail(closed_rows, lambda row: str(row.get("timeframe") or "--")),
+                },
+                "live_positions": [
+                    {
+                        **compact_trade(row),
+                        "allocation": round(trade_allocation(row), 2),
+                        "target": round(float(row.get("target") or 0.0), 2),
+                        "stop": round(float(row.get("trailing_stop") or 0.0), 2),
+                        "rr_ratio": round(float(row.get("rr_ratio") or 0.0), 2),
+                    }
+                    for row in open_rows
+                ],
+            }
+
+            payload["summary"] = {
+                "daily_pnl": round(total_pnl, 2),
+                "fut_pnl": round(sum(accounting_pnl(row) for row in closed_rows + open_rows if not is_option_dashboard_row(row)), 2),
+                "opt_pnl": round(sum(accounting_pnl(row) for row in closed_rows + open_rows if is_option_dashboard_row(row)), 2),
+                "fut_trades": len([row for row in closed_rows + open_rows if not is_option_dashboard_row(row)]),
+                "opt_trades": len([row for row in closed_rows + open_rows if is_option_dashboard_row(row)]),
+                "total_trades": len(closed_rows) + len(open_rows),
+                "open_count": len(open_rows),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": (wins / len(closed_rows) * 100.0) if closed_rows else 0.0,
+                "profit_factor": profit_factor,
+                "sharpe_ratio": sharpe,
+                "sharpe_ratio_daily": sharpe,
+                "sharpe_ratio_yearly": sharpe_yearly,
+                "sharpe_ratio_display": sharpe_display,
+                "max_drawdown": max_drawdown,
+                "vector_backend": vector_backend,
+                "futures_shadow": dict(hygiene.get("futures_shadow") or {}),
+                "engine_replay": dict(hygiene.get("engine_replay") or {}),
+            }
+            payload["monetary"] = monetary
+
+            def bucketize(key: str) -> Dict[str, Any]:
+                buckets: Dict[str, Dict[str, Any]] = {}
+                for row in closed_rows:
+                    name = str(row.get(key) or "--")
+                    if key == "grade":
+                        name = name.split()[0]
+                    if key == "instrument":
+                        name = name.split()[0]
+                    bucket = buckets.setdefault(name, {"count": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+                    value = accounting_pnl(row)
+                    bucket["count"] += 1
+                    bucket["pnl"] += value
+                    if value > 0:
+                        bucket["wins"] += 1
+                    elif value < 0:
+                        bucket["losses"] += 1
+                for bucket in buckets.values():
+                    bucket["pnl"] = round(bucket["pnl"], 0)
+                    bucket["win_rate"] = round(bucket["wins"] / bucket["count"] * 100.0, 1) if bucket["count"] else 0.0
+                return dict(sorted(buckets.items(), key=lambda item: abs(item[1]["pnl"]), reverse=True))
+
+            payload["analytics"] = {
+                "by_timeframe": bucketize("timeframe"),
+                "by_grade": bucketize("grade"),
+                "by_instrument": bucketize("instrument"),
+                "by_type": bucketize("inst_type"),
+                "by_exit_reason": bucketize("exit_reason"),
+                "open_by_type": payload.get("analytics", {}).get("open_by_type", {}),
+            }
+
+        rebuild_display_accounting()
+
+        if scanner.mode != "HISTORICAL":
+            signal_rows = []
+            if scanner._loaded_session_is_current_day():
+                instruments = list(getattr(scanner, "active_indices", []) or [])
+                for instrument in (getattr(scanner, "_session_trade_candidates", {}) or {}).keys():
+                    if instrument not in instruments:
+                        instruments.append(instrument)
+                session_day = getattr(scanner, "_session_candidate_day", scanner._get_current_session_day())
+                for instrument in instruments:
+                    candidates = scanner._get_session_trade_candidates(instrument)
+                    if hasattr(scanner, "_refresh_trade_candidates"):
+                        cfg = (
+                            getattr(scanner, "config", {}).get("indices", {}).get(instrument, {})
+                            if isinstance(getattr(scanner, "config", {}), dict)
+                            else {}
+                        )
+                        scanner._refresh_trade_candidates(candidates, cfg)
+                    for candidate in candidates:
+                        candidate_ts = getattr(candidate, "signal_timestamp", None)
+                        candidate_day = candidate_ts.date().isoformat() if candidate_ts else session_day
+                        if candidate_day != session_day:
+                            continue
+                        if inst_pref_match(candidate):
+                            scanner._normalize_loaded_exit_candidate(candidate)
+                            signal_rows.append(
+                                normalize_dashboard_accounting_row(
+                                    scanner._serialize_trade_candidate(candidate)
+                                )
+                            )
+            # Show one row per signal lifecycle: its exit when completed, or its
+            # entry while still active/watched.
+            exit_rows = [r for r in signal_rows if r.get("action") == "EXIT"]
+            active_signals = []
+            exit_keys = {r.get("lifecycle_id") for r in exit_rows}
+            for r in signal_rows:
+                if r.get("action") == "ENTRY":
+                    key = r.get("lifecycle_id")
+                    if key not in exit_keys:
+                        active_signals.append(r)
+
+            display_signal_rows = exit_rows + active_signals
+            payload["signals"] = display_signal_rows
+            # Explicit session-row contract: external consumers that read only
+            # open/closed would otherwise see zero trades when the session came
+            # back as restored signal rows (open/closed arrays intentionally stay
+            # UI-scoped). These totals are authoritative regardless of source.
+            payload["session_rows_total"] = len(display_signal_rows)
+            payload["session_closed_total"] = len(exit_rows)
+            payload["session_open_total"] = len(active_signals)
+            payload["meta"] = {
+                **payload.get("meta", {}),
+                "restored_signal_rows": len(display_signal_rows),
+                "session_rows_total": len(display_signal_rows),
+                "session_closed_total": len(exit_rows),
+                "session_open_total": len(active_signals),
+                "source": "restored_session_signals" if display_signal_rows and not (payload.get("open") or payload.get("closed")) else "mixed",
+            }
+            has_trade_rows = bool(payload.get("open") or payload.get("closed"))
+            if signal_rows and not has_trade_rows:
+                active_rows = [
+                    r for r in signal_rows
+                    if r.get("action") == "ENTRY"
+                    and r.get("lifecycle_id") not in exit_keys
+                ]
+                accounting_rows = exit_rows + active_rows
+                pnls = [accounting_pnl(r) for r in accounting_rows]
+                wins = len([p for p in pnls if p > 0])
+                losses = len([p for p in pnls if p < 0])
+                gross_win = sum(p for p in pnls if p > 0)
+                gross_loss = abs(sum(p for p in pnls if p < 0))
+                payload["summary"] = {
+                    **(payload.get("summary") or {}),
+                    "daily_pnl": round(sum(pnls), 2),
+                    "fut_pnl": round(sum(accounting_pnl(r) for r in accounting_rows if not is_option_dashboard_row(r)), 2),
+                    "opt_pnl": round(sum(accounting_pnl(r) for r in accounting_rows if is_option_dashboard_row(r)), 2),
+                    "fut_trades": len([r for r in accounting_rows if not is_option_dashboard_row(r)]),
+                    "opt_trades": len([r for r in accounting_rows if is_option_dashboard_row(r)]),
+                    "total_trades": len(accounting_rows),
+                    "open_count": len(active_rows),
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": round((wins / len(accounting_rows)) * 100, 1) if accounting_rows else 0.0,
+                    "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else (99.99 if gross_win > 0 else 1.0),
+                }
+                original_open = payload.get("open", [])
+                original_closed = payload.get("closed", [])
+                try:
+                    payload["open"] = active_rows
+                    payload["closed"] = exit_rows
+                    rebuild_display_accounting()
+                finally:
+                    payload["open"] = original_open
+                    payload["closed"] = original_closed
+        else:
+            build_historical_trade_result(
+                scanner=scanner,
+                payload=payload,
+                inst_pref_match=inst_pref_match,
+                reconcile_display_row=reconcile_legacy_trade_row,
+                row_event_seconds=trade_row_event_seconds,
+            )
+        return payload
+
+
+def build_dashboard_trade_payload(scanner: Any) -> Dict[str, Any]:
+    """Return the scanner dashboard trade payload without exposing builder internals."""
+    return ScannerTradePayloadBuilder(scanner).build()
