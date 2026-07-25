@@ -527,6 +527,18 @@ class Settings(BaseSettings):
     pullback_hedge_size_fraction: float = 0.5          # hedge lots vs parent lots
     pullback_hedge_max_per_trade: int = 2              # anti-whipsaw churn cap
     pullback_hedge_max_hold_minutes: float = 15.0      # never hold a hedge indefinitely
+    # ── Stop-out re-entry (2026-07-25) ───────────────────────────────────────
+    # A trade stopped out early on a trend day, then the move ran without us. When the
+    # SAME direction re-validates in a confirmed trend shortly after a STOP-type exit,
+    # allow one more attempt by bypassing ONLY the post-exit cooldown. The daily trade
+    # budget and the consecutive-loss halt are real risk limits and are NEVER bypassed.
+    # Backtest across 8 archived sessions: 20/54 stop-outs qualified, 11 replayable on
+    # real premium paths -> 73% win rate, +Rs 3,560 (avg +324/trade). Enabled on that
+    # evidence, with conservative caps below; flip to False to revert.
+    stop_out_reentry_enabled: bool = True
+    stop_out_reentry_window_minutes: float = 30.0   # same move, not a new session phase
+    stop_out_reentry_max_per_index: int = 1         # one second chance per index per day
+    stop_out_reentry_min_adx: float = 25.0          # only a genuinely strong trend
     # ── Rupee loss ladder (freefall OR confirmed slow bleed) ───────
     # Eligibility floors OPT -1000 / FUT -1500 are NOT auto-exits. Two cut paths:
     # (A) FREEFALL — sudden opposite flow, post-close repaint, spike dump, etc.

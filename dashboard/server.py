@@ -352,6 +352,10 @@ _ADVANCED_CONFIG_FIELDS = {
     # once in 8 sessions and lost at every setting (the 85-90% runner lock already
     # captures the give-back more cheaply). Exposed so the operator can A/B it.
     "pullback_hedge_enabled",
+    "stop_out_reentry_enabled",
+    "stop_out_reentry_window_minutes",
+    "stop_out_reentry_max_per_index",
+    "stop_out_reentry_min_adx",
     "pullback_hedge_trigger_lock_fraction",
     "pullback_hedge_resume_recovery_pct",
     "pullback_hedge_size_fraction",
@@ -359,6 +363,7 @@ _ADVANCED_CONFIG_FIELDS = {
 }
 _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
     "pullback_hedge_enabled",
+    "stop_out_reentry_enabled",
     "lean_routing_to_options",
     "price_action_module_enabled",
     "price_action_block_adverse",
@@ -1235,6 +1240,10 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 # Pullback hedge (operator A/B; ships OFF — see _ADVANCED_CONFIG_FIELDS).
                 # Must be forwarded explicitly: whitelisting alone silently drops the
                 # control (2026-07-10 regression noted above).
+                stop_out_reentry_enabled=msg.get("stop_out_reentry_enabled"),
+                stop_out_reentry_window_minutes=msg.get("stop_out_reentry_window_minutes"),
+                stop_out_reentry_max_per_index=msg.get("stop_out_reentry_max_per_index"),
+                stop_out_reentry_min_adx=msg.get("stop_out_reentry_min_adx"),
                 pullback_hedge_enabled=msg.get("pullback_hedge_enabled"),
                 pullback_hedge_trigger_lock_fraction=msg.get("pullback_hedge_trigger_lock_fraction"),
                 pullback_hedge_resume_recovery_pct=msg.get("pullback_hedge_resume_recovery_pct"),

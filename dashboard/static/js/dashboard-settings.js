@@ -235,6 +235,18 @@ function setupSettingsExperience() {
         `;
         body.appendChild(hedgeCard);
     }
+    if (!document.getElementById('settStopOutReentry')) {
+        const soCard = document.createElement('label');
+        soCard.className = 'settings-switch-card';
+        soCard.innerHTML = `
+            <span>
+                <strong>Stop-Out Re-Entry</strong>
+                <small>One more attempt when a stop-out is followed by the same trend continuing. Backtest (8 sessions): 73% win rate, +Rs 3,560. Bypasses only the cooldown — never the daily budget or loss halt.</small>
+            </span>
+            <input type="checkbox" id="settStopOutReentry">
+        `;
+        body.appendChild(soCard);
+    }
     if (!document.getElementById('settEngineLab')) {
         const engineLabCard = document.createElement('label');
         engineLabCard.className = 'settings-switch-card';
@@ -372,6 +384,7 @@ function setupSettingsExperience() {
         document.getElementById('settAutoMode')?.closest('.settings-switch-card'),
         // Keep the hedge A/B next to Auto Mode: both govern execution behaviour, and
         // further down the list it fell below the visible fold of the settings panel.
+        document.getElementById('settStopOutReentry')?.closest('.settings-switch-card'),
         document.getElementById('settPullbackHedge')?.closest('.settings-switch-card'),
         document.getElementById('settFuturesShadow')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLab')?.closest('.settings-switch-card'),
@@ -720,6 +733,8 @@ function syncSettingsFromConfig(data) {
         if (shadowEl) shadowEl.checked = cfg.futures_shadow_enabled === true;
         const hedgeEl = document.getElementById('settPullbackHedge');
         if (hedgeEl) hedgeEl.checked = cfg.pullback_hedge_enabled === true;
+        const soEl = document.getElementById('settStopOutReentry');
+        if (soEl) soEl.checked = cfg.stop_out_reentry_enabled !== false;
         setChecked('settEngineLab', cfg.engine_lab_enabled !== undefined ? cfg.engine_lab_enabled : true);
         setChecked('settEngineLabRealOnly', cfg.engine_lab_real_mode_only === true);
         const signalModeEl = document.getElementById('settIntrabarSignals');
@@ -1031,6 +1046,7 @@ function saveSettings() {
         index_cooldown_minutes: Math.max(0, parseFloat(document.getElementById('settIndexCooldown')?.value) || 0),
         futures_shadow_enabled: document.getElementById('settFuturesShadow')?.checked === true,
         pullback_hedge_enabled: document.getElementById('settPullbackHedge')?.checked === true,
+        stop_out_reentry_enabled: document.getElementById('settStopOutReentry')?.checked !== false,
         engine_lab_enabled: document.getElementById('settEngineLab')?.checked !== false,
         engine_lab_real_mode_only: document.getElementById('settEngineLabRealOnly')?.checked === true,
         signal_fire_mode: document.getElementById('settIntrabarSignals')?.checked === false

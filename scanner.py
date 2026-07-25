@@ -1942,8 +1942,130 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         return True
 
-    def _can_trade_instrument(self, instrument: str, signal_time: datetime) -> Tuple[bool, str]:
-        """Checks if we should allow another trade for this instrument today"""
+    #: Exit reasons that mean "the stop took us out", i.e. the trade was cut rather
+    #: than completed at a target / session end.
+    STOP_OUT_EXIT_REASONS = {
+        "STOP_HIT",
+        "STOP_LOSS",
+        "TRAILING_STOP",
+        "EARLY_LOSS_CUT",
+        "LOSS_THREAT_EXIT",
+    }
+
+    def _last_stop_out_exit(self, instrument: str):
+        """Most recent closed trade for this index, if it ended on a STOP-type exit.
+
+        Read from the trade book rather than tracked in a parallel dict: the book is
+        the single source of truth and survives restarts, so this cannot drift out of
+        sync with the four places that record an exit."""
+        base = str(instrument or "").split()[0].upper()
+        if not base:
+            return None
+        closed = list(getattr(getattr(self, "trades", None), "closed_trades", []) or [])
+        latest = None
+        latest_time = None
+        for trade in closed:
+            if str(getattr(trade, "instrument", "") or "").split()[0].upper() != base:
+                continue
+            when = getattr(trade, "exit_time", None)
+            if when is None:
+                continue
+            if latest_time is None or when > latest_time:
+                latest, latest_time = trade, when
+        if latest is None:
+            return None
+        reason = str(getattr(latest, "exit_reason", "") or "").upper()
+        if reason not in self.STOP_OUT_EXIT_REASONS:
+            return None
+        return latest
+
+    def _stop_out_reentry_allowed(
+        self, instrument: str, direction: str, signal_time: datetime,
+        adx_value: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """Allow a second attempt after an early stop-out on a confirmed trend.
+
+        Bypasses ONLY the post-exit cooldown; the daily trade budget and the
+        consecutive-loss halt still apply (they are the real risk limits). Requires the
+        SAME direction as the stopped trade — this re-takes the idea that was cut, it is
+        not a reversal — inside a short window, in an aligned strong-trend regime."""
+        settings = get_settings()
+        if not self._setting_enabled(getattr(settings, "stop_out_reentry_enabled", False), False):
+            return False, "disabled"
+        base = str(instrument or "").split()[0].upper()
+        last = self._last_stop_out_exit(base)
+        if last is None:
+            return False, "last exit was not a stop-out"
+        want = str(direction or "").upper()
+        if want and want != str(getattr(last, "direction", "") or "").upper():
+            return False, "opposite direction (reversal, not a re-entry)"
+
+        used = int((getattr(self, "_stop_out_reentries", None) or {}).get(base, 0))
+        cap = int(getattr(settings, "stop_out_reentry_max_per_index", 1) or 1)
+        if used >= cap:
+            return False, f"stop-out re-entry cap {cap} reached"
+
+        exit_time = getattr(last, "exit_time", None)
+        if exit_time is None:
+            return False, "exit time unknown"
+        clock = signal_time or datetime.now(IST)
+        try:
+            exit_naive = (
+                exit_time.astimezone(IST).replace(tzinfo=None)
+                if getattr(exit_time, "tzinfo", None) is not None
+                else exit_time.replace(tzinfo=None)
+            )
+            clock_naive = (
+                clock.astimezone(IST).replace(tzinfo=None)
+                if getattr(clock, "tzinfo", None) is not None
+                else clock.replace(tzinfo=None)
+            )
+            elapsed = (clock_naive - exit_naive).total_seconds() / 60.0
+        except Exception:
+            return False, "exit time unusable"
+        window = float(getattr(settings, "stop_out_reentry_window_minutes", 30.0) or 30.0)
+        if elapsed < 0 or elapsed > window:
+            return False, f"stop-out {elapsed:.0f}m ago outside {window:.0f}m window"
+
+        regime = str((getattr(self, "latest_regimes", {}) or {}).get(base, "") or "").upper()
+        if not is_trending_regime(regime):
+            return False, f"regime {regime or 'unknown'} is not a confirmed trend"
+        if want == "LONG" and not regime.endswith("_UP"):
+            return False, "trend does not agree with re-entry direction"
+        if want == "SHORT" and not regime.endswith("_DOWN"):
+            return False, "trend does not agree with re-entry direction"
+
+        try:
+            adx = float(adx_value or 0.0)
+        except Exception:
+            adx = 0.0
+        floor = float(getattr(settings, "stop_out_reentry_min_adx", 25.0) or 0.0)
+        # Only block on a KNOWN-weak reading; an unavailable ADX must not silently
+        # disable the floor (nor silently block every re-entry).
+        if floor > 0 and adx > 0 and adx < floor:
+            return False, f"ADX {adx:.1f} < {floor:.1f}"
+        return True, (
+            f"stop-out re-entry: {regime} still aligned {elapsed:.0f}m after "
+            f"{str(getattr(last, 'exit_reason', '') or '').upper()}"
+        )
+
+    def _note_stop_out_reentry(self, instrument: str) -> None:
+        """Count a granted stop-out re-entry so the per-index cap holds for the day."""
+        base = str(instrument or "").split()[0].upper()
+        if not base:
+            return
+        if not isinstance(getattr(self, "_stop_out_reentries", None), dict):
+            self._stop_out_reentries = {}
+        self._stop_out_reentries[base] = int(self._stop_out_reentries.get(base, 0)) + 1
+
+    def _can_trade_instrument(
+        self, instrument: str, signal_time: datetime, direction: str = "",
+        adx_value: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """Checks if we should allow another trade for this instrument today.
+
+        `direction` is optional and only used by the stop-out re-entry check, which
+        requires the SAME direction as the trade that was stopped out."""
         self._reset_daily_counters()
 
         # Rule 1: Max accepted entries per index (prevent over-churn). The
@@ -1990,6 +2112,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             diff = max(0.0, (cooldown_clock - last_exit_naive).total_seconds() / 60.0)
             if diff < self.index_cooldown_minutes:
+                # Stop-out re-entry: an early stop on a still-running trend gets one
+                # more attempt. This bypasses the COOLDOWN only — Rules 1 and 2 above
+                # (daily budget, consecutive-loss halt) have already been enforced.
+                reentry_ok, reentry_reason = self._stop_out_reentry_allowed(
+                    instrument, direction, signal_time, adx_value=adx_value
+                )
+                if reentry_ok:
+                    self._note_stop_out_reentry(instrument)
+                    logger.info(f"Cooldown bypassed for {instrument}: {reentry_reason}.")
+                    self.log_event(
+                        f"Stop-out re-entry allowed for {instrument}: {reentry_reason}", "trade"
+                    )
+                    return True, ""
                 remaining = max(0.0, self.index_cooldown_minutes - diff)
                 return False, f"Cooldown active: {remaining:.0f}m remaining ({cooldown_basis})"
 
@@ -2012,6 +2147,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Pullback hedge (operator A/B; ships OFF — backtest showed the runner lock
             # already captures the give-back more cheaply).
             "pullback_hedge_enabled": getattr(get_settings(), "pullback_hedge_enabled", False),
+            "stop_out_reentry_enabled": getattr(get_settings(), "stop_out_reentry_enabled", True),
+            "stop_out_reentry_window_minutes": getattr(get_settings(), "stop_out_reentry_window_minutes", 30.0),
+            "stop_out_reentry_max_per_index": getattr(get_settings(), "stop_out_reentry_max_per_index", 1),
+            "stop_out_reentry_min_adx": getattr(get_settings(), "stop_out_reentry_min_adx", 25.0),
             "pullback_hedge_trigger_lock_fraction": getattr(get_settings(), "pullback_hedge_trigger_lock_fraction", 0.5),
             "pullback_hedge_resume_recovery_pct": getattr(get_settings(), "pullback_hedge_resume_recovery_pct", 50.0),
             "pullback_hedge_size_fraction": getattr(get_settings(), "pullback_hedge_size_fraction", 0.5),
@@ -22153,7 +22292,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 signal_time = getattr(sig, "signal_timestamp", None) or datetime.now(IST).replace(tzinfo=None)
                 if getattr(signal_time, "tzinfo", None) is not None:
                     signal_time = signal_time.astimezone(IST).replace(tzinfo=None)
-                allowed, limit_reason = self._can_trade_instrument(sig.instrument, signal_time)
+                allowed, limit_reason = self._can_trade_instrument(
+                    sig.instrument, signal_time,
+                    direction=str(getattr(sig, "direction", "") or ""),
+                    adx_value=float(getattr(sig, "adx_value", 0.0) or 0.0),
+                )
                 if not allowed:
                     self.log_signal_decision_once(
                         f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{signal_time.isoformat()}|trade-limit",
