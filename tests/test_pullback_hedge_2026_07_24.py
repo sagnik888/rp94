@@ -146,7 +146,7 @@ def test_dashboard_toggle_is_fully_wired():
     # Bump the cache-buster whenever this bundle changes, or browsers keep serving the
     # old JS and the new control never appears for the operator.
     index_html = (root / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
-    assert "dashboard-settings.js?v=21-pullback-hedge-ab" in index_html
+    assert "dashboard-settings.js?v=22-hedge-toggle-position" in index_html
 
 
 def test_configure_applies_and_reverts_the_toggle(monkeypatch):

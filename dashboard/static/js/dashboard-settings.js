@@ -370,8 +370,10 @@ function setupSettingsExperience() {
         findGroup('settUtPreset'),
         document.getElementById('settIntrabarSignals')?.closest('.settings-switch-card'),
         document.getElementById('settAutoMode')?.closest('.settings-switch-card'),
-        document.getElementById('settFuturesShadow')?.closest('.settings-switch-card'),
+        // Keep the hedge A/B next to Auto Mode: both govern execution behaviour, and
+        // further down the list it fell below the visible fold of the settings panel.
         document.getElementById('settPullbackHedge')?.closest('.settings-switch-card'),
+        document.getElementById('settFuturesShadow')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLab')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLabRealOnly')?.closest('.settings-switch-card'),
     ]));
