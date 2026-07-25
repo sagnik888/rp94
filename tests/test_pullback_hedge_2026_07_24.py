@@ -137,6 +137,17 @@ def test_dashboard_toggle_is_fully_wired():
     scanner_src = (root / "scanner.py").read_text(encoding="utf-8")
     assert '"pullback_hedge_enabled": getattr(get_settings()' in scanner_src  # broadcast
 
+    # The switch card must ALSO be listed in the General tab's System Controls group —
+    # injecting it into the modal body alone leaves it out of the rendered tab (that is
+    # exactly why the toggle was initially invisible).
+    system_group = js.split("makeCard('settings-system'")[1].split("]))")[0]
+    assert "settPullbackHedge" in system_group
+
+    # Bump the cache-buster whenever this bundle changes, or browsers keep serving the
+    # old JS and the new control never appears for the operator.
+    index_html = (root / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "dashboard-settings.js?v=21-pullback-hedge-ab" in index_html
+
 
 def test_configure_applies_and_reverts_the_toggle(monkeypatch):
     """End-to-end: the dashboard toggle must actually change the live setting."""

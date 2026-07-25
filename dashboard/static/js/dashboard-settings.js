@@ -371,6 +371,7 @@ function setupSettingsExperience() {
         document.getElementById('settIntrabarSignals')?.closest('.settings-switch-card'),
         document.getElementById('settAutoMode')?.closest('.settings-switch-card'),
         document.getElementById('settFuturesShadow')?.closest('.settings-switch-card'),
+        document.getElementById('settPullbackHedge')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLab')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLabRealOnly')?.closest('.settings-switch-card'),
     ]));
