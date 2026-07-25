@@ -77,6 +77,12 @@ class Broker:
     def get_order_status(self, order_id: str) -> Optional[Dict]:
         return None
 
+    def find_working_protective_stop(self, symbol: str, token: str, side: str) -> str:
+        """Return the order id of an existing working exchange-side STOPLOSS for this
+        contract, or "" if none. Overridden by real brokers; keeps protective-stop
+        placement idempotent across retries and concurrent callers."""
+        return ""
+
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
         return False
 
@@ -464,6 +470,42 @@ class SmartApiBroker(Broker):
             logger.warning(f"Order-status poll failed for {order_id}: {exc}")
             return None
 
+    def find_working_protective_stop(self, symbol: str, token: str, side: str) -> str:
+        """Return the order id of an existing working exchange-side STOPLOSS for this
+        contract, or "" if none. Keeps protective-stop placement idempotent so a lost
+        acknowledgement or a concurrent caller can never create a duplicate SL-M."""
+        if not symbol:
+            return ""
+        try:
+            response = self._api_call("scan order book for stop", self.api.orderBook, timeout=2.0)
+        except Exception as exc:
+            logger.warning(f"Protective-stop order-book scan failed for {symbol}: {exc}")
+            return ""
+        rows = response.get("data", []) if isinstance(response, dict) else []
+        terminal = {"complete", "completed", "filled", "cancelled", "canceled", "rejected", "expired", "lapsed"}
+        want_side = str(side or "").upper()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("tradingsymbol") or "") != str(symbol):
+                continue
+            row_token = str(row.get("symboltoken") or "")
+            if token and row_token and row_token != str(token):
+                continue
+            variety = str(row.get("variety") or "").upper()
+            ordertype = str(row.get("ordertype") or "").upper()
+            if "STOPLOSS" not in variety and "STOPLOSS" not in ordertype:
+                continue
+            if want_side and str(row.get("transactiontype") or "").upper() != want_side:
+                continue
+            status = str(row.get("orderstatus") or row.get("status") or "").strip().lower().replace("_", " ")
+            if status in terminal:
+                continue
+            oid = str(row.get("orderid") or row.get("uniqueorderid") or "")
+            if oid:
+                return oid
+        return ""
+
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
         if not order_id:
             return True
@@ -502,16 +544,34 @@ class SmartApiBroker(Broker):
                 "place protective stop",
                 lambda: place_full(params) if callable(place_full) else self.api.placeOrder(params),
             )
-            if isinstance(response, dict):
-                if response.get("status") is False or response.get("errorcode"):
-                    logger.error(f"Broker rejected protective stop: {response}")
-                    return None
-                data = response.get("data", response)
-                return str(data.get("orderid") or data.get("uniqueorderid") or "") if isinstance(data, dict) else str(data or "")
-            return str(response or "")
         except Exception as exc:
+            # Audit fix: a STOPLOSS_MARKET can reach and be accepted by the exchange
+            # even when the acknowledgement is lost (timeout / 429 / socket drop). Do
+            # NOT return None here — that is indistinguishable from a clean reject, so
+            # the caller re-places and TWO SL-M orders rest at the exchange; when both
+            # trigger, the second opens a naked reversed leg. Signal ambiguity exactly
+            # like place_order so the caller reconciles instead of blindly re-placing.
             logger.error(f"Protective stop placement failed for {symbol}: {exc}")
-            return None
+            raise BrokerOrderAmbiguous(
+                f"Protective stop acknowledgement ambiguous after exception: {exc}"
+            ) from exc
+        if isinstance(response, dict):
+            if response.get("status") is False or response.get("errorcode"):
+                logger.error(f"Broker rejected protective stop: {response}")
+                return None
+            data = response.get("data", response)
+            order_id = (
+                str(data.get("orderid") or data.get("uniqueorderid") or "")
+                if isinstance(data, dict)
+                else str(data or "")
+            )
+        else:
+            order_id = str(response or "")
+        if not order_id or order_id == "None":
+            raise BrokerOrderAmbiguous(
+                f"Protective stop acknowledgement ambiguous; no order id returned: {response}"
+            )
+        return order_id
 
     def modify_protective_stop(
         self, order_id: str, symbol: str, token: str, qty: int, side: str,

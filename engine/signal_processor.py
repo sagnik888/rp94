@@ -3271,7 +3271,13 @@ class SignalProcessor:
                                 # Audit #4: never invent synthetic OPT recovery marks.
                                 # Require a verified live premium; REAL also requires a
                                 # confirmed broker position before opening a local trade.
-                                if not rec_symbol_token or not rec_trading_symbol:
+                                # Instrument-lock (2026-07-24): under OPT the retained seed
+                                # symbol/token may be a FUTURES contract inherited from an
+                                # AUTO/hybrid signal. Re-resolve to a genuine option unless
+                                # the retained symbol is already an option (…CE/…PE), and
+                                # never open OPT on a futures contract.
+                                _rec_sym_is_option = str(rec_trading_symbol).upper().endswith(("CE", "PE"))
+                                if not rec_symbol_token or not rec_trading_symbol or not _rec_sym_is_option:
                                     opt_info = None
                                     try:
                                         opt_info = scanner.data.get_option_token(
@@ -3285,10 +3291,11 @@ class SignalProcessor:
                                     if opt_info:
                                         rec_trading_symbol = str(opt_info.get("symbol") or "")
                                         rec_symbol_token = str(opt_info.get("token") or "")
-                                if not rec_symbol_token:
+                                if not rec_symbol_token or not str(rec_trading_symbol).upper().endswith(("CE", "PE")):
                                     logger.warning(
                                         f"Recovery Guard: skip OPT recovery for {instrument} {tf} — "
-                                        "no tradeable contract token (refusing synthetic premium)."
+                                        f"no genuine option contract (refusing to open OPT on "
+                                        f"'{rec_trading_symbol or 'unknown'}')."
                                     )
                                     continue
                                 exchange = "BFO" if instrument == "SENSEX" else "NFO"

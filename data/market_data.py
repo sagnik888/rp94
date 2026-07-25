@@ -1353,8 +1353,11 @@ class MarketDataProvider:
                                     ft = self.smart_api.getfeedToken()
                                     if ft:
                                         curr_feed = ft
-                                except Exception:
-                                    pass
+                                except Exception as ex:
+                                    logger.debug(
+                                        f"AngelOne getfeedToken() during WS reconnect failed; "
+                                        f"reusing prior feed token: {ex}"
+                                    )
                             self.sws = _build_and_bind_sws(curr_jwt, curr_feed)
                         
                         self.sws.connect()

@@ -52,3 +52,4 @@ scratch/
 # Orphaned pytest temp (permission noise)
 pytest-tmp-base/
 pytest-tmp-base.*/
+data_store/session_archive/

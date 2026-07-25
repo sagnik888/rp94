@@ -223,6 +223,18 @@ function setupSettingsExperience() {
         `;
         body.appendChild(shadowCard);
     }
+    if (!document.getElementById('settPullbackHedge')) {
+        const hedgeCard = document.createElement('label');
+        hedgeCard.className = 'settings-switch-card';
+        hedgeCard.innerHTML = `
+            <span>
+                <strong>Pullback Hedge (A/B)</strong>
+                <small>OFF by default. Adds a fresh-ATM opposite leg on a runner's pullback. Backtest (8 sessions): armed once and lost — the 85-90% runner lock already protects the give-back more cheaply.</small>
+            </span>
+            <input type="checkbox" id="settPullbackHedge">
+        `;
+        body.appendChild(hedgeCard);
+    }
     if (!document.getElementById('settEngineLab')) {
         const engineLabCard = document.createElement('label');
         engineLabCard.className = 'settings-switch-card';
@@ -703,6 +715,8 @@ function syncSettingsFromConfig(data) {
         if (autoSwitch) autoSwitch.checked = cfg.auto_mode;
         const shadowEl = document.getElementById('settFuturesShadow');
         if (shadowEl) shadowEl.checked = cfg.futures_shadow_enabled === true;
+        const hedgeEl = document.getElementById('settPullbackHedge');
+        if (hedgeEl) hedgeEl.checked = cfg.pullback_hedge_enabled === true;
         setChecked('settEngineLab', cfg.engine_lab_enabled !== undefined ? cfg.engine_lab_enabled : true);
         setChecked('settEngineLabRealOnly', cfg.engine_lab_real_mode_only === true);
         const signalModeEl = document.getElementById('settIntrabarSignals');
@@ -1013,6 +1027,7 @@ function saveSettings() {
         max_consecutive_losses: parseInt(document.getElementById('settMaxLosses')?.value) || 3,
         index_cooldown_minutes: Math.max(0, parseFloat(document.getElementById('settIndexCooldown')?.value) || 0),
         futures_shadow_enabled: document.getElementById('settFuturesShadow')?.checked === true,
+        pullback_hedge_enabled: document.getElementById('settPullbackHedge')?.checked === true,
         engine_lab_enabled: document.getElementById('settEngineLab')?.checked !== false,
         engine_lab_real_mode_only: document.getElementById('settEngineLabRealOnly')?.checked === true,
         signal_fire_mode: document.getElementById('settIntrabarSignals')?.checked === false

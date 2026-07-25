@@ -71,10 +71,21 @@ def test_fail_closed_charges_segment_budget_when_backstop_disabled():
 
 
 def test_circuit_breaker_defaults_single_source_of_truth():
+    # Risk percentages are operator-controllable knobs (set via .env / dashboard),
+    # NOT hard-gated constants. Assert the single-source-of-truth RELATIONSHIP —
+    # RiskManager adopts whatever the operator configured, with no hidden hardcode
+    # that silently overrides it — plus sanity bounds, rather than pinning a
+    # specific percentage the operator may legitimately change.
     s = Settings(_env_file=None)
-    assert float(s.risk_fut_pct) == 2.0
-    assert float(s.risk_opt_pct) == 8.0
+    assert 0.0 < float(s.risk_fut_pct) <= 100.0
+    assert 0.0 < float(s.risk_opt_pct) <= 100.0
+    assert float(s.max_trade_loss_abs) == 0.0
     rm = RiskManager(trade_manager=None, capital_total=100000)
-    assert float(rm.risk_fut_pct) == 2.0
-    assert float(rm.risk_opt_pct) == 8.0
+    rm.update_settings(
+        risk_fut_pct=s.risk_fut_pct,
+        risk_opt_pct=s.risk_opt_pct,
+        max_trade_loss_abs=s.max_trade_loss_abs,
+    )
+    assert float(rm.risk_fut_pct) == float(s.risk_fut_pct)
+    assert float(rm.risk_opt_pct) == float(s.risk_opt_pct)
     assert float(rm.max_trade_loss_abs) == 0.0

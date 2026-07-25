@@ -322,6 +322,56 @@ def start_live_session_tracker_scheduler():
     ).start()
 
 
+def start_session_archiver_scheduler():
+    """Archive each session's trades + real option-premium candles after the close.
+
+    Builds the multi-day validation set the offline exit backtester replays. The live
+    candle cache only keeps the last-fetched contracts, so without this snapshot a
+    traded strike's intraday bars are lost/overwritten (2026-07-24: only ~40% of trades
+    were replayable). Runs once per day AFTER market close, never during market hours,
+    in a child process so it cannot stall the scanner loop.
+    """
+    enabled = str(os.getenv("SESSION_ARCHIVE_ENABLED", "1")).strip().lower()
+    if enabled in _FALSEY_ENV:
+        logger.info("Session archiver disabled by SESSION_ARCHIVE_ENABLED.")
+        return
+
+    run_at = _parse_hhmm(os.getenv("SESSION_ARCHIVE_TIME", "15:50"), dt_time(15, 50))
+    root = Path(__file__).parent
+    script = root / "scripts" / "archive_session_data.py"
+
+    def _archive_loop():
+        completed: set[str] = set()
+        while True:
+            now = datetime.now(IST)
+            session_day = now.date().isoformat()
+            today_run = _ist_at(now.date(), run_at)
+            if session_day in completed or now < today_run:
+                target = (
+                    _ist_at(now.date() + timedelta(days=1), run_at)
+                    if session_day in completed
+                    else today_run
+                )
+                time.sleep(max(30.0, (target - now).total_seconds()))
+                continue
+            try:
+                subprocess.run(
+                    [sys.executable, str(script), session_day, "--quiet"],
+                    cwd=str(root),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    timeout=600,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                logger.info(f"Session archive written for {session_day}.")
+            except Exception as exc:
+                logger.warning(f"Session archive failed for {session_day}: {exc}")
+            completed.add(session_day)
+
+    threading.Thread(target=_archive_loop, daemon=True, name="SessionArchiver").start()
+
+
 def _scanner_trading_day(scanner: Scanner, now_ist: datetime) -> bool:
     checker = getattr(scanner, "_is_trading_day", None)
     if callable(checker):
@@ -674,6 +724,7 @@ def main():
     # Start the log cleaner thread
     start_angelone_log_cleaner()
     start_live_session_tracker_scheduler()
+    start_session_archiver_scheduler()
 
     logger.info(f"Starting dashboard server on {settings.dashboard_host}:{settings.dashboard_port}")
     uvicorn.run(

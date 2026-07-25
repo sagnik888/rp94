@@ -267,6 +267,10 @@ def test_busy_scanner_not_critical_stale():
     st._diagnostics = {}
     st.latest_results = {}
     st.data = SimpleNamespace(get_source_health=lambda: {})
+    # Isolate the busy-vs-stale classification under test from live host resource
+    # pressure: _system_performance_payload folds real RAM/disk/CPU metrics into its
+    # WARN status, which made this assertion flaky (host load flipped BUSY->WARN).
+    st._get_system_metrics_payload = lambda: {}
     # freshness while busy uses raised threshold
     fresh = st._scanner_freshness_payload()
     assert fresh["stale_after_seconds"] >= 60

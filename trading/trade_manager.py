@@ -25,7 +25,7 @@ from loguru import logger
 from data.sqlite_db import db
 from trading.performance_metrics import annualize_sharpe, format_sharpe_pair
 from trading.trade_dashboard import build_dashboard_rows
-from trading.order_retry import execute_order_with_retry
+from trading.order_retry import execute_order_with_retry, BrokerOrderAmbiguous
 
 
 def _setting_enabled(value, default: bool = True) -> bool:
@@ -446,6 +446,12 @@ class TradeManager:
         self.closed_trades: List[Trade] = []
         self._trade_counter = 0
         self._lock = threading.RLock()
+        # Serialises exchange-side protective-stop placement so two callers
+        # (PositionSync reconcile + scanner tick) can never place a duplicate SL-M
+        # for the same fresh fill. Dedicated lock (not self._lock) keeps the ~1s
+        # broker round-trip from blocking unrelated trade-manager operations; its
+        # callers never hold self._lock, so there is no lock-ordering inversion.
+        self._protection_lock = threading.RLock()
         self._state_file = "data_store/trade_state.json"
         self._last_mark_to_market_save = 0.0
         self._last_protective_sync = {}
@@ -783,74 +789,121 @@ class TradeManager:
             self._mark_recovery(trade, "Protective stop trigger is invalid")
             return False
 
-        now = time.monotonic()
-        if not hasattr(self, "_last_protective_sync"):
-            self._last_protective_sync = {}
-        if not hasattr(self, "_last_protective_status_poll"):
-            self._last_protective_status_poll = {}
-        if not hasattr(self, "_last_recovery_alert"):
-            self._last_recovery_alert = {}
-        last_sync = float(self._last_protective_sync.get(trade.id, 0.0) or 0.0)
-        existing = str(getattr(trade, "protective_order_id", "") or "")
-        last_status_poll = float(self._last_protective_status_poll.get(trade.id, 0.0) or 0.0)
-        if existing and now - last_status_poll >= 15.0:
-            getter = getattr(self.broker, "get_order_status", None)
-            stop_status = self._order_status_text(getter(existing)) if callable(getter) else ""
-            self._last_protective_status_poll[trade.id] = now
-            if stop_status in {"rejected", "cancelled", "canceled"}:
-                trade.protective_order_id = ""
-                existing = ""
-            elif stop_status in {"complete", "filled"}:
-                self._mark_recovery(
-                    trade,
-                    "Protective stop reports filled while broker position is still open",
+        # The read-decide-place window below is serialised so the PositionSync reconcile
+        # thread and the scanner tick thread cannot both observe protective_order_id==""
+        # for the same fill and each place a stop (→ duplicate SL-M → naked reversed leg
+        # on trigger). RLock: safe if this thread re-enters via save_state().
+        if not hasattr(self, "_protection_lock"):
+            self._protection_lock = threading.RLock()
+        with self._protection_lock:
+            now = time.monotonic()
+            if not hasattr(self, "_last_protective_sync"):
+                self._last_protective_sync = {}
+            if not hasattr(self, "_last_protective_status_poll"):
+                self._last_protective_status_poll = {}
+            if not hasattr(self, "_last_recovery_alert"):
+                self._last_recovery_alert = {}
+            last_sync = float(self._last_protective_sync.get(trade.id, 0.0) or 0.0)
+            existing = str(getattr(trade, "protective_order_id", "") or "")
+            last_status_poll = float(self._last_protective_status_poll.get(trade.id, 0.0) or 0.0)
+            if existing and now - last_status_poll >= 15.0:
+                getter = getattr(self.broker, "get_order_status", None)
+                stop_status = self._order_status_text(getter(existing)) if callable(getter) else ""
+                self._last_protective_status_poll[trade.id] = now
+                if stop_status in {"rejected", "cancelled", "canceled"}:
+                    trade.protective_order_id = ""
+                    existing = ""
+                elif stop_status in {"complete", "filled"}:
+                    self._mark_recovery(
+                        trade,
+                        "Protective stop reports filled while broker position is still open",
+                    )
+                    return False
+            if existing:
+                tighter = (
+                    trigger > float(trade.protective_trigger or 0.0)
+                    if side == "SELL"
+                    else trigger < float(trade.protective_trigger or float("inf"))
                 )
+                qty_changed = qty != int(trade.protective_quantity or 0)
+                if not tighter and not qty_changed:
+                    return True
+                if now - last_sync < 2.0:
+                    return True
+                ok = self.broker.modify_protective_stop(
+                    existing, trade.trading_symbol, trade.symbol_token, qty, side,
+                    trigger, self.product_type,
+                )
+                self._last_protective_sync[trade.id] = now
+                if ok:
+                    trade.protective_trigger = trigger
+                    trade.protective_quantity = qty
+                    trade.protective_updated_at = datetime.now(IST)
+                    self.save_state()
+                    return True
+                self._mark_recovery(trade, "Broker protective stop could not be tightened")
+                self.save_state()
                 return False
-        if existing:
-            tighter = (
-                trigger > float(trade.protective_trigger or 0.0)
-                if side == "SELL"
-                else trigger < float(trade.protective_trigger or float("inf"))
-            )
-            qty_changed = qty != int(trade.protective_quantity or 0)
-            if not tighter and not qty_changed:
-                return True
-            if now - last_sync < 2.0:
-                return True
-            ok = self.broker.modify_protective_stop(
-                existing, trade.trading_symbol, trade.symbol_token, qty, side,
-                trigger, self.product_type,
-            )
-            self._last_protective_sync[trade.id] = now
-            if ok:
+
+            # ── Idempotent placement (audit BLOCKER-1/2 fix) ──
+            finder = getattr(self.broker, "find_working_protective_stop", None)
+
+            def _adopt(order_id: str, note: str) -> bool:
+                trade.protective_order_id = str(order_id)
                 trade.protective_trigger = trigger
                 trade.protective_quantity = qty
                 trade.protective_updated_at = datetime.now(IST)
+                trade.recovery_required_since = None
+                self._last_protective_sync[trade.id] = now
                 self.save_state()
+                logger.info(
+                    f"{note} for {trade.trading_symbol}: {order_id} qty={qty} trigger={trigger:.2f}"
+                )
                 return True
-            self._mark_recovery(trade, "Broker protective stop could not be tightened")
+
+            # Adopt any SL-M already resting at the exchange for this contract before
+            # placing a new one — covers a concurrent caller that just placed, and an
+            # entry whose acknowledgement was lost but which reached the exchange.
+            if callable(finder):
+                try:
+                    prior = str(finder(trade.trading_symbol, trade.symbol_token, side) or "")
+                except Exception as exc:
+                    logger.warning(
+                        f"Protective-stop idempotency scan failed for {trade.trading_symbol}: {exc}"
+                    )
+                    prior = ""
+                if prior:
+                    return _adopt(prior, "Adopted existing broker SL-M")
+
+            try:
+                order_id = self.broker.place_protective_stop(
+                    trade.trading_symbol, trade.symbol_token, qty, side, trigger, self.product_type,
+                )
+            except BrokerOrderAmbiguous as exc:
+                # The SL-M may already rest at the exchange despite the lost ack. NEVER
+                # blindly re-place. Re-scan and adopt if found, else fail closed to
+                # RECOVERY_REQUIRED for supervised reconciliation.
+                self._last_protective_sync[trade.id] = now
+                recovered = ""
+                if callable(finder):
+                    try:
+                        recovered = str(finder(trade.trading_symbol, trade.symbol_token, side) or "")
+                    except Exception as scan_exc:
+                        logger.warning(
+                            f"Post-ambiguous protective-stop scan failed for {trade.trading_symbol}: {scan_exc}"
+                        )
+                if recovered:
+                    return _adopt(recovered, "Recovered ambiguous broker SL-M")
+                self._mark_recovery(trade, f"Protective stop acknowledgement ambiguous: {exc}")
+                self.save_state()
+                return False
+
+            self._last_protective_sync[trade.id] = now
+            if order_id:
+                return _adopt(order_id, "Broker SL-M armed")
+            self._mark_recovery(trade, "Confirmed broker position has no exchange-side protective stop")
             self.save_state()
             return False
-
-        order_id = self.broker.place_protective_stop(
-            trade.trading_symbol, trade.symbol_token, qty, side, trigger, self.product_type,
-        )
-        self._last_protective_sync[trade.id] = now
-        if order_id:
-            trade.protective_order_id = str(order_id)
-            trade.protective_trigger = trigger
-            trade.protective_quantity = qty
-            trade.protective_updated_at = datetime.now(IST)
-            trade.recovery_required_since = None
-            self.save_state()
-            logger.info(
-                f"Broker SL-M armed for {trade.trading_symbol}: {order_id} "
-                f"qty={qty} trigger={trigger:.2f}"
-            )
-            return True
-        self._mark_recovery(trade, "Confirmed broker position has no exchange-side protective stop")
-        self.save_state()
-        return False
 
     def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
         """Flatten a confirmed recovery position after safely cancelling its SL-M."""

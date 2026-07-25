@@ -348,8 +348,17 @@ _ADVANCED_CONFIG_FIELDS = {
     "real_mode_premarket_refresh_end",
     "real_mode_live_start",
     "auto_real_mode_premarket_switch_time",
+    # Pullback hedge (A/B): OFF by default — archived-session backtest showed it armed
+    # once in 8 sessions and lost at every setting (the 85-90% runner lock already
+    # captures the give-back more cheaply). Exposed so the operator can A/B it.
+    "pullback_hedge_enabled",
+    "pullback_hedge_trigger_lock_fraction",
+    "pullback_hedge_resume_recovery_pct",
+    "pullback_hedge_size_fraction",
+    "pullback_hedge_max_hold_minutes",
 }
 _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
+    "pullback_hedge_enabled",
     "lean_routing_to_options",
     "price_action_module_enabled",
     "price_action_block_adverse",
@@ -1223,6 +1232,14 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 rare_dual_tf_min_confidence=msg.get("rare_dual_tf_min_confidence"),
                 rare_dual_tf_prefer_opt_second=msg.get("rare_dual_tf_prefer_opt_second"),
                 one_min_scalping_high_burst_only=msg.get("one_min_scalping_high_burst_only"),
+                # Pullback hedge (operator A/B; ships OFF — see _ADVANCED_CONFIG_FIELDS).
+                # Must be forwarded explicitly: whitelisting alone silently drops the
+                # control (2026-07-10 regression noted above).
+                pullback_hedge_enabled=msg.get("pullback_hedge_enabled"),
+                pullback_hedge_trigger_lock_fraction=msg.get("pullback_hedge_trigger_lock_fraction"),
+                pullback_hedge_resume_recovery_pct=msg.get("pullback_hedge_resume_recovery_pct"),
+                pullback_hedge_size_fraction=msg.get("pullback_hedge_size_fraction"),
+                pullback_hedge_max_hold_minutes=msg.get("pullback_hedge_max_hold_minutes"),
             )
             await _send_command_response(
                 ws,

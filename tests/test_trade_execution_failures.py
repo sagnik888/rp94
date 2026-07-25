@@ -79,6 +79,7 @@ def _manager(broker, max_positions=4):
     manager.closed_trades = []
     manager._trade_counter = 0
     manager._lock = threading.RLock()
+    manager._protection_lock = threading.RLock()
     manager._state_file = ""
     manager._last_mark_to_market_save = 0.0
     manager.orphan_positions = {}

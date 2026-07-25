@@ -116,3 +116,45 @@ def test_auto_mode_actually_chooses_both():
     scanner = _make_scanner("AUTO")
     results = {Scanner._resolve_instrument_type(scanner, **kwargs) for kwargs in _grid()}
     assert results == {"FUT", "OPT"}, f"AUTO did not produce both types: {results}"
+
+
+# ── audit 2026-07-24: structural instrument-lock guards ──────────────────────
+
+
+def test_force_candidate_to_options_refused_under_fut_pref():
+    """Symmetric guard: the options converter must refuse under a FUT-only lock so
+    the FUT invariant holds structurally, not by caller discipline."""
+    stub = SimpleNamespace(_strict_instrument_pref=lambda: "FUT")
+    cand = SimpleNamespace(
+        instrument="NIFTY", direction="LONG", inst_type="FUT",
+        option_type="", trading_symbol="NIFTY26JUNFUT", symbol_token="TOK",
+    )
+    assert Scanner._force_candidate_to_options(stub, cand) is False
+    assert str(getattr(cand, "inst_type", "")) == "FUT"  # never flipped to OPT
+
+
+def test_enforce_opt_pref_rejects_unconvertible_candidate_instead_of_leaving_fut():
+    """Under OPT, a FUT candidate that cannot be converted must be REJECTED (dropped),
+    never passed through as futures."""
+    stub = SimpleNamespace(
+        _strict_instrument_pref=lambda: "OPT",
+        _force_candidate_to_options=lambda c: False,  # conversion fails
+    )
+    cand = SimpleNamespace(inst_type="FUT", instrument="NIFTY")
+    ok, why = Scanner._enforce_strict_instrument_pref_on_candidate(stub, cand)
+    assert ok is False
+    assert why == "opt_conversion_failed"
+    assert str(getattr(cand, "inst_type", "")) == "FUT"  # not booked; caller drops it
+
+
+def test_enforce_fut_pref_rejects_unconvertible_candidate_instead_of_leaving_opt():
+    """Under FUT, an OPT candidate that cannot be converted must be REJECTED, never
+    passed through as options."""
+    stub = SimpleNamespace(
+        _strict_instrument_pref=lambda: "FUT",
+        _force_candidate_to_futures_1lot=lambda c: False,  # conversion fails
+    )
+    cand = SimpleNamespace(inst_type="OPT", instrument="NIFTY")
+    ok, why = Scanner._enforce_strict_instrument_pref_on_candidate(stub, cand)
+    assert ok is False
+    assert why == "fut_conversion_failed"

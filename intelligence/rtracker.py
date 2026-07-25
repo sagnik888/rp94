@@ -248,6 +248,19 @@ class RegimeTracker:
             "signal_timestamp": _iso_or_empty(signal_ts),
             "entry_timestamp": _iso_or_empty(entry_ts),
             "exit_timestamp": _iso_or_empty(exit_ts),
+            # Traded contract identity (2026-07-24): without this an offline replay can
+            # only GUESS the contract by premium proximity, which mismatched ~60% of
+            # trades (nearest stored strike differed 15-77%). Recording it makes every
+            # future session exactly replayable against its real premium candles.
+            "contract": {
+                "trading_symbol": str(_candidate_value(candidate, "trading_symbol", "") or ""),
+                "symbol_token": str(_candidate_value(candidate, "symbol_token", "") or ""),
+                "inst_type": str(_candidate_value(candidate, "inst_type", "") or ""),
+                "option_type": str(_candidate_value(candidate, "option_type", "") or ""),
+                "atm_strike": _safe_float(_candidate_value(candidate, "atm_strike", 0.0)),
+                "lots": _safe_int(_candidate_value(candidate, "lots", 0)),
+                "lot_size": _safe_int(_candidate_value(candidate, "lot_size", 0)),
+            },
             "regime": {
                 "raw_regime": str(regime_ctx.get("raw_regime") or ""),
                 "guarded_regime": str(regime_ctx.get("guarded_regime") or ""),

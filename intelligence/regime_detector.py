@@ -231,6 +231,7 @@ class RegimeDetector:
                 settings=_settings,
                 session_context=session_context,
                 regime=regime.value,
+                adx_val=adx_val,
             )
             if guarded_regime:
                 range_day_guard_reason = f"confirmed_range_day_demoted_{regime.value}"
@@ -255,6 +256,7 @@ class RegimeDetector:
                 settings=_settings,
                 session_context=session_context,
                 regime=out_regime,
+                adx_val=adx_val,
             )
             if guarded_out:
                 if not range_day_guard_reason:
@@ -605,6 +607,7 @@ class RegimeDetector:
         settings,
         session_context: Optional[Dict[str, Any]],
         regime: str,
+        adx_val: float = 0.0,
     ) -> bool:
         if not self._setting_enabled(
             getattr(settings, "regime_range_day_trend_guard_enabled", True),
@@ -618,6 +621,17 @@ class RegimeDetector:
             MarketRegime.BREAKOUT_UP.value,
             MarketRegime.BREAKOUT_DOWN.value,
         }:
+            return False
+
+        # ADX-strength escape (2026-07-24 audit): a genuinely strong trend (high ADX) is
+        # real even when the day-type classifier labels the session a RANGE_DAY. Without
+        # this, strong trend bars (ADX 44+) were demoted to RANGING, cascading into
+        # choppy gating (mass signal rejection), scalp-lock exits (winners cut early) and
+        # dormant trend re-entry — so the system missed big directional moves.
+        adx_override = float(
+            getattr(settings, "regime_range_day_trend_guard_adx_override", 35.0) or 0.0
+        )
+        if adx_override > 0.0 and float(adx_val or 0.0) >= adx_override:
             return False
 
         ctx = session_context or {}

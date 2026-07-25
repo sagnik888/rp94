@@ -719,7 +719,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._last_loss_outcome_instrument = ""
             self._last_reset_date = today
             closed_today = []
-            for trade in list(getattr(self.trades, "closed_trades", []) or []):
+            # Guard self.trades itself (not just the missing-attribute case): the daily
+            # counter reset must never crash the live scan if the trade manager is not
+            # yet wired (partial construction / warmup race). Completes the getattr
+            # defensiveness the surrounding code already intends.
+            _trades_ref = getattr(self, "trades", None)
+            for trade in list(getattr(_trades_ref, "closed_trades", []) or []):
                 if not self._trade_counts_for_daily_budget(trade):
                     continue
                 entry_time = getattr(trade, "entry_time", None)
@@ -730,7 +735,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._counted_entry_keys.add(key)
                         self._trades_today[instrument] = self._trades_today.get(instrument, 0) + 1
                     closed_today.append(trade)
-            for trade in list(getattr(self.trades, "open_trades", {}).values()):
+            for trade in list(getattr(_trades_ref, "open_trades", {}).values()):
                 if not self._trade_counts_for_daily_budget(trade):
                     continue
                 entry_time = getattr(trade, "entry_time", None)
@@ -741,8 +746,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._counted_entry_keys.add(key)
                         self._trades_today[instrument] = self._trades_today.get(instrument, 0) + 1
             real_signal_identities = set()
-            for trade in list(getattr(self.trades, "closed_trades", []) or []) + list(
-                getattr(self.trades, "open_trades", {}).values()
+            for trade in list(getattr(_trades_ref, "closed_trades", []) or []) + list(
+                getattr(_trades_ref, "open_trades", {}).values()
             ):
                 if not self._trade_counts_for_daily_budget(trade):
                     continue
@@ -2004,6 +2009,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "opt_sl": self.options_sl_pct,
 
             "lean_routing_to_options": getattr(get_settings(), "lean_routing_to_options", True),
+            # Pullback hedge (operator A/B; ships OFF — backtest showed the runner lock
+            # already captures the give-back more cheaply).
+            "pullback_hedge_enabled": getattr(get_settings(), "pullback_hedge_enabled", False),
+            "pullback_hedge_trigger_lock_fraction": getattr(get_settings(), "pullback_hedge_trigger_lock_fraction", 0.5),
+            "pullback_hedge_resume_recovery_pct": getattr(get_settings(), "pullback_hedge_resume_recovery_pct", 50.0),
+            "pullback_hedge_size_fraction": getattr(get_settings(), "pullback_hedge_size_fraction", 0.5),
+            "pullback_hedge_max_hold_minutes": getattr(get_settings(), "pullback_hedge_max_hold_minutes", 15.0),
             "price_action_module_enabled": getattr(get_settings(), "price_action_module_enabled", True),
             "price_action_block_adverse": getattr(get_settings(), "price_action_block_adverse", True),
             "price_action_adverse_threshold": getattr(get_settings(), "price_action_adverse_threshold", -0.4),
@@ -3283,6 +3295,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "error",
                     )
                 return False
+            # Audit fix (HIGH-2): the HISTORICAL→REAL readiness gate above only runs when
+            # requested_mode=="REAL" and we are not already REAL. By the time a human
+            # toggles Auto Mode, the 09:00 premarket worker has usually already armed REAL,
+            # so this toggle sends mode=None and skips that gate entirely — arming unattended
+            # auto-execution on nothing more than a confirmation string. Re-validate broker
+            # connectivity / warmup / feed freshness here before enabling auto-execution.
+            if current_mode == "REAL" or requested_mode == "REAL":
+                readiness = validate_real_mode_readiness(settings, getattr(self, "data", None))
+                if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
+                    blockers = readiness.get("blockers") or ["readiness failed"]
+                    reason = "; ".join(str(item) for item in blockers)
+                    self._last_configure_block_reason = f"auto-execution readiness failed: {reason}"
+                    logger.error(f"REAL auto-execution blocked by safe mode: {reason}")
+                    if self.on_notification:
+                        self.on_notification(
+                            f"REAL auto-execution blocked: {reason}",
+                            "error",
+                        )
+                    return False
 
 
         # Only apply explicitly-provided values. A partial configure (e.g. the auto-mode
@@ -11359,6 +11390,197 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             + "; ".join(dict.fromkeys(reasons))
         )
 
+    def _confirmed_trend_runner(
+        self, trade_like, *, regime: str, peak_pnl: float, initial_risk_rs: float
+    ) -> bool:
+        """A with-trend PROVEN winner in a confirmed strong-trend regime rides the
+        runner lock (10% give-back) rather than the tighter give-back guard. Requires
+        the feature enabled, a genuine trend regime, the trade aligned WITH the trend,
+        and a peak that already cleared the arming R-multiple (so a small blip cannot
+        promote a chop trade into runner mode). The caller still preserves EOD and
+        unconfirmed-repaint protection."""
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "trend_runner_let_winners_run_enabled", True), True
+        ):
+            return False
+        reg = str(regime or "").upper()
+        if reg not in {"TRENDING_UP", "TRENDING_DOWN", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
+            return False
+        sig = self._trade_signal_type_for_cascade(trade_like)
+        if sig == "BUY" and not reg.endswith("_UP"):
+            return False
+        if sig == "SELL" and not reg.endswith("_DOWN"):
+            return False
+        if sig not in {"BUY", "SELL"}:
+            return False
+        risk = float(initial_risk_rs or 0.0)
+        if risk <= 0:
+            return False
+        min_r = float(getattr(settings, "trend_runner_min_peak_r_multiple", 1.0) or 1.0)
+        return float(peak_pnl or 0.0) >= min_r * risk
+
+    def _dynamic_runner_lock_pct(self, base_pct: float, regime: str) -> float:
+        """Flex the runner profit-lock with volatility/regime: give a trending premium
+        MORE room in fast/volatile tape (lock the looser high-vol pct) so noise does not
+        shake the runner out, and tighten toward the base lock in calm regimes. Bounded
+        [0.25, 0.98]; returns the base lock unchanged when disabled."""
+        settings = get_settings()
+        try:
+            base = float(base_pct or 0.90)
+        except Exception:
+            base = 0.90
+        base = min(0.98, max(0.25, base))
+        if not self._setting_enabled(
+            getattr(settings, "trend_runner_dynamic_lock_enabled", True), True
+        ):
+            return base
+        reg = str(regime or "").upper()
+        if reg in {"VOLATILE", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
+            loose = float(getattr(settings, "trend_runner_lock_pct_high_vol", 0.85) or 0.85)
+            return min(0.98, max(0.25, min(base, loose)))
+        return base
+
+    @staticmethod
+    def _trade_gain_in_r(trade_like, current_move_pts: float) -> float:
+        """Current favourable move expressed as a multiple of the trade's INITIAL risk
+        (entry->initial stop), in the trade's own price space (premium for OPT, spot for
+        FUT). 0 when risk is unknown."""
+        entry = float(
+            getattr(trade_like, "entry_price", 0.0)
+            or getattr(trade_like, "price", 0.0)
+            or 0.0
+        )
+        istop = float(
+            getattr(trade_like, "initial_stop", 0.0)
+            or getattr(trade_like, "trailing_stop", 0.0)
+            or 0.0
+        )
+        risk = abs(entry - istop)
+        if risk <= 0:
+            return 0.0
+        return max(0.0, float(current_move_pts or 0.0)) / risk
+
+    def _big_move_expected(self, trade_like, *, gain_r: float, regime: str) -> Tuple[bool, str]:
+        """Decide whether to RIDE a winner for a bigger move vs bank a small gain.
+
+        The ride (and, later, the pullback hedge) must NEVER engage on a small gain — a
+        few % of R makes no sense to hedge. It engages ONLY when: the gain has already
+        proven itself (>= trend_runner_min_peak_r_multiple x R), the position is WITH a
+        confirmed strong-trend regime, and trend strength (ADX) says the move still has
+        room. Everything else falls through to normal profit-taking / exit-and-re-enter."""
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "trend_runner_let_winners_run_enabled", True), True
+        ):
+            return False, "disabled"
+        try:
+            gr = float(gain_r or 0.0)
+        except Exception:
+            gr = 0.0
+        min_r = float(getattr(settings, "trend_runner_min_peak_r_multiple", 1.0) or 1.0)
+        if gr < min_r:
+            return False, f"gain {gr:.2f}R < {min_r:.2f}R (small move — bank it)"
+        reg = str(regime or "").upper()
+        if reg not in {"TRENDING_UP", "TRENDING_DOWN", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
+            return False, f"regime {reg or 'unknown'} not a confirmed trend"
+        sig = self._trade_signal_type_for_cascade(trade_like)
+        if sig == "BUY" and not reg.endswith("_UP"):
+            return False, "counter-trend"
+        if sig == "SELL" and not reg.endswith("_DOWN"):
+            return False, "counter-trend"
+        if sig not in {"BUY", "SELL"}:
+            return False, "no directional bias"
+        adx = float(getattr(trade_like, "adx_value", 0.0) or 0.0)
+        min_adx = float(getattr(settings, "trend_runner_big_move_min_adx", 25.0) or 0.0)
+        # Only block when ADX is KNOWN and weak; unknown ADX (0) does not veto.
+        if min_adx > 0 and adx > 0 and adx < min_adx:
+            return False, f"ADX {adx:.1f} < {min_adx:.1f} (move losing strength)"
+        return True, f"{reg} {gr:.2f}R adx={adx:.1f}: ride for bigger move"
+
+    def _pullback_hedge_arm(
+        self,
+        trade_like,
+        *,
+        current_premium: float,
+        peak_premium: float,
+        gain_r: float,
+        regime: str,
+        hedges_used: int = 0,
+        runner_stop: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """Arm a FRESH-ATM opposite leg when a riding runner starts pulling back.
+
+        Only a proven big-move runner (>= the 0.4R crossover, with-trend, strong ADX)
+        can hedge — a small gain must never pay two premiums. The hedge is armed EARLY
+        (a few % off peak, before the runner lock's give-back would trigger) so it
+        captures the pullback the lock otherwise concedes."""
+        settings = get_settings()
+        if not self._setting_enabled(getattr(settings, "pullback_hedge_enabled", False), False):
+            return False, "disabled"
+        # Options only: an opposite OPTION leg keeps an OPT-locked book pure and has
+        # defined risk. A futures hedge would add margin/short exposure — out of scope.
+        if str(getattr(trade_like, "inst_type", "") or "").upper() != "OPT":
+            return False, "hedge supported for OPT only"
+        max_hedges = int(getattr(settings, "pullback_hedge_max_per_trade", 2) or 2)
+        if int(hedges_used or 0) >= max_hedges:
+            return False, f"hedge cap {max_hedges} reached"
+        big_ok, big_reason = self._big_move_expected(trade_like, gain_r=gain_r, regime=regime)
+        if not big_ok:
+            return False, f"not a hedgeable runner ({big_reason})"
+        peak = float(peak_premium or 0.0)
+        cur = float(current_premium or 0.0)
+        if peak <= 0 or cur <= 0:
+            return False, "premium unavailable"
+        retrace = peak - cur
+        giveback_pct = retrace / peak * 100.0
+        # Primary trigger: fraction of the peak->runner-stop distance already retraced.
+        # This always arms BEFORE the parent's lock exits (a fixed premium % cannot —
+        # the lock sits only ~4-5% below peak).
+        stop_px = float(runner_stop or 0.0)
+        if stop_px > 0 and peak > stop_px:
+            frac_needed = float(
+                getattr(settings, "pullback_hedge_trigger_lock_fraction", 0.5) or 0.5
+            )
+            frac_done = retrace / (peak - stop_px)
+            if frac_done < frac_needed:
+                return False, (
+                    f"pullback {frac_done:.0%} of lock distance < {frac_needed:.0%}"
+                )
+        else:
+            return False, "runner stop unavailable"
+        floor_pct = float(getattr(settings, "pullback_hedge_trigger_giveback_pct", 0.0) or 0.0)
+        if floor_pct > 0 and giveback_pct < floor_pct:
+            return False, f"pullback {giveback_pct:.1f}% < floor {floor_pct:.1f}%"
+        return True, f"pullback {giveback_pct:.1f}% off peak {peak:.2f}: arm fresh-ATM hedge"
+
+    def _pullback_hedge_release(
+        self,
+        *,
+        current_premium: float,
+        peak_premium: float,
+        pullback_low: float,
+        minutes_held: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """Release the hedge once the move RESUMES (so the runner keeps riding), or the
+        hold cap expires. The parent exiting also closes the hedge — enforced by the
+        caller so a hedge can never outlive its parent as a naked leg."""
+        settings = get_settings()
+        cap = float(getattr(settings, "pullback_hedge_max_hold_minutes", 15.0) or 15.0)
+        if cap > 0 and float(minutes_held or 0.0) >= cap:
+            return True, f"hedge hold cap {cap:.0f}m reached"
+        peak = float(peak_premium or 0.0)
+        low = float(pullback_low or 0.0)
+        cur = float(current_premium or 0.0)
+        depth = peak - low
+        if depth <= 0 or cur <= 0:
+            return False, "no measurable pullback yet"
+        recovered_pct = (cur - low) / depth * 100.0
+        need = float(getattr(settings, "pullback_hedge_resume_recovery_pct", 50.0) or 50.0)
+        if recovered_pct >= need:
+            return True, f"move resumed ({recovered_pct:.0f}% of pullback recovered): release hedge"
+        return False, f"pullback intact ({recovered_pct:.0f}% recovered < {need:.0f}%)"
+
     def _peak_giveback_or_reversal_exit(
         self,
         trade_like,
@@ -11423,7 +11645,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ):
                 day_type = self._current_day_type(getattr(trade_like, "instrument", ""))
                 nontrend_scope = day_type not in {"TREND_DAY_UP", "TREND_DAY_DOWN"}
-            if special or repaint_window or nontrend_scope or not special_only:
+            # Confirmed live trend keeps let-winners-run even when the session day-type
+            # classifier lags or scalp-lock was armed (2026-07-24: strong-ADX trends
+            # mislabelled RANGE_DAY armed the give-back and cut winners ~70%). A with-
+            # trend proven winner rides the runner lock only. EOD and unconfirmed-repaint
+            # protection are still applied and are never suppressed here.
+            trend_runner_active = (
+                self._confirmed_trend_runner(
+                    trade_like,
+                    regime=regime,
+                    peak_pnl=peak_pnl,
+                    initial_risk_rs=initial_risk_rs,
+                )
+                and not (latest_time is not None and self._eod_protect_active(latest_time))
+                and not repaint_window
+            )
+            if (
+                special or repaint_window or nontrend_scope or not special_only
+            ) and not trend_runner_active:
                 gb_arm = self._profit_giveback_arm(
                     initial_risk_rs, now=latest_time, nontrend_scope=nontrend_scope
                 )
@@ -17850,7 +18089,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if previous.target > 0 or getattr(previous, "runner_mode", False):
                 rr_settings = get_settings()
                 runner_unlock_ratio = min(1.0, max(0.50, float(getattr(rr_settings, "dynamic_rr_runner_unlock_ratio", 0.95) or 0.95)))
-                runner_lock_pct = min(0.98, max(0.25, float(getattr(rr_settings, "dynamic_rr_runner_lock_pct", 0.90) or 0.90)))
+                runner_lock_pct = self._dynamic_runner_lock_pct(
+                    float(getattr(rr_settings, "dynamic_rr_runner_lock_pct", 0.90) or 0.90),
+                    regime,
+                )
                 if cascade_runner and isinstance(cascade_ctx, dict):
                     runner_lock_pct = min(
                         0.98,
@@ -17864,12 +18106,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         (price_direction == "LONG" and current_price > previous.price)
                         or (price_direction == "SHORT" and current_price < previous.price)
                     )
-                    if is_correct_direction and target_distance > 0 and current_move >= target_distance * runner_unlock_ratio:
+                    reached_t1 = (
+                        is_correct_direction
+                        and target_distance > 0
+                        and current_move >= target_distance * runner_unlock_ratio
+                    )
+                    # Big-move ride: engage the runner EARLY (before the fixed target) for
+                    # a proven winner in a strong trend, so a big directional move is not
+                    # cut by the fixed target. Small gains never qualify (see _big_move_expected).
+                    big_move_ok = False
+                    big_reason = ""
+                    if (
+                        is_correct_direction
+                        and not reached_t1
+                        and self._setting_enabled(
+                            getattr(settings, "trend_runner_engage_before_target_enabled", True), True
+                        )
+                    ):
+                        big_move_ok, big_reason = self._big_move_expected(
+                            previous,
+                            gain_r=self._trade_gain_in_r(previous, current_move),
+                            regime=regime,
+                        )
+                    if reached_t1 or big_move_ok:
                         setattr(previous, "runner_mode", True)
                         previous.target = 0.0
                         changed = True
                         self.log_event(
-                            f"Target 1 reached for manual/session {previous.instrument}; runner lock enabled.",
+                            f"Runner lock enabled for manual/session {previous.instrument}: "
+                            + ("Target 1 reached" if reached_t1 else big_reason),
                             "trade",
                         )
 
@@ -20483,6 +20748,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     def _force_candidate_to_options(self, candidate: TradeCandidate) -> bool:
         """Convert candidate to options; CE/PE/TF stay direction/engine driven."""
+        # Symmetric instrument-lock guard (mirrors _force_candidate_to_futures_1lot's
+        # OPT refusal at 20411): never build an options leg under a FUT-only lock, so
+        # the FUT invariant holds structurally instead of relying on caller discipline.
+        if self._strict_instrument_pref() == "FUT":
+            return False
         instrument = str(getattr(candidate, "instrument", "") or "").split()[0]
         direction = str(getattr(candidate, "direction", "LONG") or "LONG").upper()
         option_type = "CE" if direction == "LONG" else "PE"
@@ -21298,7 +21568,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if premium_momentum_confirmed:
                 return choose("OPT", "risky regime but premium momentum confirmed")
             if not high_spot_vol:
-                return choose("OPT", "choppy regime -> defined-risk options")
+                # lean routing ON (default): choppy soft-FUT -> defined-risk options.
+                # lean routing OFF: honour the base rule and keep it in futures.
+                if lean_routing:
+                    return choose("OPT", "choppy regime -> defined-risk options")
+                return choose("FUT", "choppy regime, lean routing off -> base futures")
             return choose("FUT", "choppy/volatile regime with high spot vol; prefer futures")
         if strong_momentum and option_quality_ok and not high_spot_vol:
             return choose("OPT", "strong momentum passed option-quality gate")
@@ -21328,7 +21602,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ):
             return choose("FUT", "slow-grind trend: low-thrust directional move -> futures (no theta)")
         if not high_spot_vol:
-            return choose("OPT", "ordinary setup -> defined-risk options")
+            # lean routing ON (default): ordinary catch-all -> defined-risk options.
+            # lean routing OFF: honour the base rule and keep it in futures.
+            if lean_routing:
+                return choose("OPT", "ordinary setup -> defined-risk options")
+            return choose("FUT", "ordinary setup, lean routing off -> base futures")
         return choose("FUT", "default AUTO preference for ordinary setup with high spot vol")
 
     async def _track_repaint_until_candle_close(self, trade, candidate):
@@ -21713,7 +21991,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         try:
             candidates = self._apply_strict_instrument_pref_to_entries(list(candidates or []))
         except Exception as pref_exc:
-            logger.warning(f"Strict instrument preference pass skipped: {pref_exc}")
+            # Fail closed: this is the terminal product lock — never execute an
+            # un-enforced wave. Under a FUT/OPT lock, drop every ENTRY whose product
+            # does not already match the lock rather than passing the pre-gate list
+            # through to open_trade. Exits/non-ENTRY rows are preserved.
+            logger.warning(f"Strict instrument preference pass raised; failing closed: {pref_exc}")
+            _lock = self._strict_instrument_pref()
+            if _lock in {"FUT", "OPT"}:
+                def _matches_lock(c):
+                    if str(getattr(c, "action", "ENTRY") or "ENTRY").upper() != "ENTRY":
+                        return True
+                    it = str(getattr(c, "inst_type", "") or "").upper()
+                    if it in {"CE", "PE"}:
+                        it = "OPT"
+                    return it == _lock
+                candidates = [c for c in (candidates or []) if _matches_lock(c)]
 
         # OPT contract safety net: an ENTRY claiming OPT must carry a resolved
         # option contract (rare dual-TF clones can flip a FUT winner's sibling
@@ -21996,6 +22288,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                 
                                 def make_executor(candidate_sig, is_ghost=False):
                                     def do_execute():
+                                        # Instrument-lock parity with execute_manual_signal (1320):
+                                        # this deferred click may fire after the operator switched
+                                        # the FUT/OPT preference, so re-enforce the lock at execution
+                                        # time. Ghosts are virtual and never reach the broker.
+                                        if not is_ghost:
+                                            pref_ok, pref_why = self._enforce_strict_instrument_pref_on_candidate(candidate_sig)
+                                            if not pref_ok:
+                                                candidate_sig.status = f"BLOCKED - {self._strict_instrument_pref()} PREF ({pref_why})"
+                                                return
                                         exec_price, exec_stop, exec_target = self._execution_levels(candidate_sig)
                                         if exec_price <= 0:
                                             candidate_sig.status = "QUOTE UNAVAILABLE"
@@ -23089,7 +23390,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if trade.target > 0 or getattr(trade, 'runner_mode', False):
                 rr_settings = get_settings()
                 runner_unlock_ratio = min(1.0, max(0.50, float(getattr(rr_settings, "dynamic_rr_runner_unlock_ratio", 0.95) or 0.95)))
-                runner_lock_pct = min(0.98, max(0.25, float(getattr(rr_settings, "dynamic_rr_runner_lock_pct", 0.90) or 0.90)))
+                runner_lock_pct = self._dynamic_runner_lock_pct(
+                    float(getattr(rr_settings, "dynamic_rr_runner_lock_pct", 0.90) or 0.90),
+                    regime,
+                )
                 if cascade_runner and isinstance(cascade_ctx, dict):
                     runner_lock_pct = min(
                         0.98,
@@ -23115,12 +23419,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         current_move = abs(target_current - ref_entry)
                         is_correct_direction = (trade.direction == "LONG" and target_current > ref_entry) or                                              (trade.direction == "SHORT" and target_current < ref_entry)
 
-                    if is_correct_direction and current_move >= threshold_t1:
+                    reached_t1 = is_correct_direction and current_move >= threshold_t1
+                    # Big-move ride: engage the runner EARLY (before target) for a proven
+                    # winner in a strong trend so a big move is not cut at the fixed target.
+                    # Small gains never qualify (see _big_move_expected).
+                    big_move_ok = False
+                    big_reason = ""
+                    if (
+                        is_correct_direction
+                        and not reached_t1
+                        and self._setting_enabled(
+                            getattr(get_settings(), "trend_runner_engage_before_target_enabled", True), True
+                        )
+                    ):
+                        big_move_ok, big_reason = self._big_move_expected(
+                            trade,
+                            gain_r=self._trade_gain_in_r(trade, current_move),
+                            regime=regime,
+                        )
+                    if reached_t1 or big_move_ok:
                         trade.runner_mode = True
                         trade.original_target_distance = target_distance
                         trade.target = 0 # Remove hard target to let it run to T2/T3
                         lock_label = f"{runner_lock_pct * 100:.0f}%"
-                        self.log_event(f"🚀 TARGET 1 HIT for {trade.instrument}. Entering Institutional Runner Mode ({lock_label} Gain Lock).", "trade")
+                        note = "TARGET 1 HIT" if reached_t1 else f"big-move ride ({big_reason})"
+                        self.log_event(f"🚀 {note} for {trade.instrument}. Entering Runner Mode ({lock_label} Gain Lock).", "trade")
                         logger.success(f"🔥 Runner Mode Active: {trade.instrument}. Hard target removed, locking {lock_label} gains.")
 
                 # ── Runner Mode Trailing (90% Gain Lock) ──

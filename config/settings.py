@@ -422,6 +422,12 @@ class Settings(BaseSettings):
     # phantom directional regimes to RANGING unless the day has clear directional proof.
     regime_range_day_trend_guard_enabled: bool = True
     regime_range_day_trend_guard_min_confidence: float = 0.60
+    # ADX-strength escape (2026-07-24 audit): a genuinely strong trend is real even
+    # when the session day-type classifier calls the day a RANGE_DAY. Above this ADX
+    # the range-day demotion is skipped so strong directional moves are NOT relabelled
+    # RANGING (which had cascaded into choppy gating, scalp-lock early exits and dormant
+    # trend re-entry — the system missed big moves). Set 0 to disable the escape.
+    regime_range_day_trend_guard_adx_override: float = 35.0
     # Kaufman Efficiency Ratio early-trend promotion: ADX lags the first clean
     # directional drive. When ADX is still below the trend floor but price is moving
     # straight enough (ER) with a clean SMA stack, promote RANGING/VOLATILE to an
@@ -480,6 +486,47 @@ class Settings(BaseSettings):
     profit_giveback_arm_r_multiple: float = 0.40
     profit_giveback_min_peak_rs: float = 500.0
     profit_giveback_exit_ratio: float = 0.50
+    # Confirmed-live-trend "let winners run" (2026-07-24 audit): a with-trend PROVEN
+    # winner (peak >= min_peak_r_multiple x initial risk) in a strong-trend regime
+    # rides the runner lock (10% give-back) instead of the tighter give-back guard,
+    # even when the session day-type classifier lags or scalp-lock was armed. EOD and
+    # unconfirmed-repaint protection are NEVER suppressed. Set enabled False to revert.
+    trend_runner_let_winners_run_enabled: bool = True
+    # 0.4R crossover (operator design 2026-07-24): BELOW this the current profit/loss
+    # guards run unchanged (give-back arms at ~0.40R); AT/ABOVE it, in a confirmed strong
+    # trend only, the trade hands off from the 50%-fade give-back to the 85-90% runner
+    # lock (protects more AND lets it run). The regime+ADX gate keeps this from engaging
+    # on chop days, so it is regime-adaptive rather than a blanket low threshold.
+    trend_runner_min_peak_r_multiple: float = 0.4
+    # Dynamic runner profit-lock: give a trending premium more room in fast/volatile
+    # tape (lock the looser high-vol pct so noise does not shake the runner out) and
+    # tighten toward dynamic_rr_runner_lock_pct (0.90) in calm regimes.
+    trend_runner_dynamic_lock_enabled: bool = True
+    trend_runner_lock_pct_high_vol: float = 0.85
+    # Big-move gate: the ride/runner engages EARLY (before the fixed target) only when a
+    # proven winner is in a strong trend with ADX above this floor — so small gains are
+    # banked normally and the ride is reserved for moves with room to run.
+    trend_runner_big_move_min_adx: float = 25.0
+    trend_runner_engage_before_target_enabled: bool = True
+    # ── Pullback hedge (Phase 3, operator design 2026-07-24) ──────────────────
+    # While a proven runner (>= the 0.4R crossover) is riding a confirmed trend, an
+    # early pullback arms a FRESH-ATM opposite option leg ("pullback insurance"): it
+    # captures the down-move that the runner lock would otherwise give back, and is
+    # RELEASED when the move resumes so the runner keeps riding. The hedge is never a
+    # standalone directional bet — it closes with its parent and never outlives it.
+    # DEFAULT OFF: this opens a second live broker leg (sizing/exposure/accounting),
+    # so it stays off until the archived-session backtest justifies enabling it.
+    pullback_hedge_enabled: bool = False
+    # Arm when the premium has retraced this FRACTION of the distance from peak to the
+    # runner stop. Relative (not a fixed premium %) because the runner lock sits only
+    # ~4-5% below peak: a fixed 5% trigger could never fire — the parent always exited
+    # first (proven by the archived-session backtest, 0 hedges armed).
+    pullback_hedge_trigger_lock_fraction: float = 0.5
+    pullback_hedge_trigger_giveback_pct: float = 0.0   # optional extra floor (0 = off)
+    pullback_hedge_resume_recovery_pct: float = 50.0   # % of pullback depth recovered -> release
+    pullback_hedge_size_fraction: float = 0.5          # hedge lots vs parent lots
+    pullback_hedge_max_per_trade: int = 2              # anti-whipsaw churn cap
+    pullback_hedge_max_hold_minutes: float = 15.0      # never hold a hedge indefinitely
     # ── Rupee loss ladder (freefall OR confirmed slow bleed) ───────
     # Eligibility floors OPT -1000 / FUT -1500 are NOT auto-exits. Two cut paths:
     # (A) FREEFALL — sudden opposite flow, post-close repaint, spike dump, etc.
