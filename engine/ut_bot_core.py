@@ -178,6 +178,16 @@ class UTBotEngine:
         )
         return max(float(stop_distance or 0.0), atr_floor, price_floor, 0.01)
 
+    @staticmethod
+    def _max_sizing_quantity(base_qty: int) -> int:
+        """Configured safety ceiling for raw risk-based quantity suggestions."""
+        settings = get_settings()
+        multiplier = max(
+            1.0,
+            float(getattr(settings, "ut_sizing_max_base_multiplier", 5.0) or 5.0),
+        )
+        return max(int(base_qty), int(float(base_qty) * multiplier))
+
     # ═══════════════════════════════════════════════════════════
     # HEIKIN ASHI
     # ═══════════════════════════════════════════════════════════
@@ -356,7 +366,10 @@ class UTBotEngine:
         base_qty = lots * lot_size
         if stop_dist > 0:
             sizing_stop = self._effective_sizing_stop(stop_dist, atr_arr[state_idx], curr_src_val)
-            suggested_qty = min(int(cap_rpct / sizing_stop), base_qty * 5)
+            suggested_qty = min(
+                int(cap_rpct / sizing_stop),
+                self._max_sizing_quantity(base_qty),
+            )
         else:
             suggested_qty = base_qty
         suggested_qty = max(lot_size, (suggested_qty // lot_size) * lot_size)
@@ -539,8 +552,7 @@ class UTBotEngine:
                 if stop_dist > 0:
                     sizing_stop = self._effective_sizing_stop(stop_dist, atr_arr[i], curr_src_val)
                     raw_qty = int(cap_rpct / sizing_stop)
-                    # Hard cap at 5x base qty to prevent uncapped sizing risk on tiny stop_dist
-                    suggested_qty = min(raw_qty, base_qty * 5)
+                    suggested_qty = min(raw_qty, self._max_sizing_quantity(base_qty))
                 else:
                     suggested_qty = base_qty
                 
@@ -568,7 +580,7 @@ class UTBotEngine:
                 if stop_dist > 0:
                     sizing_stop = self._effective_sizing_stop(stop_dist, atr_arr[i], curr_src_val)
                     raw_qty = int(cap_rpct / sizing_stop)
-                    suggested_qty = min(raw_qty, base_qty * 5)
+                    suggested_qty = min(raw_qty, self._max_sizing_quantity(base_qty))
                 else:
                     suggested_qty = base_qty
                 

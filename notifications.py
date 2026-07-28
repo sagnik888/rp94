@@ -3,54 +3,86 @@ Desktop Notifications — Windows Toast Notifications
 ═══════════════════════════════════════════════════════════════
 """
 
+import queue
 import threading
 from loguru import logger
 
-_toaster = None
+_notification_queue: queue.Queue = queue.Queue(maxsize=100)
+_worker_started = False
+_worker_lock = threading.Lock()
+_notifications_available = True
 
 
-def _get_toaster():
-    global _toaster
-    if _toaster is None:
+def _notification_worker():
+    """Single background thread that processes all desktop notifications sequentially."""
+    global _notifications_available
+    try:
+        import win11toast
+    except Exception as exc:
+        win11toast = None
+        _notifications_available = False
+        logger.warning(f"Desktop notifications unavailable: {exc}")
+
+    titles = {
+        "buy": "🟢 UT Bot — Trade Signal",
+        "sell": "🔴 UT Bot — Trade Signal",
+        "info": "📊 UT Bot — Info",
+        "warning": "⚠️ UT Bot — Warning",
+        "error": "❌ UT Bot — Error",
+        "entry": "🚀 TRADE EXECUTED",
+        "target": "💰 TARGET ACHIEVED",
+        "stop": "🛡️ STOPLOSS TRIGGERED",
+        "exit": "✅ TRADE EXITED",
+    }
+
+    while True:
         try:
-            from windows_toasts import InteractableWindowsToaster
-            _toaster = InteractableWindowsToaster('Command Prompt')
-            logger.debug("Desktop notifications: windows_toasts ready")
-        except ImportError:
-            logger.warning("windows_toasts not installed — desktop notifications disabled")
-    return _toaster
+            message, msg_type = _notification_queue.get()
+        except Exception:
+            continue
+
+        try:
+            if win11toast is None:
+                continue
+            title = titles.get(msg_type, "📊 UT Bot")
+
+            button_config = None
+            if msg_type in ["entry", "target", "stop", "exit"]:
+                try:
+                    from config.settings import get_settings
+
+                    port = int(getattr(get_settings(), "dashboard_port", 8001) or 8001)
+                except Exception:
+                    port = 8001
+                button_config = {
+                    "activationType": "protocol",
+                    "arguments": f"http://127.0.0.1:{port}",
+                    "content": "View Dashboard",
+                }
+
+            if button_config:
+                win11toast.toast(title, message[:256], audio={"silent": "true"}, button=button_config)
+            else:
+                win11toast.toast(title, message[:256], audio={"silent": "true"})
+        except Exception as e:
+            logger.debug(f"Notification error: {e}")
+        finally:
+            _notification_queue.task_done()
 
 
 def send_desktop_notification(message: str, msg_type: str = "info"):
     """
     Send a Windows desktop toast notification.
-    Runs in a separate thread to avoid blocking the event loop.
+    Enqueues to a single background worker to avoid thread-per-notification leak.
     """
-    def _send():
-        toaster = _get_toaster()
-        if toaster is None:
-            return
-        try:
-            from windows_toasts import Toast, ToastAudio, AudioSource
-            
-            titles = {
-                "buy": "🟢 UT Bot — Trade Signal",
-                "sell": "🔴 UT Bot — Trade Signal",
-                "info": "📊 UT Bot — Info",
-                "warning": "⚠️ UT Bot — Warning",
-                "error": "❌ UT Bot — Error",
-            }
-            
-            toast = Toast()
-            title = titles.get(msg_type, "📊 UT Bot")
-            toast.text_fields = [title, message[:256]]
-            
-            if msg_type in ("buy", "sell", "error", "warning"):
-                toast.audio = ToastAudio(AudioSource.IM)
-                
-            toaster.show_toast(toast)
-        except Exception as e:
-            logger.debug(f"Notification error: {e}")
-
-    thread = threading.Thread(target=_send, daemon=True)
-    thread.start()
+    global _worker_started
+    if not _worker_started:
+        with _worker_lock:
+            if not _worker_started:
+                t = threading.Thread(target=_notification_worker, daemon=True, name="NotificationWorker")
+                t.start()
+                _worker_started = True
+    try:
+        _notification_queue.put_nowait((message, msg_type))
+    except queue.Full:
+        logger.debug("Notification queue full — dropping notification")

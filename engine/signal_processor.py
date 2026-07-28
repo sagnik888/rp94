@@ -39,6 +39,11 @@ from trading.trade_manager import IST, Trade
 from engine.ut_bot_core import UTBotSignal
 
 
+def _is_bfo_instrument(value) -> bool:
+    normalized = str(value or "").upper()
+    return "SENSEX" in normalized or "BANKEX" in normalized
+
+
 def _setting_enabled(value, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
@@ -1501,7 +1506,10 @@ class SignalProcessor:
             return pd.DataFrame(), "", ""
         symbol = str(opt_info.get("symbol", ""))
         token = str(opt_info.get("token", ""))
-        exchange = str(opt_info.get("exch_seg") or ("BFO" if instrument == "SENSEX" else "NFO"))
+        exchange = str(
+            opt_info.get("exch_seg")
+            or ("BFO" if _is_bfo_instrument(instrument) else "NFO")
+        )
         cache_key = (symbol, interval, trade_day.isoformat() if trade_day else "")
         symbol_cache_key = (symbol, interval)
         diag = getattr(scanner, "_diag_inc", None)
@@ -2142,6 +2150,58 @@ class SignalProcessor:
         except Exception:
             return None
 
+    @staticmethod
+    def _historical_compression_state(
+        candle_5min: Optional[pd.DataFrame],
+        signal_timestamp,
+        signal_type: str,
+    ) -> str:
+        """Replay the one-lot box rule without using future session candles.
+
+        Historical rows are completed bars.  The first three completed 5m bars
+        qualify/freeze the box; a later completed close beyond the 3bp buffer is
+        equivalent to live WATCH followed by confirmation.  A close back inside
+        revokes that authorization for sizing at the current signal.
+        """
+        try:
+            if (
+                candle_5min is None
+                or candle_5min.empty
+                or not isinstance(candle_5min.index, pd.DatetimeIndex)
+                or signal_timestamp is None
+            ):
+                return "FORMING"
+            ts = pd.Timestamp(signal_timestamp)
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
+            frame = candle_5min.sort_index()
+            idx = frame.index
+            if idx.tz is not None:
+                idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+                frame = frame.copy()
+                frame.index = idx
+            frame = frame[(frame.index.date == ts.date()) & (frame.index <= ts)]
+            if len(frame) < 3:
+                return "FORMING"
+            first = frame.iloc[:3]
+            ref = float(first["open"].iloc[0] or 0.0)
+            box_low = float(first["low"].min())
+            box_high = float(first["high"].max())
+            if ref <= 0 or box_low <= 0 or box_high < box_low:
+                return "FORMING"
+            if (box_high - box_low) / ref * 100.0 > 0.20 + 1e-9:
+                return "UNRESTRICTED"
+            breach = max(ref * 0.0003, 0.01)
+            latest_close = float(frame["close"].iloc[-1] or 0.0)
+            want_up = str(signal_type or "").upper() == "BUY"
+            if want_up and latest_close >= box_high + breach:
+                return "BREAKOUT_CONFIRMED"
+            if not want_up and latest_close <= box_low - breach:
+                return "BREAKOUT_CONFIRMED"
+            return "LOCKED"
+        except Exception:
+            return "FORMING"
+
     def _append_adaptive_dual_apex_candidates(
         self,
         *,
@@ -2752,6 +2812,11 @@ class SignalProcessor:
                                 hist_stop_px = max(0.05, hist_entry_px - max(0.05, min(natural, max_sl)))
                                 requested = int(getattr(scanner, "user_lots", {}).get(instrument, 1) or 1)
 
+                            hist_compression_state = self._historical_compression_state(
+                                candles_df,
+                                s1.timestamp,
+                                s1.signal_type,
+                            )
                             size_result = resolve_trade_lots(
                                 settings=settings,
                                 inst_type=sim_inst,
@@ -2759,6 +2824,7 @@ class SignalProcessor:
                                 lot_size=lot_size,
                                 entry_price=hist_entry_px,
                                 stop_price=hist_stop_px,
+                                compression_state=hist_compression_state,
                             )
                             hist_lots = int(size_result.lots or 0)
                             if hist_lots < 1:
@@ -2803,6 +2869,7 @@ class SignalProcessor:
                                         lot_size=lot_size,
                                         entry_price=float(entry_premium or 0.0),
                                         stop_price=fut_stop,
+                                        compression_state=hist_compression_state,
                                     )
                                     hist_lots = int(size_result.lots or 0)
                                     if hist_lots < 1:
@@ -3185,8 +3252,11 @@ class SignalProcessor:
                             logger.info(f"🔍 [AUDIT] Recovery logic running for {instrument} {tf}. last_s={last_s.timestamp} {last_s.signal_type}. scanner.inst_pref: {scanner.inst_pref}")
                             
                             # Data Sanity Check: Detect swapped prices!
-                            if instrument == "SENSEX" and last_s.price < 50000:
-                                logger.error(f"🚨 [AUDIT] SENSEX signal has NIFTY price: {last_s.price}. Skipping recovery.")
+                            if _is_bfo_instrument(instrument) and last_s.price < 50000:
+                                logger.error(
+                                    f"🚨 [AUDIT] {instrument} signal has NIFTY price: "
+                                    f"{last_s.price}. Skipping recovery."
+                                )
                                 continue
                             if instrument == "NIFTY" and last_s.price > 50000:
                                 logger.error(f"🚨 [AUDIT] NIFTY signal has SENSEX price: {last_s.price}. Skipping recovery.")
@@ -3298,7 +3368,7 @@ class SignalProcessor:
                                         f"'{rec_trading_symbol or 'unknown'}')."
                                     )
                                     continue
-                                exchange = "BFO" if instrument == "SENSEX" else "NFO"
+                                exchange = "BFO" if _is_bfo_instrument(instrument) else "NFO"
                                 rec_entry = float(
                                     self._contract_ltp(
                                         scanner, exchange, rec_trading_symbol, rec_symbol_token
@@ -5495,7 +5565,7 @@ class SignalProcessor:
                 final_strike_score = strike_alpha + (oi_score * 0.3) + (vol_score * 0.3) + itm_bonus
 
                 live_trade_price = spot
-                exchange = "BFO" if instrument == "SENSEX" else "NFO"
+                exchange = "BFO" if _is_bfo_instrument(instrument) else "NFO"
                 candidate_stop = entry_stop
                 candidate_target = target
                 
@@ -5708,6 +5778,36 @@ class SignalProcessor:
                             )
                     except Exception:
                         heavy_trend_scale = False
+                # Scaling is not a breakout detector.  It is permitted only
+                # after the locked compression box has a confirmed breach and
+                # the current canonical regime agrees with this trade.
+                # Missing compression evidence is fail-closed during live sizing.
+                _compression_state = str((_session_ctx or {}).get("compression_state") or "FORMING").upper()
+                _compression_box = (_session_ctx or {}).get("compression_box", {}) or {}
+                _breakout_direction = str(_compression_box.get("breakout_direction") or "").upper()
+                _signal_breakout_direction = "UP" if str(best_sig.signal_type).upper() == "BUY" else "DOWN"
+                _confirmed_breakout_valid = bool(
+                    _compression_state == "BREAKOUT_CONFIRMED"
+                    and _compression_box.get("live_valid") is True
+                    and _breakout_direction == _signal_breakout_direction
+                )
+                _compression_allows_scale = bool(
+                    _compression_state == "UNRESTRICTED"
+                    or _confirmed_breakout_valid
+                )
+                _strict_trend = bool(
+                    _compression_allows_scale
+                    and is_trending_regime(str(regime or ""))
+                    and regime_aligns(str(regime or ""), best_sig.signal_type)
+                )
+                cascade_scale = bool(cascade_scale and _strict_trend)
+                heavy_trend_scale = bool(heavy_trend_scale and _strict_trend)
+                _effective_compression_state = (
+                    "REVERSION_LOCKED"
+                    if _compression_state == "BREAKOUT_CONFIRMED"
+                    and not _confirmed_breakout_valid
+                    else _compression_state
+                )
                 size_result = resolve_trade_lots(
                     settings=settings,
                     inst_type=inst_type,
@@ -5719,6 +5819,7 @@ class SignalProcessor:
                     cascade_scale=cascade_scale,
                     heavy_trend_scale=heavy_trend_scale,
                     high_conviction=False,
+                    compression_state=_effective_compression_state,
                 )
                 if size_result.lots < 1:
                     logger.info(
@@ -5730,6 +5831,8 @@ class SignalProcessor:
                     )
                     continue
                 actual_lots = size_result.lots
+                setattr(best_sig, "lot_sizing_mode", str(size_result.mode or "fixed"))
+                setattr(best_sig, "sizing_compression_state", _effective_compression_state)
                 if size_result.mode == "cascade":
                     candidate_reasons.append(
                         f"Cascade lot scale: {actual_lots} lot(s) "
@@ -5808,6 +5911,8 @@ class SignalProcessor:
                 if late_session_reclaim_entry and isinstance(_reversal_relief_context, dict):
                     setattr(candidate, "late_session_reclaim_context", dict(_reversal_relief_context))
                 setattr(candidate, "one_way_cascade_entry", bool(one_way_cascade_entry))
+                setattr(candidate, "lot_sizing_mode", str(size_result.mode or "fixed"))
+                setattr(candidate, "sizing_compression_state", _effective_compression_state)
                 setattr(candidate, "market_ltp_shock_entry", bool(market_ltp_shock_entry))
                 if market_ltp_shock_entry and market_ltp_shock_context:
                     setattr(candidate, "market_ltp_shock_context", dict(market_ltp_shock_context))

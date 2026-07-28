@@ -180,10 +180,12 @@ class CandleBuilder:
             ref = self._latest_prices.get(instrument, 0.0)
             if not ref or ref <= 0:
                 try:
-                    ref = float(new_data['close'].median())
+                    median_val = new_data['close'].median()
+                    import pandas as pd
+                    ref = float(median_val) if not pd.isna(median_val) else 0.0
                 except Exception:
                     ref = 0.0
-            if ref and ref > 0:
+            if ref and ref > 0 and not pd.isna(ref):
                 valid_rows = (new_data['close'] - ref).abs() / ref <= self._MAX_PRICE_DEVIATION
                 if not valid_rows.all():
                     logger.warning(f"⚠️ Filtering {int((~valid_rows).sum())} implausible rows for {instrument} (cross-index leak guard)")

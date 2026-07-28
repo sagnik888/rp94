@@ -3,17 +3,21 @@ Dashboard Server — FastAPI + WebSocket for Real-Time Dashboard
 ═══════════════════════════════════════════════════════════════
 """
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import json
 import math
 import os
 import secrets
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
+from http.cookies import SimpleCookie
 from typing import Set, Dict, Any, Optional, Callable
 from urllib.parse import urlparse
 
@@ -32,14 +36,22 @@ except Exception:  # pragma: no cover - optional fast path
 
 # WebSocket connections
 active_connections: Set[WebSocket] = set()
+_pending_ws_connections: Set[int] = set()
+_ws_command_times: Dict[int, deque] = {}
+_ws_rate_violations: Dict[int, int] = {}
 
 # Reference to scanner (set by main.py)
 scanner_ref = None
 
 # Periodic dashboard task managed by FastAPI lifespan.
 _periodic_trades_task: Optional[asyncio.Task] = None
+_broadcast_task: Optional[asyncio.Task] = None
+_broadcast_queue: Optional[asyncio.Queue] = None
+_startup_task: Optional[asyncio.Future] = None
 _ipv6_localhost_proxy: Optional[asyncio.base_events.Server] = None
 startup_hook: Optional[Callable[[], Any]] = None
+shutdown_hook: Optional[Callable[[], Any]] = None
+_dashboard_shutting_down = False
 _dashboard_runtime_token = secrets.token_urlsafe(32)
 _last_periodic_trades_hash: Optional[str] = None
 # Event-driven wake for the trades updater so entry/exit refresh the panel
@@ -66,8 +78,24 @@ _latest_full_trades_payload: Dict[str, Any] = {}
 
 def _schedule_on_scanner_loop(coro) -> bool:
     scanner_loop = getattr(scanner_ref, "_event_loop", None)
-    if scanner_loop is not None and scanner_loop.is_running():
-        asyncio.run_coroutine_threadsafe(coro, scanner_loop)
+    if scanner_loop is not None:
+        if not scanner_loop.is_running():
+            if inspect.iscoroutine(coro):
+                coro.close()
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if scanner_loop is current_loop:
+            scanner_loop.create_task(coro)
+        else:
+            try:
+                asyncio.run_coroutine_threadsafe(coro, scanner_loop)
+            except Exception:
+                if inspect.iscoroutine(coro):
+                    coro.close()
+                return False
         return True
     try:
         asyncio.create_task(coro)
@@ -84,14 +112,181 @@ async def _await_on_scanner_loop(coro, timeout_seconds: float = 8.0):
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
         current_loop = None
-    if scanner_loop is not None and scanner_loop.is_running() and scanner_loop is not current_loop:
-        fut = asyncio.run_coroutine_threadsafe(coro, scanner_loop)
-        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout_seconds)
+    if scanner_loop is not None:
+        if not scanner_loop.is_running():
+            if inspect.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("scanner event loop is not running")
+        if scanner_loop is not current_loop:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(coro, scanner_loop)
+            except Exception:
+                if inspect.iscoroutine(coro):
+                    coro.close()
+                raise
+            return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout_seconds)
     return await coro
+
+
+async def _call_on_scanner_loop(
+    func: Callable[[], Any],
+    *,
+    timeout_seconds: float = 15.0,
+) -> Any:
+    """Execute one synchronous scanner mutation on the scanner-owned loop."""
+
+    async def _invoke():
+        return func()
+
+    return await _await_on_scanner_loop(_invoke(), timeout_seconds=timeout_seconds)
+
+
+def _schedule_call_on_scanner_loop(func: Callable[[], Any]) -> bool:
+    """Schedule a synchronous scanner mutation without crossing loop ownership."""
+
+    async def _invoke():
+        return func()
+
+    return _schedule_on_scanner_loop(_invoke())
+
+
+def _dashboard_ws_limits() -> tuple[int, int, float, int]:
+    settings = get_settings()
+    max_connections = max(
+        1,
+        min(64, int(getattr(settings, "dashboard_ws_max_connections", 8) or 8)),
+    )
+    max_commands = max(
+        1,
+        min(500, int(getattr(settings, "dashboard_ws_max_commands_per_window", 30) or 30)),
+    )
+    window_seconds = max(
+        0.25,
+        min(60.0, float(getattr(settings, "dashboard_ws_command_window_seconds", 1.0) or 1.0)),
+    )
+    max_violations = max(
+        1,
+        min(20, int(getattr(settings, "dashboard_ws_max_rate_violations", 3) or 3)),
+    )
+    return max_connections, max_commands, window_seconds, max_violations
+
+
+def _record_ws_command(ws: WebSocket) -> tuple[bool, int]:
+    """Sliding-window command limiter scoped to one authenticated connection."""
+    _, max_commands, window_seconds, _ = _dashboard_ws_limits()
+    ws_id = id(ws)
+    now = time.monotonic()
+    history = _ws_command_times.setdefault(ws_id, deque())
+    cutoff = now - window_seconds
+    while history and history[0] < cutoff:
+        history.popleft()
+    history.append(now)
+    if len(history) <= max_commands:
+        _ws_rate_violations.pop(ws_id, None)
+        return True, 0
+    violations = int(_ws_rate_violations.get(ws_id, 0) or 0) + 1
+    _ws_rate_violations[ws_id] = violations
+    return False, violations
+
+
+def _forget_ws_connection(ws: WebSocket) -> None:
+    ws_id = id(ws)
+    active_connections.discard(ws)
+    _pending_ws_connections.discard(ws_id)
+    _ws_command_times.pop(ws_id, None)
+    _ws_rate_violations.pop(ws_id, None)
+    dashboard_state.last_sent_states.pop(ws_id, None)
+
+
+async def _close_active_websockets(code: int = 1012) -> None:
+    """Close and forget all dashboard clients without serial shutdown waits."""
+    clients = list(active_connections)
+    if clients:
+        async def _close_one(ws: WebSocket) -> None:
+            try:
+                await asyncio.wait_for(ws.close(code=code), timeout=1.0)
+            except Exception:
+                pass
+
+        await asyncio.gather(*(_close_one(ws) for ws in clients), return_exceptions=True)
+    for ws in clients:
+        _forget_ws_connection(ws)
 
 
 def _dashboard_token() -> str:
     return str(getattr(get_settings(), "dashboard_auth_token", "") or _dashboard_runtime_token)
+
+
+_WS_APP_PROTOCOL = "ut1.dashboard.v1"
+_WS_AUTH_PROTOCOL_PREFIX = "ut1.auth."
+
+
+def _encode_ws_auth_protocol(token: str) -> str:
+    """Encode a credential as an RFC-compatible WebSocket subprotocol token."""
+    encoded = base64.urlsafe_b64encode(str(token).encode("utf-8")).decode("ascii")
+    return _WS_AUTH_PROTOCOL_PREFIX + encoded.rstrip("=")
+
+
+def _decode_ws_auth_protocol(protocol: str) -> Optional[str]:
+    value = str(protocol or "")
+    if not value.startswith(_WS_AUTH_PROTOCOL_PREFIX):
+        return None
+    encoded = value[len(_WS_AUTH_PROTOCOL_PREFIX):]
+    if not encoded or len(encoded) > 4096:
+        return None
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        return raw.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _ws_protocols(ws: WebSocket) -> list[str]:
+    header = str(ws.headers.get("sec-websocket-protocol", "") or "")
+    return [part.strip() for part in header.split(",") if part.strip()]
+
+
+def _ws_authentication(ws: WebSocket) -> tuple[bool, Optional[str]]:
+    """Authenticate a WS handshake without reading credentials from its URL."""
+    protocols = _ws_protocols(ws)
+    candidates: list[tuple[str, Optional[str]]] = []
+
+    authorization = str(ws.headers.get("authorization", "") or "").strip()
+    scheme, separator, bearer = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer" and bearer.strip():
+        candidates.append((bearer.strip(), None))
+
+    header_token = ws.headers.get("x-dashboard-token")
+    if header_token:
+        candidates.append((str(header_token), None))
+
+    for protocol in protocols:
+        decoded = _decode_ws_auth_protocol(protocol)
+        if decoded is not None:
+            candidates.append((decoded, protocol))
+
+    # Cookie auth is useful for non-JS clients and remains protected by the
+    # strict Origin check. The app does not put this credential into a URL.
+    try:
+        cookie_header = str(ws.headers.get("cookie", "") or "")
+        cookies = SimpleCookie()
+        cookies.load(cookie_header)
+        for name in ("ut1_dashboard_token", "dashboard_token"):
+            if name in cookies:
+                candidates.append((cookies[name].value, None))
+    except Exception:
+        pass
+
+    for candidate, auth_protocol in candidates:
+        if not _token_matches(candidate):
+            continue
+        if _WS_APP_PROTOCOL in protocols:
+            return True, _WS_APP_PROTOCOL
+        # If a client offered only the auth carrier, echo it as the selected
+        # protocol so strict WebSocket implementations complete negotiation.
+        return True, auth_protocol
+    return False, None
 
 
 def _allowed_origins() -> Set[str]:
@@ -123,7 +318,7 @@ def _token_matches(token: Optional[str]) -> bool:
 
 def _request_authorized(request: Request) -> bool:
     origin = request.headers.get("origin") or request.headers.get("referer")
-    token = request.headers.get("x-dashboard-token") or request.query_params.get("token")
+    token = request.headers.get("x-dashboard-token")
     return _is_allowed_origin(origin) and _token_matches(token)
 
 
@@ -730,14 +925,129 @@ def _configuration_result_payload(configured: Any, scanner: Any, requested_mode:
 
 async def shutdown_scanner():
     logger.info("👋 Graceful Shutdown Triggered...")
-    if scanner_ref:
+    scanner = scanner_ref
+    if scanner:
+        # Out-of-band fail-safe: even if the scanner loop is temporarily busy and
+        # cannot service the stop coroutine, its next run-loop check must exit.
+        if hasattr(scanner, "is_running"):
+            scanner.is_running = False
+        scanner_trades = getattr(scanner, "trades", None)
+        if scanner_trades is not None and hasattr(scanner_trades, "_sync_active"):
+            scanner_trades._sync_active = False
+        stop_completed = False
+
+        async def _request_stop() -> None:
+            nonlocal stop_completed
+            trades = getattr(scanner, "trades", None)
+            if trades is not None and hasattr(trades, "_sync_active"):
+                trades._sync_active = False
+            provider = getattr(scanner, "data", None)
+            shutdown_streams = getattr(provider, "shutdown_streams", None)
+            if callable(shutdown_streams):
+                try:
+                    result = shutdown_streams()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:
+                    # A provider close failure must not prevent the scanner stop.
+                    logger.error(f"Error stopping provider streams: {exc}")
+            result = scanner.stop()
+            if inspect.isawaitable(result):
+                await result
+            stop_completed = True
+
         try:
-            scanner_ref.stop()
-            logger.info("✅ Scanner loop stopped.")
+            scanner_loop = getattr(scanner, "_event_loop", None)
+            if scanner_loop is not None and not scanner_loop.is_running():
+                # The owner loop has already exited, so cleanup is safe locally.
+                await _request_stop()
+            else:
+                await _await_on_scanner_loop(_request_stop(), timeout_seconds=20.0)
+            logger.info("✅ Scanner stop completed.")
         except Exception as e:
             logger.error(f"Error stopping scanner: {e}")
+            scanner_loop = getattr(scanner, "_event_loop", None)
+            if scanner_loop is not None and not scanner_loop.is_running():
+                try:
+                    await _request_stop()
+                except Exception as fallback_exc:
+                    logger.error(f"Local scanner cleanup fallback failed: {fallback_exc}")
+
+        raw_join_timeout = getattr(
+            get_settings(),
+            "scanner_shutdown_join_timeout_seconds",
+            120.0,
+        )
         try:
-            scanner_ref.trades.save_state()
+            scanner_join_timeout = max(
+                5.0,
+                min(300.0, float(raw_join_timeout or 120.0)),
+            )
+        except (TypeError, ValueError):
+            scanner_join_timeout = 120.0
+
+        # ScannerEventLoop must fully unwind before the execution queue is closed;
+        # otherwise the tail of a scan can submit broker work after queue drain.
+        runner_thread = getattr(scanner, "_runner_thread", None)
+        if runner_thread is not None and runner_thread.is_alive():
+            try:
+                await asyncio.to_thread(runner_thread.join, scanner_join_timeout)
+            except Exception as exc:
+                logger.error(f"Scanner runner join failed: {exc}")
+            if runner_thread.is_alive():
+                logger.critical(
+                    "ScannerEventLoop did not stop before the graceful-shutdown timeout."
+                )
+        if not stop_completed and (
+            runner_thread is None or not runner_thread.is_alive()
+        ):
+            try:
+                await _request_stop()
+            except Exception as exc:
+                logger.error(f"Post-join scanner cleanup failed: {exc}")
+
+        sync_thread = getattr(getattr(scanner, "trades", None), "_sync_thread", None)
+        if sync_thread is not None and sync_thread.is_alive():
+            try:
+                await asyncio.to_thread(sync_thread.join, min(10.0, scanner_join_timeout))
+            except Exception as exc:
+                logger.debug(f"Position sync join skipped: {exc}")
+            if sync_thread.is_alive():
+                logger.warning("Position sync thread did not stop before queue drain.")
+
+    # Entry/exit workers may still be persisting broker acknowledgements. Drain
+    # them before the final trade snapshot, without blocking the dashboard loop.
+    try:
+        from engine.async_queue import execution_queue
+
+        raw_queue_timeout = getattr(
+            get_settings(),
+            "shutdown_execution_queue_timeout_seconds",
+            90.0,
+        )
+        try:
+            parsed_queue_timeout = float(raw_queue_timeout or 90.0)
+        except (TypeError, ValueError):
+            parsed_queue_timeout = 90.0
+        queue_timeout = max(
+            5.0,
+            min(300.0, parsed_queue_timeout),
+        )
+        drained = await asyncio.to_thread(
+            execution_queue.shutdown,
+            drain=True,
+            timeout_seconds=queue_timeout,
+        )
+        if drained:
+            logger.info("✅ Broker execution queue drained.")
+        else:
+            logger.warning("Broker execution queue did not fully drain before timeout.")
+    except Exception as exc:
+        logger.error(f"Error draining broker execution queue: {exc}")
+
+    if scanner:
+        try:
+            await asyncio.to_thread(scanner.trades.save_state)
             logger.info("✅ Trade state saved.")
         except Exception as e:
             logger.error(f"Error saving trade state during shutdown: {e}")
@@ -803,16 +1113,32 @@ async def start_ipv6_localhost_proxy() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _periodic_trades_task, _ipv6_localhost_proxy
+    global _periodic_trades_task, _ipv6_localhost_proxy, _dashboard_shutting_down, _startup_task
+    _dashboard_shutting_down = False
+    _startup_task = None
+    try:
+        from engine.async_queue import execution_queue
+
+        start_queue = getattr(execution_queue, "start", None)
+        if callable(start_queue):
+            start_queue()
+    except Exception as exc:
+        logger.error(f"Unable to start broker execution queue: {exc}")
+    _ensure_broadcast_worker()
     _periodic_trades_task = asyncio.create_task(periodic_trades_updater())
     await start_ipv6_localhost_proxy()
     if startup_hook:
         result = startup_hook()
-        if inspect.iscoroutine(result):
+        if isinstance(result, asyncio.Future):
+            _startup_task = result
+        elif inspect.isawaitable(result):
             await result
     try:
         yield
     finally:
+        # Close the command ingress first: no new broker/scanner work may race
+        # with the shutdown hook or execution-queue drain.
+        _dashboard_shutting_down = True
         if _periodic_trades_task:
             _periodic_trades_task.cancel()
             try:
@@ -820,11 +1146,44 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _periodic_trades_task = None
+        await _stop_broadcast_worker()
+        await _close_active_websockets(code=1012)
+        # The production startup hook intentionally bootstraps the scanner in a
+        # background Task. Let it reach a known terminal state before cleanup so
+        # resources cannot be created after the shutdown hook has already run.
+        startup_task = _startup_task
+        _startup_task = None
+        if startup_task is not None:
+            try:
+                await asyncio.shield(startup_task)
+            except asyncio.CancelledError:
+                # Preserve cleanup even if the lifespan receives cancellation.
+                # Shield keeps an in-flight to_thread(create_system) bootstrap
+                # alive; wait for it once more so the hook can close its result.
+                if not startup_task.cancelled():
+                    try:
+                        await asyncio.shield(startup_task)
+                    except asyncio.CancelledError as exc:
+                        logger.error(f"Dashboard startup task did not settle: {exc}")
+                    except Exception as exc:
+                        logger.error(f"Dashboard startup task did not settle: {exc}")
+            except Exception as exc:
+                logger.error(f"Dashboard startup task failed during shutdown: {exc}")
+        shutdown_hook_completed = False
+        if shutdown_hook:
+            try:
+                result = shutdown_hook()
+                if inspect.isawaitable(result):
+                    await result
+                shutdown_hook_completed = True
+            except Exception as exc:
+                logger.error(f"Dashboard shutdown hook failed: {exc}")
+        if not shutdown_hook_completed:
+            await shutdown_scanner()
         if _ipv6_localhost_proxy is not None:
             _ipv6_localhost_proxy.close()
             await _ipv6_localhost_proxy.wait_closed()
             _ipv6_localhost_proxy = None
-        await shutdown_scanner()
 
 
 app = FastAPI(title="UT Bot Index Trading System", version="1.0.0", lifespan=lifespan)
@@ -846,7 +1205,7 @@ _TOKEN_REQUIRED_API_PATHS = {
 
 def _read_api_authorized(request: Request) -> bool:
     """Token gate for sensitive read APIs (loopback alone is not enough)."""
-    token = request.headers.get("x-dashboard-token") or request.query_params.get("token")
+    token = request.headers.get("x-dashboard-token")
     return _token_matches(token)
 
 
@@ -886,7 +1245,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(_allowed_origins()),
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Dashboard-Token"],
+    allow_headers=["Authorization", "Content-Type", "X-Dashboard-Token"],
 )
 
 # Static files
@@ -919,8 +1278,23 @@ async def api_client_config(request: Request, response: Response):
     # close_trade, place orders). Only hand it to LOCAL (loopback) requests, so that
     # if the server is ever bound to 0.0.0.0 a remote client cannot fetch it.
     local = _is_loopback_request(request)
+    token = _dashboard_token() if local else ""
+    if token:
+        # Browser WebSocket constructors cannot set Authorization headers. Seed
+        # a path-scoped, HttpOnly cookie during the same-origin bootstrap so the
+        # WS handshake remains credentialed without putting a secret in its URL.
+        response.set_cookie(
+            key="ut1_dashboard_token",
+            value=token,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path="/ws",
+        )
+    else:
+        response.delete_cookie(key="ut1_dashboard_token", path="/ws")
     return {
-        "dashboard_token": _dashboard_token() if local else "",
+        "dashboard_token": token,
         "allowed_origins": sorted(_allowed_origins()),
         "local": local,
     }
@@ -928,34 +1302,76 @@ async def api_client_config(request: Request, response: Response):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if _dashboard_shutting_down:
+        await ws.close(code=1012)
+        return
     origin = ws.headers.get("origin")
-    token = ws.query_params.get("token")
-    if not _is_allowed_origin(origin) or not _token_matches(token):
+    authenticated, selected_protocol = _ws_authentication(ws)
+    if not _is_allowed_origin(origin) or not authenticated:
         await ws.close(code=1008)
         return
-    await ws.accept()
+    max_connections, _, _, max_violations = _dashboard_ws_limits()
+    ws_id = id(ws)
+    # Reserve the slot before the accept await, preventing simultaneous handshakes
+    # from all observing the same pre-limit connection count.
+    if len(active_connections) + len(_pending_ws_connections) >= max_connections:
+        await ws.close(code=1013)
+        return
+    _pending_ws_connections.add(ws_id)
+    try:
+        await ws.accept(subprotocol=selected_protocol)
+    except Exception:
+        _pending_ws_connections.discard(ws_id)
+        raise
+    _pending_ws_connections.discard(ws_id)
+    if _dashboard_shutting_down:
+        await ws.close(code=1012)
+        return
     active_connections.add(ws)
     logger.info(f"📡 Dashboard connected ({len(active_connections)} clients)")
     try:
         while True:
+            if _dashboard_shutting_down:
+                await ws.close(code=1012)
+                return
             # Receive commands from dashboard
             data = await ws.receive_text()
+            allowed, violations = _record_ws_command(ws)
+            if not allowed:
+                await ws.send_json(
+                    {
+                        "type": "command_rejected",
+                        "data": {"reason": "rate_limited"},
+                    }
+                )
+                if violations >= max_violations:
+                    await ws.close(code=1008)
+                    return
+                continue
             try:
                 msg = json.loads(data)
                 await handle_command(ws, msg)
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        active_connections.discard(ws)
-        dashboard_state.last_sent_states.pop(id(ws), None)
+        _forget_ws_connection(ws)
         logger.info(f"📡 Dashboard disconnected ({len(active_connections)} clients)")
-    except Exception as e:
-        active_connections.discard(ws)
-        dashboard_state.last_sent_states.pop(id(ws), None)
+    except Exception:
+        _forget_ws_connection(ws)
+    finally:
+        _forget_ws_connection(ws)
 
 
 async def handle_command(ws: WebSocket, msg: Dict):
     """Handle commands from the dashboard"""
+    if _dashboard_shutting_down:
+        await ws.send_json(
+            {
+                "type": "command_rejected",
+                "data": {"reason": "system_shutting_down"},
+            }
+        )
+        return
     if not isinstance(msg, dict):
         await ws.send_json({"type": "command_rejected", "data": {"reason": "invalid_payload"}})
         return
@@ -1000,7 +1416,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
 
     elif cmd == "configure":
         if scanner_ref:
-            configured = scanner_ref.configure(
+            configured = await _call_on_scanner_loop(lambda: scanner_ref.configure(
                 capital_total=msg.get("capital_total"),
                 capital_fut=msg.get("capital_fut"),
                 risk_fut_pct=msg.get("risk_fut_pct"),
@@ -1249,7 +1665,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 pullback_hedge_resume_recovery_pct=msg.get("pullback_hedge_resume_recovery_pct"),
                 pullback_hedge_size_fraction=msg.get("pullback_hedge_size_fraction"),
                 pullback_hedge_max_hold_minutes=msg.get("pullback_hedge_max_hold_minutes"),
-            )
+            ))
             await _send_command_response(
                 ws,
                 msg,
@@ -1261,12 +1677,12 @@ async def handle_command(ws: WebSocket, msg: Dict):
         if scanner_ref:
             mode = msg.get("mode", "paper")
             reset = msg.get("reset", False)
-            configured = scanner_ref.configure(
+            configured = await _call_on_scanner_loop(lambda: scanner_ref.configure(
                 mode=mode,
                 reset=reset,
                 confirm_real_mode=msg.get("confirm_real_mode", False),
                 real_mode_verification=msg.get("real_mode_verification", ""),
-            )
+            ))
             await _send_command_response(
                 ws,
                 msg,
@@ -1276,7 +1692,9 @@ async def handle_command(ws: WebSocket, msg: Dict):
 
     elif cmd == "reset_pnl":
         if scanner_ref:
-            configured = scanner_ref.configure(reset=True)
+            configured = await _call_on_scanner_loop(
+                lambda: scanner_ref.configure(reset=True)
+            )
             await _send_command_response(
                 ws,
                 msg,
@@ -1287,31 +1705,39 @@ async def handle_command(ws: WebSocket, msg: Dict):
     elif cmd == "set_power":
         if scanner_ref:
             state = msg.get("state", "OFF")
-            scanner_ref.system_power = state
+            await _call_on_scanner_loop(
+                lambda: setattr(scanner_ref, "system_power", state)
+            )
             await _send_command_response(ws, msg, "power_updated", {"state": state})
 
     elif cmd == "set_regime_adaptation":
         if scanner_ref:
-            from config.settings import get_settings
             state = msg.get("state", "OFF")
             is_on = state == "ON"
-            settings = get_settings()
-            settings.ut_regime_adaptation = is_on
-            schedule_settings_save(settings)
-            if hasattr(getattr(scanner_ref, "mtf", None), "apply_engine_params"):
-                scanner_ref.mtf.apply_engine_params(settings.get_ut_engine_params())
+
+            def _set_regime_adaptation() -> None:
+                settings = get_settings()
+                settings.ut_regime_adaptation = is_on
+                schedule_settings_save(settings)
+                if hasattr(getattr(scanner_ref, "mtf", None), "apply_engine_params"):
+                    scanner_ref.mtf.apply_engine_params(settings.get_ut_engine_params())
+
+            await _call_on_scanner_loop(_set_regime_adaptation)
             await _send_command_response(ws, msg, "config_ack", {"status": "ok"})
 
     elif cmd == "set_sl_mode":
         if scanner_ref:
-            from config.settings import get_settings
             state = str(msg.get("state", "NATURAL") or "NATURAL").upper()
             if state not in {"NATURAL", "HARDCODED"}:
                 await _send_command_response(ws, msg, "config_ack", {"status": "blocked", "reason": "invalid_sl_mode"})
                 return
-            settings = get_settings()
-            settings.sl_mode = state
-            schedule_settings_save(settings)
+
+            def _set_sl_mode() -> None:
+                settings = get_settings()
+                settings.sl_mode = state
+                schedule_settings_save(settings)
+
+            await _call_on_scanner_loop(_set_sl_mode)
             await _send_command_response(ws, msg, "config_ack", {"status": "ok"})
 
     elif cmd == "set_scanner_engine":
@@ -1320,14 +1746,16 @@ async def handle_command(ws: WebSocket, msg: Dict):
             if state not in {"utbot", "ema", "consensus", "auto", "utbot_ema", "utbot_consensus", "quad_union", "utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}:
                 await _send_command_response(ws, msg, "config_ack", {"status": "blocked", "reason": "invalid_scanner_engine"})
                 return
-            if hasattr(scanner_ref, "apply_scanner_engine_switch"):
-                result = scanner_ref.apply_scanner_engine_switch(state)
-            else:
-                from config.settings import get_settings
+
+            def _set_scanner_engine() -> Dict[str, Any]:
+                if hasattr(scanner_ref, "apply_scanner_engine_switch"):
+                    return scanner_ref.apply_scanner_engine_switch(state)
                 settings = get_settings()
                 settings.scanner_engine = state
                 schedule_settings_save(settings)
-                result = {"scanner_engine": state, "recalculation_queued": False}
+                return {"scanner_engine": state, "recalculation_queued": False}
+
+            result = await _call_on_scanner_loop(_set_scanner_engine)
             # REAL/live mode only needs a lightweight recalibration; HISTORICAL mode
             # queues a full rebuild inside apply_scanner_engine_switch.
             if not result.get("recalculation_queued") and hasattr(scanner_ref, "perform_system_recalibration"):
@@ -1338,32 +1766,40 @@ async def handle_command(ws: WebSocket, msg: Dict):
         if scanner_ref:
             state = msg.get("state", "ON")
             is_on = state == "ON"
-            scanner_ref.configure(concurrency_guard=is_on)
+            await _call_on_scanner_loop(
+                lambda: scanner_ref.configure(concurrency_guard=is_on)
+            )
             await _send_command_response(ws, msg, "config_ack", {"status": "ok"})
 
     elif cmd == "set_expiry_gamma":
         if scanner_ref:
-            from config.settings import get_settings
             is_on = msg.get("state", "OFF") == "ON"
-            settings = get_settings()
-            settings.expiry_day_trade_current_week = is_on
-            schedule_settings_save(settings)
-            # New expiry selection only affects future option resolutions; clear the
-            # expiry token cache so already-cached (rolled) tokens don't mask the change.
-            try:
-                from engine.expiry_manager import expiry_manager
-                expiry_manager._token_cache.clear()
-            except Exception:
-                pass
+
+            def _set_expiry_gamma() -> None:
+                settings = get_settings()
+                settings.expiry_day_trade_current_week = is_on
+                schedule_settings_save(settings)
+                # New expiry selection only affects future option resolutions.
+                try:
+                    from engine.expiry_manager import expiry_manager
+
+                    expiry_manager._token_cache.clear()
+                except Exception:
+                    pass
+
+            await _call_on_scanner_loop(_set_expiry_gamma)
             await _send_command_response(ws, msg, "config_ack", {"status": "ok", "expiry_day_trade_current_week": is_on})
 
     elif cmd == "set_combo_partner_exit":
         if scanner_ref:
-            from config.settings import get_settings
             is_on = msg.get("state", "ON") == "ON"
-            settings = get_settings()
-            settings.combo_partner_confirms_exit = is_on
-            schedule_settings_save(settings)
+
+            def _set_combo_partner_exit() -> None:
+                settings = get_settings()
+                settings.combo_partner_confirms_exit = is_on
+                schedule_settings_save(settings)
+
+            await _call_on_scanner_loop(_set_combo_partner_exit)
             await _send_command_response(ws, msg, "config_ack", {"status": "ok", "combo_partner_confirms_exit": is_on})
 
     elif cmd == "execute_signal":
@@ -1390,7 +1826,44 @@ async def handle_command(ws: WebSocket, msg: Dict):
                         scanner_ref.close_dashboard_trade(tid, price, "MANUAL")
                     )
                 else:
-                    accepted = scanner_ref.trades.close_trade(tid, price, "MANUAL")
+                    async def _fallback_close() -> bool:
+                        trades = scanner_ref.trades
+                        trade = getattr(trades, "open_trades", {}).get(tid)
+                        confirm_manual = getattr(
+                            trades,
+                            "confirm_latched_manual_exit",
+                            None,
+                        )
+                        if bool(
+                            getattr(
+                                trade,
+                                "manual_exit_confirmation_pending",
+                                False,
+                            )
+                        ) and callable(confirm_manual):
+                            return bool(
+                                await asyncio.to_thread(
+                                    confirm_manual,
+                                    tid,
+                                    price,
+                                    "MANUAL",
+                                )
+                            )
+                        latch_exit = getattr(trades, "latch_exit_intent", None)
+                        if callable(latch_exit):
+                            latch_exit(tid, "MANUAL", price)
+                        return bool(
+                            await asyncio.to_thread(
+                                trades.close_trade,
+                                tid,
+                                price,
+                                "MANUAL",
+                            )
+                        )
+
+                    accepted = await _await_on_scanner_loop(
+                        _fallback_close()
+                    )
                     result = {
                         "trade_id": tid,
                         "status": "submitted" if accepted else "blocked",
@@ -1407,52 +1880,115 @@ async def handle_command(ws: WebSocket, msg: Dict):
 
     elif cmd == "kill_all":
         if scanner_ref:
-            open_tids = list(scanner_ref.trades.open_trades.keys())
-            submitted = 0
-            for tid in open_tids:
-                trade = scanner_ref.trades.open_trades[tid]
-                price = getattr(trade, 'current_price', trade.entry_price)
-                submitted += bool(
-                    scanner_ref.trades.close_trade(tid, price, "HARDBREAKER")
-                )
-            scanner_ref.log_event(
-                f"🚨 HARDBREAKER: Exit submitted for {submitted}/{len(open_tids)} trades.",
-                "warning",
+            async def _kill_all() -> Dict[str, Any]:
+                trades = scanner_ref.trades
+                lock = getattr(trades, "_lock", None)
+                if lock is None:
+                    open_snapshot = list(trades.open_trades.items())
+                else:
+                    with lock:
+                        open_snapshot = list(trades.open_trades.items())
+                latch_exit = getattr(trades, "latch_exit_intent", None)
+                if callable(latch_exit):
+                    for tid, trade in open_snapshot:
+                        price = float(
+                            getattr(trade, "current_price", 0.0)
+                            or getattr(trade, "entry_price", 0.0)
+                            or 0.0
+                        )
+                        latch_exit(tid, "HARDBREAKER", price)
+                submitted = 0
+                for tid, trade in open_snapshot:
+                    price = float(
+                        getattr(trade, "current_price", 0.0)
+                        or getattr(trade, "entry_price", 0.0)
+                        or 0.0
+                    )
+                    try:
+                        confirm_manual = getattr(
+                            trades,
+                            "confirm_latched_manual_exit",
+                            None,
+                        )
+                        close_fn = trades.close_trade
+                        if bool(
+                            getattr(
+                                trade,
+                                "manual_exit_confirmation_pending",
+                                False,
+                            )
+                        ) and callable(confirm_manual):
+                            close_fn = confirm_manual
+                        submitted += bool(
+                            await asyncio.to_thread(
+                                close_fn,
+                                tid,
+                                price,
+                                "HARDBREAKER",
+                            )
+                        )
+                    except Exception as exc:
+                        logger.error(f"HARDBREAKER exit submission failed for {tid}: {exc}")
+                requested = len(open_snapshot)
+                log_event = getattr(scanner_ref, "log_event", None)
+                if callable(log_event):
+                    try:
+                        log_event(
+                            f"🚨 HARDBREAKER: Exit submitted for {submitted}/{requested} trades.",
+                            "warning",
+                        )
+                    except Exception as exc:
+                        logger.debug(f"HARDBREAKER event log failed: {exc}")
+                return {
+                    "status": "submitted" if submitted == requested else "partial",
+                    "submitted": submitted,
+                    "requested": requested,
+                }
+
+            kill_result = await _await_on_scanner_loop(
+                _kill_all(),
+                timeout_seconds=30.0,
             )
             await _send_command_response(
                 ws,
                 msg,
                 "all_trades_killed",
-                {
-                    "status": "submitted" if submitted == len(open_tids) else "partial",
-                    "submitted": submitted,
-                    "requested": len(open_tids),
-                },
+                kill_result,
             )
 
     elif cmd == "update_fyers_token":
         if scanner_ref:
-            result = scanner_ref.update_fyers_token(msg.get("auth_code", ""))
+            result = await _await_on_scanner_loop(
+                scanner_ref.update_fyers_token_async(
+                    msg.get("auth_code", "")
+                ),
+                timeout_seconds=30.0,
+            )
             await _send_command_response(ws, msg, "fyers_auth_updated", make_serializable(result))
 
     elif cmd == "subscribe_chart":
         if scanner_ref:
             instrument = str(msg.get("instrument") or "NIFTY").upper()
             tf = str(msg.get("tf") or "5min")
-            loop = asyncio.get_running_loop()
-            snapshot = await loop.run_in_executor(
-                None,
-                lambda: scanner_ref.get_chart_snapshot(instrument=instrument, timeframe=tf),
+            snapshot = await _call_on_scanner_loop(
+                lambda: scanner_ref.get_chart_snapshot(
+                    instrument=instrument,
+                    timeframe=tf,
+                )
             )
             await _send_command_response(ws, msg, "chart_snapshot", make_serializable(snapshot))
 
     elif cmd == "set_chart_stream":
         if scanner_ref:
             enabled = msg.get("enabled", True)
-            if hasattr(scanner_ref, "set_chart_stream_enabled"):
-                enabled = scanner_ref.set_chart_stream_enabled(enabled)
-            else:
+
+            def _set_chart_stream() -> bool:
+                if hasattr(scanner_ref, "set_chart_stream_enabled"):
+                    return bool(scanner_ref.set_chart_stream_enabled(enabled))
                 scanner_ref.chart_stream_enabled = bool(enabled)
+                return bool(enabled)
+
+            enabled = await _call_on_scanner_loop(_set_chart_stream)
             await _send_command_response(ws, msg, "chart_stream_updated", {"enabled": bool(enabled)})
 
     elif cmd == "system_recalibrate":
@@ -1657,7 +2193,11 @@ def _build_fresh_trades_payload() -> Dict[str, Any]:
         _latest_full_trades_payload = payload
     try:
         if hasattr(scanner_ref, "dashboard_cache"):
-            state = dict(scanner_ref.dashboard_cache.state() or getattr(scanner_ref, "latest_results", {}) or {})
+            state = make_serializable(
+                scanner_ref.dashboard_cache.state()
+                or getattr(scanner_ref, "latest_results", {})
+                or {}
+            )
             state["mode"] = getattr(scanner_ref, "mode", None)
             if hasattr(scanner_ref, "get_broadcast_config"):
                 state["config"] = scanner_ref.get_broadcast_config()
@@ -1667,7 +2207,9 @@ def _build_fresh_trades_payload() -> Dict[str, Any]:
             state["trades"] = payload
             if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
                 scanner_ref._sync_engine_lab_active_row(state, (payload.get("summary") or {}))
-            scanner_ref.dashboard_cache.update(state)
+            _schedule_call_on_scanner_loop(
+                lambda snapshot=state: scanner_ref.dashboard_cache.update(snapshot)
+            )
     except Exception:
         logger.debug("Unable to refresh dashboard trade cache", exc_info=True)
     return payload
@@ -1846,8 +2388,53 @@ def _cap_ws_payload(safe_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _ensure_broadcast_worker() -> asyncio.Queue:
+    """Return the dashboard-loop latest-wins queue and ensure its pump is alive."""
+    global _broadcast_queue, _broadcast_task
+    if _broadcast_queue is None or _broadcast_task is None or _broadcast_task.done():
+        _broadcast_queue = asyncio.Queue(maxsize=1)
+        _broadcast_task = asyncio.create_task(
+            _broadcast_worker(_broadcast_queue),
+            name="DashboardBroadcastWorker",
+        )
+    return _broadcast_queue
+
+
 async def broadcast(data: Dict):
-    """Broadcast delta payloads to all connected WebSocket clients"""
+    """Publish a dashboard snapshot without awaiting serialization or client I/O.
+
+    The queue intentionally holds only the newest pending state. A stalled client
+    can delay its own delivery worker, but it can no longer delay the scanner loop.
+    """
+    if _dashboard_shutting_down:
+        return False
+    queue = _ensure_broadcast_worker()
+    payload = dict(data or {})
+    if queue.full():
+        try:
+            queue.get_nowait()
+            queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+    queue.put_nowait(payload)
+    return True
+
+
+async def _broadcast_worker(queue: asyncio.Queue) -> None:
+    while True:
+        payload = await queue.get()
+        try:
+            await _deliver_broadcast(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Dashboard broadcast worker error: {exc}")
+        finally:
+            queue.task_done()
+
+
+async def _deliver_broadcast(data: Dict) -> None:
+    """Serialize and deliver one coalesced snapshot on the dashboard loop."""
     global _latest_full_trades_payload
     payload = dict(data or {})
     payload["dashboard_heartbeat"] = _dashboard_heartbeat()
@@ -1858,48 +2445,87 @@ async def broadcast(data: Dict):
     safe_data = make_serializable(_lighten_state_payload(payload))
     safe_data = _cap_ws_payload(safe_data)
     
+    # The lock protects the published reference only. Never hold it while a
+    # client socket is awaited.
     async with dashboard_state.lock:
         dashboard_state.latest_safe_state = safe_data
 
-        if not active_connections:
-            return
-        
-        disconnected = set()
-        
-        # Per-client send timeout: a slow/stalled client must not delay the others
-        # (or block scanner progress, which awaits this broadcast).
-        send_timeout = 5.0
-        clients = list(active_connections)
+    if not active_connections:
+        return
 
-        async def _send_one(ws) -> None:
-            try:
-                ws_id = id(ws)
-                old_state = dashboard_state.last_sent_states.get(ws_id)
+    disconnected = set()
+    send_timeout = max(
+        0.1,
+        min(
+            5.0,
+            float(getattr(get_settings(), "dashboard_ws_send_timeout_seconds", 1.0) or 1.0),
+        ),
+    )
+    clients = list(active_connections)
 
-                if old_state is None:
-                    # First time: Send full update
-                    message = json.dumps({"type": "full_update", "data": safe_data}, default=str)
+    async def _send_one(ws) -> None:
+        try:
+            ws_id = id(ws)
+            old_state = dashboard_state.last_sent_states.get(ws_id)
+
+            if old_state is None:
+                message = json.dumps({"type": "full_update", "data": safe_data}, default=str)
+                await asyncio.wait_for(ws.send_text(message), timeout=send_timeout)
+                dashboard_state.last_sent_states[ws_id] = safe_data
+            else:
+                delta = compute_delta(old_state, safe_data)
+                if delta:
+                    message = json.dumps({"type": "delta_update", "data": delta}, default=str)
                     await asyncio.wait_for(ws.send_text(message), timeout=send_timeout)
                     dashboard_state.last_sent_states[ws_id] = safe_data
-                else:
-                    # Delta Update
-                    delta = compute_delta(old_state, safe_data)
-                    if delta:
-                        message = json.dumps({"type": "delta_update", "data": delta}, default=str)
-                        await asyncio.wait_for(ws.send_text(message), timeout=send_timeout)
-                        dashboard_state.last_sent_states[ws_id] = safe_data
-            except Exception:
-                # Includes asyncio.TimeoutError -> drop the stalled/broken client.
-                disconnected.add(ws)
+        except Exception:
+            disconnected.add(ws)
 
-        # Parallel fan-out so one slow client does not serialize the whole scan loop.
-        if clients:
-            await asyncio.gather(*[_send_one(ws) for ws in clients], return_exceptions=True)
-                
-        # Cleanup disconnected
-        for ws in disconnected:
-            active_connections.discard(ws)
-            dashboard_state.last_sent_states.pop(id(ws), None)
+    if clients:
+        await asyncio.gather(*[_send_one(ws) for ws in clients], return_exceptions=True)
+
+    async def _close_disconnected(ws: WebSocket) -> None:
+        try:
+            await asyncio.wait_for(ws.close(code=1011), timeout=0.25)
+        except Exception:
+            pass
+
+    if disconnected:
+        await asyncio.gather(
+            *(_close_disconnected(ws) for ws in disconnected),
+            return_exceptions=True,
+        )
+    for ws in disconnected:
+        _forget_ws_connection(ws)
+
+
+async def _wait_for_broadcast_idle(timeout_seconds: float = 2.0) -> None:
+    """Test/shutdown helper: wait until the latest queued snapshot is delivered."""
+    queue = _broadcast_queue
+    if queue is None:
+        return
+    await asyncio.wait_for(queue.join(), timeout=max(0.05, float(timeout_seconds)))
+
+
+async def _stop_broadcast_worker() -> None:
+    global _broadcast_task, _broadcast_queue
+    task = _broadcast_task
+    _broadcast_task = None
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    queue = _broadcast_queue
+    _broadcast_queue = None
+    if queue is not None:
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
 def compute_delta(old, new):
     """
@@ -2052,7 +2678,7 @@ async def api_state():
     if hasattr(scanner_ref, "dashboard_cache"):
         cached_state = scanner_ref.dashboard_cache.state()
         if cached_state and _payload_matches_scanner_mode(cached_state):
-            payload = dict(cached_state)
+            payload = make_serializable(cached_state)
             payload = _historical_building_state(payload)
             if not getattr(scanner_ref, "chart_stream_enabled", True) and payload.get("instruments"):
                 instruments = {}
@@ -2072,8 +2698,9 @@ async def api_state():
             payload["dashboard_heartbeat"] = _dashboard_heartbeat()
             return _api_state_json_response(payload)
     if not getattr(scanner_ref, "chart_stream_enabled", True):
-        payload = scanner_ref.get_latest_results(include_full_charts=False) or {}
-        payload = dict(payload)
+        payload = make_serializable(
+            scanner_ref.get_latest_results(include_full_charts=False) or {}
+        )
         payload = _historical_building_state(payload)
         if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
             scanner_ref._sync_engine_lab_active_row(
@@ -2083,7 +2710,7 @@ async def api_state():
         payload["dashboard_heartbeat"] = _dashboard_heartbeat()
         return _api_state_json_response(payload)
     if dashboard_state.latest_safe_state and _payload_matches_scanner_mode(dashboard_state.latest_safe_state):
-        payload = dict(dashboard_state.latest_safe_state)
+        payload = make_serializable(dashboard_state.latest_safe_state)
         payload = _historical_building_state(payload)
         if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
             scanner_ref._sync_engine_lab_active_row(
@@ -2092,8 +2719,9 @@ async def api_state():
             )
         payload["dashboard_heartbeat"] = _dashboard_heartbeat()
         return _api_state_json_response(payload)
-    payload = scanner_ref.get_latest_results(include_full_charts=False) or {}
-    payload = dict(payload)
+    payload = make_serializable(
+        scanner_ref.get_latest_results(include_full_charts=False) or {}
+    )
     payload = _historical_building_state(payload)
     if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
         scanner_ref._sync_engine_lab_active_row(
@@ -2149,10 +2777,11 @@ async def api_chart(instrument: str = "NIFTY", tf: str = "5min", bars: int | Non
     max_bars = max(1, int(getattr(settings, "api_max_chart_bars", 1000) or 1000))
     default_bars = max(1, int(getattr(settings, "api_default_chart_bars", 300) or 300))
     requested_bars = max(1, min(max_bars, int(bars or default_bars)))
-    loop = asyncio.get_running_loop()
-    snapshot = await loop.run_in_executor(
-        None,
-        lambda: scanner_ref.get_chart_snapshot(instrument=instrument, timeframe=tf),
+    snapshot = await _call_on_scanner_loop(
+        lambda: scanner_ref.get_chart_snapshot(
+            instrument=instrument,
+            timeframe=tf,
+        )
     )
     chart = snapshot.get("chart") if isinstance(snapshot, dict) else None
     if isinstance(chart, dict):
@@ -2171,9 +2800,12 @@ async def api_reset_cache(request: Request):
     if not scanner_ref:
         return {"status": "error", "message": "Scanner not initialized"}
     if hasattr(scanner_ref, "queue_full_recalculation"):
-        scanner_ref.queue_full_recalculation("api-reset-cache")
+        await _call_on_scanner_loop(
+            lambda: scanner_ref.queue_full_recalculation("api-reset-cache")
+        )
     else:
-        asyncio.create_task(scanner_ref._perform_full_recalculation())
+        if not _schedule_on_scanner_loop(scanner_ref._perform_full_recalculation()):
+            return {"status": "error", "message": "Unable to schedule cache reset"}
     return {"status": "ok", "message": "Cache reset initiated"}
 
 
@@ -2230,7 +2862,11 @@ async def api_fyers_auth_complete(request: Request):
 
     auth_code = payload.get("auth_code", "")
     try:
-        return make_serializable(scanner_ref.update_fyers_token(auth_code))
+        result = await _await_on_scanner_loop(
+            scanner_ref.update_fyers_token_async(auth_code),
+            timeout_seconds=30.0,
+        )
+        return make_serializable(result)
     except Exception as exc:
         logger.exception(f"Fyers token update failed: {exc}")
         return {"status": "error", "message": f"Fyers token update failed: {exc}"}
@@ -2354,7 +2990,8 @@ async def api_trades(
             return _window_trades_payload(cached, requested_limit, requested_offset)
     if _scanner_is_historical_building():
         return _window_trades_payload(_building_trades_payload(), requested_limit, requested_offset)
-    return _window_trades_payload(build_trades_payload(), requested_limit, requested_offset)
+    trades = await _call_on_scanner_loop(build_trades_payload)
+    return _window_trades_payload(trades, requested_limit, requested_offset)
 
 
 async def periodic_trades_updater():
@@ -2372,7 +3009,10 @@ async def periodic_trades_updater():
                 pass
             _trade_dirty_event.clear()
             if scanner_ref and active_connections:
-                trades = build_trades_payload()
+                trades = await _call_on_scanner_loop(
+                    build_trades_payload,
+                    timeout_seconds=5.0,
+                )
                 limit = _HISTORICAL_TRADE_PAGE_SIZE if _scanner_is_historical() else _DASHBOARD_STATE_TRADE_LIMIT
                 trades = _window_trades_payload(trades, limit, 0)
                 trade_hash = hashlib.blake2b(

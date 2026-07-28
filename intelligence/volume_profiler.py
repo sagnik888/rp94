@@ -38,13 +38,66 @@ class VolumeProfiler:
             return self._empty_result()
 
         try:
-            volume = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+            raw_volume = pd.to_numeric(
+                df.get('volume', pd.Series(0.0, index=df.index)),
+                errors='coerce',
+            ).fillna(0)
             close = df['close']
             high = df['high']
             low = df['low']
-            nonzero_volume = volume.where(volume > 0)
-            nonzero_count = int(nonzero_volume.count())
-            volume_for_stats = nonzero_volume if nonzero_count >= 5 else volume
+            if isinstance(df.index, pd.DatetimeIndex):
+                active_date = df.index[-1].date()
+                active_mask = pd.Series(
+                    df.index.date == active_date, index=df.index
+                )
+            else:
+                active_mask = pd.Series(True, index=df.index)
+            real_nonzero = raw_volume.where(raw_volume > 0)
+            real_nonzero_count = int(real_nonzero.count())
+            active_real_nonzero_count = int(
+                raw_volume.loc[active_mask][raw_volume.loc[active_mask] > 0].count()
+            )
+
+            # Cash-index ticks do not carry traded quantity: zero is a valid
+            # upstream absence marker, not a measured volume observation.  When
+            # the live 1m candle builder has enough samples, expose relative tick
+            # activity as an explicitly labelled proxy.  This gives the operator
+            # useful participation telemetry without inventing exchange volume.
+            tick_activity = pd.to_numeric(
+                df.get('tick_count', pd.Series(0.0, index=df.index)),
+                errors='coerce',
+            ).fillna(0)
+            tick_nonzero = tick_activity.where(tick_activity > 0)
+            tick_nonzero_count = int(tick_nonzero.count())
+            active_tick_nonzero_count = int(
+                tick_activity.loc[active_mask][tick_activity.loc[active_mask] > 0].count()
+            )
+            is_proxy = (
+                active_real_nonzero_count < 5
+                and active_tick_nonzero_count >= 5
+            )
+            if active_real_nonzero_count >= 5:
+                volume = raw_volume
+                nonzero_volume = real_nonzero
+                nonzero_count = active_real_nonzero_count
+                metric_source = "EXCHANGE_VOLUME"
+            elif is_proxy:
+                volume = tick_activity
+                nonzero_volume = tick_nonzero
+                nonzero_count = active_tick_nonzero_count
+                metric_source = "INDEX_TICK_ACTIVITY"
+            else:
+                volume = raw_volume
+                nonzero_volume = real_nonzero
+                nonzero_count = active_real_nonzero_count
+                metric_source = "UNAVAILABLE"
+            current_vol = float(volume.iloc[-1])
+            # Historical sessions may provide a comparison baseline, but they
+            # cannot qualify today's source.  The latest bar must also contain a
+            # positive observation; otherwise 0.0x is a data gap, not a neutral
+            # market measurement.
+            volume_available = bool(nonzero_count >= 5 and current_vol > 0)
+            volume_for_stats = volume.loc[active_mask]
 
             # ── Intraday Daily VWAP (Resets every day at 09:15) ──
             df_copy = df.copy()
@@ -62,11 +115,6 @@ class VolumeProfiler:
 
             # ── Volume Moving Average ──
             current_idx = volume.index[-1]
-            if nonzero_count:
-                current_idx = nonzero_volume.last_valid_index()
-                current_vol = float(nonzero_volume.loc[current_idx])
-            else:
-                current_vol = float(volume.iloc[-1])
 
             vol_ma = volume_for_stats.rolling(20, min_periods=5).mean()
             avg_at_current = vol_ma.loc[current_idx] if current_idx in vol_ma.index else vol_ma.iloc[-1]
@@ -85,23 +133,38 @@ class VolumeProfiler:
                 last_ts = current_idx
                 same_slot = df[(df.index.time == last_ts.time()) & (df.index.date != last_ts.date())]
                 if len(same_slot) >= 2:
-                    same_slot_volume = pd.to_numeric(same_slot['volume'], errors='coerce').fillna(0)
+                    same_slot_column = 'tick_count' if is_proxy else 'volume'
+                    same_slot_volume = pd.to_numeric(
+                        same_slot.get(same_slot_column, pd.Series(0.0, index=same_slot.index)),
+                        errors='coerce',
+                    ).fillna(0)
                     same_slot_nonzero = same_slot_volume[same_slot_volume > 0]
                     tod_source = same_slot_nonzero if len(same_slot_nonzero) >= 2 else same_slot_volume
                     tod_avg = float(tod_source.tail(10).mean())
                     if tod_avg > 0:
                         relative_volume_ratio = current_vol / tod_avg
-                        volume_confidence = 75
+                        volume_confidence = 65 if is_proxy else 75
 
             # ── Volume Surge Detection ──
-            effective_ratio = max(vol_ratio, relative_volume_ratio if volume_confidence >= 75 else 1.0)
-            display_ratio = relative_volume_ratio if volume_confidence >= 75 and tod_avg > 0 else vol_ratio
-            ratio_basis = "TIME_OF_DAY" if volume_confidence >= 75 and tod_avg > 0 else "ROLLING_AVG"
-            is_surge = effective_ratio > 1.5
+            tod_confident = volume_confidence >= (65 if is_proxy else 75) and tod_avg > 0
+            effective_ratio = max(vol_ratio, relative_volume_ratio if tod_confident else 1.0)
+            display_ratio = relative_volume_ratio if tod_confident else vol_ratio
+            ratio_basis = "TIME_OF_DAY" if tod_confident else "ROLLING_AVG"
+            if is_proxy:
+                ratio_basis = f"TICK_{ratio_basis}"
+            is_surge = bool(volume_available and effective_ratio > 1.5)
             surge_level = "EXTREME" if effective_ratio > 3.0 else ("HIGH" if effective_ratio > 2.0 else ("MODERATE" if effective_ratio > 1.5 else "NORMAL"))
+            if not volume_available:
+                surge_level = "NORMAL"
+                effective_ratio = 1.0
+                display_ratio = 1.0
+                vol_ratio = 1.0
+                relative_volume_ratio = 1.0
+                ratio_basis = "INSUFFICIENT_CURRENT_SESSION"
+                volume_confidence = 0
 
             # ── Cumulative Volume Today ──
-            total_volume = float(volume.sum())
+            total_volume = float(volume.loc[active_mask].sum())
 
             # ── Volume Trend (last 10 bars) ──
             trend_volume = volume_for_stats.dropna()
@@ -118,9 +181,15 @@ class VolumeProfiler:
             # Approximate using close position within high-low range
             close_position = (close - low) / (high - low)
             close_position = close_position.fillna(0.5)
-            buy_volume = (volume * close_position).sum()
-            sell_volume = (volume * (1 - close_position)).sum()
-            buy_sell_ratio = float(buy_volume / sell_volume) if sell_volume > 0 else 1.0
+            buy_volume = (volume.loc[active_mask] * close_position.loc[active_mask]).sum()
+            sell_volume = (
+                volume.loc[active_mask] * (1 - close_position.loc[active_mask])
+            ).sum()
+            buy_sell_ratio = (
+                float(buy_volume / sell_volume)
+                if volume_available and sell_volume > 0
+                else 1.0
+            )
 
             # ── Signal Generation ──
             signal = "NEUTRAL"
@@ -181,6 +250,30 @@ class VolumeProfiler:
                 "volume_ratio_basis": ratio_basis,
                 "time_of_day_avg_volume": int(tod_avg),
                 "volume_confidence": volume_confidence,
+                "available": volume_available,
+                "status": (
+                    ("PROXY" if is_proxy else "OK")
+                    if volume_available
+                    else "UNAVAILABLE"
+                ),
+                "reason": (
+                    "Index traded volume unavailable; using relative 1m tick activity"
+                    if is_proxy and volume_available
+                    else (
+                        ""
+                        if volume_available
+                        else "Current-session OHLCV/tick activity is missing, zero, or insufficient"
+                    )
+                ),
+                "source": metric_source if volume_available else "UNAVAILABLE",
+                "metric_kind": "TICK_ACTIVITY" if is_proxy else "TRADED_VOLUME",
+                "is_proxy": bool(is_proxy and volume_available),
+                "sample_count": int(len(df)),
+                "nonzero_bar_count": nonzero_count,
+                "real_volume_nonzero_bar_count": real_nonzero_count,
+                "tick_activity_nonzero_bar_count": tick_nonzero_count,
+                "active_session_real_volume_nonzero_bar_count": active_real_nonzero_count,
+                "active_session_tick_activity_nonzero_bar_count": active_tick_nonzero_count,
                 "is_surge": is_surge,
                 "surge_level": surge_level,
                 "total_volume": int(total_volume),
@@ -201,6 +294,10 @@ class VolumeProfiler:
     def _empty_result(self) -> Dict:
         return {
             "vwap": 0, "vwap_deviation_pct": 0, "current_volume": 0,
+            "available": False, "status": "UNAVAILABLE", "reason": "Insufficient OHLCV bars",
+            "source": "UNAVAILABLE", "metric_kind": "TRADED_VOLUME", "is_proxy": False,
+            "sample_count": 0, "nonzero_bar_count": 0,
+            "real_volume_nonzero_bar_count": 0, "tick_activity_nonzero_bar_count": 0,
             "avg_volume": 0, "volume_ratio": 1.0, "relative_volume_ratio": 1.0,
             "display_volume_ratio": 1.0, "effective_volume_ratio": 1.0,
             "volume_ratio_basis": "INSUFFICIENT",

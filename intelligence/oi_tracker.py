@@ -2,11 +2,11 @@
 OI Tracker — Open Interest Analysis
 ═══════════════════════════════════════════════════════════════
 
-OI Change Patterns:
-- OI ↑ + Price ↑ = Long Buildup (Bullish)
-- OI ↑ + Price ↓ = Short Buildup (Bearish)
-- OI ↓ + Price ↑ = Short Covering (Bullish)
-- OI ↓ + Price ↓ = Long Unwinding (Bearish)
+Options OI pressure model:
+- Put OI addition / Call covering contributes bullish support.
+- Call OI addition / Put unwinding contributes bearish resistance.
+- Call and Put legs stay separate; futures-style aggregate OI/price labels
+  are not valid directional evidence for an option chain.
 """
 
 import pandas as pd
@@ -46,6 +46,18 @@ class OITracker:
         try:
             analysis_chain = options_chain.copy()
             analysis_basis = "FULL_CHAIN"
+            broad_call_oi = pd.to_numeric(
+                options_chain.get("call_oi", pd.Series(0, index=options_chain.index)),
+                errors="coerce",
+            ).fillna(0)
+            broad_put_oi = pd.to_numeric(
+                options_chain.get("put_oi", pd.Series(0, index=options_chain.index)),
+                errors="coerce",
+            ).fillna(0)
+            broad_real_pair_count = int(
+                ((broad_call_oi > 0) & (broad_put_oi > 0)).sum()
+            )
+            near_real_pair_count = 0
             if spot_price and spot_price > 0 and "strike" in options_chain.columns:
                 interval = max(float(strike_interval or 0), 1.0)
                 atm = round(float(spot_price) / interval) * interval
@@ -54,7 +66,18 @@ class OITracker:
                 near_chain = options_chain.loc[
                     strike_values.between(atm - width, atm + width, inclusive="both")
                 ].copy()
-                if not near_chain.empty:
+                near_call_oi = pd.to_numeric(
+                    near_chain.get("call_oi", pd.Series(0, index=near_chain.index)),
+                    errors="coerce",
+                ).fillna(0)
+                near_put_oi = pd.to_numeric(
+                    near_chain.get("put_oi", pd.Series(0, index=near_chain.index)),
+                    errors="coerce",
+                ).fillna(0)
+                near_real_pair_count = int(
+                    ((near_call_oi > 0) & (near_put_oi > 0)).sum()
+                )
+                if near_real_pair_count >= 3:
                     analysis_chain = near_chain
                     analysis_basis = "NEAR_MONEY"
 
@@ -79,10 +102,16 @@ class OITracker:
             total_put_oi = int(analysis_chain['put_oi'].sum())
             total_call_oi_change = int(analysis_chain['call_oi_change'].sum())
             total_put_oi_change = int(analysis_chain['put_oi_change'].sum())
-            net_oi_change = total_call_oi_change + total_put_oi_change
+            net_oi_change = total_put_oi_change - total_call_oi_change
             absolute_oi_change = int(
                 analysis_chain["call_oi_change"].abs().sum()
                 + analysis_chain["put_oi_change"].abs().sum()
+            )
+            analysis_real_pair_count = int(
+                (
+                    (analysis_chain["call_oi"] > 0)
+                    & (analysis_chain["put_oi"] > 0)
+                ).sum()
             )
             oi_change_source = "unknown"
             if "oi_change_source" in analysis_chain.columns:
@@ -94,10 +123,24 @@ class OITracker:
                 if sources:
                     oi_change_source = ",".join(sorted(sources))
 
-            # ── Activity Classification ──
-            oi_increasing = net_oi_change > 0
-            price_up = price_change > 0
-
+            oi_available = bool(
+                analysis_real_pair_count >= 3
+                and total_call_oi > 0
+                and total_put_oi > 0
+            )
+            # Options-specific pressure model. Positive put additions and call
+            # covering strengthen support (bullish); positive call additions and
+            # put unwinding strengthen resistance (bearish). This is explicitly a
+            # writer/support-resistance heuristic—not the invalid futures-style
+            # price×aggregate-OI classification previously used here.
+            bullish_pressure = max(total_put_oi_change, 0) + max(-total_call_oi_change, 0)
+            bearish_pressure = max(total_call_oi_change, 0) + max(-total_put_oi_change, 0)
+            pressure_total = bullish_pressure + bearish_pressure
+            pressure_imbalance = (
+                (bullish_pressure - bearish_pressure) / pressure_total
+                if pressure_total > 0
+                else 0.0
+            )
             if absolute_oi_change == 0:
                 activity = "NO_CONFIRMED_OI_CHANGE"
                 signal = "NEUTRAL"
@@ -105,25 +148,32 @@ class OITracker:
                     "OI-change unavailable, warming up, or unchanged; "
                     "directional OI inference withheld"
                 )
-            elif oi_increasing and price_up:
-                activity = "LONG_BUILDUP"
+            elif pressure_imbalance >= 0.12:
+                activity = "PUT_SUPPORT_OR_CALL_COVERING"
                 signal = "BULLISH"
-                interpretation = "Fresh buying — bullish momentum likely to continue"
-            elif oi_increasing and not price_up:
-                activity = "SHORT_BUILDUP"
+                interpretation = (
+                    "Bullish options pressure: put support addition and/or call covering "
+                    f"outpaced bearish pressure ({pressure_imbalance:+.2f})"
+                )
+            elif pressure_imbalance <= -0.12:
+                activity = "CALL_RESISTANCE_OR_PUT_UNWINDING"
                 signal = "BEARISH"
-                interpretation = "Fresh selling — bearish momentum likely to continue"
-            elif not oi_increasing and price_up:
-                activity = "SHORT_COVERING"
-                signal = "BULLISH"
-                interpretation = "Shorts covering — strong bullish reversal signal"
+                interpretation = (
+                    "Bearish options pressure: call resistance addition and/or put unwinding "
+                    f"outpaced bullish pressure ({pressure_imbalance:+.2f})"
+                )
             else:
-                activity = "LONG_UNWINDING"
-                signal = "BEARISH"
-                interpretation = "Longs exiting — weak hands selling"
+                activity = "BALANCED_OPTIONS_OI_ACTIVITY"
+                signal = "NEUTRAL"
+                interpretation = "Call/put OI pressure is balanced; directional inference withheld"
+
+            if not oi_available:
+                signal = "NEUTRAL"
+                interpretation = "Call/put OI breadth unavailable; directional inference withheld"
 
             # ── Key Strikes (max OI) ──
-            score = 50 if signal == "NEUTRAL" else (75 if signal == "BULLISH" else 25)
+            score = int(round(50.0 + (pressure_imbalance * 25.0))) if oi_available else 50
+            score = max(0, min(100, score))
             if signal != "NEUTRAL" and abs(price_change) < 0.05:
                 score = 55 if signal == "BULLISH" else 45
 
@@ -139,12 +189,19 @@ class OITracker:
             ].to_dict('records')
 
             return {
+                "available": oi_available,
+                "status": "OK" if oi_available else "UNAVAILABLE",
+                "reason": "" if oi_available else "Need at least 3 strikes with positive call and put OI",
                 "total_call_oi": total_call_oi,
                 "total_put_oi": total_put_oi,
                 "total_call_oi_change": total_call_oi_change,
                 "total_put_oi_change": total_put_oi_change,
                 "net_oi_change": net_oi_change,
                 "absolute_oi_change": absolute_oi_change,
+                "bullish_pressure": int(bullish_pressure),
+                "bearish_pressure": int(bearish_pressure),
+                "pressure_imbalance": round(float(pressure_imbalance), 3),
+                "directional_model": "CALL_PUT_PRESSURE_V1",
                 "oi_change_source": oi_change_source,
                 "activity": activity,
                 "signal": signal,
@@ -158,6 +215,9 @@ class OITracker:
                 "top_put_buildup": top_put_buildup,
                 "analysis_basis": analysis_basis,
                 "analysis_strike_count": int(len(analysis_chain)),
+                "analysis_real_oi_pair_count": analysis_real_pair_count,
+                "near_real_oi_pair_count": near_real_pair_count,
+                "broad_real_oi_pair_count": broad_real_pair_count,
             }
 
         except Exception as e:
@@ -166,13 +226,18 @@ class OITracker:
 
     def _empty_result(self) -> Dict:
         return {
+            "available": False, "status": "UNAVAILABLE", "reason": "Option chain unavailable",
             "total_call_oi": 0, "total_put_oi": 0,
             "total_call_oi_change": 0, "total_put_oi_change": 0,
             "net_oi_change": 0, "absolute_oi_change": 0,
+            "bullish_pressure": 0, "bearish_pressure": 0,
+            "pressure_imbalance": 0.0, "directional_model": "CALL_PUT_PRESSURE_V1",
             "oi_change_source": "none",
             "activity": "UNKNOWN", "signal": "NEUTRAL", "score": 50,
             "interpretation": "No data", "max_call_oi_strike": 0,
             "max_put_oi_strike": 0, "resistance_level": 0, "support_level": 0,
             "top_call_buildup": [], "top_put_buildup": [],
             "analysis_basis": "NONE", "analysis_strike_count": 0,
+            "analysis_real_oi_pair_count": 0, "near_real_oi_pair_count": 0,
+            "broad_real_oi_pair_count": 0,
         }

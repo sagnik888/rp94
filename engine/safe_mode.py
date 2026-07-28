@@ -51,7 +51,13 @@ def _format_time(value: dtime) -> str:
     return value.strftime("%H:%M:%S" if value.second else "%H:%M")
 
 
-def validate_real_mode_readiness(settings: Any, data_provider: Any = None, now: datetime | None = None) -> Dict[str, Any]:
+def validate_real_mode_readiness(
+    settings: Any,
+    data_provider: Any = None,
+    now: datetime | None = None,
+    *,
+    require_option_chains: bool = False,
+) -> Dict[str, Any]:
     """Return a structured readiness decision before REAL mode is allowed."""
     now = now or datetime.now(IST)
     if now.tzinfo is None:
@@ -112,7 +118,59 @@ def validate_real_mode_readiness(settings: Any, data_provider: Any = None, now: 
 
     token_warning = fyers_token_freshness_warning(now)
     if token_warning:
-        warnings.append(token_warning)
+        if require_option_chains:
+            blockers.append(token_warning)
+        else:
+            warnings.append(token_warning)
+
+    if require_option_chains:
+        if data_provider is None:
+            blockers.append("option-chain readiness unavailable")
+        else:
+            active_indices = [
+                str(item or "").strip().upper()
+                for item in (getattr(settings, "active_indices", []) or [])
+                if str(item or "").strip()
+            ]
+            min_strikes = max(
+                3,
+                int(getattr(settings, "auto_option_chain_min_strikes", 3) or 3),
+            )
+            max_age = max(
+                10.0,
+                float(
+                    getattr(settings, "intelligence_cache_ttl_seconds", 90.0)
+                    or 90.0
+                ),
+            )
+            meta_by_index = getattr(data_provider, "_option_chain_meta", {}) or {}
+            cache_by_index = getattr(data_provider, "_opt_chain_cache", {}) or {}
+            now_epoch = now.timestamp()
+            for instrument in active_indices:
+                meta = meta_by_index.get(instrument, {})
+                chain = cache_by_index.get(f"opt_chain_{instrument}")
+                try:
+                    count = int(len(chain)) if chain is not None else 0
+                except Exception:
+                    count = 0
+                fetched_at = float(meta.get("fetched_at") or 0.0) if isinstance(meta, dict) else 0.0
+                age = now_epoch - fetched_at if fetched_at > 0 else float("inf")
+                reasons = []
+                if count < min_strikes:
+                    reasons.append(f"{count} strikes (need {min_strikes})")
+                if not isinstance(meta, dict) or bool(meta.get("fallback", True)):
+                    reasons.append("fallback chain")
+                if not bool((meta or {}).get("expiry_aligned", False)):
+                    reasons.append("active expiry not verified")
+                if not str((meta or {}).get("active_expiry") or "").strip():
+                    reasons.append("active expiry missing")
+                if not (0.0 <= age <= max_age):
+                    reasons.append("chain stale or missing")
+                if reasons:
+                    blockers.append(
+                        f"{instrument} option chain not Auto-ready: "
+                        + ", ".join(reasons)
+                    )
 
     special_session = False
     if data_provider:

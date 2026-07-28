@@ -46,6 +46,14 @@ class SessionContextAnalyzer:
             high_price = self._safe_float(session["high"].max())
             low_price = self._safe_float(session["low"].min())
             day_range = max(0.0, high_price - low_price)
+            # A small *absolute* session range is a different risk condition from
+            # a low range versus the ten-day average.  Keep this independently
+            # observable so entry/sizing policy never has to infer it from a
+            # historical statistic.
+            reference_price = open_price or close_price
+            reference_source = "SESSION_OPEN" if open_price > 0 else "SESSION_CLOSE_FALLBACK"
+            session_range_pct = (day_range / reference_price * 100.0) if reference_price > 0 else 0.0
+            compression_threshold_pct = 0.20
 
             pdc = self._safe_float(previous_close)
             if pdc <= 0 and not prior.empty:
@@ -189,6 +197,16 @@ class SessionContextAnalyzer:
                 "vwap_cross_count": vwap_cross_count,
                 "close_above_vwap_pct": round(above_ratio * 100.0, 1),
                 "day_range_points": round(day_range, 2),
+                "session_high": round(high_price, 2),
+                "session_low": round(low_price, 2),
+                "session_reference_price": round(reference_price, 2),
+                "session_reference_source": reference_source,
+                "session_range_pct": round(session_range_pct, 4),
+                "compression_threshold_pct": compression_threshold_pct,
+                "is_session_compressed": bool(
+                    reference_price > 0
+                    and session_range_pct <= compression_threshold_pct + 1e-9
+                ),
                 "avg_10day_range_points": round(avg_range, 2),
                 "range_vs_10day": round(range_ratio, 3),
                 "session_delta": delta_ctx,

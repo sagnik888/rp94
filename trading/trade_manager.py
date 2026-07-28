@@ -274,6 +274,9 @@ class Trade:
                 exit_year = datetime.now(ist).year
                 exit_time = datetime.strptime(f"{exit_year} {data['exit_time']}", "%Y %d %b %H:%M:%S")
                 exit_time = ist.localize(exit_time)
+                # Guard against year rollover: Dec trade loaded in Jan
+                if exit_time > datetime.now(ist):
+                    exit_time = exit_time.replace(year=exit_year - 1)
             except Exception as e:
 
                 logger.debug(f"Caught bare exception: {e}")

@@ -7,6 +7,7 @@ trading decisions until a separate validation step proves an edge.
 from __future__ import annotations
 
 import csv
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -43,6 +44,9 @@ CALIBRATION_FIELDS = [
     "session_delta_ratio",
     "vix_change_pct",
 ]
+
+
+_OUTCOME_FILE_LOCK = threading.RLock()
 
 
 class OutcomeCalibrationStore:
@@ -106,13 +110,14 @@ class OutcomeCalibrationStore:
         rows = list(rows)
         if not rows:
             return 0
-        write_header = not self.path.exists() or self.path.stat().st_size == 0
-        with self.path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CALIBRATION_FIELDS, extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
+        with _OUTCOME_FILE_LOCK:
+            write_header = not self.path.exists() or self.path.stat().st_size == 0
+            with self.path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CALIBRATION_FIELDS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
         return len(rows)
 
     def compact_from_trades(self, trades: Iterable[Any], intel_by_instrument: Dict[str, Any] | None = None) -> int:
@@ -131,12 +136,13 @@ class OutcomeCalibrationStore:
         if time.monotonic() - self._validation_cache_at < 30.0 and self._validation_cache:
             return dict(self._validation_cache)
         rows: List[Dict[str, Any]] = []
-        if self.path.exists() and self.path.stat().st_size > 0:
-            try:
-                with self.path.open("r", newline="", encoding="utf-8") as handle:
-                    rows = list(csv.DictReader(handle))
-            except Exception:
-                rows = []
+        with _OUTCOME_FILE_LOCK:
+            if self.path.exists() and self.path.stat().st_size > 0:
+                try:
+                    with self.path.open("r", newline="", encoding="utf-8") as handle:
+                        rows = list(csv.DictReader(handle))
+                except (OSError, csv.Error):
+                    rows = []
         unique_rows = {}
         for row in rows:
             key = str(row.get("trade_id") or "").strip()

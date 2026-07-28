@@ -144,9 +144,10 @@ async function authFetch(url, options = {}) {
 
 async function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const token = await getDashboardToken();
-    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
-    const wsUrl = `${protocol}//${window.location.host}/ws${tokenParam}`;
+    // /api/client_config seeds the HttpOnly /ws cookie. Never put the dashboard
+    // credential in the WebSocket URL where proxies and access logs can retain it.
+    await getDashboardToken();
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
     const ws = new WebSocket(wsUrl);
     const statusDot = document.querySelector('.status-dot');
     const statusText = document.querySelector('.status-text');
@@ -1804,16 +1805,19 @@ function updateIntelPanel(inst, data) {
     const rawVolRatio = vol.display_volume_ratio !== undefined
         ? vol.display_volume_ratio
         : (hasTrustedRelativeVolume ? vol.relative_volume_ratio : vol.volume_ratio);
+    // Availability is opt-in.  An absent payload must never render as a real
+    // zero because index spot candles commonly do not carry traded volume.
+    const volAvailable = vol.available === true && String(vol.status || '').toUpperCase() !== 'UNAVAILABLE';
     const volRatio = Number(rawVolRatio !== undefined && rawVolRatio !== null ? rawVolRatio : 1.0);
-    setText('intelVolRatio', `${Number.isFinite(volRatio) ? volRatio.toFixed(1) : '1.0'}x`);
+    setText('intelVolRatio', volAvailable && Number.isFinite(volRatio) ? `${volRatio.toFixed(1)}x` : '--');
     const volSurge = titleCaseToken(vol.surge_level || 'NORMAL');
     const buyPct = Number(vol.buy_pct !== undefined ? vol.buy_pct : 50);
-    let volLabelText = 'BALANCED';
-    if (buyPct > 50.5) {
+    let volLabelText = volAvailable ? 'BALANCED' : 'NO VOLUME DATA';
+    if (volAvailable && buyPct > 50.5) {
         volLabelText = `${volSurge} ${buyPct.toFixed(0)}% BUY`;
-    } else if (buyPct < 49.5) {
+    } else if (volAvailable && buyPct < 49.5) {
         volLabelText = `${volSurge} ${(100 - buyPct).toFixed(0)}% SELL`;
-    } else {
+    } else if (volAvailable) {
         volLabelText = `${volSurge} BALANCED`;
     }
     setHtml(document.getElementById('intelVolLabel'), getSentimentBadge(volLabelText));
@@ -1823,7 +1827,8 @@ function updateIntelPanel(inst, data) {
     const profileSummary = profile.poc
         ? ` Profile ${profileSignal || profileState || 'neutral'}: POC ${formatPrice(profile.poc)}, VAH ${formatPrice(profile.vah)}, VAL ${formatPrice(profile.val)}.`
         : '';
-    setElementTitle('intelVolRatio', `Volume ratio ${volRatio.toFixed(2)}x (${volBasis}). Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)}. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${profileSummary}`);
+    const volMetricName = vol.is_proxy ? 'Tick-activity proxy' : 'Volume';
+    setElementTitle('intelVolRatio', volAvailable ? `${volMetricName} ratio ${volRatio.toFixed(2)}x (${volBasis}). Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)}. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${profileSummary}` : `Volume unavailable: ${vol.reason || 'missing or zero OHLCV volume'}.`);
     
     const volBar = document.getElementById('intelVolBar');
     if (volBar) {
@@ -1837,18 +1842,24 @@ function updateIntelPanel(inst, data) {
         }
     }
     
+    const oiAvailable = oi.available === true && String(oi.status || '').toUpperCase() !== 'UNAVAILABLE';
     const absOi = Number(oi.absolute_oi_change || 0);
-    const oiVal = absOi > 0 ? compactNumber(absOi) : titleCaseToken(oi.activity || '--');
+    const oiVal = oiAvailable ? (absOi > 0 ? compactNumber(absOi) : titleCaseToken(oi.activity || 'NO FRESH OI')) : '--';
     setText('intelOI', oiVal);
-    const oiLabel = oi.activity === 'NO_CONFIRMED_OI_CHANGE' ? 'NO FRESH OI' : (oi.signal || 'NEUTRAL');
+    const oiLabel = oiAvailable
+        ? (oi.activity === 'NO_CONFIRMED_OI_CHANGE' ? 'NO FRESH OI' : (oi.signal || 'NEUTRAL'))
+        : 'OPTIONS DATA UNAVAILABLE';
     setHtml(document.getElementById('intelOILabel'), getSentimentBadge(oiLabel));
-    setElementTitle('intelOI', `${titleCaseToken(oi.activity || 'OI unknown')}. Net OI ${compactNumber(oi.net_oi_change)}; support ${oi.support_level || '--'}; resistance ${oi.resistance_level || '--'}; basis ${normalizeToken(oi.analysis_basis || 'unknown')}.`);
+    setElementTitle('intelOI', oiAvailable ? `${titleCaseToken(oi.activity || 'OI unknown')}. Net OI ${compactNumber(oi.net_oi_change)}; support ${oi.support_level || '--'}; resistance ${oi.resistance_level || '--'}; basis ${normalizeToken(oi.analysis_basis || 'unknown')}.` : `OI unavailable: ${oi.reason || dataQuality.reason || 'option chain unavailable'}.`);
     
+    // PCR also requires an explicit authoritative-data acknowledgement.  Empty
+    // objects and one-strike contract-lookup fallbacks are not PCR observations.
+    const pcrAvailable = pcr.available === true && String(pcr.status || '').toUpperCase() !== 'UNAVAILABLE';
     const primaryPcr = Number(pcr.primary_pcr || pcr.pcr_value || pcr.pcr_oi || 0);
-    setText('intelPCR', Number.isFinite(primaryPcr) ? primaryPcr.toFixed(2) : '--');
-    const pcrSignal = normalizeToken(pcr.contrarian_signal || pcr.signal || pcr.sentiment || 'NEUTRAL');
+    setText('intelPCR', pcrAvailable && Number.isFinite(primaryPcr) ? primaryPcr.toFixed(2) : '--');
+    const pcrSignal = pcrAvailable ? normalizeToken(pcr.contrarian_signal || pcr.signal || pcr.sentiment || 'NEUTRAL') : 'OPTIONS DATA UNAVAILABLE';
     setHtml(document.getElementById('intelPCRLabel'), getSentimentBadge(pcrSignal));
-    setElementTitle('intelPCR', `${pcr.interpretation || 'PCR contrarian sentiment.'} Basis: ${normalizeToken(pcr.pcr_basis || 'unknown')} across ${pcr.near_strike_count || 0} strikes.`);
+    setElementTitle('intelPCR', pcrAvailable ? `${pcr.interpretation || 'PCR contrarian sentiment.'} Basis: ${normalizeToken(pcr.pcr_basis || 'unknown')} across ${pcr.near_strike_count || 0} strikes.` : `PCR unavailable: ${pcr.reason || dataQuality.reason || 'option chain unavailable'}.`);
     
     // Regime tile: 3 live horizons only (1–5m / hour / day). No ADX/ER/RSI/VWAP here.
     try {

@@ -192,6 +192,7 @@ class Settings(BaseSettings):
     # FUT and OPT. Daily risk % and max_trade_loss_abs do NOT shrink lots.
     # Stops remain futures_sl_pct / options_sl_pct from settings.
     auto_risk_sizing_enabled: bool = False
+    entry_pre_submit_lot_validation_timeout_seconds: float = 10.0
     # Optional research mode only (when auto_risk_sizing_enabled=True):
     risk_per_trade_fut_pct: float = 0.0
     risk_per_trade_opt_pct: float = 0.0
@@ -309,6 +310,12 @@ class Settings(BaseSettings):
     slippage_calibration_min_samples: int = 5
     broker_fill_confirmation_timeout_seconds: float = 12.0
     broker_cancel_replace_enabled: bool = True
+    # Final broker-side affordability preflight.  The requested order value is
+    # compared with the freshest available cash/margin snapshot plus this safety
+    # buffer; the very short cache avoids duplicating funds API calls for paired
+    # checks while preventing a stale balance from authorising later entries.
+    entry_margin_buffer_pct: float = 10.0
+    entry_margin_cache_seconds: float = 2.0
     recovery_auto_flatten_seconds: float = 5.0
     max_entry_orders_per_minute: int = 6
     entry_order_rate_window_seconds: float = 60.0
@@ -994,6 +1001,7 @@ class Settings(BaseSettings):
     ut_adx_filter: bool = True      # ADX is informational, not a signal blocker
     ut_adx_period: int = 14
     ut_adx_threshold: float = 25.0
+    ut_sizing_max_base_multiplier: float = 5.0 # Cap raw risk sizing as a multiple of configured base quantity
     ut_strict_adx: bool = False      # Keep UT marker timing aligned with TradingView; ADX is graded later
     ut_smart_trailing: bool = True   # Trailing stop follows the trade's timeframe
     ut_regime_adaptation: bool = True # Enable dynamic regime adaptation for choppy markets
@@ -1016,9 +1024,21 @@ class Settings(BaseSettings):
     trade_product_type: Literal["CARRYFORWARD"] = "CARRYFORWARD"
     live_filter_leniency_pct: float = 0.0 # Keep live gates strict; loosen only during deliberate diagnostics
     intelligence_cache_ttl_seconds: float = 90.0 # Option-chain cache TTL for live intelligence
+    auto_option_chain_min_strikes: int = 3 # Minimum fresh active-expiry strikes required for OPT Auto
     vix_percentile_min_sessions: int = 20 # Minimum daily India VIX observations before volatility routing is trusted
     vix_live_cache_seconds: float = 60.0 # Avoid repeated India VIX REST calls across index scans
+    signal_vix_high_threshold: float = 20.0 # Configurable high-volatility grading threshold
+    signal_vix_low_threshold: float = 12.0 # Configurable low-volatility grading threshold
     option_premium_cache_ttl_seconds: float = 2.0 # Open option premium refresh TTL
+    index_ltp_cache_max_age_seconds: float = 6.0 # Scanner-loop index quotes must be this fresh; REST refresh happens off-loop
+    contract_ltp_cache_max_age_seconds: float = 10.0 # Scanner-loop derivative quotes must be this fresh
+    contract_ltp_background_workers: int = 2 # Bound daemon REST refreshes when live caches miss
+    contract_ltp_background_retry_cooldown_seconds: float = 2.0 # Avoid 100ms retry storms after quote failures
+    contract_ltp_background_result_limit: int = 256 # Bound completed background quote state
+    fyers_chain_background_workers: int = 1 # Bound no-timeout Fyers option-chain SDK refreshes
+    option_chain_background_workers: int = 2 # Bound full PCR/OI chain refreshes outside ScannerEventLoop
+    option_chain_background_retry_cooldown_seconds: float = 5.0 # Avoid cold-chain retry storms after provider failure
+    dynamic_subscription_background_workers: int = 2 # Bound slow WebSocket subscribe sends outside ScannerEventLoop
     history_cache_ttl_seconds: float = 120.0 # Broker history cache TTL for candles/volume
     option_history_miss_ttl_seconds: float = 900.0
     live_index_timeout_seconds: float = 9.0 # Per-index live scan budget before serving a stale fallback that cycle. Raised 6->9 so heavy indices (SENSEX/BANKNIFTY, large option chains) finish during volatile periods. NOTE: this is a CAP, not a wait — fast indices still return early, so the higher cap costs nothing on healthy cycles.
@@ -1389,6 +1409,20 @@ class Settings(BaseSettings):
     def validate_max_trade_loss(cls, v: float) -> float:
         if v < 0:
             raise ValueError('max_trade_loss_abs must be >= 0 (0 disables the per-trade rupee backstop)')
+        return v
+
+    @field_validator('entry_margin_buffer_pct')
+    @classmethod
+    def validate_entry_margin_buffer(cls, v: float) -> float:
+        if not 0 <= v <= 100:
+            raise ValueError('entry_margin_buffer_pct must be between 0 and 100')
+        return v
+
+    @field_validator('entry_margin_cache_seconds')
+    @classmethod
+    def validate_entry_margin_cache(cls, v: float) -> float:
+        if not 0 <= v <= 30:
+            raise ValueError('entry_margin_cache_seconds must be between 0 and 30')
         return v
 
     def risk_configuration_summary(self) -> Dict[str, Any]:

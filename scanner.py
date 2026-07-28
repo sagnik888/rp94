@@ -123,6 +123,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.active_chart_instrument = "NIFTY"
         self.active_chart_tf = "5min"
         self.chart_stream_enabled = True
+        self._session_breach_lock = threading.RLock()
 
         self.is_running = False
         self.scan_interval = 1.0
@@ -8977,7 +8978,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         atr_val = float(state_5m.get('atr_value') or 0)
         try:
             atr_exhaustion_str = f'ATR {int(atr_val)} pts'
-        except:
+        except Exception:
             atr_exhaustion_str = '--'
 
         quote_label, quote_session, is_preopen, preopen_settlement = self._dashboard_quote_session(
@@ -17917,11 +17918,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     def _check_session_candidates_breaches(self, instrument: str) -> None:
         """Serialize session exit evaluation across scan and fallback publishers."""
-        lock = getattr(self, "_session_breach_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._session_breach_lock = lock
-        with lock:
+        with self._session_breach_lock:
             self._check_session_candidates_breaches_locked(instrument)
 
     def _check_session_candidates_breaches_locked(self, instrument: str) -> None:

@@ -506,7 +506,8 @@ class MarketDataProvider:
             if getattr(self, "_fyers_ws_generation", 0) == ws_generation:
                 self.fyers = model
                 self._clear_fyers_auth_required()
-            return True
+                return True
+            return False
         except Exception as exc:
             logger.warning(f"Fyers token pre-reconnect validation failed; retrying existing WebSocket token: {exc}")
             return True

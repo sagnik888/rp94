@@ -7,6 +7,7 @@ does not feed back into live decisions; all writes are append-only study data.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from collections import Counter, defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -30,6 +31,9 @@ VECTOR_KEYS = (
     "volatility_expansion_prob",
     "breadth_stress_prob",
 )
+
+
+_RTRACKER_FILE_LOCK = threading.RLock()
 
 
 class RegimeTracker:
@@ -92,13 +96,14 @@ class RegimeTracker:
             event.setdefault("schema", "rtracker.v1")
             event_id = str(event.get("id") or self._event_id(event))
             event["id"] = event_id
-            if event_id in self._seen:
-                return False
-            self._remember(event_id)
-            self.events_dir.mkdir(parents=True, exist_ok=True)
-            path = self.events_dir / f"{event['date']}.jsonl"
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(_json_safe(event), separators=(",", ":"), sort_keys=True) + "\n")
+            with _RTRACKER_FILE_LOCK:
+                if event_id in self._seen:
+                    return False
+                self._remember(event_id)
+                self.events_dir.mkdir(parents=True, exist_ok=True)
+                path = self.events_dir / f"{event['date']}.jsonl"
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(_json_safe(event), separators=(",", ":"), sort_keys=True) + "\n")
             return True
         except Exception as exc:
             logger.debug(f"rtracker record skipped: {exc}")
@@ -119,28 +124,29 @@ class RegimeTracker:
             iso = event_date.isocalendar()
             grouped[f"{iso.year}-W{iso.week:02d}"].append(event)
 
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
-        week_reports = []
-        for week_key in sorted(grouped, reverse=True):
-            summary = self._weekly_summary(week_key, grouped[week_key])
-            json_path = self.reports_dir / f"{week_key}.json"
-            md_path = self.reports_dir / f"{week_key}.md"
-            json_path.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True), encoding="utf-8")
-            md_path.write_text(self._weekly_markdown(summary), encoding="utf-8")
-            week_reports.append(
-                {
-                    "week": week_key,
-                    "events": summary["summary"]["events"],
-                    "json": str(json_path),
-                    "markdown": str(md_path),
-                }
-            )
+        with _RTRACKER_FILE_LOCK:
+            self.reports_dir.mkdir(parents=True, exist_ok=True)
+            week_reports = []
+            for week_key in sorted(grouped, reverse=True):
+                summary = self._weekly_summary(week_key, grouped[week_key])
+                json_path = self.reports_dir / f"{week_key}.json"
+                md_path = self.reports_dir / f"{week_key}.md"
+                json_path.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True), encoding="utf-8")
+                md_path.write_text(self._weekly_markdown(summary), encoding="utf-8")
+                week_reports.append(
+                    {
+                        "week": week_key,
+                        "events": summary["summary"]["events"],
+                        "json": str(json_path),
+                        "markdown": str(md_path),
+                    }
+                )
 
-        eight_week = self._multi_week_summary(events, weeks)
-        summary_path = self.reports_dir / f"rtracker_{weeks}_week_summary.md"
-        summary_json = self.reports_dir / f"rtracker_{weeks}_week_summary.json"
-        summary_path.write_text(self._multi_week_markdown(eight_week), encoding="utf-8")
-        summary_json.write_text(json.dumps(_json_safe(eight_week), indent=2, sort_keys=True), encoding="utf-8")
+            eight_week = self._multi_week_summary(events, weeks)
+            summary_path = self.reports_dir / f"rtracker_{weeks}_week_summary.md"
+            summary_json = self.reports_dir / f"rtracker_{weeks}_week_summary.json"
+            summary_path.write_text(self._multi_week_markdown(eight_week), encoding="utf-8")
+            summary_json.write_text(json.dumps(_json_safe(eight_week), indent=2, sort_keys=True), encoding="utf-8")
         return {
             "weeks_requested": weeks,
             "events": len(events),
@@ -155,24 +161,25 @@ class RegimeTracker:
         events: List[Dict[str, Any]] = []
         if not self.events_dir.exists():
             return events
-        for path in sorted(self.events_dir.glob("*.jsonl")):
-            try:
-                path_day = date.fromisoformat(path.stem)
-            except Exception:
-                continue
-            if path_day < start_day or path_day > as_of_dt.date():
-                continue
-            with path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(payload, dict):
-                        events.append(payload)
+        with _RTRACKER_FILE_LOCK:
+            for path in sorted(self.events_dir.glob("*.jsonl")):
+                try:
+                    path_day = date.fromisoformat(path.stem)
+                except ValueError:
+                    continue
+                if path_day < start_day or path_day > as_of_dt.date():
+                    continue
+                with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(payload, dict):
+                            events.append(payload)
         events.sort(key=lambda item: str(item.get("timestamp") or ""))
         return events
 

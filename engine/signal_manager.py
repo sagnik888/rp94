@@ -5,8 +5,10 @@ Signal Manager — Signal Lifecycle & Grading
 Manages signal generation, deduplication, grading, and history.
 """
 
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from loguru import logger
 from engine.intelligence_score import normalize_intelligence_score
@@ -40,8 +42,15 @@ class SignalManager:
     def __init__(self, dedup_window_seconds: int = 300):
         self.dedup_window = timedelta(seconds=dedup_window_seconds)
         self.active_signals: Dict[str, GradedSignal] = {}  # key: instrument
-        self.signal_history: List[GradedSignal] = []
         self.max_history = 500
+        self.signal_history: Deque[GradedSignal] = deque(maxlen=self.max_history)
+
+    @staticmethod
+    def _timestamp_seconds(value: datetime) -> float:
+        """Stable epoch comparison for mixed aware/naive market timestamps."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        return float(value.timestamp())
 
     def process_signal(
         self,
@@ -57,17 +66,23 @@ class SignalManager:
 
         Returns GradedSignal if actionable, None if filtered out.
         """
-        # Deduplication: skip if same instrument+direction within window
+        # Deduplicate only the same direction.  A genuine stop-and-reverse signal
+        # must be allowed through immediately, and epoch arithmetic avoids the
+        # old UTC-vs-IST `.replace(tzinfo=None)` 5.5-hour skew.
         key = f"{signal.instrument}_{signal.timeframe}"
         existing = self.active_signals.get(key)
-        if existing:
-            s_ts = signal.timestamp.replace(tzinfo=None) if signal.timestamp.tzinfo else signal.timestamp
-            e_ts = existing.signal.timestamp.replace(tzinfo=None) if existing.signal.timestamp.tzinfo else existing.signal.timestamp
-            time_diff = s_ts - e_ts
-            if time_diff <= self.dedup_window:
-                if existing.signal.signal_type != signal.signal_type:
-                    logger.warning(f"Whipsaw deduplication: blocked {signal.signal_type} immediately after {existing.signal.signal_type} on {signal.instrument}")
-                return None  # Duplicate or whipsaw within cooldown
+        if (
+            existing
+            and existing.signal.signal_type == signal.signal_type
+            and signal.timestamp is not None
+            and existing.signal.timestamp is not None
+        ):
+            time_diff_seconds = abs(
+                self._timestamp_seconds(signal.timestamp)
+                - self._timestamp_seconds(existing.signal.timestamp)
+            )
+            if time_diff_seconds <= self.dedup_window.total_seconds():
+                return None
 
         # ── Grading ──
         grade, confidence, reasons = self._grade_signal(
@@ -92,8 +107,6 @@ class SignalManager:
         # Update active and history
         self.active_signals[key] = graded
         self.signal_history.append(graded)
-        if len(self.signal_history) > self.max_history:
-            self.signal_history = self.signal_history[-self.max_history:]
 
         logger.info(
             f"📊 Signal: {signal.signal_type} {signal.instrument} "
@@ -125,10 +138,22 @@ class SignalManager:
         # ── VIX Patch ──
         vix_penalty = 0.0
         reasons = []
-        if vix_value > 20.0:
+        try:
+            from config.settings import get_settings as _get_vix_settings
+            _vix_settings = _get_vix_settings()
+            vix_high_threshold = float(
+                getattr(_vix_settings, "signal_vix_high_threshold", 20.0) or 20.0
+            )
+            vix_low_threshold = float(
+                getattr(_vix_settings, "signal_vix_low_threshold", 12.0) or 12.0
+            )
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Signal VIX threshold settings unavailable: {exc}")
+            vix_high_threshold, vix_low_threshold = 20.0, 12.0
+        if vix_value > vix_high_threshold:
             vix_penalty = 0.10
             reasons.append(f"VIX High ({vix_value:.1f})")
-        elif vix_value < 12.0:
+        elif vix_value < vix_low_threshold:
             vix_penalty = -0.05
             reasons.append(f"VIX Low ({vix_value:.1f})")
         intel_score_part = 0.0
@@ -234,12 +259,12 @@ class SignalManager:
                         f"Range-day damp: {regime} alignment bonus capped at +{_cap:.2f} "
                         "(session is a confirmed range day)"
                     )
-        except Exception:
-            pass
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Range-day regime damp settings unavailable: {exc}")
 
         # ── Pillar 4: MANIPULATION FILTER (Global Penalty) ──
-        if hasattr(signal, 'raw_candle'):
-            c = signal.raw_candle
+        c = getattr(signal, "raw_candle", None)
+        if isinstance(c, dict) and {"open", "high", "low", "close"}.issubset(c):
             body = abs(c['close'] - c['open'])
             total = c['high'] - c['low']
             if total > 0:
@@ -269,7 +294,8 @@ class SignalManager:
             _s = _get_settings()
             use_logistic = setting_enabled(getattr(_s, "ut_confidence_logistic", True), True)
             logistic_k = float(getattr(_s, "ut_confidence_logistic_k", 5.0) or 5.0)
-        except Exception:
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Confidence logistic settings unavailable: {exc}")
             use_logistic = True
         if use_logistic:
             import math
@@ -284,7 +310,8 @@ class SignalManager:
             from intelligence.confidence_calibration import calibrate as _calibrate_conf
             _settings = _gs2()
             confidence = max(0.0, min(1.0, _calibrate_conf(confidence, _settings)))
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"Confidence calibration unavailable: {exc}")
             _settings = None
 
         # Exhaustion honesty cap: an ADX>40 entry carries its own "Risk of
@@ -301,8 +328,8 @@ class SignalManager:
                 reasons.append(
                     f"Exhaustion cap: ADX {raw_adx:.0f} > 40 caps confidence at {cap:.0%}"
                 )
-        except Exception:
-            pass
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Exhaustion confidence cap unavailable: {exc}")
 
         try:
             if _settings is None:
@@ -340,8 +367,8 @@ class SignalManager:
                     reasons.append(
                         f"{label} agreement {agreement}/3{source_text}: +{bonus:.0%} confidence"
                     )
-        except Exception:
-            pass
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Prime agreement confidence settings unavailable: {exc}")
 
         # Grade is purely a display bucket of confidence — single source of truth
         # lives in engine.signal_quality_policy.confidence_to_grade.

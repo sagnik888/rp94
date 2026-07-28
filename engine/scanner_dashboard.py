@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
+from loguru import logger
 
 from config.settings import get_settings
 from engine.scanner_historical_results import build_historical_trade_result
@@ -38,12 +40,21 @@ class ScannerDashboardCache:
     def update(self, results: Dict[str, Any] | None) -> None:
         if not isinstance(results, dict):
             return
+        # Freeze scanner-owned mutable dictionaries/deques before publishing
+        # across the ScannerEventLoop ↔ Uvicorn thread boundary.  The dashboard
+        # only ever sees this detached generation, never a partially mutated
+        # live object graph.
+        try:
+            snapshot = copy.deepcopy(results)
+        except Exception as exc:
+            logger.warning(f"Dashboard snapshot freeze skipped; retaining prior generation: {exc}")
+            return
         with self._lock:
-            self._state = results
-            if isinstance(results.get("trades"), dict):
-                self._trades = results["trades"]
-            if isinstance(results.get("diagnostics"), dict):
-                self._diagnostics = results["diagnostics"]
+            self._state = snapshot
+            if isinstance(snapshot.get("trades"), dict):
+                self._trades = snapshot["trades"]
+            if isinstance(snapshot.get("diagnostics"), dict):
+                self._diagnostics = snapshot["diagnostics"]
             self._updated_at = time.time()
 
     def state(self) -> Dict[str, Any]:

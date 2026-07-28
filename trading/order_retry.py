@@ -26,10 +26,7 @@ def execute_order_with_retry(
     attempts = len(ORDER_RETRY_DELAYS) + 1
     for attempt in range(attempts):
         try:
-            order_id = extract_order_id(operation())
-            if order_id:
-                return order_id, "", attempt + 1
-            last_error = "Broker rejected order"
+            res = operation()
         except BrokerOrderAmbiguous as exc:
             last_error = f"ambiguous broker acknowledgement: {exc}"
             logger.error(
@@ -38,6 +35,24 @@ def execute_order_with_retry(
             return "", last_error, attempt + 1
         except Exception as exc:
             last_error = str(exc)
+            if attempt < len(ORDER_RETRY_DELAYS):
+                delay = ORDER_RETRY_DELAYS[attempt]
+                logger.warning(
+                    f"{label} failed on attempt {attempt + 1}/{attempts}; "
+                    f"retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+            continue
+            
+        try:
+            order_id = extract_order_id(res)
+            if order_id:
+                return order_id, "", attempt + 1
+            last_error = "Broker rejected order"
+        except Exception as exc:
+            last_error = f"ambiguous broker acknowledgement: {exc}"
+            logger.error(f"{label} order placed but ID extraction failed; stopping retries: {exc}")
+            return "", last_error, attempt + 1
 
         if attempt < len(ORDER_RETRY_DELAYS):
             delay = ORDER_RETRY_DELAYS[attempt]

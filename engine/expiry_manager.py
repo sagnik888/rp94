@@ -1,6 +1,10 @@
+import asyncio
 import requests
 import pandas as pd
 import json
+import os
+import tempfile
+import threading
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Optional, Set
 from loguru import logger
@@ -24,82 +28,109 @@ class ExpiryManager:
         self.CACHE_DIR.mkdir(exist_ok=True)
         self._loaded_date = date.today()
         self._token_cache: Dict[tuple, Dict] = {}
+        self._state_lock = threading.RLock()
+        self._refresh_lock = threading.RLock()
+        self._bg_download_pending = False
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._staged_df: Optional[pd.DataFrame] = None
+        self._snapshot_generation = 0
 
     def download_master(self, force=False):
-        """Download and cache the instrument master from AngelOne"""
-        try:
-            # Clear token cache on reload
-            self._token_cache = {}
-            # Check if cache is fresh (today's date)
-            if not force and self.CACHE_FILE.exists():
-                file_time = datetime.fromtimestamp(self.CACHE_FILE.stat().st_mtime).date()
-                if file_time == date.today():
-                    logger.info("Using cached instrument master.")
-                    with open(self.CACHE_FILE, 'r') as f:
-                        data = json.load(f)
-                    self.df = pd.DataFrame(data)
-                    self._loaded_date = date.today()
-                    logger.info(f"Loaded master with columns: {self.df.columns.tolist()[:5]}")
-                    return True
+        """Load a candidate master without exposing a half-analyzed snapshot."""
+        with self._refresh_lock:
+            try:
+                if not force and self.CACHE_FILE.exists():
+                    file_time = datetime.fromtimestamp(self.CACHE_FILE.stat().st_mtime).date()
+                    if file_time == date.today():
+                        logger.info("Using cached instrument master.")
+                        data = json.loads(self.CACHE_FILE.read_text(encoding="utf-8"))
+                        self._staged_df = pd.DataFrame(data)
+                        return not self._staged_df.empty
 
-            logger.info(f"Downloading instrument master from AngelOne...")
-            response = requests.get(self.TOKEN_URL, timeout=30)
-            if response.status_code == 200:
+                logger.info("Downloading instrument master from AngelOne...")
+                response = requests.get(self.TOKEN_URL, timeout=30)
+                response.raise_for_status()
                 data = response.json()
-                with open(self.CACHE_FILE, 'w') as f:
-                    json.dump(data, f)
-                self.df = pd.DataFrame(data)
-                self._loaded_date = date.today()
-                logger.success("Instrument master downloaded and cached.")
+                candidate = pd.DataFrame(data)
+                if candidate.empty:
+                    raise ValueError("instrument master response was empty")
+                self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix="instruments_", suffix=".json", dir=str(self.CACHE_DIR)
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(data, handle)
+                    os.replace(tmp_name, self.CACHE_FILE)
+                except Exception:
+                    try:
+                        os.unlink(tmp_name)
+                    except Exception:
+                        pass
+                    raise
+                self._staged_df = candidate
+                logger.success("Instrument master downloaded and staged.")
                 return True
-            else:
-                logger.error(f"Failed to download master: Status {response.status_code}")
-                # Fallback to CSV if available
+            except Exception as exc:
+                logger.error(f"Failed to download instruments: {exc}")
                 csv_path = Path("data_store/instruments.csv")
                 if csv_path.exists():
-                    logger.info("Falling back to data_store/instruments.csv")
-                    self.df = pd.read_csv(csv_path)
-                    self._loaded_date = date.today()
-                    return True
-        except Exception as e:
-            logger.error(f"Failed to download instruments: {e}")
-            # Fallback to CSV if available
-            csv_path = Path("data_store/instruments.csv")
-            if csv_path.exists():
-                logger.info("Falling back to data_store/instruments.csv")
-                self.df = pd.read_csv(csv_path)
-                self._loaded_date = date.today()
-                return True
-        return False
+                    age_days = max(
+                        0,
+                        (datetime.now() - datetime.fromtimestamp(csv_path.stat().st_mtime)).days,
+                    )
+                    if age_days <= 7:
+                        logger.warning(
+                            f"Falling back to {csv_path} ({age_days} day(s) old)."
+                        )
+                        self._staged_df = pd.read_csv(csv_path)
+                        return not self._staged_df.empty
+                    logger.error(
+                        f"Refusing stale fallback instrument CSV ({age_days} days old)."
+                    )
+                return False
 
     def analyze_expiries(self):
-        """Analyze the master list to identify Weekly/Monthly expiries for core indices"""
-        # Clear token cache on analysis
-        self._token_cache = {}
-        # Automatic calendar rollover reload check
-        if hasattr(self, "_loaded_date") and date.today() != self._loaded_date:
-            logger.info("Calendar day rollover detected! Reloading instruments master...")
-            self.download_master(force=True)
-            self._loaded_date = date.today()
+        """Analyze into locals, then atomically publish the complete snapshot."""
+        with self._refresh_lock:
+            source = self._staged_df if self._staged_df is not None else self.df
+            if source is None or source.empty:
+                logger.warning("No data to analyze expiries.")
+                return {}
+            frame = source.copy()
+            resolved = self._build_expiry_map(frame)
+            if not resolved:
+                logger.error("Instrument master produced no usable expiry snapshot.")
+                return {}
+            with self._state_lock:
+                self.df = frame
+                self.expiries = resolved
+                self._token_cache = {}
+                self._loaded_date = date.today()
+                self._snapshot_generation += 1
+            self._staged_df = None
+            return dict(resolved)
 
-        if self.df is None or self.df.empty:
-            logger.warning("No data to analyze expiries.")
-            return
+    def _build_expiry_map(self, frame: pd.DataFrame) -> Dict[str, Dict]:
+        """Pure expiry calculation for one immutable master candidate."""
+        required = {"name", "instrumenttype", "expiry", "symbol", "token"}
+        missing = required.difference(frame.columns)
+        if missing:
+            logger.error(f"Instrument master missing required columns: {sorted(missing)}")
+            return {}
 
         indices = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
-        today_str = date.today().strftime("%d%b%Y").upper()
-        
-        # Convert expiry column to datetime for easier sorting/comparison
-        # AngelOne format is usually '25APR2024'
-        self.df['expiry_dt'] = pd.to_datetime(self.df['expiry'], format='%d%b%Y', errors='coerce')
-        
+        frame["expiry_dt"] = pd.to_datetime(
+            frame["expiry"], format="%d%b%Y", errors="coerce"
+        )
+        resolved: Dict[str, Dict] = {}
         for name in indices:
             # 1. Filter Futures
-            fut_df = self.df[(self.df['name'] == name) & (self.df['instrumenttype'] == 'FUTIDX')].copy()
+            fut_df = frame[(frame['name'] == name) & (frame['instrumenttype'] == 'FUTIDX')].copy()
             fut_df = fut_df.sort_values('expiry_dt')
             
             # 2. Filter Options
-            opt_df = self.df[(self.df['name'] == name) & (self.df['instrumenttype'].isin(['OPTIDX']))].copy()
+            opt_df = frame[(frame['name'] == name) & (frame['instrumenttype'].isin(['OPTIDX']))].copy()
             opt_df = opt_df.sort_values('expiry_dt')
             
             all_expiries = sorted(opt_df['expiry_dt'].dropna().unique())
@@ -148,7 +179,7 @@ class ExpiryManager:
                 logger.info(f"🔄 Futures Rollover triggered for {name} (DTE: {fut_dte}). Using next month's contract.")
 
             # Results Mapping
-            self.expiries[name] = {
+            resolved[name] = {
                 "weekly": nearest_expiry.strftime('%d%b%Y').upper() if nearest_expiry else None,
                 "next_weekly": next_weekly.strftime('%d%b%Y').upper() if next_weekly else None,
                 "monthly": monthly_expiry.strftime('%d%b%Y').upper() if monthly_expiry else None,
@@ -162,9 +193,10 @@ class ExpiryManager:
                 "is_monthly_rollover": is_monthly_rollover
             }
             
-            logger.info(f"Resolved {name}: Weekly={self.expiries[name]['weekly']}, Monthly={self.expiries[name]['monthly']}")
-            if is_weekly_rollover: logger.info(f"⚠️ {name} Weekly Rollover Active: Using {self.expiries[name]['active_weekly']}")
-            if is_monthly_rollover: logger.info(f"⚠️ {name} Monthly Rollover Active: Using {self.expiries[name]['active_monthly']}")
+            logger.info(f"Resolved {name}: Weekly={resolved[name]['weekly']}, Monthly={resolved[name]['monthly']}")
+            if is_weekly_rollover: logger.info(f"⚠️ {name} Weekly Rollover Active: Using {resolved[name]['active_weekly']}")
+            if is_monthly_rollover: logger.info(f"⚠️ {name} Monthly Rollover Active: Using {resolved[name]['active_monthly']}")
+        return resolved
 
     def _ensure_expiry_dates(self):
         if self.df is not None and "expiry_dt" not in self.df.columns:
@@ -179,10 +211,46 @@ class ExpiryManager:
             or (hasattr(self, "_loaded_date") and date.today() != self._loaded_date)
         )
         if needs_reload:
-            if not self.download_master():
+            usable = self.df is not None and not self.df.empty and bool(self.expiries)
+            if usable:
+                self._start_background_refresh()
+                return True
+            # Token/expiry lookups are called from the scanner's asyncio loop.
+            # A cold cache must fail closed and warm in the background instead
+            # of running the 30-second HTTP download on that latency-sensitive
+            # loop.  Synchronous startup callers may still initialize eagerly.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                self._start_background_refresh()
                 return False
-            self.analyze_expiries()
+            return bool(self.pre_market_check())
         return self.df is not None and not self.df.empty and bool(self.expiries)
+
+    def _start_background_refresh(self) -> bool:
+        with self._refresh_lock:
+            if self._bg_download_pending:
+                return False
+            self._bg_download_pending = True
+
+        def _refresh() -> None:
+            try:
+                if self.download_master(force=True):
+                    self.analyze_expiries()
+            except Exception as exc:
+                logger.warning(f"Background instrument master refresh failed: {exc}")
+            finally:
+                with self._refresh_lock:
+                    self._bg_download_pending = False
+
+        thread = threading.Thread(
+            target=_refresh, daemon=True, name="InstrumentMasterRefresh"
+        )
+        self._refresh_thread = thread
+        thread.start()
+        return True
 
     _holiday_cache: Optional[Set[str]] = None
     _special_session_cache: Optional[Set[str]] = None
@@ -526,12 +594,18 @@ class ExpiryManager:
         diff = (exp_dt - dt).days
         return max(0, diff)
 
-    def pre_market_check(self):
+    def pre_market_check(self, force: bool = False):
         """Main entry point for daily pre-market analysis"""
         logger.info("═══ PRE-MARKET EXPIRY ANALYSIS ═══")
-        if self.download_master():
-            self.analyze_expiries()
-            return self.expiries
+        usable = self.df is not None and not self.df.empty and bool(self.expiries)
+        stale = date.today() != getattr(self, "_loaded_date", date.today())
+        if usable and stale and not force:
+            self._start_background_refresh()
+            return dict(self.expiries)
+        if usable and not stale and not force:
+            return dict(self.expiries)
+        if self.download_master(force=force):
+            return self.analyze_expiries()
         return {}
 
 # Singleton for system-wide use

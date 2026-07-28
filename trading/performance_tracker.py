@@ -22,7 +22,7 @@ class PerformanceTracker:
         total_pnl = sum(pnls)
         win_rate = len(wins) / len(pnls) * 100 if pnls else 0
         avg_win = np.mean(wins) if wins else 0
-        avg_loss = abs(np.mean(losses)) if losses else 1
+        avg_loss = abs(np.mean(losses)) if losses else 0
         profit_factor = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else 99.99
         # Daily/base Sharpe uses sample std; yearly is annualized for display.
         if len(pnls) > 1:
@@ -56,10 +56,6 @@ class PerformanceTracker:
             "expectancy": round(expectancy, 1),
             "rr_ratio": round(avg_win / avg_loss, 2) if avg_loss > 0 else 0,
         }
-
-    def reset(self):
-        """No internal state to reset, but provided for API compatibility"""
-        pass
 
     def _empty(self) -> Dict:
         return {

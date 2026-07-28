@@ -1,8 +1,25 @@
 import asyncio
+import copy
+import math
+import threading
+from functools import wraps
 from loguru import logger
 from datetime import datetime
 from typing import Dict, List, Optional
 from trading.trade_manager import IST, TradeManager
+
+
+def _risk_serialized(method):
+    """Serialize breaker reset/latch/close decisions across scanner threads."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        lock = getattr(self, "_risk_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._risk_lock = lock
+        with lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 class RiskManager:
     """
@@ -22,6 +39,7 @@ class RiskManager:
         self.fut_loss_breached = False
         self.opt_loss_breached = False
         self._session_date = datetime.now(IST).date()
+        self._risk_lock = threading.RLock()
         
         # Risk settings
         self.max_daily_loss_pct = 3.0
@@ -39,6 +57,7 @@ class RiskManager:
         self.capital_fut = capital_total * 0.5
         self.capital_opt = capital_total * 0.5
 
+    @_risk_serialized
     def update_settings(self, **kwargs):
         """Update risk parameters dynamically"""
         for k, v in kwargs.items():
@@ -46,7 +65,7 @@ class RiskManager:
                 setattr(self, k, v)
         logger.info(f"🛡️ RiskManager updated: {kwargs}")
 
-    def _projected_stop_risk(self, trade) -> float:
+    def _projected_stop_risk(self, trade) -> Optional[float]:
         """Return the worst remaining loss at the configured/protective stop.
 
         A circuit breaker must not wait for mark-to-market P&L to turn red:
@@ -56,14 +75,20 @@ class RiskManager:
         """
         try:
             entry = abs(float(getattr(trade, "entry_price", 0.0) or 0.0))
-            quantity = max(
-                1,
-                int(getattr(trade, "lots", 1) or 1)
-                * int(getattr(trade, "lot_size", 1) or 1),
+            lots = int(getattr(trade, "lots", 0) or 0)
+            lot_size = int(getattr(trade, "lot_size", 0) or 0)
+            quantity = lots * lot_size
+            raw_multiplier = getattr(trade, "instrument_multiplier", 1.0)
+            multiplier = abs(
+                float(1.0 if raw_multiplier is None else raw_multiplier)
             )
-            multiplier = abs(float(getattr(trade, "instrument_multiplier", 1.0) or 1.0))
-            if entry <= 0 or multiplier <= 0:
-                return 0.0
+            if (
+                entry <= 0
+                or quantity <= 0
+                or multiplier <= 0
+                or not all(math.isfinite(value) for value in (entry, multiplier))
+            ):
+                return None
 
             inst_type = str(getattr(trade, "inst_type", "FUT") or "FUT").upper()
             sl_pct = self.futures_sl_pct if inst_type == "FUT" else self.options_sl_pct
@@ -76,6 +101,8 @@ class RiskManager:
                 stop = float(stop)
             except (TypeError, ValueError):
                 stop = 0.0
+            if not math.isfinite(stop):
+                return None
 
             direction = str(getattr(trade, "direction", "LONG") or "LONG").upper()
             if stop > 0:
@@ -88,8 +115,9 @@ class RiskManager:
             return min(stop_risk, cap) if cap > 0 else stop_risk
         except Exception as exc:
             logger.warning(f"Unable to estimate projected stop risk: {exc}")
-            return 0.0
+            return None
 
+    @_risk_serialized
     def check_circuit_breaker(self) -> bool:
         """
         Hard stop if daily loss exceeds limits.
@@ -134,8 +162,36 @@ class RiskManager:
                 opt_pnl += charge
                 opt_projected_pnl += charge
 
+        # Take one immutable view for this complete risk pass.  Reconciliation
+        # can move a Trade from open -> closed and replace orphan state at the
+        # same time; snapshots taken in separate critical sections can count it
+        # twice or miss it entirely.
+        manager_lock = getattr(self.trades, "_lock", None)
+        try:
+            if manager_lock:
+                with manager_lock:
+                    closed_snapshot = [copy.copy(t) for t in self.trades.closed_trades]
+                    open_snapshot = [copy.copy(t) for t in self.trades.open_trades.values()]
+                    orphan_snapshot = copy.deepcopy(
+                        getattr(self.trades, "orphan_positions", {}) or {}
+                    )
+            else:
+                closed_snapshot = [copy.copy(t) for t in self.trades.closed_trades]
+                open_snapshot = [copy.copy(t) for t in self.trades.open_trades.values()]
+                orphan_snapshot = copy.deepcopy(
+                    getattr(self.trades, "orphan_positions", {}) or {}
+                )
+        except Exception as exc:
+            logger.critical(f"Risk snapshot failed; halting both segments: {exc}")
+            closed_snapshot = []
+            open_snapshot = []
+            orphan_snapshot = {
+                "RISK_SNAPSHOT_UNKNOWN_FUT": {"instrumenttype": "FUT"},
+                "RISK_SNAPSHOT_UNKNOWN_CE": {"instrumenttype": "OPT"},
+            }
+
         # 1. Closed Trades for today
-        for t in self.trades.closed_trades:
+        for t in closed_snapshot:
             try:
                 et = t.entry_time.astimezone(IST) if t.entry_time.tzinfo else IST.localize(t.entry_time)
                 if et.date() == today:
@@ -149,7 +205,7 @@ class RiskManager:
                 _charge_fail_closed(getattr(t, "inst_type", "OPT"), f"closed trade: {exc}")
                 
         # 2. Open Trades (Unrealized)
-        for t in self.trades.open_trades.values():
+        for t in open_snapshot:
             if getattr(t, "is_ghost", False):
                 continue
             try:
@@ -167,9 +223,12 @@ class RiskManager:
                         / 10000.0
                     )
                     open_pnl -= slippage_buffer
+                    projected_stop_risk = self._projected_stop_risk(t)
+                    if projected_stop_risk is None:
+                        raise ValueError("projected stop risk is invalid")
                     projected_open_pnl = min(
                         open_pnl,
-                        -(self._projected_stop_risk(t) + slippage_buffer),
+                        -(projected_stop_risk + slippage_buffer),
                     )
                     if t.inst_type == "FUT":
                         fut_pnl += open_pnl
@@ -179,6 +238,26 @@ class RiskManager:
                         opt_projected_pnl += projected_open_pnl
             except Exception as exc:
                 _charge_fail_closed(getattr(t, "inst_type", "OPT"), f"open trade: {exc}")
+
+        # Broker-only, excess, and ambiguous positions are real exposure even
+        # though they are not represented by a managed Trade.  Their valuation
+        # cannot be trusted here, so consume the full relevant segment budget.
+        # This prevents a reconciliation failure from becoming invisible risk.
+        for symbol, position in orphan_snapshot.items():
+            text = str(symbol or "").upper()
+            position_type = (
+                str((position or {}).get("instrumenttype") or "").upper()
+                if isinstance(position, dict)
+                else ""
+            )
+            inst_type = (
+                "OPT"
+                if position_type in {"OPT", "OPTCUR", "OPTIDX", "OPTSTK"}
+                or text.endswith("CE")
+                or text.endswith("PE")
+                else "FUT"
+            )
+            _charge_fail_closed(inst_type, f"unreconciled broker position {symbol}")
         
         # Calculate limits in absolute terms
         fut_limit = -(self.capital_fut * (self.risk_fut_pct / 100.0))
@@ -189,7 +268,7 @@ class RiskManager:
         projected_total_pnl = fut_projected_pnl + opt_projected_pnl
         
         # ── 🚨 GLOBAL BREACH 🚨 ──
-        if projected_total_pnl < global_limit and not self.daily_loss_breached:
+        if global_limit < 0 and projected_total_pnl <= global_limit and not self.daily_loss_breached:
             self.daily_loss_breached = True
             msg = (
                 "💀 GLOBAL DAILY LOSS LIMIT BREACHED: "
@@ -201,7 +280,7 @@ class RiskManager:
             return True
             
         # ── 🚨 FUT BREACH 🚨 ──
-        if fut_projected_pnl < fut_limit and not self.fut_loss_breached:
+        if fut_limit < 0 and fut_projected_pnl <= fut_limit and not self.fut_loss_breached:
             self.fut_loss_breached = True
             msg = (
                 "🚨 FUT DAILY LOSS LIMIT BREACHED: "
@@ -212,7 +291,7 @@ class RiskManager:
             self.close_segment_trades("FUT", "FUT_DAILY_LOSS_LIMIT")
             
         # ── 🚨 OPT BREACH 🚨 ──
-        if opt_projected_pnl < opt_limit and not self.opt_loss_breached:
+        if opt_limit < 0 and opt_projected_pnl <= opt_limit and not self.opt_loss_breached:
             self.opt_loss_breached = True
             msg = (
                 "🚨 OPT DAILY LOSS LIMIT BREACHED: "
@@ -227,7 +306,13 @@ class RiskManager:
     def halt_trading(self, reason: str):
         """Emergency stop: Close ALL positions and disable entry"""
         logger.error(f"🛑 HALTING ALL TRADING: {reason}")
-        for tid, t in list(self.trades.open_trades.items()):
+        manager_lock = getattr(self.trades, "_lock", None)
+        if manager_lock:
+            with manager_lock:
+                snapshot = list(self.trades.open_trades.items())
+        else:
+            snapshot = list(self.trades.open_trades.items())
+        for tid, t in snapshot:
             if str(getattr(t, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
                 self.trades.emergency_flatten_trade(t, reason)
                 continue
@@ -236,7 +321,13 @@ class RiskManager:
     def close_segment_trades(self, segment: str, reason: str):
         """Close all positions in a specific segment (FUT or OPT)"""
         logger.warning(f"🚫 Closing all {segment} positions: {reason}")
-        for tid, t in list(self.trades.open_trades.items()):
+        manager_lock = getattr(self.trades, "_lock", None)
+        if manager_lock:
+            with manager_lock:
+                snapshot = list(self.trades.open_trades.items())
+        else:
+            snapshot = list(self.trades.open_trades.items())
+        for tid, t in snapshot:
             if str(getattr(t, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
                 if t.inst_type == segment:
                     self.trades.emergency_flatten_trade(t, reason)
@@ -244,6 +335,7 @@ class RiskManager:
             if t.inst_type == segment:
                 self.trades.close_trade(tid, t.current_price, reason)
 
+    @_risk_serialized
     def can_trade(self, inst_type: str) -> bool:
         """Check if trading is allowed for a segment"""
         self.reset_for_session(datetime.now(IST).date())
@@ -252,6 +344,7 @@ class RiskManager:
         if inst_type == "OPT" and self.opt_loss_breached: return False
         return True
 
+    @_risk_serialized
     def reset_for_session(self, session_date) -> bool:
         """Reset latched daily breakers exactly once when the session date changes."""
         if self._session_date == session_date:

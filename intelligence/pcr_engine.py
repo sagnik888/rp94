@@ -45,48 +45,85 @@ class PCREngine:
 
         Returns PCR value, sentiment, contrarian signal, and trend.
         """
-        if options_chain is None or len(options_chain) == 0:
+        if options_chain is None or len(options_chain) < 3:
             return self._empty_result()
 
         try:
             # ── OI-based PCR ──
-            total_put_oi = options_chain['put_oi'].sum()
-            total_call_oi = options_chain['call_oi'].sum()
+            broad_put_oi = pd.to_numeric(options_chain['put_oi'], errors='coerce').fillna(0)
+            broad_call_oi = pd.to_numeric(options_chain['call_oi'], errors='coerce').fillna(0)
+            total_put_oi = float(broad_put_oi.sum())
+            total_call_oi = float(broad_call_oi.sum())
+            # A literal 0 from an unavailable side is not a valid sentiment
+            # observation.  Both sides need positive exchange OI before PCR is
+            # allowed into scoring or the dashboard.
+            broad_real_pair_count = int(
+                ((broad_call_oi > 0) & (broad_put_oi > 0)).sum()
+            )
+            broad_available = bool(
+                broad_real_pair_count >= 3
+                and total_call_oi > 0
+                and total_put_oi > 0
+            )
             pcr_oi = float(total_put_oi / total_call_oi) if total_call_oi > 0 else 0
 
             # ── Volume-based PCR ──
-            total_put_vol = options_chain['put_volume'].sum()
-            total_call_vol = options_chain['call_volume'].sum()
+            total_put_vol = float(pd.to_numeric(options_chain['put_volume'], errors='coerce').fillna(0).sum())
+            total_call_vol = float(pd.to_numeric(options_chain['call_volume'], errors='coerce').fillna(0).sum())
             pcr_vol = float(total_put_vol / total_call_vol) if total_call_vol > 0 else 0
 
             pcr_basis = "BROAD"
             near_pcr_oi = pcr_oi
             near_pcr_vol = pcr_vol
             near_count = len(options_chain)
+            near_real_pair_count = broad_real_pair_count
             if spot_price > 0 and strike_interval > 0 and 'strike' in options_chain.columns:
                 atm = round(spot_price / strike_interval) * strike_interval
                 min_strike = atm - (near_strikes * strike_interval)
                 max_strike = atm + (near_strikes * strike_interval)
                 near_chain = options_chain[(options_chain['strike'] >= min_strike) & (options_chain['strike'] <= max_strike)]
                 if len(near_chain) >= 3:
-                    near_put_oi = near_chain['put_oi'].sum()
-                    near_call_oi = near_chain['call_oi'].sum()
-                    near_put_vol = near_chain['put_volume'].sum()
-                    near_call_vol = near_chain['call_volume'].sum()
-                    near_pcr_oi = float(near_put_oi / near_call_oi) if near_call_oi > 0 else 0
-                    near_pcr_vol = float(near_put_vol / near_call_vol) if near_call_vol > 0 else 0
+                    near_put_oi = float(pd.to_numeric(near_chain['put_oi'], errors='coerce').fillna(0).sum())
+                    near_call_oi = float(pd.to_numeric(near_chain['call_oi'], errors='coerce').fillna(0).sum())
+                    near_put_vol = float(pd.to_numeric(near_chain['put_volume'], errors='coerce').fillna(0).sum())
+                    near_call_vol = float(pd.to_numeric(near_chain['call_volume'], errors='coerce').fillna(0).sum())
                     near_count = len(near_chain)
-                    pcr_basis = "NEAR_MONEY"
+                    near_call_series = pd.to_numeric(
+                        near_chain['call_oi'], errors='coerce'
+                    ).fillna(0)
+                    near_put_series = pd.to_numeric(
+                        near_chain['put_oi'], errors='coerce'
+                    ).fillna(0)
+                    near_real_pair_count = int(
+                        ((near_call_series > 0) & (near_put_series > 0)).sum()
+                    )
+                    # Prefer near-money PCR only when both sides carry real OI.
+                    # Otherwise retain a valid broad-chain observation instead
+                    # of manufacturing a zero/STRONG_BEARISH near-money signal.
+                    if (
+                        near_real_pair_count >= 3
+                        and near_call_oi > 0
+                        and near_put_oi > 0
+                    ):
+                        near_pcr_oi = float(near_put_oi / near_call_oi)
+                        near_pcr_vol = float(near_put_vol / near_call_vol) if near_call_vol > 0 else 0
+                        pcr_basis = "NEAR_MONEY"
 
             # ── Interpret PCR ──
             primary_pcr = near_pcr_oi if pcr_basis == "NEAR_MONEY" else pcr_oi
-            sentiment, signal = self._interpret(primary_pcr)
+            available = broad_available and primary_pcr > 0
+            sentiment, signal = (
+                self._interpret(primary_pcr)
+                if available
+                else ("UNKNOWN", "NEUTRAL")
+            )
 
             # ── Track History ──
             with self._lock:
                 if instrument not in self._pcr_history:
                     self._pcr_history[instrument] = deque(maxlen=self.history_size)
-                self._pcr_history[instrument].append(primary_pcr)
+                if available:
+                    self._pcr_history[instrument].append(primary_pcr)
     
                 # ── PCR Trend ──
                 history = list(self._pcr_history[instrument])
@@ -104,6 +141,13 @@ class PCREngine:
                     trend = "STABLE"
 
             return {
+                "available": available,
+                "status": "OK" if available else "UNAVAILABLE",
+                "reason": (
+                    ""
+                    if available
+                    else "Need at least 3 strikes with positive paired call and put OI"
+                ),
                 "pcr_oi": round(pcr_oi, 3),
                 "pcr_volume": round(pcr_vol, 3),
                 "pcr_oi_broad": round(pcr_oi, 3),
@@ -112,6 +156,8 @@ class PCREngine:
                 "pcr_near_volume": round(near_pcr_vol, 3),
                 "pcr_basis": pcr_basis,
                 "near_strike_count": int(near_count),
+                "near_real_oi_pair_count": int(near_real_pair_count),
+                "broad_real_oi_pair_count": int(broad_real_pair_count),
                 "primary_pcr": round(primary_pcr, 3),
                 "total_put_oi": int(total_put_oi),
                 "total_call_oi": int(total_call_oi),
@@ -156,9 +202,12 @@ class PCREngine:
 
     def _empty_result(self) -> Dict:
         return {
+            "available": False, "status": "UNAVAILABLE", "reason": "Option chain unavailable or has fewer than 3 strikes",
             "pcr_oi": 0, "pcr_volume": 0, "pcr_oi_broad": 0, "pcr_volume_broad": 0,
             "pcr_near_oi": 0, "pcr_near_volume": 0, "pcr_basis": "NONE",
-            "near_strike_count": 0, "primary_pcr": 0, "total_put_oi": 0, "total_call_oi": 0,
+            "near_strike_count": 0, "near_real_oi_pair_count": 0,
+            "broad_real_oi_pair_count": 0, "primary_pcr": 0,
+            "total_put_oi": 0, "total_call_oi": 0,
             "sentiment": "UNKNOWN", "signal": "NEUTRAL", "trend": "UNKNOWN",
             "raw_sentiment": "UNKNOWN", "contrarian_signal": "NEUTRAL", "interpretation_model": "CONTRARIAN",
             "pcr_history": [], "interpretation": "No data",

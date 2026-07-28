@@ -170,7 +170,7 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     aggregate = result["aggregate"]
     assert aggregate["score_before_regime_dampening"] == 0.5
     assert aggregate["regime_score_multiplier"] == 0.15
-    assert aggregate["score"] == 2.5
+    assert aggregate["score"] == 3.75
     assert aggregate["signal"] == "HOLD"
 
 

@@ -22,8 +22,7 @@ class IntelligenceMemory:
         self._cleanup_temp_files()
         self.load()
 
-
-    def _cleanup_temp_files(self):
+    def _cleanup_temp_files(self):
         try:
             dir_path = os.path.dirname(self.storage_path) or "."
             base_name = os.path.basename(self.storage_path)
@@ -31,7 +30,7 @@ class IntelligenceMemory:
                 if f.startswith(base_name) and f.endswith(".tmp"):
                     try:
                         os.remove(os.path.join(dir_path, f))
-                    except:
+                    except Exception:
                         pass
         except Exception as e:
             logger.debug(f"Temp cleanup failed: {e}")

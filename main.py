@@ -62,7 +62,6 @@ if FILE_LOG_ENABLED:
         os.getenv("UT1_LOG_FILE", "logs/ut1.log"),
         rotation="00:00",
         retention="3 months",
-        compression="zip",
         level=file_log_level,
     )
 
@@ -79,7 +78,7 @@ def start_angelone_log_cleaner():
         locked_skip: set = set()
         while True:
             try:
-                now = datetime.datetime.now()
+                now = datetime.datetime.now(IST)
                 # Do not run heavy zip operations during active market hours (09:00 to 15:45)
                 market_start = datetime.time(9, 0)
                 market_end = datetime.time(15, 45)
@@ -291,9 +290,9 @@ def start_live_session_tracker_scheduler():
 
     def _scheduler_loop():
         while True:
-            now = datetime.now()
-            today_start = datetime.combine(now.date(), start_at)
-            today_stop = datetime.combine(now.date(), stop_at)
+            now = datetime.now(IST)
+            today_start = IST.localize(datetime.combine(now.date(), start_at))
+            today_stop = IST.localize(datetime.combine(now.date(), stop_at))
             if start_at <= now.time() <= stop_at:
                 _start_tracker_process(
                     since=start_at.strftime("%H:%M"),
@@ -601,7 +600,21 @@ def create_system():
     sim_broker = SignalSimBroker()
     real_broker = None
     if data_provider.is_connected:
-        real_broker = SmartApiBroker(data_provider.smart_api)
+        real_broker = SmartApiBroker(
+            data_provider.smart_api,
+            account_id=settings.angelone_client_id,
+            instance_id=f"UT1:{settings.dashboard_port}",
+        )
+        data_provider.on_angel_reauth = real_broker.replace_api
+        if settings.trading_mode == "REAL" and not real_broker.acquire_execution_lease():
+            logger.critical(
+                "REAL startup refused: " + real_broker.execution_lease_block_reason()
+            )
+            settings.trading_mode = "HISTORICAL"
+            try:
+                settings.save_to_env()
+            except Exception as exc:
+                logger.error(f"Failed to persist lease safe-mode fallback: {exc}")
         data_provider.fetch_instruments()
         logger.info("✅ Broker (AngelOne LIVE Ready)")
     else:
@@ -640,6 +653,7 @@ def create_system():
         max_positions=settings.max_concurrent_positions,
         session_end=settings.ut_session_end,
         product_type=settings.trade_product_type,
+        on_notification=send_desktop_notification,
     )
     # Give trade_manager references to both for hot-swapping
     trade_manager.mock_broker = sim_broker
@@ -691,6 +705,7 @@ async def run_scanner(scanner: Scanner):
 
 def main():
     settings = get_settings()
+    runtime: dict[str, object] = {}
 
     async def _bootstrap_system_after_dashboard_start():
         await asyncio.sleep(0.5)
@@ -698,6 +713,13 @@ def main():
         try:
             dashboard_loop = asyncio.get_running_loop()
             scanner, _ = await asyncio.to_thread(create_system)
+            runtime["scanner"] = scanner
+            # Lifespan shutdown may begin while create_system is running in its
+            # worker thread.  Publish the resource so the shutdown hook can close
+            # it, but never launch a scanner thread after ingress has been gated.
+            if bool(getattr(dashboard_module, "_dashboard_shutting_down", False)):
+                logger.warning("Dashboard shutdown began during bootstrap; scanner launch skipped.")
+                return
 
             async def _threadsafe_broadcast(payload):
                 future = asyncio.run_coroutine_threadsafe(broadcast(payload), dashboard_loop)
@@ -710,16 +732,49 @@ def main():
             def _run_scanner_loop():
                 asyncio.run(scanner.run())
 
-            threading.Thread(
+            scanner_thread = threading.Thread(
                 target=_run_scanner_loop,
                 name="ScannerEventLoop",
                 daemon=True,
-            ).start()
+            )
+            # Retain the runner so graceful shutdown can prove the scan/event
+            # loop has actually stopped before draining order work and releasing
+            # the account execution lease.
+            scanner._runner_thread = scanner_thread
+            runtime["scanner_thread"] = scanner_thread
+            scanner_thread.start()
             start_premarket_real_mode_worker(scanner, settings)
         except Exception as exc:
             logger.exception(f"System bootstrap failed after dashboard start: {exc}")
 
     dashboard_module.startup_hook = lambda: asyncio.create_task(_bootstrap_system_after_dashboard_start())
+
+    async def _graceful_system_shutdown() -> None:
+        """Drain broker work, persist scanner state, then release live resources."""
+        scanner = runtime.get("scanner")
+        await dashboard_module.shutdown_scanner()
+        if scanner is None:
+            return
+        real_broker = getattr(getattr(scanner, "trades", None), "real_broker", None)
+        release_lease = getattr(real_broker, "release_execution_lease", None)
+        if callable(release_lease):
+            try:
+                await asyncio.to_thread(release_lease)
+                logger.info("✅ Broker account execution lease released.")
+            except Exception as exc:
+                logger.error(f"Broker lease release failed during shutdown: {exc}")
+        telemetry_shutdown = getattr(scanner, "shutdown_telemetry_executor", None)
+        if callable(telemetry_shutdown):
+            telemetry_shutdown(wait=False)
+        lab_executor = getattr(scanner, "_engine_lab_executor", None)
+        if lab_executor is not None:
+            try:
+                lab_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug(f"Engine-lab executor shutdown skipped: {exc}")
+        runtime.clear()
+
+    dashboard_module.shutdown_hook = _graceful_system_shutdown
 
     # Start the log cleaner thread
     start_angelone_log_cleaner()

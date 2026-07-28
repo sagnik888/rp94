@@ -56,7 +56,7 @@ def _age_seconds(value: Any, now_ts: float) -> Optional[float]:
     try:
         timestamp = value.get("time") if isinstance(value, dict) else None
         if isinstance(timestamp, datetime):
-            return max(0.0, (datetime.now() - timestamp).total_seconds())
+            return max(0.0, time.time() - timestamp.timestamp())
         if timestamp:
             return max(0.0, now_ts - float(timestamp))
     except Exception:

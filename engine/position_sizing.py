@@ -150,6 +150,7 @@ def resolve_trade_lots(
     cascade_scale: bool = False,
     heavy_trend_scale: bool = False,
     high_conviction: bool = False,
+    compression_state: str = "",
 ) -> PositionSizeResult:
     """Canonical lot resolution for live + historical.
 
@@ -165,6 +166,13 @@ def resolve_trade_lots(
     lot_size = max(1, int(lot_size or 1))
     per_unit = abs(float(entry_price or 0.0) - float(stop_price or 0.0))
     risk_per_lot = per_unit * lot_size
+
+    # Final safety invariant: a quiet locked session is never enlarged by a
+    # caller accidentally carrying cascade/heavy flags.  This intentionally
+    # overrides even a user-configured base size until breakout confirmation.
+    compression = str(compression_state or "").upper()
+    if compression in {"FORMING", "LOCKED", "BREAKOUT_WATCH", "FAILED_BREAKOUT", "REVERSION_LOCKED"}:
+        return PositionSizeResult(1 if base > 0 else 0, f"Compression cap: {compression} -> 1 lot", risk_per_lot, 0.0, "compression_cap")
 
     # Futures discipline (2026-07-10, operator rule): FUT is ALWAYS capped at
     # fut_lots_hard_cap (default 1 lot) regardless of user lot settings.
@@ -303,6 +311,7 @@ def size_lots_for_trade(
     cascade_scale: bool = False,
     heavy_trend_scale: bool = False,
     high_conviction: bool = False,
+    compression_state: str = "",
 ) -> PositionSizeResult:
     """Back-compat alias for resolve_trade_lots."""
     return resolve_trade_lots(
@@ -317,4 +326,5 @@ def size_lots_for_trade(
         cascade_scale=cascade_scale,
         heavy_trend_scale=heavy_trend_scale,
         high_conviction=high_conviction,
+        compression_state=compression_state,
     )

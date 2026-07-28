@@ -132,6 +132,42 @@ class IntelligenceAggregator:
         components = 0
         regime_score_multiplier = 1.0
 
+        actual_strike_count = int(len(options_chain)) if options_chain is not None else 0
+        if chain_quality is None:
+            chain_quality = {
+                "source": "unknown" if actual_strike_count else "none",
+                "strike_count": actual_strike_count,
+                "score": 95 if actual_strike_count >= 10 else (60 if actual_strike_count >= 3 else 0),
+                "fallback": actual_strike_count < 3,
+                "stale": False,
+                "expiry_aligned": actual_strike_count >= 3,
+                "age_seconds": 0,
+            }
+        else:
+            chain_quality = dict(chain_quality)
+        reported_strikes = int(chain_quality.get("strike_count", actual_strike_count) or 0)
+        chain_authoritative = bool(
+            chain_quality.get(
+                "intelligence_usable",
+                min(actual_strike_count, reported_strikes) >= 3
+                and not bool(chain_quality.get("fallback", False))
+                and not bool(chain_quality.get("stale", False))
+                and bool(chain_quality.get("expiry_aligned", True)),
+            )
+        )
+        chain_authoritative = bool(chain_authoritative and actual_strike_count >= 3)
+        chain_quality["intelligence_usable"] = chain_authoritative
+        chain_quality["contract_lookup_only"] = bool(
+            actual_strike_count and not chain_authoritative
+        )
+        results["data_quality"] = chain_quality
+        intelligence_chain = options_chain if chain_authoritative else None
+        if not chain_authoritative:
+            chain_quality["reason"] = (
+                "Option chain unavailable" if actual_strike_count == 0 else
+                "Option chain is not authoritative (fallback, stale, expiry mismatch, or insufficient strikes)"
+            )
+
         # Use 1m data for high-resolution intelligence if available
         intel_df = candle_1min_df if candle_1min_df is not None and not candle_1min_df.empty else candle_df
 
@@ -144,14 +180,16 @@ class IntelligenceAggregator:
         results["market_structure"] = profile_ctx if isinstance(profile_ctx, dict) else {}
         results["aroon_context"] = aroon_ctx if isinstance(aroon_ctx, dict) else {}
         results["wavetrend"] = wavetrend_ctx if isinstance(wavetrend_ctx, dict) else {}
-        if vol["signal"] == "BULLISH_VOLUME":
-            score += 0.2 # Increased from 0.15
-        elif vol["signal"] == "BEARISH_VOLUME":
-            score -= 0.2 # Increased from 0.15
-        if vol["buy_sell_ratio"] > 1.5: # Increased threshold
-            score += 0.15
-        elif vol["buy_sell_ratio"] < 0.6: # Lowered threshold
-            score -= 0.15
+        volume_available = vol.get("available") is True
+        if volume_available:
+            if vol["signal"] == "BULLISH_VOLUME":
+                score += 0.2 # Increased from 0.15
+            elif vol["signal"] == "BEARISH_VOLUME":
+                score -= 0.2 # Increased from 0.15
+            if vol["buy_sell_ratio"] > 1.5: # Increased threshold
+                score += 0.15
+            elif vol["buy_sell_ratio"] < 0.6: # Lowered threshold
+                score -= 0.15
         profile_signal = str(results["market_structure"].get("signal") or "")
         if profile_signal in {"ACCEPTING_HIGHER", "UPSIDE_ACCEPTANCE"}:
             score += 0.04
@@ -168,32 +206,38 @@ class IntelligenceAggregator:
             score += 0.03
         elif aroon_trend == "DOWN" and not aroon_late:
             score -= 0.03
-        components += 1
+        # Price-structure/Aroon remain valid without traded volume, but the
+        # volume pillar itself exists only when a real/proxy source opted in.
+        if volume_available:
+            components += 1
 
         # 2. OI
-        if options_chain is not None:
-            oi_result = self.oi.analyze(options_chain, price_change_pct, spot_price, strike_interval)
+        if intelligence_chain is not None:
+            oi_result = self.oi.analyze(intelligence_chain, price_change_pct, spot_price, strike_interval)
             if not isinstance(oi_result, dict): oi_result = {}
             results["oi"] = oi_result
-            
-
-            if oi_result["signal"] == "BULLISH":
-                score += 0.2
-            elif oi_result["signal"] == "BEARISH":
-                score -= 0.2
-            components += 1
+            if oi_result.get("available") is True:
+                # Conservative vote from the options-specific call/put pressure
+                # model; OI remains context, never a standalone entry trigger.
+                if oi_result.get("signal") == "BULLISH":
+                    score += 0.10
+                elif oi_result.get("signal") == "BEARISH":
+                    score -= 0.10
+                components += 1
 
             # 3. PCR
-            pcr_result = self.pcr.analyze(options_chain, instrument, spot_price, strike_interval)
-            if not isinstance(pcr_result, dict): pcr_result = {}
+            pcr_result = self.pcr.analyze(intelligence_chain, instrument, spot_price, strike_interval)
+            if not isinstance(pcr_result, dict):
+                pcr_result = self.pcr._empty_result()
             results["pcr"] = pcr_result
             signal_map = {"STRONG_BULLISH": 0.2, "BULLISH": 0.1, "NEUTRAL": 0, "BEARISH": -0.1, "STRONG_BEARISH": -0.2}
-            score += signal_map.get(pcr_result.get("signal", "NEUTRAL"), 0)
-            components += 1
+            if pcr_result.get("available") is True:
+                score += signal_map.get(pcr_result.get("signal", "NEUTRAL"), 0)
+                components += 1
 
         # 4. Greeks & Gamma Awareness
-        if options_chain is not None and spot_price > 0:
-            iv_ctx = self._chain_iv_context(options_chain, spot_price, days_to_expiry)
+        if intelligence_chain is not None and spot_price > 0:
+            iv_ctx = self._chain_iv_context(intelligence_chain, spot_price, days_to_expiry)
             greeks_atm = self.greeks.analyze_atm(
                 spot_price,
                 strike_interval,
@@ -300,7 +344,7 @@ class IntelligenceAggregator:
                 "iv_source": iv_ctx["source"],
             }
             components += 1
-        elif options_chain is None and spot_price > 0:
+        elif intelligence_chain is None and spot_price > 0:
             # Fallback for when options chain is missing but we have price
             results["oi"] = self.oi._empty_result()
             results["pcr"] = self.pcr._empty_result()
@@ -343,7 +387,7 @@ class IntelligenceAggregator:
         # 6. Order Flow
         flow_result = self.order_flow.analyze(
             intel_df,
-            options_chain=options_chain,
+            options_chain=intelligence_chain,
             spot_price=spot_price,
             strike_interval=strike_interval,
             market_context=chain_quality,
@@ -381,14 +425,14 @@ class IntelligenceAggregator:
         results["divergence_alert"] = divergence_detected
 
         # ═══ STRESS TEST: System CA OI (Cumulative Analysis) ═══
-        if options_chain is not None and not options_chain.empty:
+        if intelligence_chain is not None and not intelligence_chain.empty:
             # Analyze distribution of OI across entire chain (Wide Format Support)
-            if 'call_oi' in options_chain.columns:
-                total_call_oi = options_chain['call_oi'].sum()
-                total_put_oi = options_chain['put_oi'].sum()
+            if 'call_oi' in intelligence_chain.columns:
+                total_call_oi = intelligence_chain['call_oi'].sum()
+                total_put_oi = intelligence_chain['put_oi'].sum()
             else:
-                total_call_oi = options_chain[options_chain['type'] == 'CE']['oi'].sum()
-                total_put_oi = options_chain[options_chain['type'] == 'PE']['oi'].sum()
+                total_call_oi = intelligence_chain[intelligence_chain['type'] == 'CE']['oi'].sum()
+                total_put_oi = intelligence_chain[intelligence_chain['type'] == 'PE']['oi'].sum()
                 
             oi_imbalance = (total_call_oi - total_put_oi) / (total_call_oi + total_put_oi) if (total_call_oi + total_put_oi) > 0 else 0
             
@@ -400,8 +444,8 @@ class IntelligenceAggregator:
                 max_strike = atm + (5 * strike_interval)
                 
                 # Filter for wide format
-                if 'strike' in options_chain.columns:
-                    nearby_chain = options_chain[(options_chain['strike'] >= min_strike) & (options_chain['strike'] <= max_strike)]
+                if 'strike' in intelligence_chain.columns:
+                    nearby_chain = intelligence_chain[(intelligence_chain['strike'] >= min_strike) & (intelligence_chain['strike'] <= max_strike)]
                     nearby_strikes = nearby_chain[['strike', 'call_oi', 'put_oi', 'call_volume', 'put_volume']].to_dict('records')
             
             results["oi"]["cumulative_analysis"] = {
@@ -415,8 +459,8 @@ class IntelligenceAggregator:
             # ═══ MAX PAIN ═══ the expiry strike that minimises total option-buyer
             # payout (an expiry magnet for index options). Pure-pandas, wide format.
             try:
-                if 'call_oi' in options_chain.columns and 'strike' in options_chain.columns and spot_price > 0:
-                    oc = options_chain.dropna(subset=['strike'])
+                if 'call_oi' in intelligence_chain.columns and 'strike' in intelligence_chain.columns and spot_price > 0:
+                    oc = intelligence_chain.dropna(subset=['strike'])
                     strikes = oc['strike'].astype(float)
                     coi = oc['call_oi'].astype(float).fillna(0.0)
                     poi = oc['put_oi'].astype(float).fillna(0.0)
@@ -450,24 +494,15 @@ class IntelligenceAggregator:
         results["breadth_context"] = breadth_context or {}
         results["top_down_context"] = top_down
 
-        if chain_quality is None:
-            strike_count = int(len(options_chain)) if options_chain is not None else 0
-            chain_quality = {
-                "source": "unknown" if strike_count else "none",
-                "strike_count": strike_count,
-                "score": 95 if strike_count >= 10 else (35 if strike_count == 1 else 0),
-                "fallback": strike_count <= 1,
-                "age_seconds": 0,
-            }
-        results["data_quality"] = chain_quality
-
         # Final Score Aggregation (Scaled to -100 to +100 for SignalManager)
         score_before_regime_dampening = score
         score *= regime_score_multiplier
-        final_score = (score / components) * 100 if components > 0 else 0
-
-        # Normalize score to [-1, 1] for legacy logic
-        score = max(-1.0, min(1.0, score))
+        averaged_score = (score / components) if components > 0 else 0.0
+        # Normalize *before* scaling so the public contract can never escape
+        # [-100, +100].  The old order computed final_score from an unclamped
+        # value and clamped a different variable afterward.
+        score = max(-1.0, min(1.0, averaged_score))
+        final_score = score * 100.0
 
         # Final signal
         if score > 0.3:

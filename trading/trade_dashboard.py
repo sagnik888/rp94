@@ -36,8 +36,10 @@ def _serialize_trade_row(manager: Any, trade: Any) -> Dict[str, Any]:
         looks_spot_stop = trade.current_stop is not None and trade.current_stop > (trade.entry_price * 5.0)
         looks_spot_target = trade.target is not None and trade.target > (trade.entry_price * 5.0)
         if looks_spot_stop or looks_spot_target:
-            stop_distance = abs(trade.entry_spot - trade.current_stop)
-            target_distance = abs(trade.target - trade.entry_spot)
+            safe_stop = trade.current_stop if trade.current_stop is not None else trade.entry_price
+            safe_target = trade.target if trade.target is not None else trade.entry_price
+            stop_distance = abs(trade.entry_spot - safe_stop)
+            target_distance = abs(safe_target - trade.entry_spot)
             multiplier = abs(trade.instrument_multiplier)
             display_stop = max(0.1, trade.entry_price - (stop_distance * multiplier))
             display_target = trade.entry_price + (target_distance * multiplier)

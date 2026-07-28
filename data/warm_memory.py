@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,13 +35,18 @@ class WarmMemoryStore:
         self.save_interval_seconds = float(save_interval_seconds)
         self.clock = clock or (lambda: datetime.now(IST))
         self._last_save_monotonic = 0.0
+        self._save_lock = threading.RLock()
+        self._generation_lock = threading.Lock()
+        self._requested_generation = 0
+        self._committed_generation = 0
 
     def should_save(self) -> bool:
         return (time.monotonic() - self._last_save_monotonic) >= self.save_interval_seconds
 
     def save(self, payload: Dict[str, Any], force: bool = False) -> bool:
-        if not force and not self.should_save():
-            return False
+        with self._generation_lock:
+            self._requested_generation += 1
+            generation = self._requested_generation
         now = self._now()
         pruned = self._prune_payload(dict(payload or {}), now)
         pruned.update({
@@ -48,30 +54,39 @@ class WarmMemoryStore:
             "saved_at": now.isoformat(),
             "ttl_minutes": int(self.ttl.total_seconds() // 60),
         })
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix="warm_memory_", suffix=".json", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(pruned, fh, separators=(",", ":"), ensure_ascii=True)
-            os.replace(tmp_name, self.path)
-            self._last_save_monotonic = time.monotonic()
-            return True
-        except Exception as exc:
+        with self._save_lock:
+            if generation < self._committed_generation:
+                return False
+            if not force and not self.should_save():
+                return False
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix="warm_memory_", suffix=".json", dir=str(self.path.parent)
+            )
             try:
-                os.unlink(tmp_name)
-            except Exception:
-                pass
-            logger.debug(f"Warm memory save skipped: {exc}")
-            return False
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(pruned, fh, separators=(",", ":"), ensure_ascii=True)
+                os.replace(tmp_name, self.path)
+                self._last_save_monotonic = time.monotonic()
+                self._committed_generation = generation
+                return True
+            except Exception as exc:
+                try:
+                    os.unlink(tmp_name)
+                except Exception:
+                    pass
+                logger.debug(f"Warm memory save skipped: {exc}")
+                return False
 
     def load(self) -> Dict[str, Any]:
-        if not self.path.exists():
-            return {}
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(f"Warm memory read failed; ignoring checkpoint: {exc}")
-            return {}
+        with self._save_lock:
+            if not self.path.exists():
+                return {}
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(f"Warm memory read failed; ignoring checkpoint: {exc}")
+                return {}
         now = self._now()
         saved_at = self._parse_dt(payload.get("saved_at"))
         if not saved_at or now - saved_at > self.ttl:
@@ -80,10 +95,11 @@ class WarmMemoryStore:
         return self._prune_payload(payload, now)
 
     def clear(self) -> None:
-        try:
-            self.path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        with self._save_lock:
+            try:
+                self.path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _now(self) -> datetime:
         now = self.clock()

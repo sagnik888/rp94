@@ -56,6 +56,11 @@ class RegimeDetector:
                 reason=f"Need at least 30 candles; have {candle_count}",
             )
         try:
+            if df is not None and not {'close', 'high', 'low'}.issubset(df.columns):
+                return self._unknown(
+                    candle_count=candle_count,
+                    reason="Missing OHLC columns",
+                )
             close = df['close']
             high = df['high']
             low = df['low']

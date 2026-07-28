@@ -13,6 +13,23 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+
+_telemetry_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='telemetry-metrics')
+
+_EMPTY_SYSTEM_METRICS: Dict[str, Any] = {
+    "pid": 0,
+    "process_ram_mb": 0.0,
+    "process_cpu_pct": 0.0,
+    "process_cpu_single_core_pct": 0.0,
+    "logical_cpu_count": 0.0,
+    "threads": 0,
+    "ram": {"total_mb": 0.0, "used_mb": 0.0, "used_pct": 0.0},
+    "disk": {"total_gb": 0.0, "free_gb": 0.0, "used_pct": 0.0},
+    "gpu": {"available": False, "label": "Warming up"},
+    "warming_up": True,
+}
+
 
 from config.settings import get_settings
 from engine.settings_persistence import settings_persistence_status
@@ -150,8 +167,41 @@ class ScannerTelemetryMixin:
         """Return cached local hardware/process metrics for the UT1 state panel."""
         now = time.time()
         cached = getattr(self, "_system_metrics_cache", None)
-        if isinstance(cached, dict) and now - float(cached.get("_sampled_at", 0.0) or 0.0) < 5.0:
+        cache_age = now - float(cached.get("_sampled_at", 0.0) or 0.0) if isinstance(cached, dict) else float('inf')
+        if cache_age < 5.0:
             return {k: v for k, v in cached.items() if k != "_sampled_at"}
+        try:
+            asyncio.get_running_loop()
+            on_event_loop = True
+        except RuntimeError:
+            on_event_loop = False
+        # Synchronous diagnostics/tests outside asyncio may request an immediate
+        # sample. The live scanner/dashboard path always receives a non-blocking
+        # warming snapshot and refreshes in the dedicated telemetry worker.
+        if not isinstance(cached, dict) and not on_event_loop:
+            return self._compute_system_metrics(now)
+        # Stale-while-revalidate: return stale cache and refresh in background
+        # to avoid blocking the event loop with subprocess calls.
+        if not isinstance(cached, dict):
+            cached = {
+                **_EMPTY_SYSTEM_METRICS,
+                "pid": os.getpid(),
+                "threads": threading.active_count(),
+                "_sampled_at": 0.0,
+            }
+            self._system_metrics_cache = cached
+        if not getattr(self, "_metrics_refresh_pending", False):
+            self._metrics_refresh_pending = True
+            def _refresh():
+                try:
+                    self._compute_system_metrics(time.time())
+                finally:
+                    self._metrics_refresh_pending = False
+            _telemetry_executor.submit(_refresh)
+            return {k: v for k, v in cached.items() if k != "_sampled_at"}
+        return {k: v for k, v in cached.items() if k != "_sampled_at"}
+
+    def _compute_system_metrics(self, now: float) -> Dict[str, Any]:
 
         def process_rss_mb() -> float:
             try:
@@ -165,7 +215,7 @@ class ScannerTelemetryMixin:
                         ["tasklist", "/FI", f"PID eq {os.getpid()}", "/FO", "CSV", "/NH"],
                         capture_output=True,
                         text=True,
-                        timeout=0.8,
+                        timeout=0.3,
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                     row = (proc.stdout or "").splitlines()[0] if proc.returncode == 0 and proc.stdout else ""
@@ -271,7 +321,7 @@ class ScannerTelemetryMixin:
             try:
                 from engine.gpu_accelerator import get_gpu_accelerator
                 accel_payload = get_gpu_accelerator().status()
-                bench_payload = get_gpu_accelerator().benchmark(n=1_000_000)
+                bench_payload = get_gpu_accelerator().benchmark(n=100_000)
             except Exception:
                 accel_payload = {
                     "compute_available": False,
@@ -299,7 +349,7 @@ class ScannerTelemetryMixin:
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=0.8,
+                    timeout=0.3,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
                 first = (proc.stdout or "").splitlines()[0].strip() if proc.returncode == 0 and proc.stdout else ""
@@ -334,6 +384,14 @@ class ScannerTelemetryMixin:
         }
         self._system_metrics_cache = {**payload, "_sampled_at": now}
         return payload
+
+    @staticmethod
+    def shutdown_telemetry_executor(wait: bool = False) -> None:
+        """Stop accepting telemetry work during process shutdown."""
+        try:
+            _telemetry_executor.shutdown(wait=wait, cancel_futures=True)
+        except Exception:
+            pass
 
     def _estimated_default_executor_max_workers(self) -> int:
         """Mirror Python's default ThreadPoolExecutor sizing formula."""

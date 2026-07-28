@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
-
 import requests
 
 try:
@@ -68,13 +67,16 @@ def get_json(base: str, path: str, session: requests.Session, token: str) -> Dic
 
 
 async def configure_days(base: str, token: str, days: int) -> None:
-    token_q = quote(str(token or ""), safe="")
     host = base.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
-    uri = f"{host}/ws?token={token_q}"
+    uri = f"{host}/ws"
     origin = base.rstrip("/")
+    encoded_token = base64.urlsafe_b64encode(
+        str(token or "").encode("utf-8")
+    ).decode("ascii").rstrip("=")
     async with websockets.connect(
         uri,
         origin=origin,
+        subprotocols=["ut1.dashboard.v1", f"ut1.auth.{encoded_token}"],
         max_size=WS_MAX_SIZE,
         open_timeout=20,
     ) as websocket:
