@@ -882,22 +882,24 @@ class MarketDataProvider:
                 self._mark_fyers_auth_required(message)
                 return False
 
-            # Fyers refresh requires a SHA256 hash of app_id + ":" + secret_key
+            # Fyers v3 validate-refresh-token expects ONLY appIdHash to be hashed:
+            #   appIdHash = SHA256("<app_id>:<secret_key>")
+            #   pin       = the 4-digit trading PIN in PLAINTEXT
+            # Hashing the PIN too made every refresh fail (the broker rejected the
+            # request and the failure was being reported as a policy block).
             import requests
             import hashlib
             app_id = settings.fyers_app_id
             secret = settings.fyers_secret_key
             app_id_hash = hashlib.sha256((app_id + ":" + secret).encode()).hexdigest()
-            
-            # Pin must also be hashed
-            pin = settings.fyers_password
-            pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-            
+
+            pin = str(settings.fyers_password or "").strip()
+
             payload = {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "appIdHash": app_id_hash,
-                "pin": pin_hash
+                "pin": pin,
             }
             
             url = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
@@ -925,9 +927,19 @@ class MarketDataProvider:
                 return True
             else:
                 if response and response.get("code") == -16:
+                    # Latch so we stop hammering the endpoint; a successful manual login
+                    # clears it. Report the broker's ACTUAL response — this code was
+                    # previously always described as a policy block, which masked a
+                    # request-side defect (the PIN was being sent hashed).
                     self._fyers_refresh_disabled = True
-                    self._mark_fyers_auth_required("Fyers automatic refresh is disabled by broker policy. Manual login is required.")
-                    logger.warning("Fyers token refresh is disabled by broker policy; using available cache/fallback data.")
+                    detail = str(response.get("message") or response)
+                    self._mark_fyers_auth_required(
+                        f"Fyers refresh rejected (code -16): {detail}. Manual login required."
+                    )
+                    logger.warning(
+                        f"Fyers token refresh rejected (code -16): {detail}; "
+                        "using available cache/fallback data until manual login."
+                    )
                 else:
                     self._mark_fyers_auth_required(f"Fyers token refresh failed: {response}")
                     logger.error(f"❌ Fyers Token Refresh Failed: {response}")
