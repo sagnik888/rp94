@@ -112,8 +112,12 @@ async def test_long_session_websocket_keeps_useful_instrument_deltas(monkeypatch
     monkeypatch.setattr(server, "active_connections", {ws})
     server.dashboard_state.last_sent_states.clear()
     try:
-        await server.broadcast(state(2_000, 22_000.0, 96.0))
-        await server.broadcast(state(2_001, 22_001.0, 97.0))
+        # broadcast() now only ENQUEUES: delivery happens on a background worker so a
+        # stalled client cannot delay the scanner loop. Deliver directly here so the
+        # test exercises serialization/delta logic deterministically instead of racing
+        # the worker (and instead of the queue coalescing the two snapshots into one).
+        await server._deliver_broadcast(state(2_000, 22_000.0, 96.0))
+        await server._deliver_broadcast(state(2_001, 22_001.0, 97.0))
     finally:
         server.dashboard_state.last_sent_states.clear()
 
