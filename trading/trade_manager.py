@@ -439,9 +439,13 @@ class TradeManager:
         max_positions: int = 3,
         session_end: str = "15:25",
         product_type: str = "CARRYFORWARD",
+        on_notification=None,
     ):
         self.broker = broker
         self.ui_logger = None
+        # Injected desktop notifier (main.py passes send_desktop_notification). Falls
+        # back to importing it directly, so behaviour is unchanged when not supplied.
+        self.on_notification = on_notification
         self.max_positions = max_positions
         self.session_end = self._parse_time(session_end)
         self.product_type = str(product_type or "CARRYFORWARD").upper()
@@ -751,8 +755,10 @@ class TradeManager:
         logger.critical(message)
         self._log_ui(message, "error")
         try:
-            from notifications import send_desktop_notification
-            send_desktop_notification(message, "error")
+            notifier = getattr(self, "on_notification", None)
+            if not callable(notifier):
+                from notifications import send_desktop_notification as notifier
+            notifier(message, "error")
         except Exception as exc:
             logger.debug(f"Recovery desktop alert unavailable: {exc}")
 
