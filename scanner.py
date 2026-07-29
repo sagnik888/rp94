@@ -6462,9 +6462,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         if not allow_fetch:
             if cached is not None:
+                age = now - last
                 quality = dict(self._chain_quality_cache.get(name, self._assess_chain_quality(name, cached)))
-                quality["age_seconds"] = round(now - last, 1)
-                quality["stale"] = True
+                quality["age_seconds"] = round(age, 1)
+                # `stale` disqualifies the chain from intelligence (OI/PCR/Greeks) in
+                # IntelligenceAggregator. Deferring a re-fetch does NOT make a chain
+                # unusable — only real age does. Flagging every deferred read as stale
+                # meant that in REAL mode, where allow_fetch is False once a chain is
+                # cached, every scan after the short cache TTL handed intelligence a
+                # "stale" chain, which it then dropped: PCR/OI showed 0/unavailable all
+                # session even though the chain was being fetched successfully.
+                max_age = float(
+                    getattr(settings, "option_chain_intelligence_max_age_seconds", 300.0) or 300.0
+                )
+                quality["stale"] = age > max_age
                 return cached, quality
             empty = pd.DataFrame()
             quality = self._assess_chain_quality(

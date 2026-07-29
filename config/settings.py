@@ -534,6 +534,11 @@ class Settings(BaseSettings):
     pullback_hedge_size_fraction: float = 0.5          # hedge lots vs parent lots
     pullback_hedge_max_per_trade: int = 2              # anti-whipsaw churn cap
     pullback_hedge_max_hold_minutes: float = 15.0      # never hold a hedge indefinitely
+    # How old a cached option chain may be and still drive intelligence (OI/PCR/Greeks).
+    # In REAL mode the scan loop deliberately serves the cached chain instead of
+    # re-fetching every cycle; only genuine age should mark it stale, otherwise the
+    # aggregator drops the chain and the panel reports "OPTIONS DATA UNAVAILABLE".
+    option_chain_intelligence_max_age_seconds: float = 300.0
     # ── Stop-out re-entry (2026-07-25) ───────────────────────────────────────
     # A trade stopped out early on a trend day, then the move ran without us. When the
     # SAME direction re-validates in a confirmed trend shortly after a STOP-type exit,
