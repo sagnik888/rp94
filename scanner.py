@@ -24150,3 +24150,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self.log_event("âœ… Fyers Token Updated: Restarting Data Sync", "success")
             self.queue_full_recalculation("fyers-token-update")
         return result
+
+    async def update_fyers_token_async(self, auth_code: str) -> Dict[str, Any]:
+        """Async entry point used by the dashboard's Fyers auth callback.
+
+        POST /api/fyers_auth awaits this on the scanner loop, so it must be a coroutine.
+        The exchange itself performs blocking HTTP, so it runs in a worker thread rather
+        than stalling the scanner loop; queue_full_recalculation is already thread-safe
+        (it re-schedules onto the scanner loop when called from another thread)."""
+        return await asyncio.to_thread(self.update_fyers_token, auth_code)
