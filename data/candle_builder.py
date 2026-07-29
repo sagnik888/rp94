@@ -181,7 +181,13 @@ class CandleBuilder:
             if not ref or ref <= 0:
                 try:
                     median_val = new_data['close'].median()
-                    import pandas as pd
+                    # NOTE: no local `import pandas as pd` here. pandas is already
+                    # imported at module scope, and re-importing inside this function
+                    # made `pd` a LOCAL name for the whole function: whenever a valid
+                    # `ref` existed this branch was skipped, the import never ran, and
+                    # the `pd.isna(ref)` / `pd.concat` calls below raised
+                    # "cannot access local variable 'pd'" — which failed every candle
+                    # update and therefore every historical fetch.
                     ref = float(median_val) if not pd.isna(median_val) else 0.0
                 except Exception:
                     ref = 0.0
