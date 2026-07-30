@@ -2390,7 +2390,11 @@ class TradeManager:
         return {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4, "Recovered": 4}.get(base, 0)
 
     def _is_aplus_setup(self, trade: Trade) -> bool:
-        return self._grade_rank(getattr(trade, "grade", "")) >= 4 or float(getattr(trade, "confidence", 0.0) or 0.0) >= 0.90
+        # Delegates to the single definition in engine.signal_quality_policy so this and
+        # scanner.py cannot drift apart (the expression was duplicated verbatim).
+        from engine.signal_quality_policy import is_top_tier_setup
+
+        return is_top_tier_setup(getattr(trade, "grade", ""), getattr(trade, "confidence", 0.0))
 
     def _valid_closed_chronology(self, trade: Trade) -> bool:
         if trade.status != "CLOSED" or not trade.entry_time or not trade.exit_time:

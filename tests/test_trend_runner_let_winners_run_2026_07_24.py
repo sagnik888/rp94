@@ -22,13 +22,23 @@ def _settings(enabled=True, min_r=1.0):
     )
 
 
-def _trade(direction="LONG", inst_type="OPT", option_type="CE"):
-    return SimpleNamespace(direction=direction, inst_type=inst_type, option_type=option_type)
+def _trade(direction="LONG", inst_type="OPT", option_type="CE",
+           instrument="NIFTY", timeframe="5min"):
+    return SimpleNamespace(direction=direction, inst_type=inst_type, option_type=option_type,
+                           instrument=instrument, timeframe=timeframe)
 
 
-def _runner(monkeypatch, trade, *, regime, peak, risk, settings=None):
+def _runner(monkeypatch, trade, *, regime, peak, risk, settings=None, own_regime=True):
     monkeypatch.setattr(scanner_module, "get_settings", lambda: settings or _settings())
     sc = Scanner.__new__(Scanner)
+    # Runner mode now refuses a BORROWED regime, so the stub must carry a regime for the
+    # trade's own timeframe — which is what a live managed trade always has. Pass
+    # own_regime=False to simulate the borrowed case.
+    key = Scanner._timeframe_intel_key(
+        str(getattr(trade, "instrument", "")), str(getattr(trade, "timeframe", "5min"))
+    )
+    sc._timeframe_regimes = {key: regime} if own_regime else {}
+    sc.latest_regimes = {}
     return Scanner._confirmed_trend_runner(
         sc, trade, regime=regime, peak_pnl=peak, initial_risk_rs=risk
     )
@@ -169,3 +179,10 @@ def test_giveback_guard_wires_the_runner_suppression():
     assert "_confirmed_trend_runner" in src
     assert "_eod_protect_active" in src  # EOD protection preserved
     assert "and not trend_runner_active" in src
+
+
+def test_runner_denied_when_regime_is_borrowed_from_another_timeframe(monkeypatch):
+    """A 15min trade must not ride the looser runner trail on a 5min regime reading."""
+    assert _runner(monkeypatch, _trade("LONG", "OPT", "CE", timeframe="15min"),
+                   regime="TRENDING_UP", peak=1200.0, risk=1000.0,
+                   own_regime=False) is False

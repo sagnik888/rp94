@@ -519,6 +519,11 @@ class Settings(BaseSettings):
     # proven winner is in a strong trend with ADX above this floor — so small gains are
     # banked normally and the ride is reserved for moves with room to run.
     trend_runner_big_move_min_adx: float = 25.0
+    # Runner mode requires a regime for the trade's OWN timeframe. _get_trade_regime
+    # falls back to the 5-minute label, which is fine for tightening but must not GRANT
+    # the looser runner trail to a 15-minute trade on a 5-minute reading. Set False to
+    # restore the previous borrow-and-assume behaviour.
+    trend_runner_require_own_timeframe_regime: bool = True
     trend_runner_engage_before_target_enabled: bool = True
     # ── Pullback hedge (Phase 3, operator design 2026-07-24) ──────────────────
     # While a proven runner (>= the 0.4R crossover) is riding a confirmed trend, an

@@ -31,6 +31,7 @@ from data.warm_memory import WarmMemoryStore, dataframe_to_records, records_to_d
 from engine.candidate_normalization import normalize_loaded_exit_candidate
 from engine.multi_timeframe import MultiTimeframeEngine
 from engine.signal_manager import SignalManager
+from engine.signal_quality_policy import is_top_tier_setup
 from intelligence.intelligence_aggregator import IntelligenceAggregator
 from intelligence.memory import IntelligenceMemory
 from intelligence.snapshot_store import MarketIntelSnapshotStore
@@ -6613,6 +6614,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             getattr(self, "_last_intel_fetch", {}).pop(name, None)
             getattr(self, "latest_regimes", {}).pop(name, None)
 
+    def _trade_regime_is_own_timeframe(self, trade_like) -> bool:
+        """Whether a regime label exists for the trade's OWN timeframe.
+
+        _get_trade_regime deliberately falls back to the 5-minute label so trailing/EOD
+        management always has something to work with. That borrowed label is fine for
+        conservative tightening, but it must NOT be used to grant a privilege: a 15-minute
+        trade could otherwise enter runner mode on a 5-minute regime, and sampled 5m/15m
+        regimes disagree in 83% of same-timestamp pairs.
+        """
+        instrument = str(getattr(trade_like, "instrument", "") or "").upper()
+        timeframe = str(getattr(trade_like, "timeframe", "5min") or "5min").lower()
+        key = self._timeframe_intel_key(instrument, timeframe)
+        tf_regimes = getattr(self, "_timeframe_regimes", {}) or {}
+        latest = getattr(self, "latest_regimes", {}) or {}
+        if tf_regimes.get(key) or latest.get(key):
+            return True
+        # The instrument-only entry IS the 5-minute label (mirror_legacy), so it counts
+        # as own-timeframe only for 5-minute trades.
+        return timeframe == "5min" and bool(latest.get(instrument))
+
     def _get_trade_regime(self, trade_like, default: str = "UNKNOWN") -> str:
         instrument = str(getattr(trade_like, "instrument", "") or "").upper()
         timeframe = str(getattr(trade_like, "timeframe", "5min") or "5min").lower()
@@ -11570,6 +11591,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return False
         reg = str(regime or "").upper()
         if reg not in {"TRENDING_UP", "TRENDING_DOWN", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
+            return False
+        # Never grant runner mode on a BORROWED regime. _get_trade_regime falls back to
+        # the 5-minute label for any timeframe, so a 15-minute trade could otherwise ride
+        # the looser runner trail on a 5-minute reading — and sampled 5m/15m regimes
+        # disagree in 83% of same-timestamp pairs. Deny rather than assume; the tighter
+        # give-back ladder still protects the trade.
+        if self._setting_enabled(
+            getattr(settings, "trend_runner_require_own_timeframe_regime", True), True
+        ) and not self._trade_regime_is_own_timeframe(trade_like):
             return False
         sig = self._trade_signal_type_for_cascade(trade_like)
         if sig == "BUY" and not reg.endswith("_UP"):
@@ -18987,7 +19017,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._persist_session_trade_candidates()
 
     def _is_aplus_setup(self, item) -> bool:
-        return SignalProcessor._grade_rank(getattr(item, "grade", "")) >= 4 or float(getattr(item, "confidence", 0.0) or 0.0) >= 0.90
+        # Single definition shared with trading/trade_manager.py — see is_top_tier_setup.
+        return is_top_tier_setup(getattr(item, "grade", ""), getattr(item, "confidence", 0.0))
 
     def _force_candidate_instrument_type(self, candidate: TradeCandidate, target_type: str) -> bool:
         """Convert a same-index cross-TF candidate to the complementary instrument type."""

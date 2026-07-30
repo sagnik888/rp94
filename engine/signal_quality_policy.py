@@ -43,6 +43,23 @@ def confidence_to_grade(confidence) -> str:
     return "C"
 
 
+def is_top_tier_setup(grade, confidence) -> bool:
+    """Single source of truth for "is this a top-tier setup?".
+
+    The expression `grade_rank >= A+ OR confidence >= 0.90` was duplicated verbatim in
+    trading/trade_manager.py and scanner.py. It is currently harmless REDUNDANCY, because
+    grade is bucket(confidence) (see confidence_to_grade) and the A+ band floor is 0.85,
+    so any confidence >= 0.90 already grades A+.
+
+    It stops being redundant the moment grade is decoupled from confidence — then a
+    grade-C signal whose pillars contradict each other but which posts a high collapsed
+    confidence would be promoted to top tier, where it can supersede a properly confirmed
+    trade and pass the all-A+ concurrency allowance. Keeping one definition means the two
+    call sites cannot drift apart if that decoupling ever happens.
+    """
+    return grade_rank(grade) >= 4 or float(confidence or 0.0) >= 0.90
+
+
 def grade_min_confidence(grade: str) -> float:
     """Lowest confidence that still maps to this grade (inverse of confidence_to_grade)."""
     base = str(grade or "C").split()[0]
