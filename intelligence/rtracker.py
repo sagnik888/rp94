@@ -259,6 +259,15 @@ class RegimeTracker:
             # only GUESS the contract by premium proximity, which mismatched ~60% of
             # trades (nearest stored strike differed 15-77%). Recording it makes every
             # future session exactly replayable against its real premium candles.
+            # Which intelligence context actually graded this candidate. The regime block
+            # below records the candidate's own context, which is NOT necessarily the one
+            # grading used — without this the per-timeframe grading flag cannot be A/B'd
+            # from archived sessions.
+            "grading": {
+                "timeframe": str(_candidate_value(candidate, "graded_timeframe", "") or ""),
+                "intel_score": _safe_float(_candidate_value(candidate, "graded_intel_score", 0.0)),
+                "regime": str(_candidate_value(candidate, "graded_regime", "") or ""),
+            },
             "contract": {
                 "trading_symbol": str(_candidate_value(candidate, "trading_symbol", "") or ""),
                 "symbol_token": str(_candidate_value(candidate, "symbol_token", "") or ""),

@@ -4184,6 +4184,15 @@ class SignalProcessor:
                     _tf_intel_result, _tf_intel_score, _tf_regime = self._candidate_timeframe_context(
                         tf, intel_result, intel_score, regime, _timeframe_contexts
                     )
+                    # Telemetry: record WHICH context actually graded this candidate.
+                    # Without it the per-timeframe grading flag cannot be A/B'd offline —
+                    # the tracker showed the candidate's regime but not the one grading used.
+                    try:
+                        setattr(sig, "graded_timeframe", str(tf or ""))
+                        setattr(sig, "graded_intel_score", float(_tf_intel_score or 0.0))
+                        setattr(sig, "graded_regime", str(_tf_regime or ""))
+                    except Exception:
+                        pass
                     _live_session_ctx = (
                         _tf_intel_result.get("session_context", {})
                         if isinstance(_tf_intel_result, dict)
