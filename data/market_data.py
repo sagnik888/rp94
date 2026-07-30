@@ -26,7 +26,7 @@ from data.market_calendar import (
 )
 from data.market_source_health import build_market_source_snapshot, build_source_health
 from engine.option_history_store import get_option_history_store
-from trading.api_rate_limiter import get_shared_api_limiter
+from trading.api_rate_limiter import get_shared_api_limiter, get_shared_history_limiter
 from trading.secure_logging import install_smartapi_log_redaction, redact_sensitive_text
 
 try:
@@ -2247,15 +2247,40 @@ class MarketDataProvider:
                 "todate": to_date
             }
             
-            # ── Institutional Grade: Direct Async-ready Fetch ──
-            # (Removed time.sleep to eliminate 300ms bottleneck)
-            resp = self.smart_api.getCandleData(params)
-            
+            # Historical data is deliberately rate-gated and best-effort: it must never
+            # flood AngelOne's published 3/s, 180/min history budget. Unpaced fetches
+            # produced 189 rate-limit hits in one session, which forced 279 Yahoo
+            # fallbacks — and Yahoo reports volume=0 for index tickers, so the whole
+            # volume pipeline died. Skipping a request here is safe (cache/fallback
+            # covers it); exhausting the budget is not.
+            history_limiter = get_shared_history_limiter(getattr(self, "client_id", ""))
+
+            def _history_request():
+                api = self.smart_api
+                if api is None:
+                    return None
+                if not history_limiter.try_begin(get_shared_api_limiter(api)):
+                    logger.debug(
+                        "Skipping AngelOne history request; rate window or "
+                        "broker-priority lane is occupied"
+                    )
+                    return None
+                try:
+                    return api.getCandleData(params)
+                finally:
+                    history_limiter.end()
+
+            resp = _history_request()
+            if not isinstance(resp, dict):
+                return pd.DataFrame()
+
             # Check for Invalid Token error
             if not resp.get('status') and resp.get('errorCode') == 'AG8001':
                 logger.warning("🔄 AngelOne History Session Expired (AG8001). Re-authenticating...")
                 if self.connect():
-                    resp = self.smart_api.getCandleData(params)
+                    resp = _history_request()
+                    if not isinstance(resp, dict):
+                        return pd.DataFrame()
                 else:
                     return pd.DataFrame()
 

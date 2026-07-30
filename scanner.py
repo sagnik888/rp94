@@ -1385,7 +1385,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             is_explosive_bypass=bool(getattr(candidate, "is_explosive_bypass", False)),
             is_reversion_scalp=bool(getattr(candidate, "is_reversion_scalp", False)),
             is_recovery=False,
-            is_ghost=True,
+            # The dashboard Execute button is a REAL order. This was is_ghost=True while
+            # the UI still reported "ORDER PENDING"/"submitted", so every dashboard
+            # execution created a virtual trade and nothing reached the broker — while
+            # the toast Execute (make_executor) passed is_ghost=False and was real. Two
+            # manual surfaces, opposite behaviour, no visible difference to the operator.
+            is_ghost=False,
             entry_time=datetime.now(IST),
             signal_time=getattr(candidate, "signal_timestamp", None),
             signal_fire_mode=getattr(candidate, "signal_fire_mode", "INTRACANDLE"),

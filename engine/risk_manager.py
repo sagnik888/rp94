@@ -65,6 +65,31 @@ class RiskManager:
                 setattr(self, k, v)
         logger.info(f"🛡️ RiskManager updated: {kwargs}")
 
+    @staticmethod
+    def _is_non_live_trade(trade) -> bool:
+        """Return true for virtual/replay rows that must not affect live risk.
+
+        The closed-trade loop below summed EVERY closed row into the daily budget while
+        the open-trade loop excluded ghosts, so virtual P&L drove the real circuit
+        breaker: ghost profits could mask real losses (breaker fails to fire) and ghost
+        losses could halt real trading. The scanner and dashboard already exclude these
+        rows from live counts/P&L; this keeps the same boundary in the breaker.
+        """
+        if trade is None or bool(getattr(trade, "is_ghost", False)):
+            return True
+        trade_id = str(getattr(trade, "id", "") or "")
+        if trade_id.startswith(("H_", "EOD_")):
+            return True
+        symbol = str(getattr(trade, "trading_symbol", "") or "").upper()
+        grade = str(getattr(trade, "grade", "") or "").upper()
+        if symbol == "FUT_SHADOW" or "FUT SHADOW" in grade:
+            return True
+        provenance = str(getattr(trade, "data_provenance", "") or "").upper()
+        return provenance in {
+            "HISTORICAL", "HISTORY", "HIST", "BACKTEST", "REPLAY",
+            "SIM", "SIMULATION", "PAPER_HIST",
+        }
+
     def _projected_stop_risk(self, trade) -> Optional[float]:
         """Return the worst remaining loss at the configured/protective stop.
 
@@ -192,6 +217,8 @@ class RiskManager:
 
         # 1. Closed Trades for today
         for t in closed_snapshot:
+            if self._is_non_live_trade(t):
+                continue
             try:
                 et = t.entry_time.astimezone(IST) if t.entry_time.tzinfo else IST.localize(t.entry_time)
                 if et.date() == today:
