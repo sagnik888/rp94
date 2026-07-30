@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     trading_mode: Literal["HISTORICAL", "REAL"] = "HISTORICAL"
     strategy_revision: str = "ut1-current"
     strategy_direction_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = "LONG_SHORT"
+    # Grade each candidate with its OWN timeframe's intelligence/regime. Today a single
+    # 5-minute snapshot grades every candidate, so 15-minute signals are scored on
+    # 5-minute intelligence. DEFAULT OFF because enabling it shifts grades and
+    # confidences system-wide — A/B it against archived sessions before turning it on.
+    per_timeframe_grading_enabled: bool = False
     active_indices: list[str] = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
     # Indices that must NEVER trade futures (route to options instead). Was set in
     # .env but never read by any code — so MIDCPNIFTY was reaching the FUT stop

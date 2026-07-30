@@ -403,6 +403,94 @@ class SignalProcessor:
         logger.info(message)
 
     @staticmethod
+    def _candidate_timeframe_context(
+        timeframe: str,
+        fallback_intel_result: Dict,
+        fallback_intel_score: float,
+        fallback_regime: str,
+        timeframe_contexts: Optional[Dict[str, Dict]] = None,
+    ) -> Tuple[Dict, float, str]:
+        """Return intelligence for a candidate's OWN timeframe.
+
+        process_best_signal receives a single intel_result/intel_score/regime (the 5-minute
+        snapshot) and grades every candidate with it, so 15-minute candidates were graded
+        on 5-minute intelligence and regime. `timeframe_contexts` is optional: when it is
+        absent or lacks an entry for `timeframe`, the caller's existing 5-minute values are
+        returned unchanged, so behaviour is identical to before.
+        """
+        fallback_result = fallback_intel_result if isinstance(fallback_intel_result, dict) else {}
+        context = (timeframe_contexts or {}).get(str(timeframe or ""))
+        if not isinstance(context, dict):
+            return fallback_result, float(fallback_intel_score or 0.0), str(fallback_regime or "UNKNOWN")
+
+        nested_result = context.get("intel_result")
+        result = nested_result if isinstance(nested_result, dict) else context
+        score = context.get("intel_score", context.get("score", fallback_intel_score))
+        try:
+            score = float(score or 0.0)
+        except (TypeError, ValueError):
+            score = float(fallback_intel_score or 0.0)
+        context_regime = context.get("regime", fallback_regime)
+        if isinstance(context_regime, dict):
+            context_regime = context_regime.get("regime", fallback_regime)
+        if not context_regime and isinstance(result, dict):
+            result_regime = result.get("regime", {})
+            context_regime = result_regime.get("regime") if isinstance(result_regime, dict) else result_regime
+        return result if isinstance(result, dict) else fallback_result, score, str(context_regime or "UNKNOWN")
+
+    @staticmethod
+    def _build_timeframe_contexts(scanner, instrument: str, settings) -> Optional[Dict[str, Dict]]:
+        """Collect each timeframe's own cached intelligence snapshot.
+
+        Returns None when the feature is disabled (the default), which makes
+        _candidate_timeframe_context fall back to the caller's 5-minute values and keeps
+        grading byte-identical to the previous behaviour.
+        """
+        enabled = getattr(settings, "per_timeframe_grading_enabled", False)
+        if not (enabled is True or str(enabled).strip().lower() in {"1", "true", "yes", "on"}):
+            return None
+        getter = getattr(scanner, "_cached_timeframe_intel", None)
+        if not callable(getter):
+            return None
+        contexts: Dict[str, Dict] = {}
+        for tf in ("1min", "5min", "15min"):
+            try:
+                intel = getter(instrument, tf, allow_fallback=False)
+            except Exception:
+                intel = None
+            if not isinstance(intel, dict):
+                continue
+            aggregate = intel.get("aggregate") if isinstance(intel.get("aggregate"), dict) else {}
+            regime_block = intel.get("regime") if isinstance(intel.get("regime"), dict) else {}
+            contexts[tf] = {
+                "intel_result": intel,
+                "intel_score": aggregate.get("score", aggregate.get("intel_score", 0.0)),
+                "regime": regime_block.get("regime") or regime_block.get("hard_label") or "",
+            }
+        return contexts or None
+
+    @staticmethod
+    def _direction_mode_allows(direction: str, settings) -> Tuple[bool, str]:
+        """Apply the configured strategy-side constraint to every entry path.
+
+        `strategy_direction_mode` was declared, persisted and displayed but never
+        enforced, so selecting LONG_ONLY / SHORT_ONLY did not actually restrict which
+        side could trade. Default LONG_SHORT allows both, so this is a no-op unless the
+        operator has deliberately narrowed the side.
+        """
+        mode = str(getattr(settings, "strategy_direction_mode", "LONG_SHORT") or "LONG_SHORT").upper()
+        side = str(direction or "").upper()
+        if side in {"BUY", "LONG"}:
+            side = "LONG"
+        elif side in {"SELL", "SHORT"}:
+            side = "SHORT"
+        if mode == "LONG_ONLY" and side == "SHORT":
+            return False, "Strategy direction mode LONG_ONLY blocks SHORT entries"
+        if mode == "SHORT_ONLY" and side == "LONG":
+            return False, "Strategy direction mode SHORT_ONLY blocks LONG entries"
+        return True, ""
+
+    @staticmethod
     def _live_signal_candle_is_closed(signal_ts: datetime, timeframe: str, now: datetime) -> bool:
         """Return whether a signal's source candle has finalized."""
         tf_minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(timeframe or ""), 5)
@@ -2314,6 +2402,10 @@ class SignalProcessor:
         if not scanner.risk_manager.can_trade("ANY"):
             return []
 
+        # None unless per_timeframe_grading_enabled is set, in which case each candidate
+        # is graded with its own timeframe's cached intelligence instead of the 5-minute one.
+        _timeframe_contexts = self._build_timeframe_contexts(scanner, instrument, settings)
+
         # Collect NEW signals from the normal entry TFs. Live mode also watches
         # 1min when: (a) 1M spike scalping is ON, or (b) post-exit reversion is
         # ON and this index has an open reversion window (decoupled toggles).
@@ -3918,6 +4010,17 @@ class SignalProcessor:
             last_time = naive_ts(scanner._last_signal_time[dedup_key])
             
             for sig in sigs:
+                # strategy_direction_mode was only ever persisted and displayed, never
+                # enforced, so LONG_ONLY / SHORT_ONLY did not actually restrict trading.
+                # No-op under the default LONG_SHORT.
+                _dir_ok, _dir_reason = self._direction_mode_allows(sig.signal_type, settings)
+                if not _dir_ok:
+                    scanner.log_signal_decision_once(
+                        f"{instrument}|{tf}|{sig.signal_type}|direction-mode",
+                        f"Signal rejected: {instrument} {sig.signal_type} {tf} - {_dir_reason}",
+                        "trade",
+                    )
+                    continue
                 s_ts = naive_ts(sig.timestamp)
                 l_ts = last_time
                 signal_identity = f"{s_ts.isoformat()}|{sig.signal_type}"
@@ -4075,16 +4178,22 @@ class SignalProcessor:
                                     "trade",
                                 )
                         
+                    # Grade each candidate with its OWN timeframe's intelligence when
+                    # per-timeframe grading is enabled; otherwise these resolve to the
+                    # caller's 5-minute values and grading is unchanged.
+                    _tf_intel_result, _tf_intel_score, _tf_regime = self._candidate_timeframe_context(
+                        tf, intel_result, intel_score, regime, _timeframe_contexts
+                    )
                     _live_session_ctx = (
-                        intel_result.get("session_context", {})
-                        if isinstance(intel_result, dict)
+                        _tf_intel_result.get("session_context", {})
+                        if isinstance(_tf_intel_result, dict)
                         else {}
                     )
                     grade, conf, reasons = scanner.signals._grade_signal(
                         sig,
                         mtf_result.confluence_score,
-                        intel_score,
-                        regime,
+                        _tf_intel_score,
+                        _tf_regime,
                         vix_value=vix_value,
                         day_type=str(_live_session_ctx.get("day_type") or ""),
                         day_type_confidence=float(_live_session_ctx.get("confidence") or 0.0),
