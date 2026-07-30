@@ -3030,7 +3030,12 @@ async def periodic_trades_updater():
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.error(f"Error in periodic trades updater: {exc}")
+            # Include the type: the common failure here is asyncio.TimeoutError from the
+            # 5s _call_on_scanner_loop budget under startup/scan contention, and its
+            # str() is empty — which logged a bare "Error in periodic trades updater:".
+            logger.error(
+                f"Error in periodic trades updater: {type(exc).__name__}: {exc or '(no message)'}"
+            )
 
 
 def _dashboard_heartbeat() -> Dict[str, Any]:
