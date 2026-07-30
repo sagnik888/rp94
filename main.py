@@ -321,6 +321,115 @@ def start_live_session_tracker_scheduler():
     ).start()
 
 
+def start_runtime_watchdog(scanner: Scanner, settings) -> None:
+    """Alert on the silent failure modes that unattended operation cannot tolerate.
+
+    Three real incidents motivated this:
+      * the scanner thread died while uvicorn kept serving, so the process looked alive
+        for hours with nothing scanning during market hours;
+      * Auto Mode is not persisted, so a restart silently reverts to manual and NOTHING
+        executes even though signals keep being produced;
+      * the Fyers access token expires ~06:00 daily and cannot auto-refresh (broker
+        returns code -16, "disabled to comply with SEBI regulations"), so the option
+        chain quietly disappears and OI/PCR/Greeks go blank.
+
+    Detection only — it never changes trading state, it just makes the failure loud.
+    """
+    if str(os.getenv("RUNTIME_WATCHDOG_ENABLED", "1")).strip().lower() in _FALSEY_ENV:
+        logger.info("Runtime watchdog disabled by RUNTIME_WATCHDOG_ENABLED.")
+        return
+
+    stale_after = float(os.getenv("RUNTIME_WATCHDOG_STALE_SECONDS", "180") or 180.0)
+    check_every = float(os.getenv("RUNTIME_WATCHDOG_INTERVAL_SECONDS", "60") or 60.0)
+    start_at = _parse_hhmm(os.getenv("RUNTIME_WATCHDOG_START", "09:15"), dt_time(9, 15))
+    stop_at = _parse_hhmm(os.getenv("RUNTIME_WATCHDOG_UNTIL", "15:30"), dt_time(15, 30))
+
+    def _alert(key: str, message: str, state: dict) -> None:
+        """CRITICAL + desktop notification, de-duplicated per incident."""
+        if state.get(key):
+            return
+        state[key] = True
+        logger.critical(f"WATCHDOG: {message}")
+        try:
+            scanner.log_event(f"WATCHDOG: {message}", "error")
+        except Exception:
+            pass
+        try:
+            send_desktop_notification(f"UT1 WATCHDOG: {message}", "error")
+        except Exception as exc:
+            logger.debug(f"Watchdog desktop alert unavailable: {exc}")
+
+    def _loop():
+        state: dict = {}
+        auto_mode_seen_on = False
+        while True:
+            try:
+                now = datetime.now(IST)
+                in_session = (
+                    now.weekday() < 5 and start_at <= now.time() <= stop_at
+                )
+
+                # 1. Scanner liveness — the dashboard staying up is NOT proof of life.
+                if in_session:
+                    last_scan = getattr(scanner, "last_scan_time", None)
+                    running = bool(getattr(scanner, "is_running", False))
+                    if not running:
+                        _alert("dead", "scanner is NOT running during market hours", state)
+                    elif last_scan is not None:
+                        try:
+                            last = last_scan if last_scan.tzinfo else IST.localize(last_scan)
+                            age = (now - last.astimezone(IST)).total_seconds()
+                        except Exception:
+                            age = 0.0
+                        if age > stale_after:
+                            _alert(
+                                "stale",
+                                f"no scan cycle for {age:.0f}s (threshold {stale_after:.0f}s)",
+                                state,
+                            )
+                        else:
+                            state.pop("stale", None)
+                            state.pop("dead", None)
+
+                # 2. Auto Mode silently reverting to OFF (it is never persisted).
+                auto_now = bool(getattr(scanner, "auto_mode", False))
+                if auto_now:
+                    auto_mode_seen_on = True
+                    state.pop("auto_off", None)
+                elif auto_mode_seen_on and in_session:
+                    _alert(
+                        "auto_off",
+                        "Auto Mode reverted to OFF during market hours - signals will "
+                        "NOT execute until it is re-enabled",
+                        state,
+                    )
+
+                # 3. Fyers auth — expires daily and cannot auto-refresh.
+                try:
+                    status = scanner.data.get_fyers_auth_status()
+                except Exception:
+                    status = {}
+                if status.get("auth_required"):
+                    _alert(
+                        "fyers",
+                        f"Fyers login required ({status.get('reason') or 'token invalid'}) - "
+                        f"option chain/OI/PCR unavailable until you visit "
+                        f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/fyers_login",
+                        state,
+                    )
+                else:
+                    state.pop("fyers", None)
+            except Exception as exc:
+                logger.debug(f"Runtime watchdog iteration failed: {exc}")
+            time.sleep(max(15.0, check_every))
+
+    threading.Thread(target=_loop, daemon=True, name="RuntimeWatchdog").start()
+    logger.info(
+        f"Runtime watchdog active (stale>{stale_after:.0f}s, "
+        f"{start_at.strftime('%H:%M')}-{stop_at.strftime('%H:%M')} IST)."
+    )
+
+
 def start_session_archiver_scheduler():
     """Archive each session's trades + real option-premium candles after the close.
 
@@ -744,6 +853,7 @@ def main():
             runtime["scanner_thread"] = scanner_thread
             scanner_thread.start()
             start_premarket_real_mode_worker(scanner, settings)
+            start_runtime_watchdog(scanner, settings)
         except Exception as exc:
             logger.exception(f"System bootstrap failed after dashboard start: {exc}")
 

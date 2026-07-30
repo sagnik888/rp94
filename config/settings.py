@@ -1044,7 +1044,11 @@ class Settings(BaseSettings):
     option_chain_background_workers: int = 2 # Bound full PCR/OI chain refreshes outside ScannerEventLoop
     option_chain_background_retry_cooldown_seconds: float = 5.0 # Avoid cold-chain retry storms after provider failure
     dynamic_subscription_background_workers: int = 2 # Bound slow WebSocket subscribe sends outside ScannerEventLoop
-    history_cache_ttl_seconds: float = 120.0 # Broker history cache TTL for candles/volume
+    history_cache_ttl_seconds: float = 240.0 # Broker history cache TTL for candles/volume
+    # Broker history request pacing (requests/second). Too aggressive a rate trips
+    # AngelOne's history limit, which forces the Yahoo fallback — and Yahoo reports
+    # volume=0 for Indian index tickers, killing every volume-gated entry path.
+    history_rate_limit_per_second: float = 0.35
     option_history_miss_ttl_seconds: float = 900.0
     live_index_timeout_seconds: float = 9.0 # Per-index live scan budget before serving a stale fallback that cycle. Raised 6->9 so heavy indices (SENSEX/BANKNIFTY, large option chains) finish during volatile periods. NOTE: this is a CAP, not a wait — fast indices still return early, so the higher cap costs nothing on healthy cycles.
     # Background broker position-reconciliation cadence. Base rate applies while

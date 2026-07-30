@@ -302,7 +302,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._live_processing_started: Dict[str, float] = {}
         self._live_inflight_skip_counts: Dict[str, int] = {}
         self._live_inflight_last_alert: Dict[str, float] = {}
-        self._history_rate_limiter = TokenBucket(capacity=1, fill_rate=0.7)
+        # Broker history pacing. 0.7/s against 4 indices x 3 timeframes self-inflicted
+        # AngelOne rate limits (189 hits on 2026-07-30), which forced 279 Yahoo fallbacks
+        # that same session — and Yahoo reports volume=0 for index tickers, so the whole
+        # volume pipeline went dead. Configurable so pacing can be tuned without a patch.
+        self._history_rate_limiter = TokenBucket(
+            capacity=1,
+            fill_rate=float(getattr(settings, "history_rate_limit_per_second", 0.35) or 0.35),
+        )
         self._session_trade_candidates: Dict[str, Dict[str, TradeCandidate]] = {}
         # Determine the current session day based on 9:15 AM rollover
         now_ist_init = datetime.now(IST)

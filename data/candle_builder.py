@@ -208,6 +208,7 @@ class CandleBuilder:
                     combined = pd.concat([existing, new_data])
                     combined = combined[~combined.index.duplicated(keep='last')]
                     combined = combined.sort_index()
+                    combined = self._restore_zeroed_volume(combined, existing)
                     if len(combined) > self.max_candles:
                         combined = combined.iloc[-self.max_candles:]
                     self._candles_1min[key] = combined
@@ -221,6 +222,35 @@ class CandleBuilder:
                 self._candles_5min[key] = self._merge_candles(self._candles_5min.get(key), new_data)
             elif timeframe == "15min":
                 self._candles_15min[key] = self._merge_candles(self._candles_15min.get(key), new_data)
+
+    @staticmethod
+    def _restore_zeroed_volume(combined, existing):
+        """Never let a zero-volume bar overwrite a bar that already had real volume.
+
+        The Yahoo fallback returns volume=0 for Indian index tickers (verified: ^NSEI /
+        ^NSEBANK report 0 on every bar), and AngelOne history rate-limiting forces that
+        fallback constantly. Because the merge keeps the LAST duplicate, those zeros were
+        overwriting genuine AngelOne volume — every index showed vol_sum=0 from
+        2026-07-27, which silently disabled every volume-gated entry path
+        (volume_spike_entry, reclaim/cascade volume votes, volume intelligence).
+        """
+        try:
+            if combined is None or existing is None:
+                return combined
+            if "volume" not in getattr(combined, "columns", []) or "volume" not in getattr(existing, "columns", []):
+                return combined
+            prior = existing[~existing.index.duplicated(keep="last")]["volume"]
+            overlap = combined.index.intersection(prior.index)
+            if len(overlap) == 0:
+                return combined
+            current = pd.to_numeric(combined.loc[overlap, "volume"], errors="coerce").fillna(0.0)
+            previous = pd.to_numeric(prior.loc[overlap], errors="coerce").fillna(0.0)
+            restore = (current <= 0) & (previous > 0)
+            if bool(restore.any()):
+                combined.loc[overlap[restore], "volume"] = previous[restore]
+        except Exception as exc:
+            logger.debug(f"Volume preservation skipped: {exc}")
+        return combined
 
     def _merge_candles(self, existing, new_data):
         """Merge new candle data with existing, deduplicate, trim"""
@@ -239,6 +269,7 @@ class CandleBuilder:
             combined = pd.concat([existing, new_data])
             combined = combined[~combined.index.duplicated(keep='last')]
             combined = combined.sort_index()
+            combined = self._restore_zeroed_volume(combined, existing)
             if len(combined) > self.max_candles:
                 combined = combined.iloc[-self.max_candles:]
             return combined
