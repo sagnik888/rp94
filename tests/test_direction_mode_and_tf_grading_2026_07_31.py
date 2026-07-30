@@ -121,3 +121,58 @@ def test_grading_call_uses_the_timeframe_context():
     src = inspect.getsource(SignalProcessor.process_best_signal)
     assert "_candidate_timeframe_context" in src
     assert "_tf_intel_score" in src and "_tf_regime" in src
+
+
+# ── dashboard A/B toggle wiring ──────────────────────────────────────────────
+
+def test_per_timeframe_grading_toggle_is_fully_wired():
+    """A whitelisted advanced field that is not ALSO forwarded, broadcast, and placed in
+    the General tab's System Controls list is silently dropped or invisible — both have
+    happened before in this codebase."""
+    from pathlib import Path
+    import dashboard.server as srv
+
+    assert "per_timeframe_grading_enabled" in srv._ADVANCED_CONFIG_FIELDS
+    assert "per_timeframe_grading_enabled" in srv._ADVANCED_BOOLEAN_CONFIG_FIELDS
+
+    root = Path(__file__).resolve().parents[1]
+    assert "per_timeframe_grading_enabled=msg.get(" in (
+        root / "dashboard" / "server.py").read_text(encoding="utf-8")
+    assert '"per_timeframe_grading_enabled": getattr(get_settings()' in (
+        root / "scanner.py").read_text(encoding="utf-8")
+
+    js = (root / "dashboard" / "static" / "js" / "dashboard-settings.js").read_text(encoding="utf-8")
+    assert "settPerTfGrading" in js
+    assert "cfg.per_timeframe_grading_enabled" in js
+    assert "per_timeframe_grading_enabled: document.getElementById" in js
+    assert "settPerTfGrading" in js.split("makeCard('settings-system'")[1].split("]))")[0]
+
+
+def test_toggle_applies_and_reverts_the_live_setting():
+    from types import SimpleNamespace as NS
+    from config.settings import get_settings
+
+    settings = get_settings()
+    original = settings.per_timeframe_grading_enabled
+    try:
+        sc = SignalProcessor  # noqa: F841 - import guard only
+        from scanner import Scanner
+
+        s = Scanner.__new__(Scanner)
+        s.mode = "HISTORICAL"
+        s.auto_mode = False
+        s.on_notification = None
+        s.futures_sl_pct, s.options_sl_pct, s.max_daily_loss_pct = 0.3, 15.0, 3.0
+        s.risk_fut_pct, s.risk_opt_pct = 2.0, 8.0
+        s.capital_fut, s.capital_opt, s.capital_total = 250000.0, 100000.0, 1100000.0
+        s.trades = NS(update_risk_settings=lambda *a, **k: None, has_live_exposure=lambda: False)
+        s.risk_manager = NS(update_settings=lambda *a, **k: None)
+        s._publish_config_snapshot = lambda *a, **k: None
+        s.mtf = NS(apply_engine_params=lambda *a, **k: None)
+
+        assert s.configure(per_timeframe_grading_enabled=True, persist_settings=False) is True
+        assert get_settings().per_timeframe_grading_enabled is True
+        assert s.configure(per_timeframe_grading_enabled=False, persist_settings=False) is True
+        assert get_settings().per_timeframe_grading_enabled is False
+    finally:
+        settings.per_timeframe_grading_enabled = original

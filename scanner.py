@@ -2161,6 +2161,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # already captures the give-back more cheaply).
             "pullback_hedge_enabled": getattr(get_settings(), "pullback_hedge_enabled", False),
             "stop_out_reentry_enabled": getattr(get_settings(), "stop_out_reentry_enabled", True),
+            "per_timeframe_grading_enabled": getattr(get_settings(), "per_timeframe_grading_enabled", False),
             "stop_out_reentry_window_minutes": getattr(get_settings(), "stop_out_reentry_window_minutes", 30.0),
             "stop_out_reentry_max_per_index": getattr(get_settings(), "stop_out_reentry_max_per_index", 1),
             "stop_out_reentry_min_adx": getattr(get_settings(), "stop_out_reentry_min_adx", 25.0),

@@ -548,6 +548,7 @@ _ADVANCED_CONFIG_FIELDS = {
     # captures the give-back more cheaply). Exposed so the operator can A/B it.
     "pullback_hedge_enabled",
     "stop_out_reentry_enabled",
+    "per_timeframe_grading_enabled",
     "stop_out_reentry_window_minutes",
     "stop_out_reentry_max_per_index",
     "stop_out_reentry_min_adx",
@@ -559,6 +560,7 @@ _ADVANCED_CONFIG_FIELDS = {
 _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
     "pullback_hedge_enabled",
     "stop_out_reentry_enabled",
+    "per_timeframe_grading_enabled",
     "lean_routing_to_options",
     "price_action_module_enabled",
     "price_action_block_adverse",
@@ -1656,6 +1658,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 # Pullback hedge (operator A/B; ships OFF — see _ADVANCED_CONFIG_FIELDS).
                 # Must be forwarded explicitly: whitelisting alone silently drops the
                 # control (2026-07-10 regression noted above).
+                per_timeframe_grading_enabled=msg.get("per_timeframe_grading_enabled"),
                 stop_out_reentry_enabled=msg.get("stop_out_reentry_enabled"),
                 stop_out_reentry_window_minutes=msg.get("stop_out_reentry_window_minutes"),
                 stop_out_reentry_max_per_index=msg.get("stop_out_reentry_max_per_index"),

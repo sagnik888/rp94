@@ -247,6 +247,18 @@ function setupSettingsExperience() {
         `;
         body.appendChild(soCard);
     }
+    if (!document.getElementById('settPerTfGrading')) {
+        const tfCard = document.createElement('label');
+        tfCard.className = 'settings-switch-card';
+        tfCard.innerHTML = `
+            <span>
+                <strong>Per-Timeframe Grading (A/B)</strong>
+                <small>OFF by default. Grades each candidate with its OWN timeframe's intelligence. Today one 5m snapshot grades everything, so 15m signals are scored on 5m context (they differ in 83% of samples). Changes grades/confidence system-wide — A/B before enabling.</small>
+            </span>
+            <input type="checkbox" id="settPerTfGrading">
+        `;
+        body.appendChild(tfCard);
+    }
     if (!document.getElementById('settEngineLab')) {
         const engineLabCard = document.createElement('label');
         engineLabCard.className = 'settings-switch-card';
@@ -385,6 +397,7 @@ function setupSettingsExperience() {
         // Keep the hedge A/B next to Auto Mode: both govern execution behaviour, and
         // further down the list it fell below the visible fold of the settings panel.
         document.getElementById('settStopOutReentry')?.closest('.settings-switch-card'),
+        document.getElementById('settPerTfGrading')?.closest('.settings-switch-card'),
         document.getElementById('settPullbackHedge')?.closest('.settings-switch-card'),
         document.getElementById('settFuturesShadow')?.closest('.settings-switch-card'),
         document.getElementById('settEngineLab')?.closest('.settings-switch-card'),
@@ -735,6 +748,8 @@ function syncSettingsFromConfig(data) {
         if (hedgeEl) hedgeEl.checked = cfg.pullback_hedge_enabled === true;
         const soEl = document.getElementById('settStopOutReentry');
         if (soEl) soEl.checked = cfg.stop_out_reentry_enabled !== false;
+        const tfEl = document.getElementById('settPerTfGrading');
+        if (tfEl) tfEl.checked = cfg.per_timeframe_grading_enabled === true;
         setChecked('settEngineLab', cfg.engine_lab_enabled !== undefined ? cfg.engine_lab_enabled : true);
         setChecked('settEngineLabRealOnly', cfg.engine_lab_real_mode_only === true);
         const signalModeEl = document.getElementById('settIntrabarSignals');
@@ -1047,6 +1062,7 @@ function saveSettings() {
         futures_shadow_enabled: document.getElementById('settFuturesShadow')?.checked === true,
         pullback_hedge_enabled: document.getElementById('settPullbackHedge')?.checked === true,
         stop_out_reentry_enabled: document.getElementById('settStopOutReentry')?.checked !== false,
+        per_timeframe_grading_enabled: document.getElementById('settPerTfGrading')?.checked === true,
         engine_lab_enabled: document.getElementById('settEngineLab')?.checked !== false,
         engine_lab_real_mode_only: document.getElementById('settEngineLabRealOnly')?.checked === true,
         signal_fire_mode: document.getElementById('settIntrabarSignals')?.checked === false
