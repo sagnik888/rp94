@@ -524,6 +524,12 @@ class Settings(BaseSettings):
     # the looser runner trail to a 15-minute trade on a 5-minute reading. Set False to
     # restore the previous borrow-and-assume behaviour.
     trend_runner_require_own_timeframe_regime: bool = True
+    # A HISTORICAL replay writes the regime it computed from PAST candles into the same
+    # intelligence caches live management reads, stamped with the current wall clock — so
+    # without this purge the replayed label is served as fresh live intel for a full
+    # intelligence_cache_ttl_seconds after switching back to REAL. Set False to restore
+    # the old carry-over behaviour.
+    purge_intel_cache_on_mode_change: bool = True
     trend_runner_engage_before_target_enabled: bool = True
     # ── Pullback hedge (Phase 3, operator design 2026-07-24) ──────────────────
     # While a proven runner (>= the 0.4R crossover) is riding a confirmed trend, an

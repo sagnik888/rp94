@@ -3700,6 +3700,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if mode == "HISTORICAL" or old_mode == "HISTORICAL":
                 needs_full_refresh = True
                 self._hist_candidates_loaded = False
+                # Replayed regimes are written into the SAME caches live management reads,
+                # stamped as current. Purge on both edges: leaving HISTORICAL so live
+                # trailing never trails on a past session's label, entering it so the
+                # replay starts deterministically instead of from live intelligence.
+                if self._setting_enabled(
+                    getattr(settings, "purge_intel_cache_on_mode_change", True), True
+                ):
+                    self._purge_intel_regime_caches(reason=f"mode_{old_mode}_to_{mode}")
 
             # Leaving HISTORICAL (or entering REAL/PAPER): strip same-day ghosts so
             # live budgets / opposite-trade guards never see simulation rows.
@@ -6613,6 +6621,36 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             getattr(self, "_intel_cache_time", {}).pop(name, None)
             getattr(self, "_last_intel_fetch", {}).pop(name, None)
             getattr(self, "latest_regimes", {}).pop(name, None)
+
+    def _purge_intel_regime_caches(self, reason: str = "") -> int:
+        """Drop every cached intelligence/regime label. Used on HISTORICAL transitions.
+
+        A replay calls _process_instrument exactly like a live scan, so it writes the
+        regime it computed from *past* candles into `_intel_cache` / `_timeframe_regimes`
+        / `latest_regimes` — stamped with `time.time()`, i.e. as if it were current. The
+        mode switch purges trade ledgers (`_purge_session_contamination`) but left these
+        untouched, so on the way back to REAL the replayed label was served as fresh live
+        intelligence for the whole `intelligence_cache_ttl_seconds` window, actively
+        suppressing the real refresh that would have corrected it.
+
+        Purging is fail-safe in both directions: a missing label reads as UNKNOWN, which
+        entry treats as choppy (stricter grade floor), runner mode treats as
+        not-own-timeframe (tighter give-back trail), and no exit path keys on. The only
+        cost is one intelligence recomputation per instrument on the next scan.
+        """
+        cleared = 0
+        for attr in ("_intel_cache", "_intel_cache_time", "_last_intel_fetch",
+                     "_timeframe_regimes", "latest_regimes"):
+            cache = getattr(self, attr, None)
+            if isinstance(cache, dict) and cache:
+                cleared += len(cache)
+                cache.clear()
+        if cleared:
+            logger.info(
+                f"🧹 Intelligence/regime caches purged ({cleared} entries) — {reason or 'mode change'}. "
+                "Next scan recomputes from live candles."
+            )
+        return cleared
 
     def _trade_regime_is_own_timeframe(self, trade_like) -> bool:
         """Whether a regime label exists for the trade's OWN timeframe.

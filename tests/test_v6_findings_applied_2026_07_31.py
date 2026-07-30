@@ -156,3 +156,59 @@ def test_historical_choppy_floor_is_intentionally_looser():
     assert grade_min_confidence("B") == 0.40
     assert grade_min_confidence("A") == 0.70
     assert min(grade_min_confidence("B"), 0.62) == 0.40
+
+
+# ── replayed regimes must not survive back into live management ──────────────
+
+def _contaminated():
+    key = Scanner._timeframe_intel_key
+    sc = Scanner.__new__(Scanner)
+    sc._intel_cache = {key("NIFTY", "15min"): {"regime": {"regime": "TRENDING_UP"}},
+                       "NIFTY": {"regime": {"regime": "TRENDING_UP"}}}
+    sc._intel_cache_time = {key("NIFTY", "15min"): 1.0, "NIFTY": 1.0}
+    sc._last_intel_fetch = {key("NIFTY", "15min"): 1.0}
+    sc._timeframe_regimes = {key("NIFTY", "15min"): "TRENDING_UP"}
+    sc.latest_regimes = {"NIFTY": "TRENDING_UP"}
+    return sc
+
+
+def test_purge_clears_every_regime_and_intel_cache():
+    sc = _contaminated()
+    assert sc._purge_intel_regime_caches(reason="test") == 7
+    for attr in ("_intel_cache", "_intel_cache_time", "_last_intel_fetch",
+                 "_timeframe_regimes", "latest_regimes"):
+        assert getattr(sc, attr) == {}, f"{attr} still holds replayed state"
+
+
+def test_purge_is_idempotent_and_safe_on_a_bare_scanner():
+    assert Scanner.__new__(Scanner)._purge_intel_regime_caches() == 0
+    sc = _contaminated()
+    sc._purge_intel_regime_caches()
+    assert sc._purge_intel_regime_caches() == 0
+
+
+def test_purged_state_is_fail_safe_not_fail_open():
+    """A missing label must DENY the runner privilege, never grant it."""
+    sc = _contaminated()
+    sc._purge_intel_regime_caches()
+    assert sc._trade_regime_is_own_timeframe(_trade("15min")) is False
+    assert sc._get_trade_regime(_trade("15min")) == "UNKNOWN"
+
+
+def test_configure_purges_on_both_historical_edges():
+    import inspect
+    src = inspect.getsource(Scanner.configure)
+    body = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+    assert "_purge_intel_regime_caches" in body
+    # Must sit under the branch that fires for BOTH directions of the transition.
+    guard = 'if mode == "HISTORICAL" or old_mode == "HISTORICAL":'
+    assert guard in body
+    after = body.split(guard, 1)[1]
+    assert "_purge_intel_regime_caches" in after.split("\n\n")[0] or \
+           "_purge_intel_regime_caches" in after[:900]
+    assert "purge_intel_cache_on_mode_change" in body
+
+
+def test_purge_is_revertible_by_setting():
+    from config.settings import Settings
+    assert Settings(_env_file=None).purge_intel_cache_on_mode_change is True
