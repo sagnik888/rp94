@@ -267,6 +267,10 @@ class RegimeTracker:
                 "timeframe": str(_candidate_value(candidate, "graded_timeframe", "") or ""),
                 "intel_score": _safe_float(_candidate_value(candidate, "graded_intel_score", 0.0)),
                 "regime": str(_candidate_value(candidate, "graded_regime", "") or ""),
+                # What each pillar actually contributed. The three collapse into one
+                # confidence before anything is recorded, so without this a rejected B+
+                # and a taken A+ are indistinguishable beyond the score itself.
+                "pillars": _candidate_value(candidate, "grade_pillars", {}) or {},
             },
             "contract": {
                 "trading_symbol": str(_candidate_value(candidate, "trading_symbol", "") or ""),

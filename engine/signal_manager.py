@@ -303,6 +303,7 @@ class SignalManager:
         else:
             confidence = max(0.0, min(1.0, 0.5 + total_score))
         confidence = max(0.0, min(1.0, confidence))
+        _confidence_pre_adjust = confidence
         # R5: optional isotonic calibration to realized win-rate (default OFF;
         # no-op until the outcome dataset is ready). Makes confidence a probability.
         try:
@@ -373,6 +374,28 @@ class SignalManager:
         # Grade is purely a display bucket of confidence — single source of truth
         # lives in engine.signal_quality_policy.confidence_to_grade.
         grade = confidence_to_grade(confidence)
+
+        # ── Pillar breakdown telemetry ──
+        # The three pillars collapse into one number before anything is recorded, so a
+        # rejected B+ and a taken A+ looked identical in the tape apart from the score —
+        # there was no way to tell whether a grade came from technicals, from intel, or
+        # from the regime bonus, nor which post-hoc adjustment moved it. Written onto the
+        # signal (which IS the candidate object at every call site) so it rides through to
+        # rtracker without changing this function's return arity.
+        try:
+            setattr(signal, "grade_pillars", {
+                "tech": round(float(tech_score), 4),
+                "intel": round(float(intel_score_part), 4),
+                "regime": round(float(regime_score), 4),
+                "vix_penalty": round(float(vix_penalty), 4),
+                "total_score": round(float(total_score), 4),
+                "confidence_pre_adjust": round(float(_confidence_pre_adjust), 4),
+                "confidence_final": round(float(confidence), 4),
+                "adjustments": round(float(confidence - _confidence_pre_adjust), 4),
+                "grade": str(grade),
+            })
+        except Exception as exc:  # telemetry must never break grading
+            logger.debug(f"Pillar breakdown telemetry unavailable: {exc}")
 
         return grade, confidence, reasons
 

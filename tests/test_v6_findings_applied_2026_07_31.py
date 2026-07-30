@@ -212,3 +212,83 @@ def test_configure_purges_on_both_historical_edges():
 def test_purge_is_revertible_by_setting():
     from config.settings import Settings
     assert Settings(_env_file=None).purge_intel_cache_on_mode_change is True
+
+
+# ── pillar breakdown telemetry (grading was a black box) ─────────────────────
+
+def _signal(**over):
+    """A real UTBotSignal — a hand-rolled stub silently misses required fields."""
+    from datetime import datetime as _dt
+
+    from engine.ut_bot_core import UTBotSignal
+    kwargs = dict(
+        timestamp=_dt(2026, 7, 31, 10, 15), signal_type="BUY", price=100.0,
+        trailing_stop=96.0, stop_distance=4.0, atr_value=2.0, adx_value=22.0,
+        position_state=1, bar_index=50, instrument="NIFTY", timeframe="5min",
+    )
+    kwargs.update(over)
+    return UTBotSignal(**kwargs)
+
+
+def _graded_signal(**over):
+    from engine.signal_manager import SignalManager
+    sig = _signal(**over)
+    sm = SignalManager.__new__(SignalManager)
+    grade, conf, _ = SignalManager._grade_signal(sm, sig, 0.6, 0.5, regime="TRENDING_UP")
+    return sig, grade, conf
+
+
+def test_pillar_breakdown_is_attached_to_the_graded_signal():
+    sig, grade, conf = _graded_signal()
+    pillars = getattr(sig, "grade_pillars", None)
+    assert isinstance(pillars, dict) and pillars, "grading is still a black box"
+    for field in ("tech", "intel", "regime", "vix_penalty", "total_score",
+                  "confidence_pre_adjust", "confidence_final", "adjustments", "grade"):
+        assert field in pillars, f"missing pillar field {field}"
+    assert pillars["grade"] == grade
+
+
+def test_pillars_reconcile_with_the_reported_confidence():
+    sig, _, conf = _graded_signal()
+    p = sig.grade_pillars
+    # total_score is exactly the pillar sum minus the VIX penalty...
+    assert abs(p["total_score"] - (p["tech"] + p["intel"] + p["regime"] - p["vix_penalty"])) < 1e-3
+    # ...and the recorded final confidence is the one actually returned.
+    assert abs(p["confidence_final"] - conf) < 1e-3
+    assert abs(p["adjustments"] - (p["confidence_final"] - p["confidence_pre_adjust"])) < 1e-3
+
+
+def test_post_hoc_adjustment_is_visible_not_hidden():
+    """The ADX>40 exhaustion cap must show up as a negative adjustment, not vanish."""
+    sig, _, conf = _graded_signal(adx_value=45.0)
+    p = sig.grade_pillars
+    if p["confidence_pre_adjust"] > 0.82:
+        assert p["adjustments"] < 0, "exhaustion cap applied but not recorded"
+        assert abs(p["confidence_final"] - 0.82) < 1e-3
+
+
+def test_rtracker_forwards_the_breakdown():
+    import inspect
+    import intelligence.rtracker as rt
+    src = inspect.getsource(rt)
+    assert '"pillars"' in src and "grade_pillars" in src
+
+
+def test_grading_never_breaks_when_telemetry_cannot_attach():
+    """A signal that refuses the telemetry setattr must still grade normally."""
+    from engine.signal_manager import SignalManager
+
+    sig = _signal()
+
+    class _Frozen(type(sig)):
+        def __setattr__(self, name, value):
+            if name == "grade_pillars":
+                raise AttributeError("frozen")
+            object.__setattr__(self, name, value)
+
+    sig.__class__ = _Frozen
+    grade, conf, _ = SignalManager._grade_signal(
+        SignalManager.__new__(SignalManager), sig, 0.6, 0.5, regime="TRENDING_UP"
+    )
+    assert isinstance(grade, str) and 0.0 <= conf <= 1.0
+    assert not hasattr(sig, "grade_pillars")
