@@ -283,6 +283,35 @@ def _entry_cutoff(settings, timeframe: str):
     return label, datetime.strptime(label, "%H:%M").time()
 
 
+#: Grading telemetry lives on the graded UTBotSignal, but TradeCandidate is built fresh
+#: field-by-field and rtracker reads these off the CANDIDATE — so without an explicit hop
+#: every `grading` block logged empty. Keep this list in sync with rtracker's grading block.
+GRADING_TELEMETRY_ATTRS = (
+    "graded_timeframe",
+    "graded_intel_score",
+    "graded_regime",
+    "grade_pillars",
+)
+
+
+def carry_grading_telemetry(candidate, signal) -> None:
+    """Copy grading telemetry from the graded signal onto the candidate that is recorded.
+
+    `_grade_signal` attaches the pillar breakdown to the signal, and the per-timeframe
+    grading context is set on that same object. TradeCandidate does not inherit from it,
+    so this hop is what makes either visible in the decision tape. Telemetry only — it
+    must never raise into the signal path.
+    """
+    for name in GRADING_TELEMETRY_ATTRS:
+        value = getattr(signal, name, None)
+        if value is None:
+            continue
+        try:
+            setattr(candidate, name, value)
+        except Exception:  # pragma: no cover - dataclass always accepts these
+            pass
+
+
 @dataclass
 class TradeCandidate:
     instrument: str
@@ -4325,6 +4354,7 @@ class SignalProcessor:
                 status=status_msg,
                 action="NO_ENTRY"
             )
+            carry_grading_telemetry(rej, sig)
             src_engine = str(getattr(sig, "source_engine", "") or "").lower()
             src_engines = [
                 str(src).lower()
@@ -6017,6 +6047,7 @@ class SignalProcessor:
                     if inst_type == "OPT"
                     else "contract_ltp"
                 )
+                carry_grading_telemetry(candidate, best_sig)
                 setattr(candidate, "source_signal_type", best_sig.signal_type)
                 setattr(candidate, "source_signal_price", float(best_sig.price or 0.0))
                 setattr(candidate, "source_signal_bar_index", int(getattr(best_sig, "bar_index", -1) or -1))

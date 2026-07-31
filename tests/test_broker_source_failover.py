@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import data.market_data as market_data_module
 from data.market_data import FYERS_INDEX_SYMBOLS, MarketDataProvider
 from scanner import Scanner
 from trading.broker import SmartApiBroker
@@ -234,7 +235,12 @@ def test_index_quote_fails_over_to_fyers_when_angel_tick_is_stale(monkeypatch):
 
 def test_index_quote_recomputes_ws_change_from_fyers_previous_close(monkeypatch):
     provider = _provider(monkeypatch)
+    # Freeze the clock. The tick is staged 0.25s old against a 6s Angel-authoritative
+    # window (_select_index_ws_quote), but the code re-reads time.time() itself — so
+    # any stall between the two reads (the suite runs a sqlite VACUUM) aged the tick
+    # past 6s and failed the test intermittently. Nothing here is about elapsed time.
     now = time.time()
+    monkeypatch.setattr(market_data_module.time, "time", lambda: now)
     provider._ws_cache["99926009"] = {
         "ltp": 58429.25,
         "time": now - 0.25,
