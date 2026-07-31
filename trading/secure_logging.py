@@ -42,6 +42,31 @@ class SensitiveDataFilter(logging.Filter):
         return True
 
 
+class _SdkToLoguruHandler(logging.Handler):
+    """Forward SmartAPI's logzero records into the application log.
+
+    The SDK reports the broker's ACTUAL failure reason through its own logger — see
+    SmartApi/smartConnect.py `_request` ("Error occurred while making a POST request ...
+    Error: {message}") and `placeOrderFullResponse` ("API request failed: {response}" /
+    "Invalid response format: {response}"). None of it reached ut1.log, because logzero is
+    a separate logger from the application's, so an order that AngelOne refused arrived in
+    our code as an unexplained response and was reported only as "acknowledgement is
+    ambiguous". Records pass through SensitiveDataFilter first, so tokens stay redacted.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from loguru import logger as _loguru
+
+            message = redact_sensitive_text(str(record.getMessage()))
+            level = record.levelname if record.levelname in {
+                "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+            } else "INFO"
+            _loguru.bind(sdk="smartapi").log(level, f"[SmartAPI] {message}")
+        except Exception:
+            pass
+
+
 def install_smartapi_log_redaction() -> bool:
     """Install one logger-level filter on the logzero logger used by SmartAPI."""
     try:
@@ -54,6 +79,15 @@ def install_smartapi_log_redaction() -> bool:
             log_filter = SensitiveDataFilter()
             sdk_logger.addFilter(log_filter)
             setattr(sdk_logger, marker, log_filter)
+
+        # Also mirror the SDK's own diagnostics into ut1.log. Without this the broker's
+        # reason for refusing an order is written only to logzero's handlers and is lost.
+        capture_marker = "_ut_sdk_capture_handler"
+        if getattr(sdk_logger, capture_marker, None) is None:
+            handler = _SdkToLoguruHandler()
+            handler.setLevel(logging.INFO)
+            sdk_logger.addHandler(handler)
+            setattr(sdk_logger, capture_marker, handler)
         return True
     except Exception:
         return False

@@ -110,6 +110,31 @@ class Broker:
             "matches": [],
         }
 
+    def inspect_recent_entry_order(
+        self,
+        symbol: str,
+        token: str = "",
+        side: str = "",
+        quantity: int = 0,
+    ) -> Dict[str, Any]:
+        """Did an ENTRY order for this contract actually reach the exchange?
+
+        Tri-state, and the distinction is the whole point:
+          FOUND   - an order exists; adopt its id, never place another
+          ABSENT  - the order book was read successfully and contains nothing, so the
+                    placement definitively failed and the trade can be closed out cleanly
+          UNKNOWN - we could not read the order book; the caller MUST stay ambiguous
+
+        Only a successful scan may return ABSENT. A failed scan says UNKNOWN so a lost
+        acknowledgement can never be mistaken for "not placed".
+        """
+        return {
+            "state": "UNKNOWN",
+            "order_id": "",
+            "reason": "broker does not support entry-order inspection",
+            "matches": [],
+        }
+
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
         return False
 
@@ -862,8 +887,36 @@ class SmartApiBroker(Broker):
                 order_id = str(response or "")
 
             if not order_id or order_id == "None":
+                # Record what the broker actually said. This raise used to be silent, so a
+                # refused order surfaced only as "acknowledgement is ambiguous" with no
+                # trace of the reason anywhere in the log.
+                logger.error(
+                    f"Entry order for {symbol} returned no order id. Raw broker response: {response!r}"
+                )
+                # "No order id" is not automatically unknowable. Ask the order book whether
+                # anything for this contract actually reached the exchange: a CONFIRMED
+                # miss can be reported as a clean failure instead of parking the trade in
+                # RECOVERY_REQUIRED limbo, which is what stranded a trade today. Only a
+                # lookup that finds an order, or that itself fails, stays ambiguous — we
+                # never conclude "not placed" from a scan we could not complete.
+                resting = self.inspect_recent_entry_order(symbol, token, side, qty)
+                state = str(resting.get("state") or "UNKNOWN").upper()
+                if state == "ABSENT":
+                    logger.error(
+                        f"Order book confirms no {side} order exists for {symbol}; "
+                        "treating as a clean rejection rather than an ambiguous acknowledgement."
+                    )
+                    return None
+                if state == "FOUND":
+                    found_id = str(resting.get("order_id") or "")
+                    logger.warning(
+                        f"Recovered entry order id {found_id} for {symbol} from the order "
+                        "book after a missing acknowledgement."
+                    )
+                    return found_id or None
                 raise BrokerOrderAmbiguous(
-                    f"Broker acknowledgement ambiguous; no order id returned: {response}"
+                    f"Broker acknowledgement ambiguous; no order id returned and the order-book "
+                    f"scan was inconclusive ({resting.get('reason') or 'unknown'}): {response}"
                 )
 
             logger.success(f"REAL ORDER PLACED: {order_id} ({exchange})")
@@ -945,6 +998,83 @@ class SmartApiBroker(Broker):
             product_type="",
         )
         return str(result.get("order_id") or "") if result.get("state") == "FOUND" else ""
+
+    def inspect_recent_entry_order(
+        self,
+        symbol: str,
+        token: str = "",
+        side: str = "",
+        quantity: int = 0,
+    ) -> Dict[str, Any]:
+        """Scan the order book for a non-stop entry order on this contract.
+
+        Used after a placement returns no order id, to tell a rejected order (nothing at
+        the exchange) apart from a lost acknowledgement (order may be live). Getting this
+        wrong in the 'absent' direction would re-place a live order, so a scan that cannot
+        be completed returns UNKNOWN and the caller stays ambiguous.
+        """
+        if not symbol:
+            return {"state": "UNKNOWN", "order_id": "", "reason": "entry symbol is empty", "matches": []}
+        try:
+            response = self._api_call(
+                "scan order book for entry",
+                lambda: self.api.orderBook(),
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.warning(f"Entry order-book scan failed for {symbol}: {exc}")
+            return {"state": "UNKNOWN", "order_id": "", "reason": f"order-book scan failed: {exc}", "matches": []}
+        if (
+            not isinstance(response, dict)
+            or response.get("status") is False
+            or response.get("errorcode")
+            or not isinstance(response.get("data", []), list)
+        ):
+            return {
+                "state": "UNKNOWN",
+                "order_id": "",
+                "reason": f"order-book response is invalid/rejected: {response}",
+                "matches": [],
+            }
+
+        want_side = str(side or "").upper()
+        want_qty = max(0, int(quantity or 0))
+        matches = []
+        for row in response.get("data", []) or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("tradingsymbol") or "") != str(symbol):
+                continue
+            # Protective stops are a different animal and are inspected separately.
+            variety = str(row.get("variety") or "").upper()
+            ordertype = str(row.get("ordertype") or "").upper()
+            if "STOPLOSS" in variety or "STOPLOSS" in ordertype:
+                continue
+            if want_side and str(row.get("transactiontype") or "").upper() != want_side:
+                continue
+            if want_qty:
+                try:
+                    row_qty = int(float(row.get("quantity") or 0))
+                except (TypeError, ValueError):
+                    row_qty = 0
+                if row_qty != want_qty:
+                    continue
+            status = str(row.get("orderstatus") or row.get("status") or "").strip().lower().replace("_", " ")
+            # A rejected/cancelled order never reached a working state: it is not something
+            # to adopt, and it must not make us think an order is live.
+            if status in {"rejected", "cancelled", "canceled", "expired", "lapsed"}:
+                continue
+            matches.append(dict(row))
+
+        if not matches:
+            return {"state": "ABSENT", "order_id": "", "reason": "order book has no live entry for this contract", "matches": []}
+        best = matches[0]
+        return {
+            "state": "FOUND",
+            "order_id": str(best.get("orderid") or best.get("uniqueorderid") or ""),
+            "reason": f"{len(matches)} live entry order(s) found",
+            "matches": matches,
+        }
 
     def inspect_working_protective_stop(
         self,
