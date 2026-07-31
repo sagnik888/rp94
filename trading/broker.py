@@ -304,9 +304,26 @@ class SmartApiBroker(Broker):
         )
 
     def _require_account_execution_lease(self, action: str) -> None:
-        if not self.has_execution_lease():
-            reason = self.execution_lease_block_reason()
-            raise PermissionError(f"{action} blocked: {reason}")
+        if self.has_execution_lease():
+            return
+        # Claim it on demand before refusing. The lease was previously acquired ONLY at
+        # startup in main.py, and only when trading_mode was already REAL — so a process
+        # that reached REAL through a runtime mode switch never asked for it and had every
+        # order blocked by "owned by another UT1 process" while the OS lock sat FREE and
+        # the named owner was a pid that had exited the previous day (the message reads
+        # stale metadata out of the lock file).
+        #
+        # This cannot let two processes execute at once: the underlying acquire is an
+        # exclusive non-blocking OS file lock, so a genuine live holder still refuses us
+        # here and we fail closed exactly as before.
+        if self.acquire_execution_lease():
+            logger.warning(
+                f"Acquired the REAL account execution lease on demand before {action}; "
+                "it had not been claimed by this process."
+            )
+            return
+        reason = self.execution_lease_block_reason()
+        raise PermissionError(f"{action} blocked: {reason}")
 
     @staticmethod
     def _exchange_for_symbol(symbol: str) -> str:

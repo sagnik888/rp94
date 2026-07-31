@@ -3731,13 +3731,44 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
                     if self.data.is_connected:
                         from trading.broker import SmartApiBroker
-                        new_real_broker = SmartApiBroker(self.data.smart_api)
+                        # account_id/instance_id are REQUIRED for the cross-process
+                        # execution lease. Without account_id the broker builds no lease
+                        # at all and every guard silently fails OPEN — two UT1 processes
+                        # could then net each other's positions on one account, which is
+                        # the exact thing the lease exists to prevent.
+                        new_real_broker = SmartApiBroker(
+                            self.data.smart_api,
+                            account_id=getattr(settings, "angelone_client_id", ""),
+                            instance_id=f"UT1:{getattr(settings, 'dashboard_port', '')}",
+                        )
                         self.trades.real_broker = new_real_broker
                         logger.info("âœ… Dynamic Broker Connection Successful")
                     else:
                         logger.error("â Œ CRITICAL: Failed to connect AngelOne for REAL mode!")
 
                 if hasattr(self.trades, "real_broker") and self.trades.real_broker:
+                    # Claim the cross-process account lease as part of entering REAL.
+                    # It used to be acquired only in main.py at startup, and only when
+                    # trading_mode was ALREADY REAL — so every session that reached REAL
+                    # via this switch (which is the normal premarket path) ran with an
+                    # unclaimed lease and had all its orders refused at execution time.
+                    acquire = getattr(self.trades.real_broker, "acquire_execution_lease", None)
+                    if callable(acquire) and not acquire():
+                        reason = ""
+                        reader = getattr(
+                            self.trades.real_broker, "execution_lease_block_reason", None
+                        )
+                        if callable(reader):
+                            reason = reader()
+                        reason = reason or "REAL broker account is owned by another UT1 process"
+                        logger.critical(f"â Œ REAL mode refused: {reason}")
+                        self._last_configure_block_reason = reason
+                        self.mode = "HISTORICAL"  # fail closed, never trade unprotected
+                        self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
+                        self.trades.mode = self.mode
+                        if self.on_notification:
+                            self.on_notification(f"REAL mode refused: {reason}", "error")
+                        return False
                     self.trades.broker = self.trades.real_broker
                     logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (AngelOne)")
                 else:
