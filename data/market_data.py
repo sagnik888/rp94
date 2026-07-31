@@ -2376,15 +2376,46 @@ class MarketDataProvider:
                         "cont_flag": "1"
                     }
                     response = self.fyers.history(data=data)
-                    if response and response.get('s') == 'ok':
+                    # This is the ONLY source of index volume — AngelOne does not supply it
+                    # and the Yahoo tertiary reports 0 for index tickers. Every exit below
+                    # used to be silent, so when Fyers stopped returning current-day index
+                    # candles on 2026-07-27 the volume pipeline died with nothing in the log
+                    # to say why; every volume-gated entry has been dead since. Say why.
+                    if not response or response.get('s') != 'ok':
+                        logger.warning(
+                            f"⚠️ Fyers index history returned no data for {fyers_symbol} "
+                            f"({res}m, {range_from}..{range_to}): "
+                            f"s={(response or {}).get('s')!r} code={(response or {}).get('code')!r} "
+                            f"message={(response or {}).get('message')!r}. "
+                            "Index VOLUME is unavailable from any other source; volume-gated "
+                            "entries cannot fire until this is restored."
+                        )
+                    else:
                         candles = response.get('candles', [])
-                        if candles:
+                        if not candles:
+                            logger.warning(
+                                f"⚠️ Fyers index history for {fyers_symbol} returned s=ok but ZERO "
+                                f"candles ({res}m, {range_from}..{range_to}); falling through "
+                                "to a source that has no index volume."
+                            )
+                        else:
                             fyers_df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             fyers_df['timestamp'] = pd.to_datetime(fyers_df['timestamp'], unit='s')
                             fyers_df['timestamp'] = fyers_df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
                             fyers_df.set_index('timestamp', inplace=True)
-                            
+
                             if not fyers_df.empty:
+                                nonzero = int((fyers_df['volume'] > 0).sum())
+                                if nonzero == 0:
+                                    logger.warning(
+                                        f"⚠️ Fyers returned {len(fyers_df)} candles for {fyers_symbol} "
+                                        "but EVERY volume is zero — the feed is up, the volume field is not."
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"Fyers index history {fyers_symbol}: {len(fyers_df)} candles, "
+                                        f"{nonzero} with volume, newest {fyers_df.index[-1]}."
+                                    )
                                 df = fyers_df
                                 df = self._save_and_merge_candles(df, cache_file)
                                 # Cache update moved to bottom
@@ -2477,7 +2508,13 @@ class MarketDataProvider:
                     yahoo_df = yf.Ticker(ticker).history(period=f"{days_back}d", interval=YAHOO_INTERVALS.get(interval, "5m"))
                     if not yahoo_df.empty:
                         self._yahoo_last_used_at = time.time()
-                        df = yahoo_df
+                        # Yahoo reports volume=0 for index tickers. This used to be a blind
+                        # `df = yahoo_df`, so a stale-but-real frame WITH volume was replaced
+                        # by a fresh one WITHOUT it — and volume_ratio then computes 0.0
+                        # (not a neutral 1.0), silently disabling every volume-gated entry
+                        # and the fast-opposite thrust exit guard. Take Yahoo's prices, but
+                        # never let it zero out volume we already had for the same bars.
+                        df = self._merge_yahoo_preserving_volume(df, yahoo_df, instrument_name)
                 except Exception as e:
                     logger.error(f"❌ Yahoo Fetch Error for {instrument_name}: {e}")
 
@@ -2508,6 +2545,59 @@ class MarketDataProvider:
         self._last_api_hist_fetch[cache_key] = now
         
         return final_df
+
+    @staticmethod
+    def _merge_yahoo_preserving_volume(
+        prior: pd.DataFrame, yahoo_df: pd.DataFrame, instrument_name: str = ""
+    ) -> pd.DataFrame:
+        """Take Yahoo's fresher prices without letting it zero out real volume.
+
+        Yahoo reports volume=0 for index tickers. The tertiary fallback used to replace the
+        frame outright, so a stale-but-real frame WITH volume lost it to a fresh one
+        WITHOUT — and `volume_ratio` then evaluates to 0.0 rather than a neutral 1.0
+        (see Scanner._candle_thrust_metrics), which silently disables volume_spike_entry,
+        one_way_cascade, market_ltp_shock, late_session_reclaim, the 15m choppy scalp and
+        the fast-opposite thrust exit guard.
+
+        Yahoo still wins on price and on any bar we did not already have. Volume is only
+        ever carried FORWARD from the prior frame for bars it actually covered; bars only
+        Yahoo has keep their zero, which is honest — we have no volume for them.
+        """
+        out = yahoo_df.copy()
+        out.columns = [str(c).lower() for c in out.columns]
+        if "volume" not in out.columns:
+            out["volume"] = 0
+        if prior is None or prior.empty:
+            return out
+
+        before = prior.copy()
+        before.columns = [str(c).lower() for c in before.columns]
+        if "volume" not in before.columns:
+            return out
+
+        try:
+            prior_vol = pd.to_numeric(before["volume"], errors="coerce").fillna(0)
+            prior_vol = prior_vol[~prior_vol.index.duplicated(keep="last")]
+            if float(prior_vol.sum()) <= 0:
+                return out  # nothing worth preserving
+
+            # Write the coerced series back first: a str/object volume column makes the
+            # .loc assignment below raise, and the except would then silently preserve
+            # nothing — the very failure this helper exists to prevent.
+            new_vol = pd.to_numeric(out["volume"], errors="coerce").fillna(0)
+            out["volume"] = new_vol
+            carried = prior_vol.reindex(out.index)
+            # Only fill where Yahoo gave us nothing and we genuinely had something.
+            fill = (new_vol <= 0) & carried.notna() & (carried > 0)
+            if bool(fill.any()):
+                out.loc[fill, "volume"] = carried[fill]
+                logger.info(
+                    f"🔁 Yahoo fallback for {instrument_name}: preserved real volume on "
+                    f"{int(fill.sum())}/{len(out)} bars (Yahoo reports 0 for indices)."
+                )
+        except Exception as exc:
+            logger.debug(f"Yahoo volume preservation skipped for {instrument_name}: {exc}")
+        return out
 
     def _save_and_merge_candles(self, df: pd.DataFrame, cache_file: Path):
         """Merge new candles with existing cache to prevent data loss and fill gaps"""
