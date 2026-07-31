@@ -53,3 +53,6 @@ scratch/
 pytest-tmp-base/
 pytest-tmp-base.*/
 data_store/session_archive/
+
+# Upstox probe token (expires 03:30 IST daily; never commit)
+upstox_token.json
