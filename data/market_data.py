@@ -25,6 +25,7 @@ from data.market_calendar import (
     load_nse_special_trading_days,
 )
 from data.market_source_health import build_market_source_snapshot, build_source_health
+from data.kite_market_data import KiteDataSource
 from engine.option_history_store import get_option_history_store
 from trading.api_rate_limiter import get_shared_api_limiter, get_shared_history_limiter
 from trading.secure_logging import install_smartapi_log_redaction, redact_sensitive_text
@@ -200,13 +201,32 @@ class MarketDataProvider:
         totp_secret: str = "",
         start_streams: bool = True,
     ):
+        # api_key/client_id/password/totp_secret are VESTIGIAL AngelOne credentials.
+        # They are accepted only so existing callers (scripts, workers) keep working;
+        # nothing reads them. Kite has no password login — connect() binds to the
+        # shared KiteAuth session established by the browser flow instead.
         self.api_key = api_key
         self.client_id = client_id
         self.password = password
         self.totp_secret = totp_secret
         self.start_streams = bool(start_streams)
-        self.smart_api: Optional[SmartConnect] = None
+        # AngelOne is retired. smart_api stays as a None attribute because every legacy
+        # Angel path is guarded by `self.is_connected and self.smart_api`, so leaving it
+        # None makes those branches inert instead of requiring a risky mass deletion in
+        # a 3000-line file. New work goes through self.kite.
+        self.smart_api = None
+        self.kite = KiteDataSource(auth=None)
+        self.on_kite_reauth = None
         self.is_connected = False
+        self.kws = None                       # KiteTicker
+        self._kite_ws_connected = False
+        self._last_kite_ws_tick = 0.0
+        self._active_kite_tokens: set = set()
+        self._kite_index_names: Dict[str, str] = {}
+        self._quote_divergence: Dict[str, Dict[str, Any]] = {}
+        # Last cumulative index volume seen from Fyers. Kite reports none for indices,
+        # so its price ticks carry this forward rather than zeroing the candle.
+        self._index_cum_volume: Dict[str, float] = {}
         self._rest_lock = threading.Lock()
         self._angel_quote_lease_state = threading.local()
         self._angel_rest_backoff_until: float = 0.0
@@ -664,6 +684,13 @@ class MarketDataProvider:
                         if hasattr(self, 'on_tick') and self.on_tick:
                             if symbol in FYERS_SYMBOL_TO_INDEX:
                                 index_name = FYERS_SYMBOL_TO_INDEX[symbol]
+                                # Fyers is the only feed carrying index volume (Kite
+                                # returns None — an index is not a traded instrument).
+                                # Remember the cumulative total so a Kite price tick can
+                                # carry it forward instead of resetting the candle's
+                                # volume delta to zero.
+                                if vol:
+                                    self._index_cum_volume[index_name] = float(vol)
                                 self._record_index_tick_volume_diag(
                                     index_name,
                                     "fyers_ws",
@@ -1137,276 +1164,341 @@ class MarketDataProvider:
             return session
         return "REF"
 
-    def _connect_attempt(self) -> bool:
-        if not HAS_SMARTAPI or not self.api_key:
-            return False
-            
-        import threading
-        if not hasattr(self, "_connect_lock"):
-            self._connect_lock = threading.Lock()
-            
-        with self._connect_lock:
-            # Check if another thread already connected while we were waiting
-            if getattr(self, "is_connected", False) and getattr(self, "smart_api", None):
-                # Optionally check if token is valid, but returning True is safe
-                return True
-                
-            self.smart_api = SmartConnect(api_key=self.api_key)
-            # SmartConnect configures logzero handlers inside its constructor;
-            # install again afterwards so every future SDK record is redacted.
-            install_smartapi_log_redaction()
-            totp = pyotp.TOTP(self.totp_secret).now()
-            
-            import requests
-            import json
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            totp = pyotp.TOTP(self.totp_secret).now()
-            
-            import requests
-            import json
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            
-            clean_client_id = self.client_id.strip("'").strip('"')
-            clean_password = self.password.strip("'").strip('"')
-            clean_api_key = self.api_key.strip("'").strip('"')
-            
-            url = "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword"
-            payload = {"clientcode": clean_client_id, "password": clean_password, "totp": totp}
-            headers = {
-                "X-UserType": "USER",
-                "X-SourceID": "WEB",
-                "X-ClientLocalIP": "127.0.0.1",
-                "X-ClientPublicIP": "127.0.0.1",
-                "X-MACAddress": "00:00:00:00:00:00",
-                "X-PrivateKey": clean_api_key,
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            
-            try:
-                response = requests.post(url, json=payload, headers=headers, timeout=10, verify=False)
-                data = response.json()
-            except Exception as e:
-                data = {"status": False, "message": f"HTTP Error: {str(e)}"}
-                
-            if not data.get('status'):
-                raise Exception(f"Login failed: {data.get('message', 'Unknown error')} - {data}")
-                
-            jwt_token = data.get('data', {}).get('jwtToken')
-            feed_token = data.get('data', {}).get('feedToken')
-            refresh_token = data.get('data', {}).get('refreshToken')
-            
-            self.smart_api.setAccessToken(jwt_token)
-            self.smart_api.setRefreshToken(refresh_token)
-            self.smart_api.setFeedToken(feed_token)
-            self.smart_api.setUserId(clean_client_id)
-            self._angel_jwt_token = jwt_token
-            self._angel_feed_token = feed_token
-            
-        self.is_connected = True
-        logger.success("✅ AngelOne Connected")
-        # Start WebSocket only for the live provider. History workers use REST only.
-        if self.start_streams:
-            jwt_token = data.get('data', {}).get('jwtToken')
-            feed_token = self.smart_api.getfeedToken()
-            self.start_websocket(jwt_token, feed_token)
-        return True
-
     @retry_on_exception(retries=3, delay=1.0)
-    def _connect_with_retry(self) -> bool:
-        return self._connect_attempt()
-
     def connect(self) -> bool:
+        """Bind market data to the shared Kite session.
+
+        There is nothing to retry here, unlike the AngelOne password+TOTP login this
+        replaces: a Kite session exists only if the operator completed the browser
+        login, and no amount of retrying creates one. Returning False with a clear
+        reason is the whole contract.
+        """
         try:
-            logger.info(
-                f"Trying to connect AngelOne. HAS_SMARTAPI: {HAS_SMARTAPI}, "
-                f"api_key_configured={bool(self.api_key)}"
-            )
-            return self._connect_with_retry()
+            from data.kite_auth import get_kite_auth
+
+            auth = get_kite_auth()
+            if auth.kite is None:
+                auth.load_cached_session()
+            self.kite = KiteDataSource(auth=auth)
+            self.is_connected = auth.kite is not None
+            if self.is_connected:
+                logger.success(
+                    f"Kite market data connected ({auth.status().get('user_id') or 'user'})"
+                )
+                try:
+                    self.kite.load_instruments(("NFO", "BFO", "NSE", "BSE"))
+                    self._load_kite_index_tokens()
+                    # Index spot must stream from the open, before any option is
+                    # resolved, or the first candles of the session are REST-only.
+                    self._active_kite_tokens.update(self._kite_index_names)
+                    self.start_kite_ticker()
+                except Exception as exc:
+                    logger.warning(f"Kite contract master / ticker startup failed: {exc}")
+            else:
+                logger.error(
+                    f"Kite market data unavailable: {auth.status().get('reason')}. "
+                    "Complete the daily login at /api/kite_login."
+                )
+            return self.is_connected
         except Exception as e:
-            logger.error(f"❌ AngelOne connection failed after retries: {e}")
+            logger.error(f"Kite connection failed: {e}")
+            self.is_connected = False
             return False
 
-    def start_websocket(self, jwt_token: str, feed_token: str):
-        """Start AngelOne WebSocket in a separate thread"""
-        if not SmartWebSocketV2:
-            logger.warning("SmartWebSocketV2 not available")
-            return
-            
+    # Index spot lives on the cash segment under a different name than the derivative
+    # root: Kite quotes NIFTY 50, not NIFTY. Options are already Kite tradingsymbols
+    # because expiry_manager now builds them from the Kite contract master.
+    KITE_INDEX_SPOT = {
+        "NIFTY": ("NSE", "NIFTY 50"),
+        "BANKNIFTY": ("NSE", "NIFTY BANK"),
+        "FINNIFTY": ("NSE", "NIFTY FIN SERVICE"),
+        "MIDCPNIFTY": ("NSE", "NIFTY MID SELECT"),
+        "SENSEX": ("BSE", "SENSEX"),
+        "BANKEX": ("BSE", "BANKEX"),
+    }
+
+    # Two feeds quoting the SAME index tick should agree almost exactly — they are
+    # reporting one number from one exchange, not an opinion. 0.05% of NIFTY at 24,400
+    # is about 12 points: wide enough to absorb sub-second arrival skew between two
+    # sockets, tight enough that a real fault cannot hide inside it.
+    #
+    # This started at 0.75%, which is far too loose for an index system: a 0.5% error
+    # is ~120 NIFTY points and would sail through silently while every stop, target and
+    # position size derived from it was wrong.
+    QUOTE_DIVERGENCE_ALERT_PCT = 0.05
+
+    def _flag_quote_divergence(
+        self, symbol: str, primary: str, primary_ltp: float,
+        secondary: str, secondary_ltp: float,
+    ) -> float:
+        """Report two feeds disagreeing about one instrument. Returns the deviation %."""
+        if primary_ltp <= 0 or secondary_ltp <= 0:
+            return 0.0
+        # Lazily materialise state: this runs inside price resolution, and a monitor
+        # that can raise is a monitor that takes down the thing it was watching.
+        if not isinstance(getattr(self, "_quote_divergence", None), dict):
+            self._quote_divergence = {}
+        deviation = abs(primary_ltp - secondary_ltp) / primary_ltp * 100.0
+        if deviation < self.QUOTE_DIVERGENCE_ALERT_PCT:
+            self._quote_divergence.pop(symbol, None)
+            return deviation
+
+        now = time.time()
+        last = float((self._quote_divergence.get(symbol) or {}).get("alerted_at", 0.0) or 0.0)
+        self._quote_divergence[symbol] = {
+            "symbol": symbol, "deviation_pct": round(deviation, 3),
+            "primary": primary, "primary_ltp": primary_ltp,
+            "secondary": secondary, "secondary_ltp": secondary_ltp,
+            "at": now, "alerted_at": last or now,
+        }
+        if now - last >= 300.0:
+            self._quote_divergence[symbol]["alerted_at"] = now
+            message = (
+                f"BAD MARKET DATA: {symbol} {secondary}={secondary_ltp:,.2f} disagrees with "
+                f"{primary}={primary_ltp:,.2f} by {deviation:.2f}%. Using {primary} (the "
+                f"execution broker). Treat {secondary}-sourced numbers as suspect."
+            )
+            logger.critical(message)
+            try:
+                from notifications import send_desktop_notification
+
+                send_desktop_notification(message, "error")
+            except Exception as exc:
+                logger.debug(f"Divergence alert notification unavailable: {exc}")
+        return deviation
+
+    def get_quote_divergences(self) -> Dict[str, Any]:
+        """Live feed-disagreement report, for the dashboard and the watchdog."""
+        return {k: dict(v) for k, v in (self._quote_divergence or {}).items()}
+
+    def _kite_quote_target(self, symbol: str, token: str, exchange: str):
+        """Resolve (tradingsymbol, exchange) for a Kite quote, or ("", "")."""
+        spot = self.KITE_INDEX_SPOT.get(str(symbol or "").upper())
+        if spot:
+            return spot[1], spot[0]
+        name = str(symbol or "").upper()
+        if not name:
+            return "", ""
+        segment = "BFO" if ("SENSEX" in name or "BANKEX" in name) else "NFO"
+        return symbol, segment
+
+    # ── Kite tick stream ─────────────────────────────────────────────────────
+    def start_kite_ticker(self) -> bool:
+        """Stream ticks over KiteTicker, replacing the retired AngelOne socket.
+
+        Subscribed in MODE_FULL, which carries open interest and 5-level depth in the
+        tick itself — AngelOne needed a separate SNAP_QUOTE mode for OI and never
+        supplied a book at all. Writes the same token-keyed `_ws_cache` records the
+        rest of the system already reads, so nothing downstream changes.
+        """
+        if not self.start_streams:
+            logger.info("Kite ticker skipped for history-only provider.")
+            return False
+        auth = getattr(self.kite, "_auth", None)
+        api_key = str(getattr(auth, "api_key", "") or "")
+        access_token = str(getattr(getattr(auth, "kite", None), "access_token", "") or "")
+        if not api_key or not access_token:
+            logger.error("Kite ticker not started: no authenticated session.")
+            return False
+
         try:
-            def on_data(ws, tick_data):
-                token = tick_data.get('token')
-                ltp = tick_data.get('last_traded_price')
-                oi = tick_data.get('open_interest', 0)
-                oi_change_pct = tick_data.get('open_interest_change_percentage', 0)
-                vol, vol_key, vol_fields = self._extract_index_tick_volume(
-                    tick_data,
-                    (
-                        "volume_trade_for_the_day",
-                        "vol_traded_today",
-                        "volume_traded_today",
-                        "volume",
-                        "vol",
-                        "last_traded_quantity",
-                        "last_traded_qty",
-                        "ltq",
-                        "qty",
-                        "quantity",
-                    ),
-                )
-                
-                if token and ltp:
-                    now_ts = time.time()
-                    self._last_angel_ws_tick = now_ts
+            from kiteconnect import KiteTicker
+        except ImportError as exc:
+            logger.error(f"KiteTicker unavailable: {exc}")
+            return False
+
+        # KiteTicker exposes close()/stop(), not close_connection() — the shared helper
+        # tries each in turn so a stale socket is always torn down before reconnecting.
+        self._close_ws_socket(getattr(self, "kws", None), "kite ticker")
+        ticker = KiteTicker(api_key, access_token)
+
+        def on_ticks(ws, ticks):
+            now_ts = time.time()
+            for tick in ticks or []:
+                try:
+                    token = str(tick.get("instrument_token") or "")
+                    price = float(tick.get("last_price") or 0.0)
+                    if not token or price <= 0:
+                        continue
+                    volume = int(tick.get("volume_traded") or tick.get("volume") or 0)
+                    depth = tick.get("depth") or {}
+                    buy = (depth.get("buy") or [{}])[0] if depth.get("buy") else {}
+                    sell = (depth.get("sell") or [{}])[0] if depth.get("sell") else {}
+                    self._ws_cache[token] = {
+                        "ltp": price,
+                        "oi": int(tick.get("oi") or 0),
+                        "oi_change_pct": 0.0,
+                        "vol": volume,
+                        "volume_key": "volume_traded",
+                        "volume_fields": {"volume_traded": volume},
+                        "previous_close": float((tick.get("ohlc") or {}).get("close") or 0.0),
+                        # Depth arrives free in MODE_FULL. Carrying it here is what lets
+                        # touch-quote execution anchor to a real book instead of a blind
+                        # LTP mark-up, which is how every 2026-07-31 option order priced.
+                        "bid": float(buy.get("price") or 0.0),
+                        "ask": float(sell.get("price") or 0.0),
+                        "bid_qty": int(buy.get("quantity") or 0),
+                        "ask_qty": int(sell.get("quantity") or 0),
+                        "time": now_ts,
+                        "source": "kite_ws",
+                    }
+                    self._last_kite_ws_tick = now_ts
                     self._last_ws_tick = now_ts
                     self._last_ltp_time = now_ts
-                    price = float(ltp) / 100.0
-                    # Store as dict instead of float
-                    self._ws_cache[token] = {
-                        'ltp': price,
-                        'oi': int(oi),
-                        'oi_change_pct': float(oi_change_pct or 0.0),
-                        'vol': int(vol),
-                        'volume_key': vol_key,
-                        'volume_fields': dict(vol_fields or {}),
-                        'previous_close': self._quote_float(tick_data, *PREVIOUS_CLOSE_KEYS),
-                        'time': now_ts,
-                        'source': 'angel_ws',
-                    }
-                    last_ws_debug = getattr(self, "_last_ws_debug_log", {})
-                    if now_ts - last_ws_debug.get(token, 0) >= 10:
-                        logger.debug(f"WS Tick: {token} -> {price} | OI: {oi} | Vol: {vol}")
-                        last_ws_debug[token] = now_ts
-                        self._last_ws_debug_log = last_ws_debug
-                    
-                    if hasattr(self, 'on_tick') and self.on_tick:
-                        if token in INDEX_SHORT_TOKENS:
-                            index_name = INDEX_SHORT_TOKENS[token]
-                            self._record_index_tick_volume_diag(
-                                index_name,
-                                "angel_ws",
-                                float(vol or 0.0),
-                                vol_key,
-                                vol_fields,
-                                now_ts,
-                            )
-                            self.on_tick(index_name, price, int(vol), datetime.now())
+                    index_name = self._kite_index_names.get(token)
+                    if index_name and callable(getattr(self, "on_tick", None)):
+                        # Kite reports NO volume for indices — they are computed values,
+                        # not traded instruments, so every field comes back None. The
+                        # candle builder treats `volume` as a CUMULATIVE day total and
+                        # stores volume - start_volume, so feeding it 0 alongside Fyers'
+                        # real cumulative figure either zeroes the bar or fabricates a
+                        # multi-million spike, depending on which feed ticks first.
+                        # Carry the last known cumulative total so the delta stays
+                        # coherent and Fyers remains the sole source of index volume.
+                        carried = float(self._index_cum_volume.get(index_name, 0.0) or 0.0)
+                        volume = int(volume or carried)
+                        self._record_index_tick_volume_diag(
+                            index_name, "kite_ws", float(volume), "volume_traded",
+                            {"volume_traded": volume}, now_ts,
+                        )
+                        self.on_tick(index_name, price, volume, datetime.now())
+                except Exception as exc:
+                    logger.debug(f"Kite tick parse failed: {exc}")
 
-            def on_open(ws):
-                logger.info("🔌 AngelOne WebSocket Connected")
-                if hasattr(self.sws, "current_retry_attempt"):
-                    self.sws.current_retry_attempt = 0
-                self._angel_ws_retry_count = 0
-                self._angel_ws_connected = True
-                self._last_angel_ws_tick = time.time()
-                self._last_ws_tick = self._last_angel_ws_tick
-                
-                token_list = [{"exchangeType": exch, "tokens": list(toks)} for exch, toks in self._active_angel_tokens.items() if toks]
-                if token_list:
-                    self.sws.subscribe(correlation_id="ut1_default", mode=2, token_list=token_list)
-                    logger.info(f"Subscribed to tokens (Mode 2): {token_list}")
+        def on_connect(ws, response):
+            self._kite_ws_connected = True
+            self._last_kite_ws_tick = time.time()
+            logger.info("🔌 Kite WebSocket Connected")
+            tokens = sorted({int(t) for t in self._active_kite_tokens if str(t).isdigit()})
+            if tokens:
+                ws.subscribe(tokens)
+                ws.set_mode(ws.MODE_FULL, tokens)
+                logger.info(f"Subscribed to {len(tokens)} Kite token(s) in FULL mode")
 
-            def on_error(ws, error):
-                self._angel_ws_connected = False
-                logger.error(f"WS Error: {error}")
+        def on_close(ws, code, reason):
+            self._kite_ws_connected = False
+            logger.warning(f"🔌 Kite WebSocket closed ({code}): {reason}")
 
-            def on_close(ws):
-                self._angel_ws_connected = False
-                logger.warning("🔌 AngelOne WebSocket Closed")
+        def on_error(ws, code, reason):
+            self._kite_ws_connected = False
+            logger.error(f"Kite WebSocket error ({code}): {reason}")
 
-            def _build_and_bind_sws(curr_jwt, curr_feed):
-                sws_inst = SmartWebSocketV2(
-                    curr_jwt,
-                    self.api_key,
-                    self.client_id,
-                    curr_feed,
-                    max_retry_attempt=2,
-                    retry_strategy=1,
-                    retry_delay=2,
-                    retry_multiplier=1.5,
-                    retry_duration=10,
-                )
-                sws_inst.on_data = on_data
-                sws_inst.on_open = on_open
-                sws_inst.on_error = on_error
-                sws_inst.on_close = on_close
-                return sws_inst
+        def on_reconnect(ws, attempts):
+            logger.warning(f"Kite WebSocket reconnecting (attempt {attempts})")
 
-            self.sws = _build_and_bind_sws(jwt_token, feed_token)
+        def on_noreconnect(ws):
+            self._kite_ws_connected = False
+            logger.critical(
+                "Kite WebSocket gave up reconnecting — live ticks are STOPPED. "
+                "Prices fall back to slower REST polling until restart."
+            )
 
-            def _ws_runner():
-                self._angel_ws_retry_count = 0
-                
-                def watchdog():
-                    while True:
-                        if self._last_angel_ws_tick > 0 and getattr(self, '_angel_ws_connected', False) and (time.time() - self._last_angel_ws_tick > 60):
-                            if self.is_market_open():
-                                logger.warning("AngelOne WS Silent Disconnect Detected (No ticks > 60s).")
-                                self._close_ws_socket(getattr(self, "sws", None), "angel silent disconnect")
-                        time.sleep(10)
-                
-                import threading
-                threading.Thread(target=watchdog, daemon=True, name="AngelWSWatchdog").start()
+        ticker.on_ticks = on_ticks
+        ticker.on_connect = on_connect
+        ticker.on_close = on_close
+        ticker.on_error = on_error
+        ticker.on_reconnect = on_reconnect
+        ticker.on_noreconnect = on_noreconnect
+        self.kws = ticker
+        try:
+            ticker.connect(threaded=True)
+        except Exception as exc:
+            logger.error(f"Kite ticker failed to start: {exc}")
+            return False
+        logger.info("🚀 Kite WebSocket thread started")
+        return True
 
-                while True:
-                    try:
-                        if getattr(self, "_angel_ws_retry_count", 0) > 0 or not getattr(self, "sws", None):
-                            if getattr(self, "_angel_ws_retry_count", 0) >= 3 or not getattr(self, "is_connected", False):
-                                try:
-                                    logger.info("Refreshing AngelOne REST login before WS reconnect...")
-                                    self._connect_with_retry()
-                                except Exception as ex:
-                                    logger.debug(f"AngelOne login refresh during WS reconnect failed: {ex}")
-                            curr_jwt = getattr(self, "_angel_jwt_token", None) or jwt_token
-                            curr_feed = getattr(self, "_angel_feed_token", None) or feed_token
-                            if hasattr(self.smart_api, "getfeedToken"):
-                                try:
-                                    ft = self.smart_api.getfeedToken()
-                                    if ft:
-                                        curr_feed = ft
-                                except Exception as ex:
-                                    logger.debug(
-                                        f"AngelOne getfeedToken() during WS reconnect failed; "
-                                        f"reusing prior feed token: {ex}"
-                                    )
-                            self.sws = _build_and_bind_sws(curr_jwt, curr_feed)
-                        
-                        self.sws.connect()
-                    except Exception as e:
-                        logger.error(f"AngelOne WS Runner error: {e}")
-                    
-                    self._angel_ws_retry_count += 1
-                    backoff = min(60, 2 ** self._angel_ws_retry_count)
-                    logger.warning(f"🔄 AngelOne WS Reconnecting in {backoff}s (Attempt {self._angel_ws_retry_count})...")
-                    time.sleep(backoff)
+    def _load_kite_index_tokens(self) -> None:
+        """Map index instrument_tokens to names so on_tick still fires for indices.
 
-            import threading
-            t = threading.Thread(target=_ws_runner, daemon=True, name="AngelWSRunner")
-            t.start()
-            logger.info("🚀 WebSocket Thread Started")
-            
-        except Exception as e:
-            logger.error(f"Failed to start WebSocket: {e}")
+        Resolved from the contract master rather than hardcoded: the AngelOne token
+        constants (26000, 26009…) mean nothing to Kite, and a wrong constant would
+        silently stop index candles rather than raise.
+        """
+        self._kite_index_names = {}
+        source = getattr(self, "kite", None)
+        if source is None or not source.is_connected:
+            return
+        wanted = {
+            "NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY",
+            "NIFTY MID SELECT": "MIDCPNIFTY", "SENSEX": "SENSEX",
+        }
+        try:
+            with source._lock:
+                dumps = {ex: list(rows) for ex, rows in source._instruments.items()}
+        except Exception:
+            return
+        for exchange in ("NSE", "BSE"):
+            for row in dumps.get(exchange, []):
+                name = wanted.get(str(row.get("tradingsymbol") or "").upper())
+                if name and row.get("instrument_token"):
+                    self._kite_index_names[str(row["instrument_token"])] = name
+        if self._kite_index_names:
+            logger.info(f"Kite index tick tokens resolved: {sorted(set(self._kite_index_names.values()))}")
+
+    def rebind_kite(self, kite) -> None:
+        """Adopt a session issued by a fresh browser login, mid-run.
+
+        Everything holding the dead session has to be rebuilt here, not just the
+        broker: the data source, the contract master and the tick socket all
+        authenticate with the access token. Rebinding only the broker leaves orders
+        working while quotes, ticks and contract lookups stay broken until a full
+        restart — and the dashboard looks healthy throughout.
+        """
+        from data.kite_auth import get_kite_auth
+
+        self.kite = KiteDataSource(auth=get_kite_auth(), kite=kite)
+        self.is_connected = kite is not None
+        if kite is not None:
+            try:
+                self.kite.load_instruments(("NFO", "BFO", "NSE", "BSE"), force=True)
+                self._load_kite_index_tokens()
+                self._active_kite_tokens.update(self._kite_index_names)
+            except Exception as exc:
+                logger.warning(f"Contract master reload after re-auth failed: {exc}")
+            # The socket authenticates with the access token, so a dead session means
+            # a dead stream: it must be torn down and reopened with the new one.
+            try:
+                self.start_kite_ticker()
+            except Exception as exc:
+                logger.error(f"Kite ticker restart after re-auth failed: {exc}")
+        callback = getattr(self, "on_kite_reauth", None)
+        if callable(callback):
+            try:
+                callback(kite)
+            except Exception as exc:
+                logger.warning(f"Kite re-auth callback failed: {exc}")
+        logger.success("Kite session rebound: data, contract master, ticker and broker.")
 
     def subscribe_tokens(self, tokens: List[str], exchange_type: int = 1):
-        """Dynamically subscribe to more tokens"""
-        active = self._active_angel_tokens.setdefault(exchange_type, set())
-        new_tokens = [str(token) for token in tokens if str(token) and str(token) not in active]
+        """Subscribe additional instruments to the Kite tick stream.
+
+        `exchange_type` is retained only for call-site compatibility — it was an
+        AngelOne segment id, and Kite derives the segment from the instrument_token
+        itself. Tokens are remembered even when the socket is down so on_connect can
+        replay them; before this the whole call was a silent no-op and option
+        contracts were never streamed at all.
+        """
+        new_tokens = {
+            str(token).strip() for token in tokens
+            if str(token).strip().isdigit() and str(token).strip() not in self._active_kite_tokens
+        }
         if not new_tokens:
             return
-        active.update(new_tokens)
-        if hasattr(self, 'sws') and self.sws:
-            if not getattr(self, '_angel_ws_connected', False):
-                logger.warning(f"WebSocket is closed. Token subscription delayed until reconnection.")
-                return
-            try:
-                # AngelOne exposes OI only in SNAP_QUOTE mode (3), not QUOTE (2).
-                self.sws.subscribe(correlation_id="ut1_dynamic", mode=3, token_list=[{"exchangeType": exchange_type, "tokens": new_tokens}])
-                logger.info(f"📡 AngelOne: Dynamically subscribed to {len(new_tokens)} option tokens (SNAP_QUOTE mode)")
-            except Exception as e:
-                logger.error(f"Failed to subscribe to tokens: {e}")
+        self._active_kite_tokens.update(new_tokens)
+        ticker = getattr(self, "kws", None)
+        if ticker is None or not getattr(self, "_kite_ws_connected", False):
+            logger.debug(
+                f"Kite socket down; {len(new_tokens)} token(s) queued for the next connect."
+            )
+            return
+        try:
+            numeric = sorted(int(t) for t in new_tokens)
+            ticker.subscribe(numeric)
+            ticker.set_mode(ticker.MODE_FULL, numeric)
+            logger.debug(f"Subscribed {len(numeric)} Kite token(s) in FULL mode")
+        except Exception as exc:
+            logger.warning(f"Kite token subscription failed: {exc}")
 
     def get_source_health(self) -> Dict[str, Any]:
         """Check each provider independently; Yahoo is an idle emergency source."""
@@ -1524,12 +1616,18 @@ class MarketDataProvider:
     ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
         """Select one stable live source instead of oscillating between brokers.
 
-        AngelOne is the order-authoritative index feed. Keep using it while its
-        tick is entry-eligible; only fail over to Fyers when AngelOne is stale.
-        Choosing the newest tick across both feeds made dashboard LTPs jump
-        backward and forward whenever their arrival order changed.
+        The EXECUTION BROKER's tick is authoritative — it is the price orders fill
+        against. Fyers is a display/analysis failover, not a competing tick that should
+        replace it several times per second.
+
+        This keyed the lookup on INDEX_SPOT_TOKENS, the AngelOne token map. Post-Kite
+        those keys never appear in the cache, so the broker branch always missed and
+        every index quote silently came from Fyers — which on 2026-08-01 was quoting
+        NIFTY 6.49% high. The Kite ticker was running correctly the whole time; nothing
+        was reading it.
         """
         now = time.time() if now_ts is None else float(now_ts)
+        kite_token = self._kite_token_for_index(symbol)
         configured_token = INDEX_SPOT_TOKENS.get(symbol, ("", ""))[0]
         angel_token = token or configured_token
         short_token = angel_token[3:] if angel_token.startswith("999") else angel_token
@@ -1547,15 +1645,233 @@ class MarketDataProvider:
                     candidates.append((age, cached))
             return min(candidates, key=lambda item: item[0]) if candidates else None
 
-        # Match market_source_health: Angel ticks remain authoritative for six
-        # seconds. Fyers is a live display/analysis failover, not a competing
-        # tick that should replace AngelOne several times per second.
-        selected = freshest((angel_token, short_token), 6.0)
-        if selected is None:
-            selected = freshest((FYERS_INDEX_SYMBOLS.get(symbol, ""),), 15.0)
+        # Selection is by TRUST first, freshness second. Picking the fresher tick let a
+        # continuously-streaming bad feed outrank a briefly-quiet good one: on
+        # 2026-08-01 Fyers published a fabricated Saturday session for every index
+        # (NIFTY lp=26,230.10 against a true 24,383.60, with its own prev_close field
+        # correctly reading 24,383.60) and won purely because it kept ticking.
+        #
+        # Staleness only means something while the market is open. With the market
+        # shut, the last traded price IS the price and does not decay — so a broker
+        # tick from an hour ago is still correct, while the old 6s window aged it out
+        # and handed the quote to whatever kept streaming.
+        try:
+            market_open = bool(self.is_market_open())
+        except Exception:
+            market_open = True
+        broker_window = 6.0 if market_open else 86400.0
+        broker = freshest((kite_token, angel_token, short_token), broker_window)
+        fyers = freshest((FYERS_INDEX_SYMBOLS.get(symbol, ""),), 15.0)
+
+        if broker is not None and fyers is not None:
+            broker_ltp = float(broker[1].get("ltp", 0.0) or 0.0)
+            fyers_ltp = float(fyers[1].get("ltp", 0.0) or 0.0)
+            deviation = self._flag_quote_divergence(
+                symbol, "kite", broker_ltp, "fyers", fyers_ltp
+            )
+            if deviation >= self.QUOTE_DIVERGENCE_ALERT_PCT:
+                # Disagreement this large is a fault in one of them. Trust the venue
+                # that fills the orders and quarantine the other for this symbol.
+                return broker[1], broker[0]
+            # They agree; take whichever is fresher.
+            selected = min((broker, fyers), key=lambda item: item[0])
+            return selected[1], selected[0]
+
+        selected = broker or fyers
         if selected is None:
             return None, None
         return selected[1], selected[0]
+
+    # A Fyers index-volume reading older than this counts as the feed being down.
+    # 120s was far too slack for a live market: at 5min bars that is a third of a
+    # candle built on a frozen number, and the system would keep reporting healthy
+    # volume the whole time. 20s is longer than any normal tick gap but short enough
+    # that at most one bar is affected before the fallback engages.
+    FYERS_VOLUME_STALE_SECONDS = 20.0
+
+    # While in fallback, actively poll Fyers this often so recovery is noticed within
+    # seconds. The websocket reconnects on its own, but a dead socket that never
+    # reconnects would otherwise leave the system on futures volume indefinitely.
+    FYERS_RECOVERY_PROBE_SECONDS = 3.0
+
+    def get_index_activity(self, symbol: str) -> Dict[str, Any]:
+        """Index participation, with a broker cross-check and a broker fallback.
+
+        Fyers stays PRIMARY for index volume — it is the only source of the cash-market
+        quantity every volume threshold in this system was calibrated against. Kite
+        cannot supply it at all (an index is not a traded instrument), so the broker
+        contributes near-month FUTURES volume and open interest instead: an independent,
+        exchange-sourced read on whether there is conviction behind a move.
+
+        The two are different quantities, not two versions of one. `unit` and `source`
+        say which is in play, and `comparable_to_thresholds` is False whenever the
+        fallback is active — a caller that ignores it will compare contracts against
+        thresholds tuned on constituent share volume and be wrong by ~1000x.
+        """
+        symbol = str(symbol or "").upper()
+        now = time.time()
+        result: Dict[str, Any] = {
+            "symbol": symbol, "volume": 0.0, "source": "none", "unit": "shares",
+            "comparable_to_thresholds": True, "fyers_online": False,
+            "futures": {}, "confirmation": "unavailable",
+        }
+
+        cached = (self._ws_cache or {}).get(FYERS_INDEX_SYMBOLS.get(symbol, ""), None)
+        fyers_volume, fyers_age = 0.0, None
+        if isinstance(cached, dict):
+            fyers_volume = float(cached.get("vol", 0.0) or 0.0)
+            fyers_age = max(0.0, now - float(cached.get("time") or 0.0))
+        fyers_online = fyers_volume > 0 and (fyers_age or 0.0) <= self.FYERS_VOLUME_STALE_SECONDS
+        if not fyers_online:
+            # Poll before deciding, so a recoverable feed is not written off for a
+            # whole cycle. Cheap, throttled, and it refreshes the same cache the
+            # websocket writes — so the very next read sees the recovery.
+            probed = self._probe_fyers_volume(symbol, now)
+            if probed > 0:
+                fyers_volume, fyers_age, fyers_online = probed, 0.0, True
+        result["fyers_online"] = fyers_online
+        result["fyers_volume_age_seconds"] = round(fyers_age, 1) if fyers_age is not None else None
+
+        futures = {}
+        source = getattr(self, "kite", None)
+        if source is not None and source.is_connected:
+            try:
+                futures = source.index_futures_activity(symbol) or {}
+            except Exception as exc:
+                logger.debug(f"Futures activity lookup failed for {symbol}: {exc}")
+        result["futures"] = futures
+
+        if fyers_online:
+            result.update({
+                "volume": fyers_volume, "source": "fyers_index", "unit": "shares",
+                "comparable_to_thresholds": True,
+            })
+            self._note_volume_source(symbol, "fyers_index")
+            if futures.get("available"):
+                # Both present: the broker confirms or contradicts direction of
+                # participation. Levels are not comparable, so only presence is used.
+                result["confirmation"] = (
+                    "broker_confirms" if float(futures.get("volume") or 0.0) > 0
+                    else "broker_quiet"
+                )
+            return result
+
+        # Fyers is down or stale. Fall back to the broker so volume-aware logic has
+        # SOMETHING real rather than a silent zero — but say loudly that the unit
+        # changed, because every calibrated threshold is now meaningless.
+        if futures.get("available"):
+            result.update({
+                "volume": float(futures.get("volume") or 0.0),
+                "oi": float(futures.get("oi") or 0.0),
+                "source": "kite_index_futures", "unit": "contracts",
+                "comparable_to_thresholds": False,
+                "confirmation": "fallback_only",
+            })
+            self._note_volume_source(symbol, "kite_index_futures")
+            self._warn_volume_fallback(symbol, futures)
+            return result
+
+        result["confirmation"] = "no_volume_source"
+        return result
+
+    def _probe_fyers_volume(self, symbol: str, now: float) -> float:
+        """Throttled REST poll to detect Fyers coming back. Returns volume, or 0.0.
+
+        Recovery has to be noticed in seconds, not on whatever cadence the websocket
+        happens to reconnect at — the fallback is a different quantity, so every extra
+        second on it is another bar the volume series cannot use.
+        """
+        if not hasattr(self, "_fyers_probe_at"):
+            self._fyers_probe_at = {}
+        if now - float(self._fyers_probe_at.get(symbol, 0.0) or 0.0) < self.FYERS_RECOVERY_PROBE_SECONDS:
+            return 0.0
+        self._fyers_probe_at[symbol] = now
+        fyers_symbol = FYERS_INDEX_SYMBOLS.get(symbol)
+        if not fyers_symbol or not getattr(self, "fyers", None):
+            return 0.0
+        try:
+            response = self.fyers.quotes({"symbols": fyers_symbol})
+            if not response or response.get("s") != "ok":
+                return 0.0
+            values = (response.get("d") or [{}])[0].get("v", {}) or {}
+            volume = float(values.get("volume") or values.get("vol_traded_today") or 0.0)
+        except Exception as exc:
+            logger.debug(f"Fyers volume recovery probe failed for {symbol}: {exc}")
+            return 0.0
+        if volume <= 0:
+            return 0.0
+        # Write it back into the same cache the socket feeds, so every other consumer
+        # sees the recovery at once rather than each rediscovering it.
+        cached = dict(self._ws_cache.get(fyers_symbol) or {})
+        cached.update({"vol": volume, "time": now, "source": "fyers_rest_probe"})
+        self._ws_cache[fyers_symbol] = cached
+        if str((getattr(self, "_volume_source_active", {}) or {}).get(symbol) or "") == "kite_index_futures":
+            logger.info(
+                f"INDEX VOLUME RECOVERED: {symbol} Fyers cash volume is back "
+                f"({volume:,.0f}); switching off the futures fallback."
+            )
+        return volume
+
+    def _note_volume_source(self, symbol: str, source: str) -> None:
+        """Record when an index's volume series changes provenance.
+
+        Volume gates work on a RATIO (recent bars / prior bars), which survives a unit
+        change perfectly well — as long as the whole window is one unit. A window that
+        STRADDLES the switch is the hazard: 3 recent bars of futures contracts over 17
+        prior bars of constituent shares gives ~0.006 and reads as THIN, and the
+        reverse gives ~175 and reads as a SURGE. Both are fabrications of the join, not
+        of the market.
+        """
+        if not hasattr(self, "_volume_source_changed_at"):
+            self._volume_source_changed_at = {}
+        if not hasattr(self, "_volume_source_active"):
+            self._volume_source_active = {}
+        previous = self._volume_source_active.get(symbol)
+        if previous == source:
+            return
+        self._volume_source_active[symbol] = source
+        if previous is not None:
+            self._volume_source_changed_at[symbol] = time.time()
+            logger.warning(
+                f"VOLUME SOURCE CHANGED for {symbol}: {previous} -> {source}. "
+                "Volume ratios are suppressed until the lookback window is one source."
+            )
+
+    def volume_series_is_homogeneous(
+        self, symbol: str, timeframe_minutes: float = 5.0, bars: int = 20
+    ) -> bool:
+        """False while a volume lookback window still spans two different sources."""
+        changed_at = float(
+            (getattr(self, "_volume_source_changed_at", {}) or {}).get(symbol, 0.0) or 0.0
+        )
+        if changed_at <= 0:
+            return True
+        window_seconds = max(1.0, float(timeframe_minutes) * 60.0 * float(bars))
+        return (time.time() - changed_at) >= window_seconds
+
+    def _warn_volume_fallback(self, symbol: str, futures: Dict[str, Any]) -> None:
+        """Announce the substitution once per 10 minutes per index."""
+        if not hasattr(self, "_volume_fallback_alerted"):
+            self._volume_fallback_alerted = {}
+        now = time.time()
+        if now - float(self._volume_fallback_alerted.get(symbol, 0.0) or 0.0) < 600.0:
+            return
+        self._volume_fallback_alerted[symbol] = now
+        logger.warning(
+            f"INDEX VOLUME FALLBACK: {symbol} cash volume unavailable from Fyers; using "
+            f"{futures.get('tradingsymbol')} futures volume "
+            f"({futures.get('volume'):,.0f} contracts, OI {futures.get('oi'):,.0f}) "
+            "instead. Units differ from index volume — volume thresholds do NOT apply "
+            "until Fyers returns."
+        )
+
+    def _kite_token_for_index(self, symbol: str) -> str:
+        """Kite instrument_token for an index spot, as the tick cache keys it."""
+        wanted = str(symbol or "").upper()
+        for token, name in (getattr(self, "_kite_index_names", {}) or {}).items():
+            if name == wanted:
+                return str(token)
+        return ""
 
     @staticmethod
     def _cache_epoch(value: Any) -> float:
@@ -1634,22 +1950,51 @@ class MarketDataProvider:
             if fyers_symbol in self._ws_cache and _is_valid_cache(self._ws_cache[fyers_symbol]):
                 return _remember_ltp_time(self._ws_cache[fyers_symbol])
             
-        # 2. BROKER LIVE FEED (REST Fallback - TIER 2: FYERS)
+        # 2. TIER 1 — THE EXECUTION BROKER (Zerodha Kite).
+        # The broker's price is the one orders actually fill against, so it outranks
+        # every other feed. Fyers used to be consulted first and on 2026-08-01 it
+        # returned NIFTY at 25,965.35 against a true 24,383.60 — a 6.49% error that
+        # the dashboard displayed and the engine would have traded on.
+        kite_ltp = 0.0
+        kite_source = getattr(self, "kite", None)
+        if kite_source is not None and kite_source.is_connected:
+            try:
+                kite_symbol, kite_exchange = self._kite_quote_target(symbol, token, exchange)
+                if kite_symbol:
+                    kite_ltp = float(kite_source.get_ltp(kite_exchange, kite_symbol) or 0.0)
+            except Exception as exc:
+                logger.debug(f"Kite REST quote failed for {symbol}: {exc}")
+
+        # 3. TIER 2 — FYERS, used as a cross-check when the broker answered, and as a
+        # fallback when it did not.
+        fyers_ltp = 0.0
         if getattr(self, 'fyers', None):
             try:
                 f_sym = FYERS_INDEX_SYMBOLS.get(symbol)
                 if f_sym:
                     f_resp = self.fyers.quotes({"symbols": f_sym})
                     if f_resp and f_resp.get('s') == 'ok':
-                        f_ltp = f_resp.get('d', [{}])[0].get('v', {}).get('lp', 0)
-                        if f_ltp > 0:
-                            self._last_ltp_time = time.time()
-                            self._ltp_cache[symbol] = {'ltp': f_ltp, 'time': datetime.now(), 'source': 'fyers'}
-                            return f_ltp
+                        fyers_ltp = float(f_resp.get('d', [{}])[0].get('v', {}).get('lp', 0) or 0.0)
             except Exception as exc:
                 logger.debug(f"Fyers REST quote fallback failed for {symbol}: {exc}")
 
-        # 3. BROKER LIVE FEED (REST Fallback - TIER 1: AngelOne)
+        if kite_ltp > 0:
+            if fyers_ltp > 0:
+                self._flag_quote_divergence(symbol, "kite", kite_ltp, "fyers", fyers_ltp)
+            self._last_ltp_time = time.time()
+            self._ltp_cache[symbol] = {"ltp": kite_ltp, "time": datetime.now(), "source": "kite"}
+            return kite_ltp
+        if fyers_ltp > 0:
+            # No broker price to check it against. Accept it, but say so — an
+            # unverified quote is how the wrong number reached the screen.
+            logger.debug(f"{symbol} quote from Fyers only (no broker price to cross-check)")
+            self._last_ltp_time = time.time()
+            self._ltp_cache[symbol] = {"ltp": fyers_ltp, "time": datetime.now(), "source": "fyers"}
+            return fyers_ltp
+
+        # 3b. Legacy AngelOne REST. Retired: smart_api is always None now, so this is
+        # inert. Left in place rather than excised mid-migration so the surrounding
+        # cache/backoff machinery keeps its shape until the file is cleaned up.
         if self.is_connected and self.smart_api:
             if not self._throttle_angel_rest("ltpData"):
                 return self._ltp_cache.get(symbol, {}).get('ltp', 0.0)
@@ -2671,6 +3016,75 @@ class MarketDataProvider:
             return None
         return cached
 
+    # Only fire the Kite overlay when Fyers genuinely failed to supply OI. Load stays
+    # split by default — Fyers carries the chain structure and premiums, Kite carries
+    # execution and the tick stream — so neither broker is hammered while the other
+    # idles. The overlay is demand-driven, not a second unconditional chain fetch.
+    _KITE_OI_OVERLAY_MIN_INTERVAL = 60.0
+
+    def _chain_oi_is_usable(self, chain: "pd.DataFrame") -> bool:
+        if chain is None or chain.empty:
+            return False
+        try:
+            calls = pd.to_numeric(chain.get("call_oi", 0), errors="coerce").fillna(0).sum()
+            puts = pd.to_numeric(chain.get("put_oi", 0), errors="coerce").fillna(0).sum()
+        except Exception:
+            return False
+        return bool(calls > 0 and puts > 0)
+
+    def _augment_chain_oi_from_kite(self, index_symbol: str, chain: "pd.DataFrame") -> "pd.DataFrame":
+        """Fill open interest from Kite when the Fyers chain has none.
+
+        The 2026-08-01 startup logged `PCR=0, Call Delta=0` against a 123-row Fyers
+        chain: the rows arrived, the OI did not, and PCR silently degraded to zero
+        rather than reporting itself unavailable. Kite is the broker actually holding
+        the position, so its OI is authoritative — but it is only queried when the
+        primary source has already failed, keeping the two feeds balanced.
+        """
+        if self._chain_oi_is_usable(chain):
+            return chain
+        source = getattr(self, "kite", None)
+        if source is None or not source.is_connected:
+            return chain
+        # Callers pass the Fyers symbol ("NSE:NIFTY50-INDEX"); Kite needs the index root.
+        index = FYERS_SYMBOL_TO_INDEX.get(str(index_symbol), str(index_symbol)).upper()
+        now = time.time()
+        if not hasattr(self, "_last_kite_oi_overlay"):
+            self._last_kite_oi_overlay = {}
+        if now - float(self._last_kite_oi_overlay.get(index, 0.0) or 0.0) < self._KITE_OI_OVERLAY_MIN_INTERVAL:
+            return chain
+        self._last_kite_oi_overlay[index] = now
+        try:
+            spot = float(self._ltp_cache.get(index, {}).get("ltp", 0.0) or 0.0)
+            kite_chain = source.get_option_chain(index, spot=spot, strikes_each_side=20)
+            if kite_chain.empty:
+                return chain
+            by_strike = {
+                float(row["strike"]): row for _, row in kite_chain.iterrows()
+            }
+            filled = 0
+            for position, strike in chain["strike"].items():
+                row = by_strike.get(float(strike))
+                if row is None:
+                    continue
+                chain.at[position, "call_oi"] = float(row["call_oi"])
+                chain.at[position, "put_oi"] = float(row["put_oi"])
+                # Carry the live mid so implied volatility is solved from a current
+                # two-way price rather than a possibly-stale last trade.
+                for side in ("call", "put"):
+                    mid = float(row.get(f"{side}_mid") or 0.0)
+                    if mid > 0:
+                        chain.at[position, f"{side}_mid"] = mid
+                filled += 1
+            if filled:
+                logger.info(
+                    f"Filled OI for {filled}/{len(chain)} {index} strikes from Kite "
+                    "(Fyers chain returned none) — PCR is live again."
+                )
+        except Exception as exc:
+            logger.warning(f"Kite OI overlay failed for {index}: {exc}")
+        return chain
+
     def get_option_chain(self, index_symbol: str, exchange: str = "NFO") -> Optional[pd.DataFrame]:
         """Fetch real options data using Fyers (Primary) or AngelOne (Fallback)"""
         now = time.time()
@@ -2793,6 +3207,7 @@ class MarketDataProvider:
                         ]
                         chain = pd.merge(ce_df[ce_cols], pe_df[pe_cols], on='strike', how='outer')
                         chain = chain.fillna(0)
+                        chain = self._augment_chain_oi_from_kite(index_symbol, chain)
                         chain = self._apply_option_oi_snapshot_deltas(
                             index_symbol,
                             chain,

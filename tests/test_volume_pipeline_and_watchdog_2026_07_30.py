@@ -13,8 +13,11 @@ live dashboard, Auto Mode reverting to OFF (it is never persisted), or the Fyers
 expiring (cannot auto-refresh: broker code -16, SEBI).
 """
 import os
+import sys
 import time
 from types import SimpleNamespace
+
+import data.kite_auth  # noqa: F401  (imported so _watchdog can stub get_kite_auth)
 
 import pandas as pd
 import pytest
@@ -72,17 +75,47 @@ def test_history_pacing_is_configurable_and_conservative(monkeypatch):
 
 # ── watchdog ────────────────────────────────────────────────────────────────
 
-def _watchdog(scanner, alerts):
+def _watchdog(scanner, alerts, kite_auth_required=False):
+    """Drive the watchdog deterministically.
+
+    The liveness checks are gated on `now.weekday() < 5`, so these tests silently
+    stopped exercising them on weekends — a Saturday run reported "no alert" and
+    looked like a regression. The clock is pinned to a Wednesday so the result no
+    longer depends on the day the suite happens to run.
+
+    Kite session state is injected for the same reason: the real one depends on
+    whether a token happens to be cached on this machine.
+    """
     os.environ["RUNTIME_WATCHDOG_INTERVAL_SECONDS"] = "1"
     os.environ["RUNTIME_WATCHDOG_START"] = "00:00"
     os.environ["RUNTIME_WATCHDOG_UNTIL"] = "23:59"
     import main
 
+    real_datetime = main.datetime
+    midweek = real_datetime(2026, 7, 29, 12, 0, 0)  # a Wednesday
+
+    class _FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return tz.localize(midweek) if tz is not None else midweek
+
+    status = {
+        "auth_required": bool(kite_auth_required),
+        "reason": "token expired" if kite_auth_required else "",
+    }
+
+    main.datetime = _FrozenDatetime
     main.send_desktop_notification = lambda msg, level="info": alerts.append(msg)
-    main.start_runtime_watchdog(
-        scanner, SimpleNamespace(dashboard_host="127.0.0.1", dashboard_port=8500)
+    sys.modules["data.kite_auth"].get_kite_auth = lambda *a, **k: SimpleNamespace(
+        status=lambda: status
     )
-    time.sleep(2.0)
+    try:
+        main.start_runtime_watchdog(
+            scanner, SimpleNamespace(dashboard_host="127.0.0.1", dashboard_port=8500)
+        )
+        time.sleep(2.0)
+    finally:
+        main.datetime = real_datetime
 
 
 def _scanner(**over):

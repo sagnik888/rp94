@@ -56,3 +56,11 @@ data_store/session_archive/
 
 # Upstox probe token (expires 03:30 IST daily; never commit)
 upstox_token.json
+
+# Broker session tokens — rotate daily and grant live account access. Never commit.
+kite_token.json
+fyers_token.json.old-*
+*.token.json
+
+# Local market/trade data store (large binaries, machine-specific)
+data_store/

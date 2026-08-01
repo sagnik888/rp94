@@ -6,7 +6,7 @@ color 0B
 set "APP_EXIT=0"
 set "APP_DIR=%~dp0"
 set "DASHBOARD_HOST=127.0.0.1"
-set "DASHBOARD_PORT=8503"
+set "DASHBOARD_PORT=8500"
 set "DASHBOARD_URL=http://%DASHBOARD_HOST%:%DASHBOARD_PORT%/"
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
@@ -44,9 +44,20 @@ if errorlevel 1 (
     goto done
 )
 
+:: Pin the interpreter explicitly — `activate.bat` only prepends to PATH, and when
+:: that fails to take effect a global python answers instead. Every older dependency
+:: still imports from global site-packages, so nothing looks wrong until a newer one
+:: (kiteconnect) is missing at runtime.
+set "PY=%CD%\venv\Scripts\python.exe"
+if not exist "%PY%" (
+    echo [ERROR] venv interpreter not found at "%PY%". Recreate: python -m venv venv
+    set "APP_EXIT=1"
+    goto done
+)
+
 echo [INFO] Python:
-python --version
-python scripts\check_python_runtime.py
+"%PY%" --version
+"%PY%" scripts\check_python_runtime.py
 if errorlevel 1 (
     echo [ERROR] Unsupported Python runtime. Recreate venv with Python 3.13.x.
     set "APP_EXIT=1"
@@ -54,10 +65,10 @@ if errorlevel 1 (
 )
 
 echo [INFO] Checking core dependencies...
-python -c "import uvicorn, fastapi, loguru, pandas, numpy, yfinance, pyarrow; import fyers_apiv3; import SmartApi" >nul 2>&1
+"%PY%" -c "import uvicorn, fastapi, loguru, pandas, numpy, yfinance, pyarrow; import fyers_apiv3; import kiteconnect" >nul 2>&1
 if errorlevel 1 (
     echo [INFO] Missing dependencies found. Installing from requirements.txt...
-    pip install -r requirements.txt
+    "%PY%" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [ERROR] Dependency installation failed. Check the pip error above.
         set "APP_EXIT=1"
@@ -82,7 +93,7 @@ echo.
 
 :: Open the browser only after the API has live dashboard state, not just an open port.
 if /I not "%UTBOT_SKIP_BROWSER%"=="1" start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%scripts\open_dashboard_when_ready.ps1" -Url "%DASHBOARD_URL%" -Port %DASHBOARD_PORT%
-python main.py
+"%PY%" main.py
 set "APP_EXIT=%ERRORLEVEL%"
 
 echo.

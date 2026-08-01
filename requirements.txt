@@ -18,6 +18,9 @@ websockets==16.0
 Jinja2==3.1.6
 
 # Broker/data APIs
+kiteconnect==5.2.1
+# smartapi-python: AngelOne retired as broker; kept installed only so legacy
+# imports in data/market_data.py resolve until those dead branches are excised.
 smartapi-python==1.5.5
 pyotp==2.9.0
 pytz==2026.1.post1

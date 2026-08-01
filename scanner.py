@@ -3730,21 +3730,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self.data.connect()
 
                     if self.data.is_connected:
-                        from trading.broker import SmartApiBroker
+                        from data.kite_auth import get_kite_auth
+                        from trading.kite_broker import KiteBroker
                         # account_id/instance_id are REQUIRED for the cross-process
                         # execution lease. Without account_id the broker builds no lease
                         # at all and every guard silently fails OPEN — two UT1 processes
                         # could then net each other's positions on one account, which is
                         # the exact thing the lease exists to prevent.
-                        new_real_broker = SmartApiBroker(
-                            self.data.smart_api,
-                            account_id=getattr(settings, "angelone_client_id", ""),
+                        #
+                        # This built a SmartApiBroker from data.smart_api until the Kite
+                        # migration. That attribute is permanently None now and the
+                        # account id came from angelone_client_id, so the fallback would
+                        # have produced a broker that could not trade AND had no lease —
+                        # failing open on the one guard that must never fail open.
+                        kite_auth = get_kite_auth(settings)
+                        new_real_broker = KiteBroker(
+                            kite=kite_auth.kite,
+                            auth=kite_auth,
+                            account_id=str(getattr(settings, "kite_user_id", "") or "").strip(),
                             instance_id=f"UT1:{getattr(settings, 'dashboard_port', '')}",
                         )
                         self.trades.real_broker = new_real_broker
-                        logger.info("âœ… Dynamic Broker Connection Successful")
+                        self.data.on_kite_reauth = new_real_broker.replace_api
+                        logger.info("âœ… Dynamic Kite broker connection successful")
                     else:
-                        logger.error("â Œ CRITICAL: Failed to connect AngelOne for REAL mode!")
+                        logger.error("â Œ CRITICAL: No Kite session for REAL mode — log in at /api/kite_login")
 
                 if hasattr(self.trades, "real_broker") and self.trades.real_broker:
                     # Claim the cross-process account lease as part of entering REAL.
@@ -8476,6 +8486,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         recent = float(v.iloc[-3:].mean() or 0.0)
                         prior = float(v.iloc[-20:-3].mean() or 0.0) if len(v) >= 20 else float(v.iloc[:-3].mean() or 0.0)
                         vol_ratio = (recent / prior) if prior > 0 else 0.0
+                        # A ratio is unit-free, but only while the whole window shares
+                        # one source. If index volume just failed over from Fyers cash
+                        # volume to Kite futures contracts, the recent bars and the
+                        # prior bars are different quantities and their ratio is an
+                        # artefact of the join — ~0.006 (reads THIN) or ~175 (reads
+                        # SURGE). Report UNKNOWN until the window is homogeneous again.
+                        homogeneous = getattr(self.data, "volume_series_is_homogeneous", None)
+                        if callable(homogeneous):
+                            tf_minutes = {"1min": 1.0, "5min": 5.0, "15min": 15.0}.get(tf, 5.0)
+                            if not homogeneous(name, tf_minutes, 20):
+                                vol_ratio = 0.0
                 except Exception:
                     vol_ratio = 0.0
         regime_code = str(reg.get("regime") or reg.get("smoothed_regime") or "UNKNOWN").upper()

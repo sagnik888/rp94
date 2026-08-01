@@ -14,17 +14,19 @@ def build_source_health(
 ) -> Dict[str, Any]:
     now = time.time() if now_ts is None else float(now_ts)
     is_live = provider.is_market_open()
-    angel_tick = float(getattr(provider, "_last_angel_ws_tick", 0.0) or 0.0)
     fyers_tick = float(getattr(provider, "_last_fyers_ws_tick", 0.0) or 0.0)
-    angel_age = None if angel_tick <= 0 else max(0.0, now - angel_tick)
     fyers_age = None if fyers_tick <= 0 else max(0.0, now - fyers_tick)
-
-    angel_fresh = angel_age is not None and angel_age < freshness_threshold
     fyers_fresh = fyers_age is not None and fyers_age < freshness_threshold
-    angel_health = bool(provider.is_connected and (angel_fresh if is_live else True))
+
+    # Kite health is session-based FIRST: a valid access token is what determines
+    # whether orders work, and the stream being quiet must never read as "broker
+    # down". Tick age is reported alongside so a stalled socket is still visible.
+    kite_tick = float(getattr(provider, "_last_kite_ws_tick", 0.0) or 0.0)
+    kite_age = None if kite_tick <= 0 else max(0.0, now - kite_tick)
+    kite_health = bool(provider.is_connected)
     fyers_available = provider.fyers is not None and not provider._fyers_auth_required
     fyers_health = bool(fyers_available and (fyers_fresh if is_live else True))
-    all_brokers_unavailable = bool(is_live and not angel_health and not fyers_health)
+    all_brokers_unavailable = bool(is_live and not kite_health and not fyers_health)
     yahoo_mode = (
         "emergency_used"
         if all_brokers_unavailable and provider._yahoo_request_count
@@ -32,11 +34,11 @@ def build_source_health(
     )
 
     return {
-        "angel": angel_health,
-        "angel_tick_age_seconds": round(angel_age, 2) if angel_age is not None else None,
+        "kite": kite_health,
+        "kite_tick_age_seconds": round(kite_age, 2) if kite_age is not None else None,
         "fyers": fyers_health,
         "fyers_tick_age_seconds": round(fyers_age, 2) if fyers_age is not None else None,
-        "broker_degraded": bool(is_live and not (angel_health and fyers_health)),
+        "broker_degraded": bool(is_live and not (kite_health and fyers_health)),
         "all_brokers_unavailable": all_brokers_unavailable,
         "fyers_auth_required": provider._fyers_auth_required,
         "fyers_auth_reason": provider._fyers_auth_reason,
@@ -72,7 +74,10 @@ def _source_record(
     now_ts: float,
 ) -> Dict[str, Any]:
     age = _age_seconds(value, now_ts)
-    has_order_authority = str(name or "").startswith("angel")
+    # Order authority means "this feed comes from the broker we actually trade
+    # through", which is Kite now. Leaving it matching "angel" marked every source as
+    # non-authoritative once AngelOne was retired.
+    has_order_authority = str(name or "").startswith("kite")
     return {
         "source": name,
         "latency_class": latency_class,
@@ -121,7 +126,7 @@ def build_market_source_snapshot(
         source = str(cached_ltp.get("source") or "unknown")
         if source == "yahoo":
             records.append(_source_record("yahoo", cached_ltp, "DELAYED", False, now))
-        elif source in {"angel", "fyers"}:
+        elif source in {"kite", "fyers"}:
             age = _age_seconds(cached_ltp, now)
             records.append(
                 _source_record(

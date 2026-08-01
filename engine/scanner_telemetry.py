@@ -519,7 +519,9 @@ class ScannerTelemetryMixin:
         data_freshness = dict(candle_freshness)
         if str(getattr(self, "mode", "") or "").upper() == "REAL":
             live_source_ages: List[float] = []
-            for source_name in ("angel", "fyers"):
+            # Kite reports no tick age (its stream is not wired yet), so in practice
+            # Fyers supplies the live freshness number until KiteTicker lands.
+            for source_name in ("kite", "fyers"):
                 age_value = source_health.get(f"{source_name}_tick_age_seconds")
                 if source_health.get(source_name) and age_value is not None:
                     try:

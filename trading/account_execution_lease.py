@@ -35,11 +35,14 @@ class AccountExecutionLease:
         self._handle = None
         self._guard = threading.RLock()
         self._owner_metadata: Dict[str, Any] = {}
+        self._self_owned = False
         atexit.register(self.release)
 
     @property
     def held(self) -> bool:
         with self._guard:
+            if self._self_owned:
+                return True
             return self._handle is not None and not self._handle.closed
 
     @property
@@ -91,8 +94,24 @@ class AccountExecutionLease:
             try:
                 self._lock(handle)
             except (OSError, BlockingIOError):
-                self._owner_metadata = self._read_metadata(handle)
+                metadata = self._read_metadata(handle)
                 handle.close()
+                self._owner_metadata = metadata
+                # Windows byte-range locks are per-HANDLE, not per-process: a second
+                # AccountExecutionLease object for the same account inside THIS process
+                # cannot take the lock its sibling holds, and the refusal reads as
+                # "owned by another UT1 process" while naming our own pid. A process
+                # that rebuilds its SmartApiBroker (dynamic reconnect, AngelOne re-auth)
+                # would then refuse every one of its own orders.
+                #
+                # Claiming self-ownership here cannot let two processes execute at once.
+                # We only reach this branch while the lock is genuinely HELD, and every
+                # acquire() rewrites the metadata — so a live holder naming our own pid
+                # and host can only be us. A partial/garbled read yields no pid and we
+                # still fail closed.
+                if self._is_this_process(metadata):
+                    self._self_owned = True
+                    return True
                 return False
 
             metadata = {
@@ -110,8 +129,21 @@ class AccountExecutionLease:
             self._owner_metadata = metadata
             return True
 
+    @staticmethod
+    def _is_this_process(metadata: Optional[Dict[str, Any]]) -> bool:
+        metadata = metadata or {}
+        try:
+            pid = int(metadata.get("pid") or 0)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0 or pid != os.getpid():
+            return False
+        host = str(metadata.get("host") or "")
+        return host == socket.gethostname()
+
     def release(self) -> None:
         with self._guard:
+            self._self_owned = False
             handle = self._handle
             self._handle = None
             if handle is None or handle.closed:
@@ -126,4 +158,12 @@ def lease_owner_description(metadata: Optional[Dict[str, Any]]) -> str:
     metadata = metadata or {}
     instance = str(metadata.get("instance_id") or "another UT1 process")
     pid = metadata.get("pid")
-    return f"{instance} (pid {pid})" if pid else instance
+    if not pid:
+        # No metadata means the lock file was never written or could not be parsed —
+        # say so, rather than asserting a phantom owner. The bare "another UT1 process"
+        # sent 2026-07-31 chasing a second instance that did not exist.
+        return f"{instance} (owner unknown — no readable lock metadata)"
+    host = str(metadata.get("host") or "")
+    acquired = str(metadata.get("acquired_at") or "")
+    suffix = f" since {acquired}" if acquired else ""
+    return f"{instance} (pid {pid}{f' on {host}' if host else ''}){suffix}"

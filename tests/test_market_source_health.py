@@ -12,7 +12,7 @@ def _provider():
     return SimpleNamespace(
         _ws_cache={},
         _ltp_cache={},
-        _last_angel_ws_tick=0.0,
+        _last_angel_ws_tick=0.0,   # retired; Kite health is session-based
         _last_fyers_ws_tick=0.0,
         _fyers_auth_required=False,
         _fyers_auth_reason="",
@@ -29,24 +29,23 @@ def test_source_health_uses_injected_clock_at_freshness_boundary():
     provider = _provider()
     provider.is_connected = True
     provider.fyers = object()
-    provider._last_angel_ws_tick = 955.01
     provider._last_fyers_ws_tick = 955.0
 
     health = build_source_health(provider, now_ts=1000.0, freshness_threshold=45.0)
 
-    assert health["angel"] is True
+    assert health["kite"] is True   # session-based: is_connected means a live token
     assert health["fyers"] is False
     assert health["broker_degraded"] is True
     assert health["all_brokers_unavailable"] is False
     assert health["yahoo_mode"] == "idle_standby"
 
 
-def test_snapshot_keeps_only_angel_fresh_data_entry_eligible():
+def test_snapshot_keeps_only_kite_fresh_data_entry_eligible():
     provider = _provider()
     provider._ws_cache["99926000"] = {
         "ltp": 23000.0,
         "time": 999.0,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     provider._ws_cache[FYERS["NIFTY"]] = {
         "ltp": 23001.0,
@@ -63,7 +62,7 @@ def test_snapshot_keeps_only_angel_fresh_data_entry_eligible():
     )
 
     assert snapshot["entry_eligible"] is True
-    assert snapshot["freshest"]["source"] == "angel_ws"
+    assert snapshot["freshest"]["source"] == "kite_ws"
     fyers = next(row for row in snapshot["sources"] if row["source"] == "fyers_ws")
     assert fyers["order_authority"] is False
     assert fyers["entry_eligible"] is False

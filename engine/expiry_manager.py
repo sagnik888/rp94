@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Optional, Set
 from loguru import logger
@@ -35,9 +36,144 @@ class ExpiryManager:
         self._staged_df: Optional[pd.DataFrame] = None
         self._snapshot_generation = 0
 
+    @staticmethod
+    def _kite_master_frame() -> Optional[pd.DataFrame]:
+        """Kite's contract dump, reshaped into the AngelOne column schema.
+
+        Everything downstream — expiry rolling, gamma windows, get_token, the strike
+        fallback — is written against {name, instrumenttype, expiry, symbol, token,
+        strike, lotsize}. Translating once here converts the entire contract pipeline
+        to Kite without touching that logic.
+
+        Two conventions are preserved deliberately:
+          * `expiry` is the %d%b%Y string the expiry map parses ("04AUG2026").
+          * `strike` is multiplied by 100, because get_token compares against
+            float(strike) * 100 and the closest-strike fallback divides by 100.
+        """
+        try:
+            from data.kite_auth import get_kite_auth
+            from data.kite_market_data import KiteDataSource
+        except Exception as exc:
+            logger.error(f"Kite contract master unavailable (import failed): {exc}")
+            return None
+
+        auth = get_kite_auth()
+        if auth.kite is None:
+            logger.error(
+                "Kite contract master unavailable: no session. "
+                "Complete the daily login at /api/kite_login."
+            )
+            return None
+
+        source = KiteDataSource(auth=auth)
+        if not source.load_instruments(("NFO", "BFO")):
+            return None
+
+        rows = []
+        with source._lock:
+            dumps = {ex: list(rowset) for ex, rowset in source._instruments.items()}
+        for exchange, instruments in dumps.items():
+            for row in instruments:
+                kind = row.get("instrument_type") or ""
+                if kind in {"CE", "PE"}:
+                    instrumenttype = "OPTIDX"
+                elif kind == "FUT":
+                    instrumenttype = "FUTIDX"
+                else:
+                    continue
+                expiry = row.get("expiry")
+                if not expiry:
+                    continue
+                rows.append({
+                    "token": str(row.get("instrument_token") or ""),
+                    "symbol": row.get("tradingsymbol") or "",
+                    "name": row.get("name") or "",
+                    "expiry": expiry.strftime("%d%b%Y").upper(),
+                    "strike": float(row.get("strike") or 0.0) * 100.0,
+                    "lotsize": int(row.get("lot_size") or 0),
+                    "instrumenttype": instrumenttype,
+                    "exch_seg": exchange,
+                })
+        if not rows:
+            logger.error("Kite contract master produced no index derivatives.")
+            return None
+        frame = pd.DataFrame(rows)
+        logger.success(f"Kite contract master staged: {len(frame)} index derivatives.")
+        return frame
+
+    # Kite-derived cache. Deliberately a different file from the AngelOne CACHE_FILE:
+    # the two masters use different tradingsymbols and a different strike scale, so
+    # mixing them silently resolves contracts the broker will refuse.
+    KITE_CACHE_FILE = CACHE_DIR / "kite_instruments.json"
+
+    # Retry pacing for a master we cannot build. Without a Kite session every attempt
+    # fails identically, and _ensure_ready() is reached from the option-chain path on
+    # every scan — which turned one real problem into a CRITICAL line every few
+    # seconds. The cause needs a human (a browser login), so retrying faster than this
+    # cannot help; the window is short enough to pick the session up promptly.
+    MASTER_RETRY_COOLDOWN_SECONDS = 60.0
+
     def download_master(self, force=False):
         """Load a candidate master without exposing a half-analyzed snapshot."""
         with self._refresh_lock:
+            blocked_until = float(getattr(self, "_master_failure_until", 0.0) or 0.0)
+            if not force and time.monotonic() < blocked_until:
+                return False
+            # Kite is the primary broker, so its contract master is the only source of
+            # truth for what can actually be traded. There is deliberately NO AngelOne
+            # fallback: that path resolved AngelOne tradingsymbols (NIFTY04AUG2624350CE,
+            # strikes x100) which Kite cannot trade, and it did so silently — the log
+            # said "Resolved NIFTY: Weekly=04AUG2026" and looked entirely healthy.
+            frame = self._kite_master_frame()
+            if frame is not None and not frame.empty:
+                self._master_failure_until = 0.0     # a live session clears the cooldown
+                self._staged_df = frame
+                try:
+                    self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    self.KITE_CACHE_FILE.write_text(
+                        frame.to_json(orient="records"), encoding="utf-8"
+                    )
+                except Exception as exc:
+                    logger.debug(f"Could not cache the Kite master: {exc}")
+                return True
+
+            # Same-day Kite cache only. Contracts expire, so a stale file is refused
+            # rather than used to resolve a contract that no longer exists.
+            if self.KITE_CACHE_FILE.exists():
+                cached_on = datetime.fromtimestamp(
+                    self.KITE_CACHE_FILE.stat().st_mtime
+                ).date()
+                if cached_on == date.today():
+                    try:
+                        cached = pd.DataFrame(
+                            json.loads(self.KITE_CACHE_FILE.read_text(encoding="utf-8"))
+                        )
+                        if not cached.empty:
+                            logger.warning(
+                                "Using today's cached Kite contract master (no live session)."
+                            )
+                            self._staged_df = cached
+                            return True
+                    except Exception as exc:
+                        logger.error(f"Kite master cache unreadable: {exc}")
+                else:
+                    logger.error(
+                        f"Kite contract cache is from {cached_on}; refusing to resolve "
+                        "contracts from an expired master."
+                    )
+
+            self._master_failure_until = time.monotonic() + self.MASTER_RETRY_COOLDOWN_SECONDS
+            logger.critical(
+                "No Kite contract master available — contract resolution is DISABLED "
+                "until you complete the daily login at /api/kite_login. No AngelOne "
+                f"fallback exists: its symbols are not tradeable on Kite. "
+                f"(retrying at most every {self.MASTER_RETRY_COOLDOWN_SECONDS:.0f}s)"
+            )
+            return False
+
+    def _retired_angelone_download(self, force=False):
+        """Dead code kept only for reference; AngelOne is no longer a broker here."""
+        if True:
             try:
                 if not force and self.CACHE_FILE.exists():
                     file_time = datetime.fromtimestamp(self.CACHE_FILE.stat().st_mtime).date()
@@ -596,7 +732,6 @@ class ExpiryManager:
 
     def pre_market_check(self, force: bool = False):
         """Main entry point for daily pre-market analysis"""
-        logger.info("═══ PRE-MARKET EXPIRY ANALYSIS ═══")
         usable = self.df is not None and not self.df.empty and bool(self.expiries)
         stale = date.today() != getattr(self, "_loaded_date", date.today())
         if usable and stale and not force:
@@ -604,6 +739,10 @@ class ExpiryManager:
             return dict(self.expiries)
         if usable and not stale and not force:
             return dict(self.expiries)
+        # Only announce the analysis when it is actually about to do work. This is
+        # reached from the per-scan option-chain path, so logging unconditionally
+        # printed the banner every few seconds while nothing happened.
+        logger.info("═══ PRE-MARKET EXPIRY ANALYSIS ═══")
         if self.download_master(force=force):
             return self.analyze_expiries()
         return {}

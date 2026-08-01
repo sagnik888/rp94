@@ -84,12 +84,22 @@ class IntelligenceAggregator:
             put_iv /= 100.0
         source = "chain_iv" if call_iv or put_iv else "default"
         strike = float(atm_row.get("strike") or 0.0)
-        if not call_iv and float(atm_row.get("call_ltp", 0.0) or 0.0) > 0:
-            call_iv = self._implied_iv_from_price(spot_price, strike, days_to_expiry, float(atm_row.get("call_ltp")), "call")
-            source = "premium_implied_iv" if call_iv else source
-        if not put_iv and float(atm_row.get("put_ltp", 0.0) or 0.0) > 0:
-            put_iv = self._implied_iv_from_price(spot_price, strike, days_to_expiry, float(atm_row.get("put_ltp")), "put")
-            source = "premium_implied_iv" if put_iv else source
+        # Prefer a live two-way mid over last-traded price. IV — and therefore every
+        # Greek — is only as real as the premium it is solved from, and an LTP on an
+        # illiquid strike can be minutes old. `*_mid` is present when the broker
+        # supplied a usable book; it falls back to LTP when it did not.
+        def _premium(side: str) -> float:
+            mid = float(atm_row.get(f"{side}_mid", 0.0) or 0.0)
+            return mid if mid > 0 else float(atm_row.get(f"{side}_ltp", 0.0) or 0.0)
+
+        call_premium, put_premium = _premium("call"), _premium("put")
+        premium_basis = "mid" if float(atm_row.get("call_mid", 0.0) or 0.0) > 0 else "ltp"
+        if not call_iv and call_premium > 0:
+            call_iv = self._implied_iv_from_price(spot_price, strike, days_to_expiry, call_premium, "call")
+            source = f"premium_implied_iv_{premium_basis}" if call_iv else source
+        if not put_iv and put_premium > 0:
+            put_iv = self._implied_iv_from_price(spot_price, strike, days_to_expiry, put_premium, "put")
+            source = f"premium_implied_iv_{premium_basis}" if put_iv else source
         if call_iv is None and put_iv is not None:
             call_iv = put_iv
             source = f"{source}_put_proxy"

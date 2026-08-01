@@ -25,7 +25,11 @@ from loguru import logger
 from data.sqlite_db import db
 from trading.performance_metrics import annualize_sharpe, format_sharpe_pair
 from trading.trade_dashboard import build_dashboard_rows
-from trading.order_retry import execute_order_with_retry, BrokerOrderAmbiguous
+from trading.order_retry import (
+    execute_order_with_retry,
+    BrokerOrderAmbiguous,
+    broker_rejection,
+)
 
 
 def _setting_enabled(value, default: bool = True) -> bool:
@@ -66,6 +70,10 @@ class Trade:
     protective_order_id: str = ""
     protective_trigger: float = 0.0
     protective_quantity: int = 0
+    # Zerodha GTT trigger id. Armed ONLY as a fallback when no exchange-side SL-M could
+    # be established, never alongside a working one: an SL-M and a GTT that both fire
+    # exit the position twice, and the second fill opens a naked reversed leg.
+    gtt_trigger_id: str = ""
     protective_updated_at: Optional[datetime] = None
     recovery_required_since: Optional[datetime] = None
     execution_status: str = "OPEN"
@@ -154,6 +162,22 @@ class Trade:
     # shadowed a clamped copy here — the ACTIVE definition lives next to
     # unrealized_pnl; behavior unchanged by removing the dead one.)
 
+    def _never_reached_market(self) -> bool:
+        """True when this trade demonstrably never became a broker position.
+
+        Deliberately narrow: it requires BOTH a terminal not-filled status AND the
+        absence of any broker order id. A trade whose acknowledgement was merely
+        ambiguous is NOT covered — that one may well be live at the exchange, and
+        zeroing its P&L would hide real money.
+        """
+        status = str(getattr(self, "execution_status", "") or "").upper()
+        reason = str(getattr(self, "exit_reason", "") or "").upper()
+        if status not in {"REJECTED"} and reason not in {"BROKER_ERROR", "CONTRACT_MISSING"}:
+            return False
+        if str(getattr(self, "broker_order_id", "") or "").strip():
+            return False
+        return int(getattr(self, "broker_quantity", 0) or 0) <= 0
+
     def to_dict(self) -> Dict:
         """Convert trade to dictionary for dashboard sync"""
         display_name = self.instrument
@@ -185,9 +209,20 @@ class Trade:
             "protective_order_id": self.protective_order_id,
             "protective_trigger": self.protective_trigger,
             "protective_quantity": self.protective_quantity,
+            "gtt_trigger_id": self.gtt_trigger_id,
             "protective_updated_at": self.protective_updated_at.isoformat() if self.protective_updated_at else "",
             "recovery_required_since": self.recovery_required_since.isoformat() if self.recovery_required_since else "",
             "broker_quantity": self.broker_quantity,
+            # The broker contract identity MUST survive the round-trip. to_dict() is
+            # both the dashboard payload and the only serializer save_state() feeds to
+            # db.save_trades(), which writes INSERT OR REPLACE — so any column missing
+            # here is actively NULLed on every save, not merely left alone. Dropping
+            # these two stranded every 2026-07-31 trade with trading_symbol/symbol_token
+            # NULL, which is exactly what emergency_flatten_trade() and
+            # _ensure_protective_stop() require: a reloaded position could then neither
+            # be flattened nor given an exchange-side stop.
+            "trading_symbol": self.trading_symbol,
+            "symbol_token": self.symbol_token,
             "instrument": display_name,
             "direction": self.direction,
             "entry_price": self.entry_price,
@@ -196,7 +231,14 @@ class Trade:
             "trailing_stop": self.trailing_stop if self.trailing_stop is not None else 0.0,
             "current_stop": self.current_stop if self.current_stop is not None else 0.0,
             "target": self.target if self.target is not None else 0.0,
-            "pnl": round((self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0, 0),
+            # A trade the broker never accepted has no P&L — there was no position to
+            # gain or lose on. The 2026-07-31 rows carried a phantom -80 because an
+            # UNREALISED mark was written into the persisted `pnl` column while the
+            # entry was still pending, and it survived onto the closed row after the
+            # order turned out to have been rejected.
+            "pnl": 0.0 if self._never_reached_market() else round(
+                (self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0, 0
+            ),
             "charges": self.charges,
             "lots": self.lots,
             "lot_size": self.lot_size,
@@ -332,6 +374,7 @@ class Trade:
             broker_order_id=data.get("broker_order_id", ""),
             exit_order_id=data.get("exit_order_id", ""),
             protective_order_id=data.get("protective_order_id", ""),
+            gtt_trigger_id=data.get("gtt_trigger_id", ""),
             protective_trigger=float(data.get("protective_trigger", 0.0) or 0.0),
             protective_quantity=int(data.get("protective_quantity", 0) or 0),
             protective_updated_at=parse_ist_datetime(data.get("protective_updated_at")),
@@ -762,6 +805,67 @@ class TradeManager:
         except Exception as exc:
             logger.debug(f"Recovery desktop alert unavailable: {exc}")
 
+    # Broker conditions that refuse EVERY order until a human changes something
+    # outside this process. Matched against the broker's own refusal text.
+    _BLOCKING_BROKER_CONDITIONS = (
+        (
+            "registered ip",
+            "AngelOne is refusing orders from this machine's public IP ({detail}). "
+            "Add that IP to your SmartAPI app at smartapi.angelone.in "
+            "(My Profile -> your app -> Redirect/Whitelisted IP) and restart. "
+            "Until then NO order can reach the exchange.",
+        ),
+        (
+            "invalid token",
+            "The AngelOne session token is invalid. Re-login and restart; no order "
+            "can reach the exchange until the session is renewed.",
+        ),
+        (
+            "invalid session",
+            "The AngelOne session has expired. Re-login and restart; no order can "
+            "reach the exchange until the session is renewed.",
+        ),
+        (
+            "session expired",
+            "The AngelOne session has expired. Re-login and restart; no order can "
+            "reach the exchange until the session is renewed.",
+        ),
+    )
+
+    def _alert_blocking_broker_condition(self, error: str) -> None:
+        """Escalate a refusal that no retry and no later signal can get past.
+
+        A generic "entry failed" line scrolls past in a busy log. On 2026-07-31 the
+        account refused every order from 14:51 onward with AG7002 and the session ran
+        to the close still trying, because nothing separated "this order failed" from
+        "nothing can succeed until you change something".
+        """
+        text = str(error or "").lower()
+        for marker, template in self._BLOCKING_BROKER_CONDITIONS:
+            if marker not in text:
+                continue
+            if not hasattr(self, "_last_blocking_alert"):
+                self._last_blocking_alert = {}
+            now = time.monotonic()
+            if now - float(self._last_blocking_alert.get(marker, 0.0) or 0.0) < 600.0:
+                return
+            self._last_blocking_alert[marker] = now
+            # The broker names the offending IP in its own message; quote it back
+            # rather than guessing, because the SDK's X-ClientPublicIP header is a
+            # hardcoded constant and never reflects this machine.
+            found = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", str(error or ""))
+            message = "TRADING BLOCKED: " + template.format(detail=found.group(0) if found else "unknown")
+            logger.critical(message)
+            self._log_ui(message, "error")
+            try:
+                notifier = getattr(self, "on_notification", None)
+                if not callable(notifier):
+                    from notifications import send_desktop_notification as notifier
+                notifier(message, "error")
+            except Exception as exc:
+                logger.debug(f"Blocking-condition desktop alert unavailable: {exc}")
+            return
+
     def _protective_exit_side(self, trade: Trade) -> str:
         return "SELL" if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"} else "BUY"
 
@@ -781,6 +885,111 @@ class TradeManager:
         if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}:
             return max(0.05, trade.entry_price * (1.0 - pct / 100.0))
         return trade.entry_price * (1.0 + pct / 100.0)
+
+    def on_broker_postback(self, payload: Dict[str, Any]) -> bool:
+        """Apply a verified Zerodha order postback to the matching trade.
+
+        Push beats polling here: the postback is the broker telling us what happened,
+        so a REJECTED entry is known immediately with its reason instead of being
+        inferred from an order-book scan on the next cycle.
+
+        Deliberately conservative — it records state and surfaces the reason, and does
+        NOT close or open positions. Reconciliation against actual broker positions
+        stays the single authority for that, so a duplicated or out-of-order postback
+        can never invent a fill.
+        """
+        order_id = str((payload or {}).get("order_id") or "")
+        status = str((payload or {}).get("status") or "").upper()
+        if not order_id:
+            return False
+        with self._lock:
+            trade = next(
+                (t for t in self.open_trades.values()
+                 if str(getattr(t, "broker_order_id", "")) == order_id),
+                None,
+            )
+        if trade is None:
+            return False
+
+        message = str(payload.get("status_message") or "").strip()
+        if status == "REJECTED":
+            trade.execution_error = message or "Broker rejected the order"
+            logger.error(f"Postback: {trade.trading_symbol} entry REJECTED — {trade.execution_error}")
+            self._alert_blocking_broker_condition(trade.execution_error)
+        elif status == "COMPLETE":
+            try:
+                filled = int(float(payload.get("filled_quantity") or 0))
+                average = float(payload.get("average_price") or 0.0)
+            except (TypeError, ValueError):
+                filled, average = 0, 0.0
+            if filled > 0:
+                trade.broker_quantity = filled
+            if average > 0:
+                trade.execution_error = ""
+            logger.info(
+                f"Postback: {trade.trading_symbol} COMPLETE filled={filled} avg={average}"
+            )
+        elif status == "CANCELLED":
+            trade.execution_error = message or "Broker cancelled the order"
+        self.save_state()
+        return True
+
+    def _arm_gtt_fallback(self, trade: Trade, qty: int, side: str, trigger: float) -> bool:
+        """Arm a server-side GTT stop. Only valid when NO SL-M is working.
+
+        A GTT and an SL-M that both fire exit the position twice, and the second fill
+        opens a naked reversed leg — so this must never run alongside a live stop.
+        """
+        placer = getattr(self.broker, "place_gtt_stop", None)
+        if not callable(placer):
+            return False
+        if str(getattr(trade, "gtt_trigger_id", "") or ""):
+            return True                      # already armed; never stack triggers
+        try:
+            trigger_id = placer(
+                trade.trading_symbol, qty, side, trigger,
+                last_price=float(getattr(trade, "current_price", 0.0) or trade.entry_price),
+                product_type=self.product_type,
+            )
+        except Exception as exc:
+            logger.error(f"GTT fallback failed for {trade.trading_symbol}: {exc}")
+            return False
+        if not trigger_id:
+            return False
+        trade.gtt_trigger_id = str(trigger_id)
+        logger.critical(
+            f"GTT fallback armed for {trade.trading_symbol} at {trigger:.2f} "
+            f"(id {trigger_id}) — the position is protected server-side even if this "
+            "process stops. Reconcile the missing SL-M."
+        )
+        return True
+
+    def _release_gtt_fallback(self, trade: Trade, note: str) -> bool:
+        """Cancel the GTT once real stop management takes over, or before flattening.
+
+        Returns False when the broker refused, so callers can withhold an exit rather
+        than market out on top of a trigger that is still armed.
+        """
+        trigger_id = str(getattr(trade, "gtt_trigger_id", "") or "")
+        if not trigger_id:
+            return True
+        canceller = getattr(self.broker, "cancel_gtt_stop", None)
+        if not callable(canceller):
+            return True
+        try:
+            cancelled = bool(canceller(trigger_id))
+        except Exception as exc:
+            logger.error(f"GTT cancellation raised for {trade.trading_symbol}: {exc}")
+            return False
+        if not cancelled:
+            logger.error(
+                f"GTT {trigger_id} for {trade.trading_symbol} could NOT be cancelled; "
+                "withholding actions that could double-exit the position."
+            )
+            return False
+        trade.gtt_trigger_id = ""
+        logger.info(f"GTT {trigger_id} released for {trade.trading_symbol}: {note}")
+        return True
 
     def ensure_broker_protection(self, trade: Trade, quantity: Optional[int] = None) -> bool:
         """Create or tighten the exchange-side SL-M for a confirmed REAL position."""
@@ -858,6 +1067,9 @@ class TradeManager:
             finder = getattr(self.broker, "find_working_protective_stop", None)
 
             def _adopt(order_id: str, note: str) -> bool:
+                # A working SL-M is now in charge, so the fallback trigger must go —
+                # leaving both armed means two exits and a naked reversed leg.
+                self._release_gtt_fallback(trade, "exchange SL-M took over")
                 trade.protective_order_id = str(order_id)
                 trade.protective_trigger = trigger
                 trade.protective_quantity = qty
@@ -910,14 +1122,42 @@ class TradeManager:
             self._last_protective_sync[trade.id] = now
             if order_id:
                 return _adopt(order_id, "Broker SL-M armed")
-            self._mark_recovery(trade, "Confirmed broker position has no exchange-side protective stop")
+            # The broker REFUSED the stop outright — so unlike the ambiguous branch
+            # above, nothing is resting at the exchange and a GTT cannot double up with
+            # an invisible SL-M. Arm one: it lives on Zerodha's servers and fires even
+            # if this process dies, which is precisely the exposure that left positions
+            # unprotected on 2026-07-31. Still marked RECOVERY_REQUIRED — a GTT is a
+            # safety net, not working stop management.
+            armed = self._arm_gtt_fallback(trade, qty, side, trigger)
+            self._mark_recovery(
+                trade,
+                "Confirmed broker position has no exchange-side protective stop"
+                + ("; GTT fallback armed on the server" if armed else ""),
+            )
             self.save_state()
             return False
 
     def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
         """Flatten a confirmed recovery position after safely cancelling its SL-M."""
         if not self.broker or not trade.symbol_token or not trade.trading_symbol:
-            self._mark_recovery(trade, f"{reason}; emergency flatten unavailable")
+            # There is no contract to submit against, so re-entering here every cycle
+            # cannot ever succeed. check_session_end() calls this on every pass for as
+            # long as the row stays RECOVERY_REQUIRED, which on 2026-07-31 turned into
+            # CRITICAL "emergency flatten unavailable" for NIFTY and SENSEX every 30s
+            # until the session ended. Latch it once and escalate to the operator: the
+            # position may or may not exist at the broker, and only a human can settle
+            # that — we must not invent a terminal state for an unknown position.
+            if not hasattr(self, "_unflattenable_latched"):
+                self._unflattenable_latched = set()
+            if trade.id in self._unflattenable_latched:
+                return False
+            self._unflattenable_latched.add(trade.id)
+            self._mark_recovery(
+                trade,
+                f"{reason}; emergency flatten unavailable (no broker contract on the "
+                "trade). Reconcile this position manually at your AngelOne terminal — "
+                "the system cannot act on it and will stop retrying.",
+            )
             return False
         if trade.protective_order_id:
             if not self.broker.cancel_order(trade.protective_order_id, "STOPLOSS"):
@@ -927,6 +1167,14 @@ class TradeManager:
                 )
                 return False
             trade.protective_order_id = ""
+        # Same rule for the server-side trigger: a GTT that survives this flatten will
+        # fire later against a flat book and open a naked reversed leg.
+        if not self._release_gtt_fallback(trade, "flattening the position"):
+            self._mark_recovery(
+                trade,
+                f"{reason}; GTT cancellation unconfirmed, market flatten withheld to avoid over-exit",
+            )
+            return False
         qty = int(trade.broker_quantity or trade.quantity)
         side = self._protective_exit_side(trade)
         order_id = self.broker.close_order(
@@ -1109,7 +1357,22 @@ class TradeManager:
                 trade.execution_status = "OPEN" if filled_qty == expected_qty else "PARTIAL"
                 
                 # ACTUAL BROKER FILL PRICE SYNC
-                fill_price = float(position.get("buyavgprice", 0.0) if trade.direction in {"LONG", "BUY"} or trade.inst_type == "OPT" else position.get("sellavgprice", 0.0))
+                # Prefer this order's own executions over the position average: the
+                # position blends every trade on the contract, so a second entry on the
+                # same strike silently rewrites the first one's entry price. Only a
+                # FILLED answer is used — UNKNOWN falls through to the position figure
+                # rather than being treated as "no fill".
+                fill_price = 0.0
+                filler = getattr(self.broker, "get_fill", None)
+                if callable(filler) and getattr(trade, "broker_order_id", ""):
+                    try:
+                        detail = filler(str(trade.broker_order_id))
+                        if str(detail.get("state") or "") == "FILLED":
+                            fill_price = float(detail.get("average_price") or 0.0)
+                    except Exception as exc:
+                        logger.debug(f"Order-level fill lookup failed for {trade.id}: {exc}")
+                if fill_price <= 0.1:
+                    fill_price = float(position.get("buyavgprice", 0.0) if trade.direction in {"LONG", "BUY"} or trade.inst_type == "OPT" else position.get("sellavgprice", 0.0))
                 if fill_price > 0.1:
                     if trade.inst_type != "OPT" or self._option_premium_quote_plausible(
                         trade,
@@ -1209,11 +1472,20 @@ class TradeManager:
             closed_records = db.load_closed_trades()
             
             stale_ghosts = 0
+            auto_closed_missing_contracts = 0
             for data in open_records:
                 tid = data.get("id", "")
                 if not tid: continue
                 t = Trade.from_dict(data)
                 t.status = "OPEN"
+                symbol = str(getattr(t, "trading_symbol", "") or "").strip()
+                token = str(getattr(t, "symbol_token", "") or "").strip()
+                broker_order_id = str(getattr(t, "broker_order_id", "") or "").strip()
+                unusable_contract = (
+                    not bool(getattr(t, "is_ghost", False))
+                    and not broker_order_id
+                    and (not symbol or not token)
+                )
                 if t.entry_time.date() < datetime.now(IST).date():
                     # Ghost/shadow rows (engine-lab, tests) never had broker
                     # orders — there is nothing to reconcile. Retaining them as
@@ -1237,6 +1509,30 @@ class TradeManager:
                     t.execution_status = "RECOVERY_REQUIRED"
                     t.execution_error = "Previous-session trade requires broker reconciliation"
                     logger.critical(f"Previous-session active trade retained for reconciliation: {tid}")
+                elif unusable_contract:
+                    # Same-session row the broker never acknowledged: no order id AND no
+                    # contract to act on, so there is no position to reconcile and nothing
+                    # emergency_flatten_trade() could ever submit. Left open it becomes the
+                    # 2026-07-31 EOD loop — FORCE_EOD_KILL retrying "emergency flatten
+                    # unavailable" every cycle until the session ends.
+                    #
+                    # Deliberately restricted to same-session rows. A trade that survived a
+                    # day boundary keeps the reconciliation path above even when its
+                    # metadata looks unusable, because discarding a position that may be
+                    # live at the broker is far worse than one noisy alert.
+                    t.status = "CLOSED"
+                    t.pending_exit = False
+                    t.pending_execution = False
+                    t.execution_status = "REJECTED"
+                    t.execution_error = (
+                        "Trade discarded: broker contract metadata missing (trading_symbol/symbol_token)"
+                    )
+                    t.exit_reason = "CONTRACT_MISSING"
+                    t.exit_time = datetime.now(IST)
+                    t.exit_price = float(getattr(t, "entry_price", 0.0) or 0.0)
+                    self.closed_trades.append(t)
+                    auto_closed_missing_contracts += 1
+                    continue
                 elif not t.execution_status:
                     t.execution_status = "OPEN"
                 self.open_trades[tid] = t
@@ -1244,6 +1540,14 @@ class TradeManager:
                 logger.info(
                     f"Closed {stale_ghosts} stale previous-session ghost trade(s) as "
                     "STALE_SESSION_END on load (no broker reconciliation applies)."
+                )
+                try:
+                    self.save_state()
+                except Exception:
+                    pass
+            if auto_closed_missing_contracts:
+                logger.warning(
+                    f"Closed {auto_closed_missing_contracts} trade(s) with missing broker contract metadata on load."
                 )
                 try:
                     self.save_state()
@@ -1409,7 +1713,7 @@ class TradeManager:
         if not result:
             return ""
         if isinstance(result, dict):
-            if result.get("status") is False or result.get("errorcode"):
+            if broker_rejection(result):
                 return ""
             data = result.get("data", result)
             if isinstance(data, dict):
@@ -1575,9 +1879,17 @@ class TradeManager:
                             product_type=self.product_type,
                             price=price,
                             touch_quote=execution_touch_quote,
+                            # Tag the order with its trade so the order book, trades
+                            # and postbacks map back exactly instead of by heuristic.
+                            trade_id=trade.id,
+                            # Decides MARKET vs LIMIT: only a high-conviction signal
+                            # is worth risking a missed fill to get a better price.
+                            confidence=float(getattr(trade, "confidence", 0.0) or 0.0),
                         )
                     except TypeError as exc:
-                        if "touch_quote" not in str(exc):
+                        if not any(
+                            arg in str(exc) for arg in ("touch_quote", "trade_id", "confidence")
+                        ):
                             raise
                         return self.broker.place_order(
                             symbol=trading_symbol,
@@ -1637,6 +1949,7 @@ class TradeManager:
                 )
                 logger.error(msg)
                 self._log_ui(msg, "error")
+                self._alert_blocking_broker_condition(error)
                 with self._lock:
                     if trade.id in self.open_trades:
                         trade.status = "CLOSED"

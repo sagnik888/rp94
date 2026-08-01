@@ -46,7 +46,7 @@ def test_source_health_keeps_yahoo_idle_when_main_brokers_are_fresh(monkeypatch)
 
     health = provider.get_source_health()
 
-    assert health["angel"] is True
+    assert health["kite"] is True
     assert health["fyers"] is True
     assert health["broker_degraded"] is False
     assert health["all_brokers_unavailable"] is False
@@ -80,7 +80,7 @@ def test_source_health_marks_single_broker_degraded_but_not_total_outage(monkeyp
 
     health = provider.get_source_health()
 
-    assert health["angel"] is False
+    assert health["kite"] is False
     assert health["fyers"] is True
     assert health["broker_degraded"] is True
     assert health["all_brokers_unavailable"] is False
@@ -92,22 +92,22 @@ def test_source_health_marks_total_outage_for_live_market(monkeypatch):
 
     health = provider.get_source_health()
 
-    assert health["angel"] is False
+    assert health["kite"] is False
     assert health["fyers"] is False
     assert health["broker_degraded"] is True
     assert health["all_brokers_unavailable"] is True
     assert health["yahoo_mode"] == "emergency_used"
 
 
-def test_market_snapshot_allows_entries_only_from_fresh_angel_authority(monkeypatch):
+def test_market_snapshot_allows_entries_only_from_fresh_kite_authority(monkeypatch):
     provider = _provider(monkeypatch)
     now = time.time()
-    provider._ws_cache["99926000"] = {"ltp": 23250.0, "time": now, "source": "angel_ws"}
+    provider._ws_cache["99926000"] = {"ltp": 23250.0, "time": now, "source": "kite_ws"}
 
     snapshot = provider.get_market_source_snapshot("NIFTY")
 
     assert snapshot["entry_eligible"] is True
-    assert snapshot["freshest"]["source"] == "angel_ws"
+    assert snapshot["freshest"]["source"] == "kite_ws"
     assert snapshot["freshest"]["order_authority"] is True
 
 
@@ -180,7 +180,7 @@ def test_index_quote_marks_fresh_ws_price_as_live(monkeypatch):
         "change": 25.0,
         "change_pct": 0.11,
         "time": now - 1.25,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     monkeypatch.setattr(provider, "get_market_session_label", lambda dt=None: "LIVE")
 
@@ -193,13 +193,13 @@ def test_index_quote_marks_fresh_ws_price_as_live(monkeypatch):
     assert 1.0 <= quote["quote_age_seconds"] <= 2.0
 
 
-def test_index_quote_keeps_fresh_angel_source_when_fyers_tick_is_newer(monkeypatch):
+def test_index_quote_keeps_fresh_kite_source_when_fyers_tick_is_newer(monkeypatch):
     provider = _provider(monkeypatch)
     now = time.time()
     provider._ws_cache["99926000"] = {
         "ltp": 23275.0,
         "time": now - 0.5,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     provider._ws_cache[FYERS_INDEX_SYMBOLS["NIFTY"]] = {
         "ltp": 23190.0,
@@ -210,16 +210,16 @@ def test_index_quote_keeps_fresh_angel_source_when_fyers_tick_is_newer(monkeypat
     quote = provider.get_index_quote("NIFTY")
 
     assert quote["ltp"] == 23275.0
-    assert quote["source"] == "angel_ws"
+    assert quote["source"] == "kite_ws"
 
 
-def test_index_quote_fails_over_to_fyers_when_angel_tick_is_stale(monkeypatch):
+def test_index_quote_fails_over_to_fyers_when_kite_tick_is_stale(monkeypatch):
     provider = _provider(monkeypatch)
     now = time.time()
     provider._ws_cache["99926000"] = {
         "ltp": 23200.0,
         "time": now - 7.0,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     provider._ws_cache[FYERS_INDEX_SYMBOLS["NIFTY"]] = {
         "ltp": 23280.0,
@@ -244,11 +244,11 @@ def test_index_quote_recomputes_ws_change_from_fyers_previous_close(monkeypatch)
     provider._ws_cache["99926009"] = {
         "ltp": 58429.25,
         "time": now - 0.25,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     provider._prev_close_global_cache = {"BANKNIFTY": 57938.50}
     provider._prev_close_cache_time = {"BANKNIFTY": now}
-    provider._prev_close_cache_source = {"BANKNIFTY": "angel_rest"}
+    provider._prev_close_cache_source = {"BANKNIFTY": "kite_rest"}
 
     class FakeFyers:
         def quotes(self, payload):
@@ -263,7 +263,7 @@ def test_index_quote_recomputes_ws_change_from_fyers_previous_close(monkeypatch)
     quote = provider.get_index_quote("BANKNIFTY")
 
     assert quote["ltp"] == 58429.25
-    assert quote["source"] == "angel_ws"
+    assert quote["source"] == "kite_ws"
     assert quote["previous_close"] == 58291.50
     assert quote["change"] == pytest.approx(137.75)
     assert quote["change_pct"] == pytest.approx(137.75 / 58291.50 * 100.0)
@@ -274,7 +274,7 @@ def test_previous_close_prefers_fyers_index_quote_over_stale_angel_cache(monkeyp
     now = time.time()
     provider._prev_close_global_cache = {"BANKNIFTY": 57938.50}
     provider._prev_close_cache_time = {"BANKNIFTY": now}
-    provider._prev_close_cache_source = {"BANKNIFTY": "angel_rest"}
+    provider._prev_close_cache_source = {"BANKNIFTY": "kite_rest"}
     provider.is_connected = True
 
     class StaleAngel:
@@ -300,7 +300,7 @@ def test_preopen_index_quote_prefers_fyers_rest_over_fresh_reference_angel_ws(mo
     provider._ws_cache["99926000"] = {
         "ltp": 23200.0,
         "time": now - 0.5,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     monkeypatch.setattr(provider, "get_market_session_label", lambda dt=None: "PRE-OPEN")
     monkeypatch.setattr(provider, "_preopen_rest_quote_allowed", lambda *args, **kwargs: True)
@@ -355,7 +355,7 @@ def test_preopen_index_quote_uses_fresh_ws_after_settlement(monkeypatch):
         "change": 95.0,
         "change_pct": 0.41,
         "time": now - 0.5,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
     monkeypatch.setattr(provider, "get_market_session_label", lambda dt=None: "PRE-OPEN")
     monkeypatch.setattr(provider, "_preopen_rest_quote_allowed", lambda *args, **kwargs: False)
@@ -371,7 +371,7 @@ def test_preopen_index_quote_uses_fresh_ws_after_settlement(monkeypatch):
     assert quote["ltp"] == 23295.0
     assert quote["change"] == 95.0
     assert quote["change_pct"] == 0.41
-    assert quote["source"] == "angel_ws"
+    assert quote["source"] == "kite_ws"
     assert quote["quote_label"] == "PRE-OPEN"
     assert quote["is_preopen"] is True
     assert quote["preopen_settlement"] is False
@@ -453,7 +453,7 @@ def test_stale_index_websocket_tick_falls_through_to_fyers_rest(monkeypatch):
     provider._ws_cache["99926000"] = {
         "ltp": 23000.0,
         "time": time.time() - 60,
-        "source": "angel_ws",
+        "source": "kite_ws",
     }
 
     class FakeFyers:

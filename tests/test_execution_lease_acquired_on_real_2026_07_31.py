@@ -15,6 +15,10 @@ Second defect: the dynamically-created SmartApiBroker was built with no account_
 had NO lease object at all and every guard failed OPEN — removing the cross-process
 protection entirely rather than enforcing it.
 """
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 from types import SimpleNamespace
 
@@ -44,12 +48,37 @@ def test_lease_is_claimed_on_demand_rather_than_refusing_a_free_lock(tmp_path):
 
 
 def test_a_genuine_live_holder_still_blocks(tmp_path):
-    """Claiming on demand must not defeat the protection it exists to provide."""
+    """Claiming on demand must not defeat the protection it exists to provide.
+
+    The holder must be a REAL second process. This test used to hold the lock with
+    another lease object inside the pytest process, which is not the thing the lease
+    guards against — Windows byte-range locks are per-handle, so that also happens
+    whenever ONE process rebuilds its own SmartApiBroker, and treating it as a foreign
+    owner is what made a process refuse its own orders. Self-ownership is now allowed;
+    a different process must still be refused, which is what this asserts.
+    """
     path = tmp_path / "acct.lock"
-    holder = AccountExecutionLease("TESTACCT1", "UT1:holder")
-    holder.path = path
-    assert holder.acquire() is True
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(f"""
+                import sys, time
+                from pathlib import Path
+                sys.path.insert(0, {os.getcwd()!r})
+                from trading.account_execution_lease import AccountExecutionLease
+                lease = AccountExecutionLease("TESTACCT1", "UT1:holder")
+                lease.path = Path({str(path)!r})
+                assert lease.acquire()
+                print("held", flush=True)
+                time.sleep(30)
+            """),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     try:
+        assert holder.stdout.readline().strip() == "held"
         b = _broker()
         b._execution_lease.path = path
         with pytest.raises(PermissionError) as err:
@@ -57,7 +86,8 @@ def test_a_genuine_live_holder_still_blocks(tmp_path):
         assert "blocked" in str(err.value)
         assert b.has_execution_lease() is False
     finally:
-        holder.release()
+        holder.kill()
+        holder.wait(timeout=10)
 
 
 def test_stale_metadata_from_a_dead_pid_does_not_block(tmp_path):
@@ -94,10 +124,28 @@ def test_real_mode_switch_claims_the_lease_and_fails_closed():
 
 
 def test_dynamic_broker_is_given_an_account_id():
-    """Otherwise it silently builds no lease and loses cross-process protection."""
+    """Otherwise it silently builds no lease and loses cross-process protection.
+
+    An empty account_id makes AccountExecutionLease None, so every lease guard fails
+    OPEN — the one guard that must never fail open, because two UT1 processes would
+    then net each other's positions on one account.
+
+    Matched on the constructor call rather than a class name: this test passed for the
+    whole AngelOne era and then went stale the moment the broker changed, while the
+    dynamic path was still handing the lease an angelone_client_id that no longer
+    exists.
+    """
     import inspect
+    import re
+
     from scanner import Scanner
+
     body = inspect.getsource(Scanner.configure)
-    seg = body.split("SmartApiBroker(")[1][:400]
-    assert "account_id" in seg, "dynamic SmartApiBroker built without account_id"
-    assert "instance_id" in seg, "dynamic SmartApiBroker built without instance_id"
+    calls = re.findall(r"\b(\w*Broker)\(\s*(.{0,400})", body, re.S)
+    assert calls, "Scanner.configure builds no broker at all"
+    for name, seg in calls:
+        assert "account_id" in seg, f"dynamic {name} built without account_id"
+        assert "instance_id" in seg, f"dynamic {name} built without instance_id"
+        assert "angelone" not in seg.lower(), (
+            f"dynamic {name} still keys its lease on a retired AngelOne setting"
+        )

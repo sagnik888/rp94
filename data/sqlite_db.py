@@ -28,6 +28,35 @@ def _resolve_db_path(db_path: str = "data_store/utbot_data.db") -> str:
     return db_path or "data_store/utbot_data.db"
 
 
+# Single source of truth for what a trade row persists. save_trade() and
+# save_trades() each used to carry their own copy of this list, and the two drifted:
+# a column missing from the copy is silently dropped, and because both writers use
+# INSERT OR REPLACE, a dropped column is NULLed on the stored row rather than left
+# untouched. Keep this in step with Trade.to_dict()/from_dict() — tests/
+# test_trade_persistence_roundtrip.py fails if any of the three fall out of sync.
+TRADE_PERSISTED_COLUMNS = frozenset({
+    "id", "instrument", "timeframe", "direction", "entry_price", "entry_time",
+    "trailing_stop", "current_stop", "lots", "lot_size", "grade",
+    "entry_timestamp", "exit_timestamp", "broker_order_id", "exit_order_id",
+    "execution_status", "execution_error", "pending_execution", "entry_submitted_at",
+    "pending_exit", "broker_quantity", "trading_symbol", "symbol_token",
+    "atm_strike", "option_type", "target", "rr_ratio", "confidence",
+    "inst_type", "instrument_multiplier", "exec_type", "status",
+    "current_price", "entry_spot", "spot_stop", "spot_target", "exit_price",
+    "exit_time", "exit_reason", "pnl", "charges", "peak_pnl", "max_drawdown",
+    "is_ghost", "market_regime", "data_provenance", "price_action_verdict",
+    "intelligence_score", "strategy_revision", "strategy_direction_mode",
+    "initial_stop", "scalp_lock_mode", "market_wide_reversal_entry",
+    "volume_spike_entry", "power_move", "source_lane",
+    # Exchange-side protection + recovery state: read by from_dict(), so it has to
+    # be written or every restart silently resets it.
+    "protective_order_id", "protective_trigger", "protective_quantity",
+    "gtt_trigger_id",
+    "protective_updated_at", "recovery_required_since", "signal_time",
+    "entry_replace_count",
+})
+
+
 def _running_under_pytest() -> bool:
     return bool(
         os.environ.get("PYTEST_CURRENT_TEST")
@@ -181,6 +210,18 @@ class DatabaseManager:
                     "volume_spike_entry": "INTEGER",
                     "power_move": "INTEGER",
                     "source_lane": "TEXT",
+                    # Exchange-side protection state. Trade.from_dict() has always read
+                    # these back, but nothing ever wrote them, so a restart forgot that a
+                    # live SL-M order existed — emergency_flatten_trade() would then market
+                    # out without cancelling it first, risking a double exit.
+                    "protective_order_id": "TEXT",
+                    "gtt_trigger_id": "TEXT",
+                    "protective_trigger": "REAL",
+                    "protective_quantity": "INTEGER",
+                    "protective_updated_at": "TEXT",
+                    "recovery_required_since": "TEXT",
+                    "signal_time": "TEXT",
+                    "entry_replace_count": "INTEGER",
                 },
             )
             
@@ -235,8 +276,7 @@ class DatabaseManager:
         """Insert or replace a trade record."""
         # SQLite doesn't natively support datetime objects without adapters, 
         # so we ensure entry_time and exit_time are strings.
-        VALID_COLUMNS = {"id", "instrument", "timeframe", "direction", "entry_price", "entry_time", "trailing_stop", "current_stop", "lots", "lot_size", "grade", "entry_timestamp", "exit_timestamp", "broker_order_id", "exit_order_id", "execution_status", "execution_error", "pending_execution", "entry_submitted_at", "pending_exit", "broker_quantity", "trading_symbol", "symbol_token", "atm_strike", "option_type", "target", "rr_ratio", "confidence", "inst_type", "instrument_multiplier", "exec_type", "status", "current_price", "entry_spot", "spot_stop", "spot_target", "exit_price", "exit_time", "exit_reason", "pnl", "charges", "peak_pnl", "max_drawdown", "is_ghost", "market_regime", "data_provenance", "price_action_verdict", "intelligence_score", "strategy_revision", "strategy_direction_mode", "initial_stop", "scalp_lock_mode", "market_wide_reversal_entry", "volume_spike_entry", "power_move", "source_lane"}
-        filtered_dict = {k: v for k, v in trade_dict.items() if k in VALID_COLUMNS}
+        filtered_dict = {k: v for k, v in trade_dict.items() if k in TRADE_PERSISTED_COLUMNS}
 
         with self.write_lock:
             cursor = self.conn.cursor()
@@ -267,25 +307,13 @@ class DatabaseManager:
 
     def save_trades(self, trade_dicts: List[Dict]) -> None:
         """Persist a trade snapshot in one transaction instead of one commit per row."""
-        valid_columns = {
-            "id", "instrument", "timeframe", "direction", "entry_price", "entry_time",
-            "trailing_stop", "current_stop", "lots", "lot_size", "grade",
-            "entry_timestamp", "exit_timestamp", "broker_order_id", "exit_order_id",
-            "execution_status", "execution_error", "pending_execution", "entry_submitted_at", "pending_exit",
-            "broker_quantity", "trading_symbol", "symbol_token",
-            "atm_strike", "option_type", "target", "rr_ratio", "confidence",
-            "inst_type", "instrument_multiplier", "exec_type", "status",
-            "current_price", "entry_spot", "spot_stop", "spot_target", "exit_price",
-            "exit_time", "exit_reason", "pnl", "charges", "peak_pnl", "max_drawdown", "is_ghost",
-            "market_regime", "data_provenance", "price_action_verdict",
-            "intelligence_score", "strategy_revision", "strategy_direction_mode",
-            "initial_stop", "scalp_lock_mode",
-            "market_wide_reversal_entry", "volume_spike_entry", "power_move",
-            "source_lane",
-        }
         grouped: Dict[tuple, List[tuple]] = {}
         for trade_dict in trade_dicts:
-            filtered = {key: value for key, value in trade_dict.items() if key in valid_columns}
+            filtered = {
+                key: value
+                for key, value in trade_dict.items()
+                if key in TRADE_PERSISTED_COLUMNS
+            }
             if not filtered:
                 continue
             columns = tuple(filtered)

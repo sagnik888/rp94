@@ -2851,6 +2851,176 @@ async def api_fyers_login_redirect(request: Request):
     except Exception as exc:
         return HTMLResponse(f"Error generating Fyers URL: {exc}", status_code=500)
 
+def _is_loopback_client(request: Request) -> bool:
+    """True when the request came from this machine.
+
+    The Kite login legs are browser NAVIGATIONS, not XHR: the first is a new tab and
+    the second is Zerodha redirecting back. Neither can carry the x-dashboard-token
+    header that _request_authorized() requires, so header auth would reject the login
+    permanently. Loopback is the boundary that actually applies here — the dashboard
+    binds 127.0.0.1, and a request_token is single-use, short-lived, and worthless
+    without the api_secret held in this process.
+    """
+    # A reverse proxy or tunnel connects to this app FROM localhost, so client.host
+    # alone would call a request from the public internet "local" and hand a stranger
+    # the Kite login flow. Any forwarding header means the request was relayed, and a
+    # relayed request is not local no matter what the socket says.
+    for header in ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "cf-connecting-ip",
+                   "forwarded", "cf-ray"):
+        if request.headers.get(header):
+            return False
+    host = getattr(getattr(request, "client", None), "host", "") or ""
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+@app.get("/api/kite_auth_url")
+async def api_kite_auth_url(request: Request):
+    """Authenticated: hand the dashboard the Kite login URL to open."""
+    if not _request_authorized(request):
+        return {"status": "error", "message": "Unauthorized"}
+    from data.kite_auth import get_kite_auth
+
+    try:
+        return {"status": "ok", "auth_url": get_kite_auth().login_url()}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/api/kite_login")
+async def api_kite_login(request: Request):
+    """Both halves of the Kite daily login.
+
+    Zerodha redirects back to this same URL with ?request_token=..., which is why the
+    app's registered redirect must point here. Called with no token it sends the
+    operator to Kite; called with one it completes the exchange.
+
+    Kite has no password-based API login, so no account password is accepted, stored,
+    or transmitted anywhere in this flow.
+    """
+    if not _is_loopback_client(request):
+        return HTMLResponse("Unauthorized", status_code=401)
+    from data.kite_auth import get_kite_auth
+
+    auth = get_kite_auth()
+    request_token = str(request.query_params.get("request_token") or "").strip()
+    kite_status = str(request.query_params.get("status") or "").strip()
+
+    if not request_token:
+        if kite_status and kite_status.lower() != "success":
+            return HTMLResponse(
+                f"<h3>Kite login was not completed</h3><p>Zerodha reported: {kite_status}</p>",
+                status_code=400,
+            )
+        try:
+            return RedirectResponse(auth.login_url())
+        except Exception as exc:
+            return HTMLResponse(f"Cannot start the Kite login: {exc}", status_code=500)
+
+    try:
+        result = auth.complete_login(request_token)
+    except Exception as exc:
+        logger.exception(f"Kite login exchange failed: {exc}")
+        return HTMLResponse(
+            f"<h3>Kite login failed</h3><p>{exc}</p>"
+            "<p>A request_token is single-use and expires within minutes — "
+            "<a href='/api/kite_login'>start again</a>.</p>",
+            status_code=500,
+        )
+
+    # Hand the live session to anything already constructed with the old one.
+    try:
+        if scanner_ref is not None:
+            # rebind_kite() rebuilds the data source, contract master, tick socket AND
+            # the broker. Calling on_kite_reauth directly only rebound the broker, so
+            # quotes and ticks kept using the dead token after a re-login.
+            data_provider = getattr(scanner_ref, "data", None)
+            rebind = getattr(data_provider, "rebind_kite", None)
+            if callable(rebind):
+                rebind(auth.kite)
+            else:
+                fallback = getattr(data_provider, "on_kite_reauth", None)
+                if callable(fallback):
+                    fallback(auth.kite)
+    except Exception as exc:
+        logger.warning(f"Kite session rebind after login failed: {exc}")
+
+    return HTMLResponse(
+        f"<h3>Kite session active</h3><p>Logged in as {result.get('user_id') or 'user'}."
+        "</p><p>This token expires tomorrow morning; log in again before the next "
+        "session. You can close this tab.</p>"
+    )
+
+
+@app.get("/api/kite_postback")
+async def api_kite_postback_probe():
+    """Liveness probe for URL validators. Exposes nothing and accepts nothing."""
+    return {"status": "ok", "endpoint": "kite_postback"}
+
+
+@app.post("/api/kite_postback")
+async def api_kite_postback(request: Request):
+    """Zerodha order postback: authoritative order state, pushed not polled.
+
+    Kite POSTs here on every order state change. That settles the exact question the
+    2026-07-31 incident could not answer — whether an order reached the exchange —
+    without the order-book scan heuristic, and without waiting for the next poll.
+
+    Authenticity is established by the checksum Zerodha sends: SHA-256 of
+    order_id + order_timestamp + api_secret. An unsigned or mismatched payload is
+    ignored, because this endpoint must be reachable by Zerodha and therefore cannot
+    sit behind the dashboard's header token.
+    """
+    import hashlib
+
+    from fastapi.responses import JSONResponse
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "message": "malformed payload"}
+    if not isinstance(payload, dict):
+        return {"status": "error", "message": "malformed payload"}
+
+    from data.kite_auth import get_kite_auth
+
+    auth = get_kite_auth()
+    secret = getattr(auth, "_KiteAuth__api_secret", None) or getattr(auth, "_api_secret", "")
+    order_id = str(payload.get("order_id") or "")
+    stamp = str(payload.get("order_timestamp") or "")
+    received = str(payload.get("checksum") or "")
+    expected = hashlib.sha256(f"{order_id}{stamp}{secret}".encode("utf-8")).hexdigest()
+    if not received or received != expected:
+        # Never act on an unverified payload: this route is public by necessity, so a
+        # forged "COMPLETE" could convince the system a phantom position exists.
+        logger.warning(f"Rejected Kite postback with bad checksum for order {order_id}")
+        # 403, not a 200 carrying an error body: a 200 tells the sender it succeeded,
+        # and it matches what the standalone listener returns for the same payload.
+        return JSONResponse({"status": "error", "message": "checksum mismatch"}, status_code=403)
+
+    status = str(payload.get("status") or "").upper()
+    logger.info(
+        f"Kite postback: order {order_id} -> {status} "
+        f"filled={payload.get('filled_quantity')} avg={payload.get('average_price')}"
+    )
+    try:
+        if scanner_ref is not None:
+            handler = getattr(getattr(scanner_ref, "trades", None), "on_broker_postback", None)
+            if callable(handler):
+                handler(dict(payload))
+    except Exception as exc:
+        logger.exception(f"Kite postback handling failed for {order_id}: {exc}")
+    return {"status": "ok"}
+
+
+@app.get("/api/kite_status")
+async def api_kite_status(request: Request):
+    if not (_request_authorized(request) or _is_loopback_client(request)):
+        return {"status": "error", "message": "Unauthorized"}
+    from data.kite_auth import get_kite_auth
+
+    return make_serializable(get_kite_auth().status())
+
+
 @app.post("/api/fyers_auth")
 async def api_fyers_auth_complete(request: Request):
     if not _request_authorized(request):

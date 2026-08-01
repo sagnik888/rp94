@@ -2016,6 +2016,15 @@ function setupEventListeners() {
         fyersBadge.title = 'Fyers Data Status. Click to refresh login.';
     }
 
+    // The Kite access token dies every morning, so the badge doubles as the login
+    // button — a red KITE badge means no order can reach the exchange.
+    const kiteBadge = document.getElementById('gw_kite');
+    if (kiteBadge) {
+        kiteBadge.style.cursor = 'pointer';
+        kiteBadge.onclick = startKiteAuthFlow;
+        kiteBadge.title = 'Zerodha Kite session. Click to log in (token expires daily).';
+    }
+
     const autoSwitch = document.getElementById('autoModeSwitch');
     if (autoSwitch) {
         autoSwitch.addEventListener('change', () => {
@@ -2266,6 +2275,36 @@ async function completeFyersRedirectIfPresent() {
     }
 }
 
+async function startKiteAuthFlow() {
+    // The login URL is fetched over an AUTHENTICATED XHR, then opened. Navigating
+    // straight to a server route cannot work: a new tab sends no x-dashboard-token
+    // header, so the request is rejected as Unauthorized. Same shape as Fyers below.
+    let loginWindow = null;
+    try {
+        loginWindow = window.open('about:blank', '_blank');   // opened on the click, or popups block it
+        if (loginWindow) {
+            loginWindow.opener = null;
+            loginWindow.document.write('<!doctype html><title>Kite Login</title><body style="font-family:sans-serif;background:#070a0f;color:#e7edf6;padding:24px">Preparing Zerodha Kite login...</body>');
+        }
+        const res = await authFetch('/api/kite_auth_url', { cache: 'no-store' });
+        const data = await res.json();
+        if (data.status !== 'ok' || !data.auth_url) {
+            if (loginWindow && !loginWindow.closed) loginWindow.close();
+            showToast(data.message || 'Unable to start the Kite login', 'error');
+            return;
+        }
+        if (loginWindow && !loginWindow.closed) {
+            loginWindow.location.href = data.auth_url;
+        } else {
+            window.open(data.auth_url, '_blank');
+        }
+        showToast('Complete the Kite login in the new tab. The token lasts until tomorrow morning.', 'info');
+    } catch (err) {
+        if (loginWindow && !loginWindow.closed) loginWindow.close();
+        showToast('Kite login failed to start: ' + err.message, 'error');
+    }
+}
+
 async function startFyersAuthFlow() {
     let loginWindow = null;
     try {
@@ -2331,7 +2370,7 @@ async function submitFyersCode(authCode) {
 
 function updateGatewayStatus(status) {
     const gateways = {
-        'gw_angel': status.angel,
+        'gw_kite': status.kite,
         'gw_fyers': status.fyers,
         'gw_yahoo': status.yahoo
     };
@@ -2394,7 +2433,7 @@ function updateDiagnosticsPanel(diagnostics) {
     // Sources: A:ON F:ON Y:ON
     const yahooState = sources.yahoo_mode === 'emergency_used' ? 'EMERG' : 'STBY';
     const sourceText = [
-        `A:${sources.angel ? 'ON' : 'OFF'}`,
+        `K:${sources.kite ? 'ON' : 'OFF'}`,
         `F:${sources.fyers ? 'ON' : 'OFF'}`,
         `Y:${sources.yahoo ? yahooState : 'OFF'}`,
     ].join(' ');

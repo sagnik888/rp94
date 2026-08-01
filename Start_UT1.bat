@@ -42,7 +42,19 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-python scripts\check_python_runtime.py
+:: Pin the interpreter explicitly. `activate.bat` only prepends to PATH, and when that
+:: does not take effect a global python silently answers instead. That is how the
+:: system ran against global site-packages: every older dependency imported fine, so
+:: nothing looked wrong until kiteconnect - installed only in venv - was missing.
+set "PY=%CD%\venv\Scripts\python.exe"
+if not exist "%PY%" (
+    echo [ERROR] venv interpreter not found at "%PY%".
+    echo Recreate it with: python -m venv venv
+    pause
+    exit /b
+)
+
+"%PY%" scripts\check_python_runtime.py
 if %errorlevel% neq 0 (
     echo [ERROR] Unsupported Python runtime. Recreate venv with Python 3.13.x.
     pause
@@ -51,10 +63,10 @@ if %errorlevel% neq 0 (
 
 :: 5. Ensure dependencies are installed (Quick check)
 echo [INFO] Verifying dependencies...
-python -c "import uvicorn, loguru" >nul 2>&1
+"%PY%" -c "import uvicorn, loguru, kiteconnect" >nul 2>&1
 if %errorlevel% neq 0 (
     echo [INFO] Missing core dependencies. Installing from requirements.txt...
-    pip install -r requirements.txt
+    "%PY%" -m pip install -r requirements.txt
     if %errorlevel% neq 0 (
         echo [ERROR] Failed to install dependencies. Check your internet connection.
         pause
@@ -63,10 +75,10 @@ if %errorlevel% neq 0 (
 )
 
 :: 6. Pre-flight: ensure the dashboard port is free (stale instance check)
-echo [INFO] Checking port 8503 for a stale instance...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\preflight_port.ps1" -Port 8503
+echo [INFO] Checking port 8500 for a stale instance...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\preflight_port.ps1" -Port 8500
 if %errorlevel% neq 0 (
-    echo [INFO] Launch aborted ^(port 8503 still in use or left running by choice^).
+    echo [INFO] Launch aborted ^(port 8500 still in use or left running by choice^).
     pause
     exit /b
 )
@@ -74,14 +86,14 @@ if %errorlevel% neq 0 (
 :: 7. Launch the Server
 echo ========================================================
 echo [INFO] Starting Backend Server (main.py)...
-echo [INFO] Dashboard will be available at http://127.0.0.1:8503/
+echo [INFO] Dashboard will be available at http://127.0.0.1:8500/
 echo ========================================================
 
 :: Open the browser only after the API has live dashboard state, not just an open port.
-start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "http://127.0.0.1:8503/" -Port 8503
+start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "http://127.0.0.1:8500/" -Port 8500
 
 :: Start the python process
-python main.py
+"%PY%" main.py
 
 :: 8. Error Handling
 echo.

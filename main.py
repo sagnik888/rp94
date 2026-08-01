@@ -8,6 +8,7 @@ Dashboard: http://localhost:8001
 import sys
 import asyncio
 import os
+import re
 import subprocess
 import threading
 import time
@@ -31,7 +32,7 @@ from engine.signal_manager import SignalManager
 from intelligence.intelligence_aggregator import IntelligenceAggregator
 from trading.trade_manager import TradeManager, IST
 from trading.performance_tracker import PerformanceTracker
-from trading.broker import SignalSimBroker, SmartApiBroker
+from trading.broker import SignalSimBroker
 from scanner import Scanner
 from notifications import send_desktop_notification
 from dashboard.server import app, broadcast
@@ -404,6 +405,26 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                         state,
                     )
 
+                # 2b. Kite session — the token dies every morning, and without it
+                # every order is refused while the scanner still looks perfectly
+                # healthy. This is the Kite equivalent of the AngelOne AG7002 trap.
+                try:
+                    from data.kite_auth import get_kite_auth
+
+                    kite_status = get_kite_auth().status()
+                except Exception as exc:
+                    kite_status = {"auth_required": True, "reason": f"status unavailable: {exc}"}
+                if kite_status.get("auth_required"):
+                    _alert(
+                        "kite_token",
+                        f"Kite login required ({kite_status.get('reason') or 'no session'}) - "
+                        f"NO order can reach the exchange until you log in at "
+                        f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/kite_login",
+                        state,
+                    )
+                else:
+                    state.pop("kite_token", None)
+
                 # 3. Fyers auth — expires daily and cannot auto-refresh.
                 try:
                     status = scanner.data.get_fyers_auth_status()
@@ -679,12 +700,10 @@ def create_system():
     logger.info("═" * 60)
 
     # 1. Data Provider (Yahoo Finance + AngelOne)
-    data_provider = MarketDataProvider(
-        api_key=settings.angelone_api_key,
-        client_id=settings.angelone_client_id,
-        password=settings.angelone_password,
-        totp_secret=settings.angelone_totp_secret,
-    )
+    # No credentials passed: Kite authenticates through the browser login, and the
+    # provider binds to the shared KiteAuth session in connect(). Feeding it the old
+    # AngelOne credentials implied they still mattered — they do not.
+    data_provider = MarketDataProvider()
     data_provider.connect()
     if settings.trading_mode == "REAL":
         readiness = validate_real_mode_readiness(settings, data_provider)
@@ -708,13 +727,39 @@ def create_system():
     # 1b. Broker Setup (Dual Mode)
     sim_broker = SignalSimBroker()
     real_broker = None
-    if data_provider.is_connected:
-        real_broker = SmartApiBroker(
-            data_provider.smart_api,
-            account_id=settings.angelone_client_id,
+    # Build the Kite broker even with no session yet. Gating this on a live connection
+    # was an AngelOne assumption: that login happened automatically at startup, so
+    # "not connected" meant "broker impossible". Kite's login is a manual browser step
+    # that normally happens AFTER startup, and refusing to construct the broker left
+    # the system stuck in SIGNAL SIMULATION until a full restart — the operator would
+    # log in, see a healthy dashboard, and still place no live orders.
+    # KiteBroker holds the shared auth, so the session it gets rebound at login time.
+    if True:
+        # Zerodha Kite is the execution broker. The session comes from the shared
+        # KiteAuth so the dashboard login route, the data layer and the broker all
+        # observe one token — a browser re-login must not leave the broker holding a
+        # dead one. The lease is keyed on the Kite user id, since it is Kite positions
+        # that are account-netted now.
+        from data.kite_auth import get_kite_auth
+        from trading.kite_broker import KiteBroker
+
+        kite_auth = get_kite_auth(settings)
+        real_broker = KiteBroker(
+            kite=kite_auth.kite,
+            auth=kite_auth,
+            account_id=str(getattr(settings, "kite_user_id", "") or "").strip(),
             instance_id=f"UT1:{settings.dashboard_port}",
         )
-        data_provider.on_angel_reauth = real_broker.replace_api
+        data_provider.on_kite_reauth = real_broker.replace_api
+        if kite_auth.kite is None:
+            # Not fatal at startup: the operator logs in through the dashboard and the
+            # session is rebound. It IS fatal for placing orders, and KiteBroker
+            # refuses them with that exact instruction until then.
+            logger.critical(
+                "Kite session required: no valid token. Complete the daily login at "
+                f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/kite_login "
+                f"({kite_auth.status().get('reason')})"
+            )
         if settings.trading_mode == "REAL" and not real_broker.acquire_execution_lease():
             logger.critical(
                 "REAL startup refused: " + real_broker.execution_lease_block_reason()
@@ -725,9 +770,27 @@ def create_system():
             except Exception as exc:
                 logger.error(f"Failed to persist lease safe-mode fallback: {exc}")
         data_provider.fetch_instruments()
-        logger.info("✅ Broker (AngelOne LIVE Ready)")
-    else:
-        logger.warning("⚠️ Real Broker not available (AngelOne not connected)")
+        if kite_auth.kite is not None:
+            logger.info("✅ Broker (Zerodha Kite LIVE Ready)")
+        else:
+            logger.warning(
+                "⚠️ Broker built but IDLE — Kite login pending; orders are refused until then"
+            )
+
+        # The Kite app's registered redirect must match the port this dashboard
+        # actually serves, or Zerodha bounces the browser to a dead address and the
+        # login silently never completes.
+        redirect = str(getattr(settings, "kite_redirect_uri", "") or "").strip()
+        expected = f"/api/kite_login"
+        if redirect and (
+            str(settings.dashboard_port) not in redirect or expected not in redirect
+        ):
+            logger.critical(
+                f"KITE REDIRECT MISMATCH: the app is registered to {redirect} but this "
+                f"dashboard serves http://{settings.dashboard_host}:{settings.dashboard_port}"
+                f"{expected}. Update the redirect URL at developers.kite.trade or the "
+                f"login will never complete."
+            )
 
     # Initial broker selection based on settings
     active_broker = real_broker if (settings.trading_mode == "REAL" and real_broker) else sim_broker

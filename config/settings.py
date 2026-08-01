@@ -36,6 +36,33 @@ PROTECTED_SECRET_ENV_KEYS = {
 }
 
 
+def _set_env_key_with_retry(env_key: str, value: str, attempts: int = 4) -> bool:
+    """Write one .env key, tolerating a transient Windows file lock.
+
+    python-dotenv writes a temp file and os.replace()s it over .env. On Windows that
+    fails outright with "[WinError 5] Access is denied" whenever anything else holds a
+    handle — an antivirus scan or an open editor is enough. The lock is momentary, so a
+    short backoff clears it, where the single attempt simply dropped the setting.
+    """
+    import time as _time
+
+    delay = 0.15
+    for attempt in range(max(1, attempts)):
+        try:
+            dotenv.set_key('.env', env_key, value)
+            return True
+        except (PermissionError, OSError) as exc:
+            if attempt == attempts - 1:
+                print(
+                    f"Could not persist {env_key} to .env after {attempts} attempts: {exc}. "
+                    "Close any editor or sync tool holding the file."
+                )
+                return False
+            _time.sleep(delay)
+            delay *= 2
+    return False
+
+
 def _clean_env_secret(value: Any) -> str:
     return str(value or "").strip().strip("'").strip('"')
 
@@ -44,11 +71,53 @@ class Settings(BaseSettings):
     """Main application settings loaded from .env"""
 
     # ─── AngelOne API ────────────────────────────────────────
+    # ── Zerodha Kite Connect (primary broker) ────────────────────────────────
+    # Kite has no password login: the account password is never stored or used by
+    # this system. A browser login issues a request_token, which is exchanged for an
+    # access_token that expires every morning (~06:00-07:30 IST), so a manual login
+    # is required once per trading day via /api/kite_login.
+    kite_api_key: str = ""
+    kite_api_secret: str = ""
+    kite_user_id: str = ""
+    # Where the daily access token is cached. Kept out of .env because it rotates.
+    kite_token_file: str = "kite_token.json"
+    # Kite's redirect target must match the one registered on the app at
+    # developers.kite.trade. The dashboard serves the landing route itself.
+    kite_redirect_uri: str = ""
+    # NRML = overnight/carryforward, MIS = intraday auto-squareoff. The system's
+    # product_type strings are broker-neutral and mapped in KiteBroker.
+    kite_default_product: str = "NRML"
+    # Entries go in at the market by default. A LIMIT that does not fill is a missed
+    # signal, and the cancel/replace path already converts a stale limit to MARKET
+    # after ~12s — so a limit mostly buys a 12-second delay and an extra failure mode.
+    # Slippage is bounded instead by market_protection on the order itself.
+    #
+    # A LIMIT is used only when the signal clears this confidence bar, where waiting
+    # for a price is worth the risk of not being filled at all. 100 disables limits
+    # entirely; 0 makes every priced entry a limit (the old behaviour).
+    entry_limit_confidence_threshold: float = 95.0
+
+    # Server-side life span for entry LIMIT orders, in minutes. 0 disables it.
+    #
+    # This is a BACKSTOP, not the primary mechanism: broker_cancel_replace_enabled
+    # already cancels a stale limit after ~12s and re-sends it as MARKET, which
+    # actually gets the position taken — TTL only cancels. Set well beyond that
+    # window so it never races the replace logic. Its job is the case the replace
+    # logic cannot cover: if this process dies while a limit rests, Zerodha expires
+    # the order instead of leaving it to fill hours later at a stale price.
+    kite_entry_limit_ttl_minutes: int = 5
+
     angelone_api_key: str = ""
     angelone_client_id: str = ""
     angelone_password: str = ""
     angelone_totp_secret: str = ""
     angelone_secret_key: str = ""
+    # The public IP whitelisted on your SmartAPI app (smartapi.angelone.in ->
+    # My Profile -> app -> Redirect/Whitelisted IP). AngelOne validates the TCP
+    # source IP and refuses EVERY order with AG7002 when it does not match, so a
+    # dynamic ISP address silently kills a whole session. Set this and the runtime
+    # watchdog warns the moment the machine's real egress IP drifts off it.
+    # Leave blank to disable the check.
 
     # ─── Fyers API ───────────────────────────────────────────
     fyers_app_id: str = "6P37DKRJG6-100"
@@ -1608,7 +1677,7 @@ class Settings(BaseSettings):
                 existing_secret = existing_values.get(env_key)
                 if _clean_env_secret(existing_secret):
                     str_val = str(existing_secret)
-            dotenv.set_key('.env', env_key, str_val)
+            _set_env_key_with_retry(env_key, str_val)
 
     def get_instruments(self) -> Dict[str, Any]:
         """Load instrument configuration from instruments.json"""

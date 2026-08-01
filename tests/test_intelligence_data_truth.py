@@ -273,16 +273,40 @@ def test_option_oi_snapshot_save_is_thread_safe(tmp_path, monkeypatch):
     assert list(Path("data_store").glob("option_oi_snapshots.json.*.tmp")) == []
 
 
-def test_angelone_option_subscription_uses_snap_quote_for_oi():
-    calls = []
+def test_option_subscription_uses_full_mode_for_oi():
+    """Option streams must carry OI, or the intelligence layer runs on stale REST data.
+
+    AngelOne needed a separate SNAP_QUOTE mode (3) for this; Kite carries OI *and*
+    5-level depth in MODE_FULL. The requirement is unchanged, the mechanism is not.
+    """
+    subscribed, modes = [], []
     provider = MarketDataProvider.__new__(MarketDataProvider)
-    provider._active_angel_tokens = {}
-    provider._angel_ws_connected = True
-    provider.sws = SimpleNamespace(
-        subscribe=lambda **kwargs: calls.append(kwargs)
+    provider._active_kite_tokens = set()
+    provider._kite_ws_connected = True
+    provider.kws = SimpleNamespace(
+        MODE_FULL="full",
+        subscribe=lambda tokens: subscribed.extend(tokens),
+        set_mode=lambda mode, tokens: modes.append((mode, tuple(tokens))),
     )
     provider.subscribe_tokens(["111", "222"], exchange_type=2)
-    assert calls[0]["mode"] == 3
+
+    assert subscribed == [111, 222]
+    assert modes == [("full", (111, 222))]
+
+
+def test_option_subscription_queues_tokens_while_the_socket_is_down():
+    """Tokens must survive a disconnect: on_connect replays them.
+
+    Previously subscribe_tokens() was a silent no-op with no socket, so option
+    contracts were never streamed at all after the AngelOne retirement.
+    """
+    provider = MarketDataProvider.__new__(MarketDataProvider)
+    provider._active_kite_tokens = set()
+    provider._kite_ws_connected = False
+    provider.kws = None
+
+    provider.subscribe_tokens(["333"])
+    assert provider._active_kite_tokens == {"333"}
 
 
 def test_zero_oi_delta_never_creates_directional_signal():

@@ -25,7 +25,7 @@ def test_dashboard_recovers_immediately_and_periodically_from_omitted_ws_state()
     assert "refreshDashboardSnapshot('websocket-payload-omitted', { force: true })" in js
     assert "state.wsPayloadOmitted || wsIsStale || !hasState" in js
     assert "state.wsPayloadOmitted = false" in js
-    assert "app.js?v=july2026-v40-ws-live-state-recovery" in html
+    assert "app.js?v=aug2026-v42-kite-login-flow" in html
 
 
 def test_index_cards_render_preopen_settlement_quote_label():

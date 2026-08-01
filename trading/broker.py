@@ -13,7 +13,12 @@ from typing import Any, Dict, Optional
 from loguru import logger
 from trading.api_rate_limiter import get_shared_api_limiter
 from trading.account_execution_lease import AccountExecutionLease, lease_owner_description
-from trading.order_retry import BrokerOrderAmbiguous
+from trading.order_retry import (
+    BrokerOrderAmbiguous,
+    BrokerOrderRejected,
+    broker_rejection,
+    is_terminal_rejection,
+)
 from trading.secure_logging import install_smartapi_log_redaction
 try:
     from SmartApi import SmartConnect
@@ -266,7 +271,16 @@ class SignalSimBroker(Broker):
         return True
 
 class SmartApiBroker(Broker):
-    """AngelOne SmartAPI Broker"""
+    """RETIRED — AngelOne SmartAPI. Not constructed anywhere in the live path.
+
+    Zerodha Kite is the execution broker (trading/kite_broker.py). This class is kept
+    only because ten test modules exercise safety invariants through it — SL-M
+    duplicate prevention, entry-order ambiguity classification, the cross-process
+    execution lease, unattended-live guards. Those invariants now also live in
+    KiteBroker with their own tests, so deleting this is a deliberate follow-up:
+    port each test to KiteBroker FIRST, then remove the class, so no invariant is
+    silently dropped along with the code that proved it.
+    """
     requires_contract_master_validation = True
     requires_protective_stop_metadata_validation = True
     requires_entry_margin_preflight = True
@@ -425,8 +439,11 @@ class SmartApiBroker(Broker):
         except Exception as exc:
             logger.error(f"Entry funds preflight failed: {exc}")
             return None, f"RMS_API_ERROR:{exc}"
-        if not isinstance(response, dict) or response.get("status") is False or response.get("errorcode"):
+        if not isinstance(response, dict):
             return None, f"RMS_API_REJECTED:{response}"
+        rejection = broker_rejection(response)
+        if rejection:
+            return None, f"RMS_API_REJECTED:{rejection}"
         # Angel RMS payloads vary by SDK/API revision. availablecash is the
         # preferred conservative field; net is used only when it is absent.
         available = self._nested_numeric(response, ("availablecash",))
@@ -493,11 +510,7 @@ class SmartApiBroker(Broker):
                     lambda: getattr(self.api, "getMarginApi")(payload),
                     timeout=2.0,
                 )
-                if (
-                    isinstance(response, dict)
-                    and response.get("status") is not False
-                    and not response.get("errorcode")
-                ):
+                if isinstance(response, dict) and not broker_rejection(response):
                     required = self._nested_numeric(
                         response,
                         (
@@ -871,9 +884,15 @@ class SmartApiBroker(Broker):
                 ) from api_err
 
             if isinstance(response, dict):
-                if response.get("status") is False or response.get("errorcode"):
-                    logger.error(f"Broker rejected order: {response}")
-                    return None
+                reason = broker_rejection(response)
+                if reason:
+                    # Carry the broker's own words to the trade record. This used to
+                    # `return None`, so the dashboard showed a bare "BROKER ERROR" and
+                    # the actual cause — e.g. "49.37.34.211 is not a registered IP" —
+                    # was discarded at the one place it was known.
+                    terminal = is_terminal_rejection(reason)
+                    logger.error(f"Broker rejected {side} {symbol}: {reason}")
+                    raise BrokerOrderRejected(reason, code="", terminal=terminal)
                 data = response.get("data", response)
                 if isinstance(data, dict):
                     order_id = str(
@@ -922,8 +941,13 @@ class SmartApiBroker(Broker):
             logger.success(f"REAL ORDER PLACED: {order_id} ({exchange})")
             return order_id
         except Exception as e:
-            if isinstance(e, BrokerOrderAmbiguous):
+            if isinstance(e, (BrokerOrderAmbiguous, BrokerOrderRejected)):
                 raise
+            if isinstance(e, PermissionError):
+                # Lease refusal. Retrying it seven times over ~40s cannot help — the
+                # other owner does not surrender the account mid-schedule — and it
+                # buried the real reason under a generic "Broker rejected order".
+                raise BrokerOrderRejected(str(e), terminal=True) from e
             logger.error(f"Order placement failed on {exchange if 'exchange' in locals() else 'Unknown'}: {e}")
             return None
 
@@ -951,7 +975,11 @@ class SmartApiBroker(Broker):
                 ),
             )
             if isinstance(response, dict):
-                if response.get("status") is False or response.get("errorcode"):
+                reason = broker_rejection(response)
+                if reason:
+                    # An exit that the broker refused is a live-risk event, not a
+                    # quiet None: say why, loudly, so the operator can act.
+                    logger.critical(f"Broker refused EXIT order for {symbol}: {reason}")
                     return None
                 data = response.get("data", response)
                 order_id = str(data.get("orderid") or data.get("uniqueorderid") or "") if isinstance(data, dict) else str(data or "")
@@ -1026,8 +1054,7 @@ class SmartApiBroker(Broker):
             return {"state": "UNKNOWN", "order_id": "", "reason": f"order-book scan failed: {exc}", "matches": []}
         if (
             not isinstance(response, dict)
-            or response.get("status") is False
-            or response.get("errorcode")
+            or broker_rejection(response)
             or not isinstance(response.get("data", []), list)
         ):
             return {
@@ -1109,8 +1136,7 @@ class SmartApiBroker(Broker):
             }
         if (
             not isinstance(response, dict)
-            or response.get("status") is False
-            or response.get("errorcode")
+            or broker_rejection(response)
             or not isinstance(response.get("data", []), list)
         ):
             return {
@@ -1248,9 +1274,17 @@ class SmartApiBroker(Broker):
                 "cancel order",
                 lambda: self.api.cancelOrder(str(order_id), str(variety or "NORMAL").upper()),
             )
-            return not isinstance(response, dict) or (
-                response.get("status") is not False and not response.get("errorcode")
-            )
+            # A refused cancellation MUST read as False. It used to read as True for
+            # the gateway envelope, and emergency_flatten_trade() takes that as proof
+            # the SL-M is gone: it clears protective_order_id and fires a market exit
+            # while the stop is still resting at the exchange. When the stop later
+            # triggers, the position is exited twice and the second fill opens a naked
+            # reversed leg with no protection.
+            reason = broker_rejection(response)
+            if reason:
+                logger.error(f"Broker refused cancellation of {order_id}: {reason}")
+                return False
+            return True
         except Exception as exc:
             logger.error(f"Order cancellation failed for {order_id}: {exc}")
             return False
@@ -1294,8 +1328,9 @@ class SmartApiBroker(Broker):
                 f"Protective stop acknowledgement ambiguous after exception: {exc}"
             ) from exc
         if isinstance(response, dict):
-            if response.get("status") is False or response.get("errorcode"):
-                logger.error(f"Broker rejected protective stop: {response}")
+            reason = broker_rejection(response)
+            if reason:
+                logger.error(f"Broker rejected protective stop for {symbol}: {reason}")
                 return None
             data = response.get("data", response)
             order_id = (
@@ -1335,9 +1370,16 @@ class SmartApiBroker(Broker):
                 "modify protective stop",
                 lambda: self.api.modifyOrder(params),
             )
-            return not isinstance(response, dict) or (
-                response.get("status") is not False and not response.get("errorcode")
-            )
+            # A refused modify MUST read as False. Reporting success let the caller
+            # record trade.protective_trigger at the new tighter level while the
+            # resting SL-M kept its original trigger; every later tightening check
+            # then compares against that fabricated value, sees "already tighter",
+            # and never contacts the broker again — so the divergence is permanent.
+            reason = broker_rejection(response)
+            if reason:
+                logger.error(f"Broker refused protective-stop modify for {symbol}: {reason}")
+                return False
+            return True
         except Exception as exc:
             logger.error(f"Protective stop modification failed for {symbol}: {exc}")
             return False
@@ -1352,10 +1394,11 @@ class SmartApiBroker(Broker):
                 "fetch positions", lambda: self.api.position(), timeout=2.0
             )
             if isinstance(response, dict):
-                if response.get("status") is False or response.get("errorcode"):
+                reason = broker_rejection(response)
+                if reason:
                     if self._position_should_backoff(response):
                         self._mark_position_backoff(response)
-                    logger.error(f"Broker returned error for positions: {response}")
+                    logger.error(f"Broker returned error for positions: {reason}")
                     return None
             self._position_backoff_failures = 0
             self._position_backoff_until = 0.0
