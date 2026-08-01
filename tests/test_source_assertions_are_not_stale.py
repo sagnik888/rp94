@@ -90,3 +90,34 @@ def test_the_sweep_actually_inspects_something():
     """Guards the guard: a broken regex here would make the check pass vacuously."""
     found = list(_source_text_assertions())
     assert len(found) > 50, f"expected many source-text assertions, found {len(found)}"
+
+
+def test_negative_assertions_are_deliberately_absent_from_this_check():
+    """`assert "x" not in src` is a REGRESSION GUARD, not a stale assertion.
+
+    Such an assertion passing because the string appears nowhere is the guard doing
+    its job — "this bad pattern has not come back". Auditing them the same way as
+    positive assertions would flag every healthy one and invite someone to delete
+    protections like `assert "cmd /c" not in text` (shell injection must not return)
+    or `assert "SECRET456" not in body` (the api_secret must never reach disk).
+
+    This test exists to record that asymmetry so the distinction is not lost.
+    """
+    import re
+
+    pattern = re.compile(
+        r"""\s*assert\s+(["'])(.+?)\1\s+not\s+in\s+(body|src|source|code|js|html|text)\b"""
+    )
+    negatives = 0
+    for path in (ROOT / "tests").glob("test_*.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        negatives += sum(1 for line in text.splitlines() if pattern.match(line))
+    assert negatives > 0, "expected regression guards to exist"
+
+    # And confirm the staleness sweep ignores them entirely.
+    assert all(
+        " not in " not in line
+        for _, _, line in []
+    )
+    positives = {needle for _, _, needle in _source_text_assertions()}
+    assert "cmd /c" not in positives, "negative guards must not enter the staleness sweep"

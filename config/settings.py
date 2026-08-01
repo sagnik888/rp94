@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     # NRML = overnight/carryforward, MIS = intraday auto-squareoff. The system's
     # product_type strings are broker-neutral and mapped in KiteBroker.
     kite_default_product: str = "NRML"
+    # Permanent postback hostname, if you have one (a NAMED Cloudflare tunnel on a
+    # domain you control). Set it and scripts/start_postback_tunnel.py verifies that
+    # URL instead of minting a throwaway quick-tunnel hostname that changes every
+    # restart and has to be re-registered at Zerodha by hand each time.
+    kite_postback_url: str = ""
     # Entries go in at the market by default. A LIMIT that does not fill is a missed
     # signal, and the cancel/replace path already converts a stale limit to MARKET
     # after ~12s — so a limit mostly buys a 12-second delay and an extra failure mode.
