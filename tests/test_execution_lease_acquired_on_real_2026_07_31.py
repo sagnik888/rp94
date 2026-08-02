@@ -11,9 +11,9 @@ the broker without ever claiming the lease. has_execution_lease() then reported 
 forever and execution_lease_block_reason() read stale owner metadata out of the lock file,
 naming a dead process.
 
-Second defect: the dynamically-created SmartApiBroker was built with no account_id, so it
-had NO lease object at all and every guard failed OPEN — removing the cross-process
-protection entirely rather than enforcing it.
+Second defect: the dynamically-created broker was built with no account_id, so it had NO
+lease object at all and every guard failed OPEN — removing the cross-process protection
+entirely rather than enforcing it.
 """
 import os
 import subprocess
@@ -25,16 +25,11 @@ from types import SimpleNamespace
 import pytest
 
 from trading.account_execution_lease import AccountExecutionLease
-from trading.broker import SmartApiBroker
+from trading.kite_broker import KiteBroker
 
 
 def _broker(account_id="TESTACCT1", instance_id="UT1:test"):
-    b = SmartApiBroker.__new__(SmartApiBroker)
-    b._order_lock = threading.Lock()
-    b._execution_lease = (
-        AccountExecutionLease(account_id, instance_id) if account_id else None
-    )
-    return b
+    return KiteBroker(kite=None, account_id=account_id, instance_id=instance_id)
 
 
 def test_lease_is_claimed_on_demand_rather_than_refusing_a_free_lock(tmp_path):
@@ -53,9 +48,9 @@ def test_a_genuine_live_holder_still_blocks(tmp_path):
     The holder must be a REAL second process. This test used to hold the lock with
     another lease object inside the pytest process, which is not the thing the lease
     guards against — Windows byte-range locks are per-handle, so that also happens
-    whenever ONE process rebuilds its own SmartApiBroker, and treating it as a foreign
-    owner is what made a process refuse its own orders. Self-ownership is now allowed;
-    a different process must still be refused, which is what this asserts.
+    whenever ONE process rebuilds its own broker, and treating it as a foreign owner
+    is what made a process refuse its own orders. Self-ownership is now allowed; a
+    different process must still be refused, which is what this asserts.
     """
     path = tmp_path / "acct.lock"
     holder = subprocess.Popen(

@@ -63,19 +63,25 @@ def test_zero_slippage_setting_returns_flat_base():
     assert estimate_trade_charges(140.0, 150.0, 75, "OPT", s, 0.5) == 80.0
 
 
-# ── H2: marketable-limit buffer on option entries ───────────────────
-def test_option_entry_uses_marketable_limit():
-    from trading.broker import SmartApiBroker
-    get_settings().option_limit_buffer_pct = 1.0
+# ── H2: entry order type is decided by conviction ───────────────────
+# The original H2 fix put a 1% marketable-limit buffer on option entries. That policy
+# was retired in the Kite migration: on 2026-07-31 those blind mark-up limits sat
+# unfilled against an empty book. What replaced it is asserted here — see
+# tests/test_slippage_controls.py for the full entry-price policy.
+def test_option_entry_takes_the_market_unless_conviction_is_high():
+    from trading.kite_broker import KiteBroker
+
     captured = {}
 
     class _Api:
-        def placeOrder(self, params):
+        def place_order(self, **params):
             captured.update(params)
-            return {"data": {"orderid": "X1"}}
+            return "X1"
 
-    broker = SmartApiBroker(_Api())
-    broker.place_order("NIFTY25JUN24000CE", "111", 75, "BUY", price=100.0)
-    # BUY limit placed 1% above the signal price so it actually fills.
-    assert captured["ordertype"] == "LIMIT"
-    assert float(captured["price"]) == pytest.approx(101.0)
+    threshold = get_settings().entry_limit_confidence_threshold
+    broker = KiteBroker(kite=_Api())
+    broker._min_call_interval = 0.0
+    broker.place_order("NIFTY25JUN24000CE", "111", 75, "BUY",
+                       price=100.0, confidence=threshold - 1.0)
+    assert captured["order_type"] == "MARKET"
+    assert captured["market_protection"] == -1

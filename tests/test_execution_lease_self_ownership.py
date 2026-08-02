@@ -6,9 +6,9 @@ take the lock its sibling holds, and the refusal surfaced as
 
     entry order blocked: REAL broker account is owned by another UT1 process
 
-while naming this process's own pid. Any path that rebuilds SmartApiBroker while an
-earlier one still holds the lease — scanner.py's dynamic reconnect, an AngelOne re-auth
-— would then refuse every one of its own orders.
+while naming this process's own pid. Any path that rebuilds the broker while an earlier
+one still holds the lease — scanner.py's dynamic reconnect, a daily broker re-auth —
+would then refuse every one of its own orders.
 
 The safety invariant that must NEVER regress: a genuinely different process still gets
 refused. Self-ownership is only claimed when the live holder's metadata names this exact

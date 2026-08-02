@@ -7,7 +7,8 @@ import pytest
 import data.market_data as market_data_module
 from data.market_data import FYERS_INDEX_SYMBOLS, MarketDataProvider
 from scanner import Scanner
-from trading.broker import SmartApiBroker
+# NetworkException comes via kite_broker so this file still collects without the SDK.
+from trading.kite_broker import KiteBroker, NetworkException
 
 
 def _provider(monkeypatch):
@@ -430,21 +431,27 @@ def test_angel_rest_rate_limit_enters_backoff_and_skips_next_call(monkeypatch):
 
 
 def test_broker_position_rate_limit_uses_cooldown():
+    """A throttled positions endpoint must not be re-hit on the next reconcile tick.
+
+    Kite signals throttling by raising, where AngelOne returned an error dict, so the
+    trigger changed shape. The cooldown it must produce did not.
+    """
     class RateLimitedPositions:
         calls = 0
 
-        def position(self):
+        def positions(self):
             self.calls += 1
-            return {"status": False, "message": "Access denied because of exceeding access rate"}
+            raise NetworkException("Too many requests")
 
     api = RateLimitedPositions()
-    broker = SmartApiBroker(api)
+    broker = KiteBroker(kite=api)
+    broker._min_call_interval = 0.0
 
     assert broker.get_positions() is None
     assert api.calls == 1
     assert broker._position_backoff_until > time.time()
 
-    api.position = lambda: (_ for _ in ()).throw(AssertionError("position should be skipped"))
+    api.positions = lambda: (_ for _ in ()).throw(AssertionError("positions should be skipped"))
     assert broker.get_positions() is None
 
 

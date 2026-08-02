@@ -7,21 +7,26 @@ parked in RECOVERY_REQUIRED limbo where nothing reconciles it.
 
 Two defects behind that:
   * The `no order id` raise logged NOTHING, so the broker's actual response was discarded.
-    The SDK does report the reason, but through logzero (SmartApi/smartConnect.py `_request`
-    and `placeOrderFullResponse`), which never reached ut1.log — 0 SDK lines in the whole
-    file.
   * "No order id" was treated as unknowable. It is only unknowable if we cannot see the
     order book; if we CAN read it and the contract is absent, the placement definitively
     failed and the trade should fail cleanly instead of stranding.
 
 The safety rule that must never regress: we may never conclude "not placed" from a scan we
 could not complete, because re-placing a live order caused duplicate orders previously.
+
+Proved here against KiteBroker, the live execution broker. The order-book payload changed
+shape in the Kite migration (a bare list of typed rows instead of an AngelOne envelope) —
+which is exactly the kind of change that can quietly turn "could not read" into "nothing
+there", so the UNKNOWN-never-ABSENT direction is re-proved against the new shape.
 """
 import threading
 
 import pytest
 
-from trading.broker import BrokerOrderAmbiguous, SmartApiBroker
+# NetworkException via kite_broker, which stubs it when the SDK is absent, so this
+# file still collects on a machine without kiteconnect.
+from trading.kite_broker import KiteBroker, NetworkException
+from trading.order_retry import BrokerOrderAmbiguous
 
 
 class _Api:
@@ -29,7 +34,7 @@ class _Api:
         self._book = book
         self.calls = 0
 
-    def orderBook(self):
+    def orders(self):
         self.calls += 1
         if isinstance(self._book, Exception):
             raise self._book
@@ -37,48 +42,42 @@ class _Api:
 
 
 def _broker(book=None):
-    b = SmartApiBroker.__new__(SmartApiBroker)
-    b.api = _Api(book)
-    b._order_lock = threading.Lock()
+    b = KiteBroker(kite=_Api(book))
     b._execution_lease = None          # lease is tested separately
-    b._api_call = lambda ctx, fn, timeout=5.0: fn()
+    b._min_call_interval = 0.0
     return b
 
 
 def _row(**over):
     row = {
-        "tradingsymbol": "NIFTY04AUG2624350CE", "transactiontype": "BUY",
-        "quantity": "65", "orderstatus": "open", "orderid": "OID-1",
-        "variety": "NORMAL", "ordertype": "LIMIT",
+        "tradingsymbol": "NIFTY04AUG2624350CE", "transaction_type": "BUY",
+        "quantity": 65, "status": "OPEN", "order_id": "OID-1",
+        "order_type": "LIMIT",
     }
     row.update(over)
     return row
 
 
-def _ok(rows):
-    return {"status": True, "data": rows}
-
-
 # ── the scan itself ──────────────────────────────────────────────────────────
 
 def test_absent_only_when_the_book_was_actually_read():
-    r = _broker(_ok([]))._inspect = None or _broker(_ok([])).inspect_recent_entry_order(
+    r = _broker([]).inspect_recent_entry_order(
         "NIFTY04AUG2624350CE", side="BUY", quantity=65
     )
     assert r["state"] == "ABSENT"
 
 
 def test_live_order_is_found_and_its_id_returned():
-    r = _broker(_ok([_row()])).inspect_recent_entry_order(
+    r = _broker([_row()]).inspect_recent_entry_order(
         "NIFTY04AUG2624350CE", side="BUY", quantity=65
     )
     assert r["state"] == "FOUND" and r["order_id"] == "OID-1"
 
 
 @pytest.mark.parametrize("book", [
-    RuntimeError("network down"),
-    {"status": False, "message": "rejected"},
-    {"status": True, "data": "not-a-list"},
+    NetworkException("network down"),
+    RuntimeError("unclassified failure"),
+    "not-a-list",
     None,
 ])
 def test_an_unreadable_book_is_UNKNOWN_never_absent(book):
@@ -88,44 +87,100 @@ def test_an_unreadable_book_is_UNKNOWN_never_absent(book):
 
 
 def test_terminal_and_stop_rows_are_not_mistaken_for_a_live_entry():
-    for over in ({"orderstatus": "rejected"}, {"orderstatus": "cancelled"},
-                 {"variety": "STOPLOSS"}, {"ordertype": "STOPLOSS_MARKET"},
-                 {"transactiontype": "SELL"}, {"quantity": "130"}):
-        r = _broker(_ok([_row(**over)])).inspect_recent_entry_order(
+    for over in ({"status": "REJECTED"}, {"status": "CANCELLED"},
+                 {"order_type": "SL-M"}, {"order_type": "SL"},
+                 {"transaction_type": "SELL"}):
+        r = _broker([_row(**over)]).inspect_recent_entry_order(
             "NIFTY04AUG2624350CE", side="BUY", quantity=65
         )
         assert r["state"] == "ABSENT", f"{over} should not count as a live entry"
 
 
+def test_a_differently_sized_order_is_not_adopted_as_this_entry():
+    """Adopting a stranger's order books this trade against someone else's position.
+
+    Two trades on one strike is the ambiguity Kite tags exist to solve. Until the scan
+    matches on tag, a CONFIDENT quantity mismatch must still disqualify the row —
+    otherwise a lost ack on a 65-lot entry adopts a resting 130-lot order, the stop is
+    placed for 65, and 65 lots sit permanently naked.
+    """
+    r = _broker([_row(quantity=130, order_id="OID-OTHER")]).inspect_recent_entry_order(
+        "NIFTY04AUG2624350CE", side="BUY", quantity=65
+    )
+    assert r["state"] != "FOUND", "adopted a resting order of a different size"
+    assert r["order_id"] != "OID-OTHER"
+
+
+def test_an_unreadable_quantity_does_not_manufacture_ABSENT():
+    """The unsafe direction of the same filter.
+
+    If the row's size cannot be parsed we do NOT know it is a different order, and
+    ABSENT would tell place_order the entry definitively failed — which re-places a
+    possibly-live order. Unknown size must stay adoptable.
+    """
+    for bad in (None, "", "abc"):
+        r = _broker([_row(quantity=bad)]).inspect_recent_entry_order(
+            "NIFTY04AUG2624350CE", side="BUY", quantity=65
+        )
+        assert r["state"] == "FOUND", f"quantity={bad!r} wrongly read as a clean failure"
+
+
+def test_an_unidentifiable_contract_is_UNKNOWN_not_absent():
+    """An empty symbol matches no row, and "matched nothing" must not read as ABSENT."""
+    r = _broker([_row()]).inspect_recent_entry_order("", side="BUY", quantity=65)
+    assert r["state"] == "UNKNOWN"
+
+
 def test_base_broker_defaults_to_unknown():
     """A broker with no order-book support must never claim ABSENT."""
-    import inspect as _i
-    from trading import broker as bm
-    base = None
-    for _, obj in _i.getmembers(bm, _i.isclass):
-        if obj.__name__ != "SmartApiBroker" and hasattr(obj, "inspect_recent_entry_order"):
-            base = obj
-            break
-    assert base is not None
-    inst = base.__new__(base)
-    assert base.inspect_recent_entry_order(inst, "X")["state"] == "UNKNOWN"
+    from trading.broker import Broker
+
+    assert Broker().inspect_recent_entry_order("X")["state"] == "UNKNOWN"
 
 
 # ── how place_order uses it ──────────────────────────────────────────────────
 
 def test_place_order_wiring_is_failsafe():
     import inspect
-    src = inspect.getsource(SmartApiBroker.place_order)
+
+    # The submit body lives in _submit_entry; place_order wraps it so a failure between
+    # taking an entry-rate slot and submitting gives the slot back.
+    src = inspect.getsource(KiteBroker._submit_entry)
     body = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
     assert "inspect_recent_entry_order" in body, "no order-book check after a missing id"
-    assert "Raw broker response" in src, "the broker response is still discarded unlogged"
-    # ABSENT -> clean failure; anything else must still be able to raise
-    assert '"ABSENT"' in body and "return None" in body
+    # ABSENT -> clean, non-terminal rejection; anything else must still be able to raise
+    assert '"ABSENT"' in body and "BrokerOrderRejected" in body
     assert "BrokerOrderAmbiguous" in body, "genuine ambiguity must still raise"
+
+    wrapper = "\n".join(
+        l.split("#", 1)[0] for l in inspect.getsource(KiteBroker.place_order).splitlines()
+    )
+    assert "_entry_rate_allowed" in wrapper, "entries are no longer rate-gated"
+    assert "_release_entry_reservation" in wrapper, "a failed submit keeps its slot"
+
+
+def test_a_missing_order_id_with_an_unreadable_book_stays_ambiguous():
+    """Behavioural counterpart to the wiring check above.
+
+    An entry that returns no id, when the order book cannot be read either, is the
+    2026-07-31 case exactly. It must raise rather than resolve either way.
+    """
+    class _Silent:
+        def place_order(self, **_kw):
+            return None
+
+        def orders(self):
+            raise NetworkException("order book unreadable")
+
+    b = KiteBroker(kite=_Silent())
+    b._execution_lease = None
+    b._min_call_interval = 0.0
+    with pytest.raises(BrokerOrderAmbiguous):
+        b.place_order("NIFTY04AUG2624350CE", "60620", 65, "BUY")
 
 
 def test_sdk_logs_are_captured_into_the_application_log():
-    """0 SmartAPI lines had ever reached ut1.log; the reason was always thrown away."""
+    """0 SDK lines had ever reached ut1.log; the reason was always thrown away."""
     import inspect
     from trading import secure_logging
     src = inspect.getsource(secure_logging)

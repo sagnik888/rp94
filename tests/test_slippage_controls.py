@@ -1,5 +1,19 @@
-"""Slippage controls: marketable-limit caps on entries, tick alignment, and the
-realized-slippage tracker that auto-calibrates the charge model from real fills."""
+"""Slippage controls: entry price policy, tick alignment, and the realized-slippage
+tracker that auto-calibrates the charge model from real fills.
+
+The AngelOne marketable-limit subsystem this file used to cover — an LTP-anchored
+percentage buffer, a futures bps buffer, and touch-quote (bid/ask) anchoring with a
+shadow/strict mode — was deliberately retired in the Kite migration (commit e6778f3),
+not lost. On 2026-07-31 every entry went out as a blind LTP mark-up limit against an
+empty book and none filled. The replacement policy: take the market unless the signal
+is strong enough that missing the fill beats paying the spread, and cap the damage with
+Zerodha's market-protection band, which AngelOne had no equivalent for.
+
+So the buffer/touch-quote tests are gone with the code they described rather than being
+ported to a broker that deliberately does not behave that way. What survives is the part
+that was never about AngelOne: a limit price must land on the exchange's tick grid, and a
+market order must carry a slippage cap.
+"""
 import threading
 from datetime import datetime
 
@@ -8,7 +22,7 @@ import pytest
 from config.settings import get_settings
 from engine.slippage_tracker import SlippageTracker
 from engine.trade_accounting import estimate_trade_charges
-from trading.broker import SmartApiBroker
+from trading.kite_broker import KiteBroker
 from trading.trade_manager import Trade, TradeManager
 
 
@@ -16,180 +30,72 @@ class _CaptureApi:
     def __init__(self):
         self.params = {}
 
-    def placeOrder(self, params):
+    def place_order(self, **params):
         self.params.update(params)
-        return {"data": {"orderid": "X1"}}
+        return "X1"
+
+    def orders(self):
+        return []
 
 
 def _broker():
     api = _CaptureApi()
-    return SmartApiBroker(api), api
+    broker = KiteBroker(kite=api)
+    broker._min_call_interval = 0.0
+    return broker, api
 
 
-# ── Marketable-limit entry caps ──────────────────────────────────────
+# ── Entry price policy ───────────────────────────────────────────────
 
-def test_option_buy_limit_uses_pct_buffer_tick_aligned(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
+def test_high_conviction_entry_uses_a_limit():
+    """A limit risks missing the fill; only a strong signal earns that trade-off."""
     broker, api = _broker()
-    broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY", price=150.0)
-    assert api.params["ordertype"] == "LIMIT"
-    # 150 * 0.40% = 0.60 above signal, already tick-aligned.
-    assert float(api.params["price"]) == pytest.approx(150.60)
+    threshold = get_settings().entry_limit_confidence_threshold
+    broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY",
+                       price=150.0, confidence=threshold)
+    assert api.params["order_type"] == "LIMIT"
+    assert float(api.params["price"]) == pytest.approx(150.0)
 
 
-def test_cheap_option_gets_tick_floor_not_pct(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
+def test_ordinary_conviction_takes_the_market_with_a_protection_band():
+    """The 2026-07-31 failure: blind mark-up limits against an empty book, no fills."""
     broker, api = _broker()
-    broker.place_order("MIDCPNIFTY25JUL12000CE", "111", 140, "BUY", price=3.0)
-    # 0.40% of 3.0 is 0.012 — the 2-tick floor (0.10) keeps it fillable.
-    assert float(api.params["price"]) == pytest.approx(3.10)
-
-
-def test_option_sell_limit_buffers_downward(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
-    broker, api = _broker()
-    broker.place_order("NIFTY25JUL25000PE", "111", 75, "SELL", price=150.0)
-    assert float(api.params["price"]) == pytest.approx(149.40)
-
-
-def test_option_limit_price_is_tick_aligned(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
-    broker, api = _broker()
-    broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY", price=100.13)
-    limit = float(api.params["price"])
-    # Exchange rejects non-tick prices; must land on a 0.05 grid.
-    assert round(limit * 100) % 5 == 0
-
-
-def test_futures_entry_gets_protection_limit(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "fut_entry_protection_limit_enabled", True)
-    monkeypatch.setattr(settings, "fut_limit_buffer_bps", 5.0)
-    broker, api = _broker()
-    broker.place_order("NIFTY25JULFUT", "222", 65, "BUY", price=25000.0)
-    assert api.params["ordertype"] == "LIMIT"
-    # 25000 * 5bps = 12.50 above signal — hard cap instead of a naked MARKET order.
-    assert float(api.params["price"]) == pytest.approx(25012.50)
-
-
-def test_futures_protection_toggle_off_restores_market(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "fut_entry_protection_limit_enabled", False)
-    broker, api = _broker()
-    broker.place_order("NIFTY25JULFUT", "222", 65, "BUY", price=25000.0)
-    assert api.params["ordertype"] == "MARKET"
+    threshold = get_settings().entry_limit_confidence_threshold
+    broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY",
+                       price=150.0, confidence=threshold - 1.0)
+    assert api.params["order_type"] == "MARKET"
     assert "price" not in api.params
+    # The slippage control that replaced the buffer: Zerodha caps how far from the
+    # touch a market order may fill. Without it these fills are unbounded.
+    assert api.params["market_protection"] == -1
 
 
 def test_no_reference_price_falls_back_to_market():
     broker, api = _broker()
-    broker.place_order("NIFTY25JULFUT", "222", 65, "BUY", price=0.0)
-    assert api.params["ordertype"] == "MARKET"
+    broker.place_order("NIFTY25JULFUT", "222", 65, "BUY", price=0.0, confidence=100.0)
+    assert api.params["order_type"] == "MARKET"
 
 
-def test_touch_quote_off_shadows_but_keeps_ltp_anchor(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", False)
-    monkeypatch.setattr(settings, "execution_touch_quote_shadow_enabled", True)
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
-    monkeypatch.setattr(settings, "option_touch_limit_extra_ticks", 1)
+def test_limit_price_is_tick_aligned():
+    """The exchange rejects a non-tick price outright, whoever the broker is."""
     broker, api = _broker()
-    broker.place_order(
-        "NIFTY25JUL25000CE",
-        "111",
-        75,
-        "BUY",
-        price=150.0,
-        touch_quote={"bid": 150.15, "ask": 150.20, "age_seconds": 0.2, "usable": True},
-    )
-    assert float(api.params["price"]) == pytest.approx(150.60)
-    assert broker._last_execution_preview["anchor"] == "ltp"
-    assert broker._last_execution_preview["touch_limit_price"] == pytest.approx(150.25)
+    broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY",
+                       price=100.13, confidence=100.0)
+    limit = float(api.params["price"])
+    assert round(limit * 100) % 5 == 0
 
 
-def test_touch_quote_on_uses_ask_plus_tick_for_option_buy(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", True)
-    monkeypatch.setattr(settings, "execution_touch_quote_strict", False)
-    monkeypatch.setattr(settings, "option_touch_limit_extra_ticks", 1)
+def test_protective_stop_trigger_is_tick_aligned():
     broker, api = _broker()
-    broker.place_order(
-        "NIFTY25JUL25000CE",
-        "111",
-        75,
-        "BUY",
-        price=150.0,
-        touch_quote={"bid": 150.15, "ask": 150.20, "age_seconds": 0.2, "usable": True},
-    )
-    assert api.params["ordertype"] == "LIMIT"
-    assert float(api.params["price"]) == pytest.approx(150.25)
-    assert broker._last_execution_preview["anchor"] == "touch"
+    broker.place_protective_stop("NIFTY25JUL25000CE", "111", 75, "SELL", 95.03)
+    assert float(api.params["trigger_price"]) == pytest.approx(95.05)
 
 
-def test_touch_quote_on_uses_bid_minus_tick_for_option_sell(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", True)
-    monkeypatch.setattr(settings, "option_touch_limit_extra_ticks", 1)
+def test_exit_is_slippage_capped():
     broker, api = _broker()
-    broker.place_order(
-        "NIFTY25JUL25000PE",
-        "111",
-        75,
-        "SELL",
-        price=150.0,
-        touch_quote={"bid": 149.80, "ask": 149.85, "age_seconds": 0.2, "usable": True},
-    )
-    assert float(api.params["price"]) == pytest.approx(149.75)
-    assert broker._last_execution_preview["anchor"] == "touch"
-
-
-def test_touch_quote_on_non_strict_falls_back_to_ltp_anchor(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", True)
-    monkeypatch.setattr(settings, "execution_touch_quote_strict", False)
-    monkeypatch.setattr(settings, "option_limit_buffer_pct", 0.40)
-    monkeypatch.setattr(settings, "option_limit_buffer_min_ticks", 2)
-    broker, api = _broker()
-    order_id = broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY", price=150.0)
-    assert order_id == "X1"
-    assert float(api.params["price"]) == pytest.approx(150.60)
-    assert broker._last_execution_preview["anchor"] == "ltp"
-    assert broker._last_execution_preview["touch_reason"] == "missing"
-
-
-def test_touch_quote_strict_blocks_missing_touch(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", True)
-    monkeypatch.setattr(settings, "execution_touch_quote_strict", True)
-    broker, api = _broker()
-    assert broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY", price=150.0) is None
-    assert api.params == {}
-
-
-def test_touch_quote_strict_blocks_stale_touch(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(settings, "execution_use_touch_quote", True)
-    monkeypatch.setattr(settings, "execution_touch_quote_strict", True)
-    monkeypatch.setattr(settings, "execution_touch_quote_max_age_seconds", 1.5)
-    broker, api = _broker()
-    assert broker.place_order(
-        "NIFTY25JUL25000CE",
-        "111",
-        75,
-        "BUY",
-        price=150.0,
-        touch_quote={"bid": 150.15, "ask": 150.20, "age_seconds": 5.0, "usable": True},
-    ) is None
-    assert api.params == {}
+    broker.close_order("NIFTY25JUL25000CE", "111", 75, "SELL")
+    assert api.params["order_type"] == "MARKET"
+    assert api.params["market_protection"] == -1
 
 
 # ── Realized-slippage tracker ────────────────────────────────────────
