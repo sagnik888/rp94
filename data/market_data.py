@@ -227,6 +227,17 @@ class MarketDataProvider:
         # Last cumulative index volume seen from Fyers. Kite reports none for indices,
         # so its price ticks carry this forward rather than zeroing the candle.
         self._index_cum_volume: Dict[str, float] = {}
+        # Which feed produced the cumulative total above, and when. A change of
+        # source means a change of UNIT (cash shares vs futures contracts), which
+        # the candle builder must rebase across rather than subtract.
+        self._index_cum_volume_source: Dict[str, str] = {}
+        self._index_cum_volume_at: Dict[str, float] = {}
+        self._index_futures_volume_at: Dict[str, float] = {}
+        # One in-flight volume refresh at a time; the tick thread never waits on it.
+        self._index_volume_refresh_lock = threading.Lock()
+        # Cached tick-callback arity; see _emit_index_tick.
+        self._tick_callback_ref = None
+        self._tick_callback_takes_source: Optional[bool] = None
         self._rest_lock = threading.Lock()
         self._angel_quote_lease_state = threading.local()
         self._angel_rest_backoff_until: float = 0.0
@@ -690,7 +701,19 @@ class MarketDataProvider:
                                 # carry it forward instead of resetting the candle's
                                 # volume delta to zero.
                                 if vol:
+                                    # Stamp freshness only when the cumulative total
+                                    # actually ADVANCED. A vendor that keeps republishing
+                                    # a frozen non-zero figure — the 2026-07-27 shape,
+                                    # where the quote cache looked healthy while candles
+                                    # were empty — would otherwise read as fresh forever
+                                    # and the futures fallback would never engage.
+                                    previous = float(self._index_cum_volume.get(index_name, 0.0) or 0.0)
                                     self._index_cum_volume[index_name] = float(vol)
+                                    self._index_cum_volume_source[index_name] = "fyers_index"
+                                    if float(vol) != previous:
+                                        self._index_cum_volume_at[index_name] = now_ts
+                                    elif index_name not in self._index_cum_volume_at:
+                                        self._index_cum_volume_at[index_name] = now_ts
                                 self._record_index_tick_volume_diag(
                                     index_name,
                                     "fyers_ws",
@@ -699,7 +722,10 @@ class MarketDataProvider:
                                     vol_fields,
                                     now_ts,
                                 )
-                                self.on_tick(index_name, float(ltp), int(vol) if vol else 0, datetime.now())
+                                self._emit_index_tick(
+                                    index_name, float(ltp), int(vol) if vol else 0,
+                                    "fyers_index" if vol else "",
+                                )
 
             def on_open():
                 if getattr(self, "_fyers_ws_generation", 0) != ws_generation:
@@ -1355,13 +1381,13 @@ class MarketDataProvider:
                         # multi-million spike, depending on which feed ticks first.
                         # Carry the last known cumulative total so the delta stays
                         # coherent and Fyers remains the sole source of index volume.
-                        carried = float(self._index_cum_volume.get(index_name, 0.0) or 0.0)
+                        carried, carried_source = self._index_volume_for_tick(index_name, now_ts)
                         volume = int(volume or carried)
                         self._record_index_tick_volume_diag(
                             index_name, "kite_ws", float(volume), "volume_traded",
                             {"volume_traded": volume}, now_ts,
                         )
-                        self.on_tick(index_name, price, volume, datetime.now())
+                        self._emit_index_tick(index_name, price, volume, carried_source)
                 except Exception as exc:
                     logger.debug(f"Kite tick parse failed: {exc}")
 
@@ -1688,11 +1714,112 @@ class MarketDataProvider:
     # volume the whole time. 20s is longer than any normal tick gap but short enough
     # that at most one bar is affected before the fallback engages.
     FYERS_VOLUME_STALE_SECONDS = 20.0
+    # The futures fallback hits the broker's quote endpoint, and it is consulted from
+    # the tick path, so it is throttled hard. Cumulative volume only ever grows, so a
+    # coarse refresh loses nothing but the last few seconds of a minute's delta.
+    INDEX_FUTURES_VOLUME_REFRESH_SECONDS = 15.0
 
     # While in fallback, actively poll Fyers this often so recovery is noticed within
     # seconds. The websocket reconnects on its own, but a dead socket that never
     # reconnects would otherwise leave the system on futures volume indefinitely.
     FYERS_RECOVERY_PROBE_SECONDS = 3.0
+
+    def _emit_index_tick(self, index_name: str, price: float, volume, source: str) -> None:
+        """Hand a tick to the candle builder, telling it which feed the volume came from.
+
+        The source label is what stops a Fyers(shares) -> futures(contracts) switch being
+        subtracted as if it were one series; the builder rebases instead.
+        """
+        callback = getattr(self, "on_tick", None)
+        if not callable(callback):
+            return
+        # Decide arity by INSPECTING the callback, not by catching TypeError around the
+        # call. A try/except there cannot tell "wrong number of arguments" from a
+        # TypeError raised inside the callback body, and the retry would run the tick a
+        # second time — double-counting tick_count, re-entering the candle mutation, and
+        # replaying it WITHOUT the source label, i.e. without the rebase protection.
+        if self._tick_callback_takes_source is None or self._tick_callback_ref is not callback:
+            self._tick_callback_ref = callback
+            self._tick_callback_takes_source = self._accepts_five_args(callback)
+        stamp = datetime.now()
+        if self._tick_callback_takes_source:
+            callback(index_name, price, volume, stamp, source)
+        else:
+            callback(index_name, price, volume, stamp)
+
+    @staticmethod
+    def _accepts_five_args(callback) -> bool:
+        """Whether this callback takes the volume_source argument."""
+        import inspect
+
+        try:
+            inspect.signature(callback).bind("i", 0.0, 0, None, "")
+            return True
+        except TypeError:
+            return False
+        except (ValueError, KeyError):
+            # Un-introspectable (a builtin or C callable). Assume the legacy form:
+            # passing an argument it cannot take would break every tick.
+            return False
+
+    def _index_volume_for_tick(self, index_name: str, now_ts: float):
+        """(cumulative_volume, source) to carry on a Kite index tick.
+
+        Kite sends no volume for an index, so a Kite tick would otherwise reset the
+        candle's delta to zero. Prefer the last Fyers cash total; when Fyers has gone
+        quiet, fall back to near-month FUTURES volume via get_index_activity — the
+        decided policy, and previously implemented but never called from anywhere.
+        """
+        carried = float(self._index_cum_volume.get(index_name, 0.0) or 0.0)
+        source = str(self._index_cum_volume_source.get(index_name, "") or "")
+        fyers_ts = float(self._index_cum_volume_at.get(index_name, 0.0) or 0.0)
+        fyers_fresh = carried > 0 and (now_ts - fyers_ts) <= self.FYERS_VOLUME_STALE_SECONDS
+        if fyers_fresh:
+            return carried, source or "fyers_index"
+
+        # NEVER block here. kiteconnect dispatches on_ticks synchronously on the socket
+        # reader thread, so a blocking HTTPS round-trip to Fyers (the feed that is by
+        # definition already degraded) plus a Kite quote under a lock would stall ticks
+        # for EVERY instrument for the duration. Kick the refresh onto a worker and serve
+        # whatever the last one resolved; cumulative volume only grows, so a slightly old
+        # total is a small undercount, never a fabricated surge.
+        self._request_index_volume_refresh(index_name, now_ts)
+        return carried, source
+
+    def _request_index_volume_refresh(self, index_name: str, now_ts: float) -> None:
+        """Throttled, off-thread refresh of the cumulative index volume."""
+        last_try = float(self._index_futures_volume_at.get(index_name, 0.0) or 0.0)
+        if now_ts - last_try < self.INDEX_FUTURES_VOLUME_REFRESH_SECONDS:
+            return
+        # Stamp BEFORE dispatching, so a slow or failing refresh cannot be re-dispatched
+        # on every subsequent tick.
+        self._index_futures_volume_at[index_name] = now_ts
+        if not self._index_volume_refresh_lock.acquire(blocking=False):
+            return
+        try:
+            threading.Thread(
+                target=self._refresh_index_volume_worker,
+                args=(index_name,),
+                name=f"index-volume-{index_name}",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._index_volume_refresh_lock.release()
+            logger.debug(f"Index volume refresh dispatch failed for {index_name}: {exc}")
+
+    def _refresh_index_volume_worker(self, index_name: str) -> None:
+        try:
+            activity = self.get_index_activity(index_name) or {}
+            source = str(activity.get("source") or "")
+            volume = float(activity.get("volume") or 0.0)
+            if source in {"kite_index_futures", "fyers_index"} and volume > 0:
+                self._index_cum_volume[index_name] = volume
+                self._index_cum_volume_source[index_name] = source
+                self._index_cum_volume_at[index_name] = time.time()
+        except Exception as exc:
+            logger.debug(f"Index activity fallback failed for {index_name}: {exc}")
+        finally:
+            self._index_volume_refresh_lock.release()
 
     def get_index_activity(self, symbol: str) -> Dict[str, Any]:
         """Index participation, with a broker cross-check and a broker fallback.
@@ -1720,7 +1847,11 @@ class MarketDataProvider:
         fyers_volume, fyers_age = 0.0, None
         if isinstance(cached, dict):
             fyers_volume = float(cached.get("vol", 0.0) or 0.0)
-            fyers_age = max(0.0, now - float(cached.get("time") or 0.0))
+            # vol_time when the REST probe set it, else the socket's tick time. Using
+            # the price timestamp for a volume freshness test would call volume fresh
+            # whenever a price tick landed, which is the failure mode this measures.
+            stamped = cached.get("vol_time") or cached.get("time") or 0.0
+            fyers_age = max(0.0, now - float(stamped))
         fyers_online = fyers_volume > 0 and (fyers_age or 0.0) <= self.FYERS_VOLUME_STALE_SECONDS
         if not fyers_online:
             # Poll before deciding, so a recoverable feed is not written off for a
@@ -1803,7 +1934,18 @@ class MarketDataProvider:
         # Write it back into the same cache the socket feeds, so every other consumer
         # sees the recovery at once rather than each rediscovering it.
         cached = dict(self._ws_cache.get(fyers_symbol) or {})
-        cached.update({"vol": volume, "time": now, "source": "fyers_rest_probe"})
+        # Refresh the VOLUME timestamp only. Stamping time=now while leaving `ltp` at
+        # whatever the dead websocket last published makes a frozen price look freshly
+        # ticked, and _select_index_ws_quote then serves it as the live index spot for
+        # signals and strike selection instead of falling through to the REST tier.
+        # This probe knows about volume; it must not vouch for the price.
+        try:
+            probed_price = float(values.get("lp") or values.get("ltp") or 0.0)
+        except (TypeError, ValueError):
+            probed_price = 0.0
+        cached.update({"vol": volume, "vol_time": now, "source": "fyers_rest_probe"})
+        if probed_price and probed_price > 0:
+            cached.update({"ltp": probed_price, "time": now})
         self._ws_cache[fyers_symbol] = cached
         if str((getattr(self, "_volume_source_active", {}) or {}).get(symbol) or "") == "kite_index_futures":
             logger.info(

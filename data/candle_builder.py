@@ -13,6 +13,14 @@ from typing import Dict, Optional
 from loguru import logger
 
 
+def _basis_of_bucket(values) -> str:
+    """The single volume unit in this bucket, "" if unknown, MIXED if more than one."""
+    seen = {str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() != "nan"}
+    if not seen:
+        return ""
+    return seen.pop() if len(seen) == 1 else "MIXED"
+
+
 class CandleBuilder:
     """
     Builds and maintains OHLCV candles.
@@ -38,6 +46,9 @@ class CandleBuilder:
         
         # Real-time LTP tracking
         self._latest_prices: Dict[str, float] = {}
+        # Which feed last supplied the cumulative volume total, per instrument. A change
+        # means the unit changed and the running baseline must be rebased, not subtracted.
+        self._volume_source: Dict[str, str] = {}
 
     # Relative cross-index leak guard. Replaces hardcoded absolute price ceilings
     # (e.g. BANKNIFTY>65000, NIFTY>35000) that become stale time-bombs as indices
@@ -80,8 +91,24 @@ class CandleBuilder:
         """Get the latest real-time LTP for an instrument"""
         return self._latest_prices.get(instrument, 0.0)
 
-    def update_from_tick(self, instrument: str, price: float, volume: float, timestamp: datetime):
-        """Build 1min candles from websocket tick updates."""
+    def update_from_tick(
+        self,
+        instrument: str,
+        price: float,
+        volume: float,
+        timestamp: datetime,
+        volume_source: str = "",
+    ):
+        """Build 1min candles from websocket tick updates.
+
+        ``volume`` is a CUMULATIVE day total; the per-candle figure is the delta since
+        the candle opened. ``volume_source`` names which feed produced that total, and
+        it matters: index volume can switch between Fyers cash-market shares and the
+        broker's near-month FUTURES contracts, which differ by ~1000x. Subtracting a
+        shares baseline from a contracts total (or the reverse) invents a spike or a
+        hole, and a fabricated spike is worse than no volume — it is exactly what the
+        2.5x surge gate reads as a real breakout.
+        """
         if not self._price_plausible(instrument, price):
             if price and price > 0:
                 logger.warning(f"⚠️ Ignoring implausible tick {price} for {instrument} "
@@ -90,6 +117,12 @@ class CandleBuilder:
 
         self._latest_prices[instrument] = price
         candle_time = timestamp.replace(second=0, microsecond=0)
+        source = str(volume_source or "")
+        source_changed = bool(
+            source and self._volume_source.get(instrument, source) != source
+        )
+        if source:
+            self._volume_source[instrument] = source
         finalized = None
         partial = None
 
@@ -110,7 +143,12 @@ class CandleBuilder:
                     "high": max(float(existing_row["high"]), price) if existing_row is not None else price,
                     "low": min(float(existing_row["low"]), price) if existing_row is not None else price,
                     "close": price,
-                    "start_volume": volume,
+                    # None = "no baseline yet". A price-only tick (volume 0) carries no
+                    # volume information, so it must NOT establish a baseline of 0 — the
+                    # next tick's full cumulative total would then be recorded as this
+                    # bar's delta.
+                    "start_volume": volume if volume > 0 else None,
+                    "volume_basis": source if (source and volume > 0) else "",
                     "volume": float(existing_row["volume"]) if existing_row is not None else 0,
                     "tick_count": existing_ticks + 1,
                 }
@@ -120,7 +158,41 @@ class CandleBuilder:
                 current["close"] = price
                 current["high"] = max(current["high"], price)
                 current["low"] = min(current["low"], price)
-                current["volume"] = max(float(current["volume"]), max(0, volume - current["start_volume"]))
+                # A tick with no volume is a PRICE tick. Both feeds publish these, and
+                # the vol-less case is the steady state of the very outage this fallback
+                # exists for. It must not touch the baseline: rebasing to 0 here made the
+                # next tick's whole day-cumulative total land as this bar's delta — a
+                # ~4000x fabricated spike that clears the 2.5x surge gate and admits a
+                # 1min entry on fiction. Leave the running delta exactly as it was.
+                if volume > 0:
+                    baseline = current.get("start_volume")
+                    # Rebase rather than subtract across a discontinuity: the feed
+                    # switched unit (shares <-> contracts), or the broker's cumulative
+                    # counter went backwards (daily reset / reconnect). A first positive
+                    # total after price-only ticks simply establishes the baseline.
+                    if source:
+                        current["volume_basis"] = source
+                    if baseline is None:
+                        current["start_volume"] = volume
+                    elif source_changed or volume < baseline:
+                        if source_changed:
+                            logger.info(
+                                f"📊 {instrument} volume source -> {source}; rebasing the "
+                                "candle baseline so no cross-unit delta is recorded."
+                            )
+                            # The delta accumulated so far was measured in the OLD unit.
+                            # Relabelling the bar while keeping that figure hands the
+                            # surge guard a bar carrying shares volume stamped as
+                            # contracts — and `max()` below would preserve the larger old
+                            # number forever. Restart the measurement in the new unit:
+                            # this bar undercounts once, which can only fail SAFE, where
+                            # a mislabelled cross-unit figure fabricates a breakout.
+                            current["volume"] = 0
+                        current["start_volume"] = volume
+                    else:
+                        current["volume"] = max(
+                            float(current["volume"]), max(0, volume - baseline)
+                        )
                 current["tick_count"] = int(current.get("tick_count", 0) or 0) + 1
 
             else:
@@ -132,6 +204,7 @@ class CandleBuilder:
                         "close": current["close"],
                         "volume": current["volume"],
                         "tick_count": int(current.get("tick_count", 0) or 0),
+                        "volume_basis": current.get("volume_basis", ""),
                     }], index=[current["timestamp"]])
 
                 current = {
@@ -140,7 +213,8 @@ class CandleBuilder:
                     "high": price,
                     "low": price,
                     "close": price,
-                    "start_volume": volume,
+                    "start_volume": volume if volume > 0 else None,
+                    "volume_basis": source if (source and volume > 0) else "",
                     "volume": 0,
                     "tick_count": 1,
                 }
@@ -153,6 +227,7 @@ class CandleBuilder:
                 "close": current["close"],
                 "volume": current["volume"],
                 "tick_count": int(current.get("tick_count", 0) or 0),
+                "volume_basis": current.get("volume_basis", ""),
             }], index=[current["timestamp"]])
 
         if finalized is not None:
@@ -304,15 +379,23 @@ class CandleBuilder:
         freq_map = {"5min": "5min", "15min": "15min"}
         pd_freq = freq_map.get(freq, freq)
 
-        resampled = df.resample(pd_freq, label='left', closed='left').agg({
+        agg = {
             'open': 'first',
             'high': 'max',
             'low': 'min',
             'close': 'last',
             'volume': 'sum',
-        }).dropna()
-
-        return resampled
+        }
+        # Carry the volume unit up with the volume. Dropping it here left 5min/15min
+        # frames with no volume_basis at all, and the mixed-unit surge guard treats a
+        # missing column as "one unit" — so the guard was inert on exactly the
+        # timeframes _detect_power_move runs on. A bucket spanning a feed failover is
+        # marked MIXED so the guard fires instead of comparing shares against contracts.
+        if 'volume_basis' in df.columns:
+            agg['volume_basis'] = _basis_of_bucket
+        resampled = df.resample(pd_freq, label='left', closed='left').agg(agg)
+        # dropna() must not discard a bar merely because its basis is unknown.
+        return resampled.dropna(subset=[c for c in ('open', 'high', 'low', 'close') if c in resampled])
 
     def get_candles(self, instrument: str, timeframe: str) -> Optional[pd.DataFrame]:
         """Get candles for instrument at given timeframe"""

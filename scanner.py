@@ -5111,7 +5111,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 is_live = False
                 
             interval = 1800 if is_live else 7200 # 30 mins live, 2 hrs off-market
-            
+
+            # Checked on its own faster cadence than the health LOG below: a volume
+            # feed dying is the kind of thing that must not wait up to 30 minutes to
+            # be noticed, and this only fires on a TRANSITION so it cannot spam.
+            if is_live:
+                try:
+                    self._alert_volume_source_degradation()
+                except Exception as exc:
+                    logger.debug(f"Volume source health check failed: {exc}")
+
             current_time = time.time()
             if current_time - last_log_time >= interval:
                 # 1. Regime State
@@ -6956,6 +6965,134 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "acceleration_points_per_min": round(acceleration, 4),
         }
 
+    # Every volume gate in this system is a RATIO against recent average — the 2.5x
+    # surge that is the only way a 1min signal enters, the 1.6x/1.8x hybrid thrusts,
+    # the 1.40x cascade, and the fast-opposite thrust EXIT guard. They all read one
+    # number, so a dead volume feed silently disables the lot at once, entries and
+    # exits alike. Index volume was zero for days before anyone noticed, because
+    # nothing surfaced it. This is that missing surface.
+    _VOLUME_DEGRADED_SOURCES = {"kite_index_futures", "none", ""}
+
+    def _recent_candle_volume(self, instrument: str):
+        """(bars_checked, is_dry) for the 1min series the volume gates actually read.
+
+        "Dry" means enough recent bars exist and none of them carries volume — the shape
+        of a feed outage as the ENGINE sees it, regardless of what any quote endpoint
+        says. Too few bars is not dry: that is a warm-up, not an outage.
+        """
+        candles = getattr(self, "candles", None)
+        if candles is None or not hasattr(candles, "get_candles"):
+            return 0, False
+        try:
+            df = candles.get_candles(instrument, "1min")
+        except Exception:
+            return 0, False
+        if df is None or "volume" not in getattr(df, "columns", []):
+            return 0, False
+        recent = df.tail(10)
+        bars = int(len(recent))
+        if bars < 5:
+            return bars, False
+        try:
+            return bars, bool(float(pd.to_numeric(recent["volume"], errors="coerce").fillna(0).abs().sum()) <= 0.0)
+        except Exception:
+            return bars, False
+
+    def volume_source_health(self) -> Dict[str, Any]:
+        """Per-instrument volume provenance, for the dashboard and the watchdog."""
+        data = getattr(self, "data", None)
+        # ACTIVE indices only. Reporting a configured-but-inactive instrument as
+        # "degraded" is a false alarm about a feed nobody is trading.
+        active = list(getattr(self, "active_indices", None) or [])
+        indices = {name: {} for name in active}
+        if not indices:
+            indices = dict(getattr(self, "config", {}).get("indices", {}) or {})
+
+        rows: Dict[str, Any] = {}
+        degraded: List[str] = []
+        for name in indices:
+            activity: Dict[str, Any] = {}
+            try:
+                if data is not None and hasattr(data, "get_index_activity"):
+                    activity = data.get_index_activity(name) or {}
+            except Exception as exc:
+                activity = {"source": "none", "error": str(exc)}
+            futures = (activity or {}).get("futures") or {}
+            source = str(activity.get("source") or "none")
+            row = {
+                "instrument": name,
+                "source": source,
+                "unit": str(activity.get("unit") or "shares"),
+                "volume": float(activity.get("volume") or 0.0),
+                "comparable_to_thresholds": bool(activity.get("comparable_to_thresholds", True)),
+                "fyers_online": bool(activity.get("fyers_online")),
+                "fyers_volume_age_seconds": activity.get("fyers_volume_age_seconds"),
+                "confirmation": str(activity.get("confirmation") or ""),
+                "futures_available": bool(futures.get("available")),
+                "futures_volume": float(futures.get("volume") or 0.0),
+                "futures_oi": float(futures.get("oi") or 0.0),
+                "futures_symbol": str(futures.get("tradingsymbol") or ""),
+            }
+            # What a feed COULD supply is not what reached the candles, and the gates
+            # read the candles. During the 2026-07-27 outage the Fyers quote cache was
+            # fine while the candle series was all zeros — a health check built on the
+            # quote alone reports all-green through the exact failure it exists to catch.
+            bars, dry = self._recent_candle_volume(name)
+            row["candle_bars_checked"] = bars
+            row["candle_volume_dry"] = dry
+            row["degraded"] = bool(source in self._VOLUME_DEGRADED_SOURCES or dry)
+            if row["degraded"]:
+                degraded.append(name)
+            rows[name] = row
+
+        return {
+            "instruments": rows,
+            "degraded": degraded,
+            "healthy": not degraded,
+            # The fallback is deliberately silent in the trading path — that is the
+            # point of a fallback — so "everything looks fine" is exactly how the
+            # last outage hid. Say plainly which feed is actually in play.
+            "summary": (
+                "All indices on Fyers cash volume"
+                if not degraded
+                else (
+                    "Volume degraded for: "
+                    + ", ".join(
+                        f"{n}({'candles dry' if rows[n]['candle_volume_dry'] else rows[n]['source']})"
+                        for n in degraded
+                    )
+                )
+            ),
+        }
+
+    def _alert_volume_source_degradation(self) -> None:
+        """Warn once per transition when an index loses its primary volume feed."""
+        try:
+            health = self.volume_source_health()
+        except Exception:
+            return
+        previous = getattr(self, "_volume_degraded_seen", set())
+        current = set(health.get("degraded") or [])
+        newly = current - previous
+        recovered = previous - current
+        self._volume_degraded_seen = current
+        for name in sorted(newly):
+            row = (health.get("instruments") or {}).get(name, {})
+            message = (
+                f"{name} volume feed degraded to '{row.get('source')}' "
+                f"(unit: {row.get('unit')}). Volume-ratio gates still work, but the "
+                "cash-market series every threshold was calibrated on is gone."
+            )
+            logger.warning(f"📉 {message}")
+            notifier = getattr(self, "on_notification", None)
+            if callable(notifier):
+                try:
+                    notifier(message, "warning")
+                except Exception:
+                    pass
+        for name in sorted(recovered):
+            logger.info(f"📈 {name} volume feed recovered to primary cash volume.")
+
     def _prediction_volume_context(self, instrument: str, candle_1min: Optional[pd.DataFrame]) -> Dict[str, Any]:
         """Expose live index-volume reliability and tick activity to the read-only predictor."""
         name = str(instrument or "").upper()
@@ -6980,6 +7117,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception:
                 candle_tick_count = 0
 
+        activity = {}
+        try:
+            if hasattr(data, "get_index_activity"):
+                activity = data.get_index_activity(name) or {}
+        except Exception:
+            activity = {}
+        futures_activity = (activity or {}).get("futures") or {}
+
         diag_tick_count = int(float((diag or {}).get("tick_count_current_minute") or 0))
         volume_available = bool(latest_volume > 0.0 or (diag or {}).get("volume_available"))
         return {
@@ -6992,7 +7137,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "latest_1min_volume": round(latest_volume, 4),
             "tick_count_current_minute": max(diag_tick_count, candle_tick_count),
             "candle_tick_count": candle_tick_count,
-            "futures_volume_available": False,
+            # Was hardcoded False, so the one diagnostic that could have revealed the
+            # index-volume outage always reported the fallback as unavailable — even
+            # once the fallback existed. Report what the provider actually resolved.
+            "futures_volume_available": bool(futures_activity.get("available")),
+            "futures_volume": float(futures_activity.get("volume") or 0.0),
+            "futures_oi": float(futures_activity.get("oi") or 0.0),
+            "volume_unit": str(activity.get("unit") or "shares"),
+            "volume_comparable_to_thresholds": bool(
+                activity.get("comparable_to_thresholds", True)
+            ),
         }
 
     def _log_pre_candle_prediction(self, instrument: str, timeframe: str, prediction: Dict[str, Any]) -> None:
@@ -9454,6 +9608,36 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         return round(self._candidate_gross_pnl(candidate, exit_px) - charges, 2)
 
+    @staticmethod
+    def _volume_window_is_homogeneous(recent) -> bool:
+        """False when the window mixes volume units, so no ratio across it is meaningful.
+
+        Index volume can switch mid-session between Fyers cash-market shares and the
+        broker's near-month futures contracts. Both are legitimate; they are simply not
+        the same quantity. Comparing a bar in one against an average of the other
+        manufactures a surge out of a feed failover.
+        """
+        if "volume_basis" not in getattr(recent, "columns", []):
+            return True
+        try:
+            seen = set()
+            for value in recent["volume_basis"].tolist():
+                text = str(value).strip()
+                # Historical backfill frames carry no basis, so concatenating them with
+                # live rows leaves NaN. float('nan') is TRUTHY, so an `or ""` test let
+                # "nan" through as if it were a distinct unit — which marked every
+                # post-backfill window mixed, returned None from the thrust metrics, and
+                # silently re-killed the 1min surge signal this guard was added to
+                # protect. Unknown is not a unit.
+                if not text or text.lower() in {"nan", "none"}:
+                    continue
+                if text == "MIXED":
+                    return False        # a resampled bucket that already spans a switch
+                seen.add(text)
+        except Exception:
+            return True
+        return len(seen) <= 1
+
     def _detect_power_move(
         self,
         instrument: str,
@@ -9494,6 +9678,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             high = float(last["high"]); low = float(last["low"]); close = float(last["close"])
             rng = high - low
             if rng <= 0:
+                return False
+            if not Scanner._volume_window_is_homogeneous(recent):
+                # The lookback straddles a volume-unit change (Fyers cash shares vs
+                # near-month futures contracts, ~1000x apart). A ratio across that
+                # boundary is ~100x with no change in participation whatsoever, and
+                # it clears every surge gate — including the 2.5x that is the only
+                # route a 1min signal has into a live entry. The per-candle rebase
+                # cannot see this: it only protects the delta INSIDE one bar.
                 return False
             prior_vol = float(prior["volume"].mean())
             volume_ratio = (float(last["volume"]) / prior_vol) if prior_vol > 0 else 0.0
@@ -9560,6 +9752,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             high = float(last["high"]); low = float(last["low"]); close = float(last["close"])
             rng = high - low
             if rng <= 0:
+                return None
+            if not Scanner._volume_window_is_homogeneous(recent):
+                # The lookback straddles a volume-unit change (Fyers cash shares vs
+                # near-month futures contracts, ~1000x apart). A ratio across that
+                # boundary is ~100x with no change in participation whatsoever, and
+                # it clears every surge gate — including the 2.5x that is the only
+                # route a 1min signal has into a live entry. The per-candle rebase
+                # cannot see this: it only protects the delta INSIDE one bar.
                 return None
             prior_vol = float(prior["volume"].mean())
             volume_ratio = (float(last["volume"]) / prior_vol) if prior_vol > 0 else 0.0
