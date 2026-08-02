@@ -28,6 +28,7 @@ from trading.trade_dashboard import build_dashboard_rows
 from trading.order_retry import (
     execute_order_with_retry,
     BrokerOrderAmbiguous,
+    BrokerOrderRejected,
     broker_rejection,
 )
 
@@ -76,6 +77,10 @@ class Trade:
     gtt_trigger_id: str = ""
     protective_updated_at: Optional[datetime] = None
     recovery_required_since: Optional[datetime] = None
+    # Set when a flatten went out while a protective stop MAY still have been resting.
+    # If that stop later fires it opens a position in the opposite direction, so this
+    # contract needs watching until reconciliation confirms it is flat.
+    reversal_watch_required: bool = False
     execution_status: str = "OPEN"
     execution_error: str = ""
     pending_exit: bool = False
@@ -945,6 +950,40 @@ class TradeManager:
             return False
         if str(getattr(trade, "gtt_trigger_id", "") or ""):
             return True                      # already armed; never stack triggers
+        # Nor stack one we armed but never recorded — a lost acknowledgement on a
+        # previous cycle leaves an active trigger with no local id.
+        finder = getattr(self.broker, "find_gtt_stop", None)
+        if callable(finder):
+            try:
+                prior = finder(trade.trading_symbol) or {}
+            except Exception:
+                prior = {}
+            prior_id = str(prior.get("trigger_id") or "")
+            if str(prior.get("state") or "") == "FOUND" and prior_id:
+                # find_gtt_stop matches the CONTRACT, not the trade — no side, quantity
+                # or trigger level. Two trades on one strike is supported, so adopting
+                # blindly points both at one trigger: this trade would sit behind the
+                # OTHER trade's stop level, and whichever exits first cancels it and
+                # silently strips the survivor's server-side protection.
+                owner = self._trade_owning_gtt(prior_id, exclude_id=trade.id)
+                if owner is not None:
+                    logger.error(
+                        f"GTT {prior_id} on {trade.trading_symbol} belongs to trade "
+                        f"{owner.id}; not adopting it for {trade.id}."
+                    )
+                    return False
+                if not self._gtt_matches_trade(prior, trigger):
+                    logger.error(
+                        f"Active GTT {prior_id} on {trade.trading_symbol} does not match "
+                        f"this trade's trigger {trigger:.2f}; not adopting it."
+                    )
+                    return False
+                trade.gtt_trigger_id = prior_id
+                logger.warning(
+                    f"Adopted existing GTT {prior_id} for {trade.trading_symbol} "
+                    "instead of arming a second one."
+                )
+                return True
         try:
             trigger_id = placer(
                 trade.trading_symbol, qty, side, trigger,
@@ -963,6 +1002,33 @@ class TradeManager:
             "process stops. Reconcile the missing SL-M."
         )
         return True
+
+    def _trade_owning_gtt(self, trigger_id: str, exclude_id: str = ""):
+        """The open trade already holding this GTT trigger id, if any."""
+        if not trigger_id:
+            return None
+        with self._lock:
+            for other in list(getattr(self, "open_trades", {}).values()):
+                if other.id == exclude_id:
+                    continue
+                if str(getattr(other, "gtt_trigger_id", "") or "") == str(trigger_id):
+                    return other
+        return None
+
+    @staticmethod
+    def _gtt_matches_trade(row: Dict, trigger: float) -> bool:
+        """Only adopt a trigger armed at this trade's own stop level.
+
+        A GTT at someone else's level is not protection for this position — it fires
+        early or late by exactly the difference between the two stops.
+        """
+        values = (row or {}).get("trigger_values") or []
+        if not values:
+            return False
+        try:
+            return any(abs(float(v) - float(trigger)) <= 0.051 for v in values)
+        except (TypeError, ValueError):
+            return False
 
     def _release_gtt_fallback(self, trade: Trade, note: str) -> bool:
         """Cancel the GTT once real stop management takes over, or before flattening.
@@ -1048,10 +1114,19 @@ class TradeManager:
                     return True
                 if now - last_sync < 2.0:
                     return True
-                ok = self.broker.modify_protective_stop(
-                    existing, trade.trading_symbol, trade.symbol_token, qty, side,
-                    trigger, self.product_type,
-                )
+                try:
+                    ok = self.broker.modify_protective_stop(
+                        existing, trade.trading_symbol, trade.symbol_token, qty, side,
+                        trigger, self.product_type,
+                    )
+                except (BrokerOrderRejected, PermissionError) as exc:
+                    # modify_protective_stop now requires the account lease, so it can
+                    # refuse by raising. An escape here would skip _mark_recovery and
+                    # leave the trade believing its stop was tightened.
+                    logger.error(
+                        f"Protective-stop tighten refused for {trade.trading_symbol}: {exc}"
+                    )
+                    ok = False
                 self._last_protective_sync[trade.id] = now
                 if ok:
                     trade.protective_trigger = trigger
@@ -1066,12 +1141,36 @@ class TradeManager:
             # ── Idempotent placement (audit BLOCKER-1/2 fix) ──
             finder = getattr(self.broker, "find_working_protective_stop", None)
 
-            def _adopt(order_id: str, note: str) -> bool:
+            def _adopt(order_id: str, note: str, actual_trigger=None) -> bool:
                 # A working SL-M is now in charge, so the fallback trigger must go —
-                # leaving both armed means two exits and a naked reversed leg.
-                self._release_gtt_fallback(trade, "exchange SL-M took over")
+                # leaving both armed means two exits and a naked reversed leg. The
+                # return value is the whole point of that helper and was discarded
+                # here: a REFUSED cancellation left the GTT armed alongside the SL-M,
+                # and the trade was then reported protected.
+                # Record the id FIRST. This order is live at the exchange whether or not
+                # the GTT can be cancelled, and losing its id is how the position ends up
+                # with a SECOND SL-M next cycle — the duplicate this subsystem exists to
+                # prevent. _adopt is also the success path for a freshly PLACED stop.
                 trade.protective_order_id = str(order_id)
-                trade.protective_trigger = trigger
+                if not self._release_gtt_fallback(trade, "exchange SL-M took over"):
+                    trade.protective_quantity = qty
+                    trade.protective_updated_at = datetime.now(IST)
+                    self._last_protective_sync[trade.id] = now
+                    self._mark_recovery(
+                        trade,
+                        f"SL-M {order_id} is live but the GTT fallback could not be "
+                        "cancelled; both are armed and would exit the position twice.",
+                    )
+                    self.save_state()
+                    return False
+                # The level the EXCHANGE holds, which is not always the level we want.
+                # Writing the desired trigger for a stale-trigger adoption made every
+                # later tightening check compare against a value no order carried, see
+                # "already tighter", and never contact the broker again — the position
+                # reads as protected at a price nothing is protecting it at.
+                trade.protective_trigger = (
+                    float(actual_trigger) if actual_trigger is not None else trigger
+                )
                 trade.protective_quantity = qty
                 trade.protective_updated_at = datetime.now(IST)
                 trade.recovery_required_since = None
@@ -1085,16 +1184,57 @@ class TradeManager:
             # Adopt any SL-M already resting at the exchange for this contract before
             # placing a new one — covers a concurrent caller that just placed, and an
             # entry whose acknowledgement was lost but which reached the exchange.
-            if callable(finder):
-                try:
-                    prior = str(finder(trade.trading_symbol, trade.symbol_token, side) or "")
-                except Exception as exc:
-                    logger.warning(
-                        f"Protective-stop idempotency scan failed for {trade.trading_symbol}: {exc}"
+            #
+            # This reads the TRI-STATE, not the collapsed id. find_working_protective_stop
+            # returns "" for AMBIGUOUS and CONFLICT just as it does for NONE, and ""
+            # here means "place a new stop" — so two resting SL-Ms would get a third.
+            prior_state, prior, prior_trigger = self._inspect_existing_stop(trade, side, qty, trigger)
+            if prior_state == "FOUND_STALE_TRIGGER" and prior:
+                # It IS this position's stop, just armed at a different level. Adopt it
+                # and let the ordinary tightening path move the trigger — placing a
+                # second stop here would be the duplicate-SL-M bug.
+                owner = self._trade_owning_protective_order(prior, exclude_id=trade.id)
+                if owner is None:
+                    adopted = _adopt(
+                        prior,
+                        "Adopted existing broker SL-M (stale trigger)",
+                        actual_trigger=prior_trigger,
                     )
-                    prior = ""
-                if prior:
-                    return _adopt(prior, "Adopted existing broker SL-M")
+                    if adopted:
+                        # Clear the sync clock AND leave protective_trigger at the level
+                        # the exchange actually holds, so the next pass sees a genuine
+                        # divergence and issues the modify. Recording the desired level
+                        # here is what let a stale stop sit un-rearmed forever.
+                        self._last_protective_sync[trade.id] = 0.0
+                    return adopted
+                prior_state, prior = "CONFLICT", ""
+            if prior_state in {"AMBIGUOUS", "CONFLICT"}:
+                # Something is resting that we cannot match to this position. Placing
+                # another is how a contract ends up with several stops, and each extra
+                # one is a naked reversed leg waiting for the others to fill.
+                self._last_protective_sync[trade.id] = now
+                self._mark_recovery(
+                    trade,
+                    f"Existing protective stop(s) on {trade.trading_symbol} are "
+                    f"{prior_state.lower()}; refusing to place another. Reconcile the "
+                    "order book manually.",
+                )
+                self.save_state()
+                return False
+            if prior:
+                owner = self._trade_owning_protective_order(prior, exclude_id=trade.id)
+                if owner is not None:
+                    # Adopting it would point two trades at one SL-M; whichever exits
+                    # first cancels it and silently strips the other's protection.
+                    self._last_protective_sync[trade.id] = now
+                    self._mark_recovery(
+                        trade,
+                        f"The only working stop on {trade.trading_symbol} belongs to trade "
+                        f"{owner.id}; refusing to adopt or duplicate it.",
+                    )
+                    self.save_state()
+                    return False
+                return _adopt(prior, "Adopted existing broker SL-M")
 
             try:
                 order_id = self.broker.place_protective_stop(
@@ -1118,6 +1258,27 @@ class TradeManager:
                 self._mark_recovery(trade, f"Protective stop acknowledgement ambiguous: {exc}")
                 self.save_state()
                 return False
+            except (BrokerOrderRejected, PermissionError) as exc:
+                # The OTHER two ways place_protective_stop fails: a dead broker session
+                # and an account lease held by another process. Both refuse before any
+                # order is sent, so nothing is resting — but neither was caught here, so
+                # both unwound out of this method AND out of reconcile_broker_positions.
+                # A filled position was left booked OPEN with no stop and no recovery
+                # flag (a healthy-looking row on the dashboard), and every trade after it
+                # in the reconcile loop went unreconciled.
+                self._last_protective_sync[trade.id] = now
+                # A GTT is safe when the refusal was ours to fix — nothing is resting.
+                # It is NOT safe when another process owns the account: that holder is
+                # managing this position's stop, and our trigger would stack on theirs.
+                lease_denied = isinstance(exc, PermissionError)
+                armed = False if lease_denied else self._arm_gtt_fallback(trade, qty, side, trigger)
+                self._mark_recovery(
+                    trade,
+                    f"Protective stop refused: {exc}"
+                    + ("; GTT fallback armed on the server" if armed else ""),
+                )
+                self.save_state()
+                return False
 
             self._last_protective_sync[trade.id] = now
             if order_id:
@@ -1136,6 +1297,206 @@ class TradeManager:
             )
             self.save_state()
             return False
+
+    def _clear_flatten_block(self, trade: Trade) -> None:
+        for attr in ("_flatten_block_counts", "_flatten_block_since", "_last_flatten_block_alert"):
+            blocks = getattr(self, attr, None)
+            if blocks:
+                blocks.pop(trade.id, None)
+
+    def _flatten_block_deadline_passed(self, trade: Trade, blocked_since: float) -> bool:
+        """Has the operator opted into flattening anyway after being blocked this long?
+
+        Off by default (0). Withholding is the safe default — a stop still resting plus
+        our market exit is a naked reversed leg — but it can carry an NRML position past
+        the close on nothing but an alert, so the trade-off is exposed as a setting
+        rather than decided here.
+        """
+        from config.settings import get_settings
+
+        try:
+            deadline = float(
+                getattr(get_settings(), "recovery_flatten_block_deadline_seconds", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            # Deliberately narrow: a broad except here swallowed a NameError from a
+            # missing import and turned an opted-in deadline into a silent no-op.
+            return False
+        if deadline <= 0 or (time.time() - float(blocked_since or 0.0)) < deadline:
+            return False
+        trade.reversal_watch_required = True
+        logger.critical(
+            f"FLATTEN DEADLINE REACHED for {trade.trading_symbol} after "
+            f"{deadline:.0f}s blocked: exiting anyway per "
+            "recovery_flatten_block_deadline_seconds. A protective stop MAY still be "
+            "resting — if it fires it will open a REVERSED position. Watch this contract."
+        )
+        return True
+
+    def _withhold_flatten(self, trade: Trade, note: str) -> bool:
+        """Refuse a flatten, count it, and escalate once it stops being transient.
+
+        Every withholding path routes through here. Withholding is correct — a double
+        exit is worse than a late one — but check_session_end retries on every pass, so
+        an unbounded refusal silently carries a live NRML position past the close.
+        """
+        if not hasattr(self, "_flatten_block_counts"):
+            self._flatten_block_counts = {}
+        if not hasattr(self, "_flatten_block_since"):
+            self._flatten_block_since = {}
+        seen = self._flatten_block_counts.get(trade.id, 0) + 1
+        self._flatten_block_counts[trade.id] = seen
+        blocked_since = self._flatten_block_since.setdefault(trade.id, time.time())
+        if self._flatten_block_deadline_passed(trade, blocked_since):
+            return False
+        if seen >= 3:
+            note += (
+                f" ({seen} consecutive blocked attempts). ACT MANUALLY: inspect the order "
+                f"book for {trade.trading_symbol} at your Zerodha terminal, cancel any "
+                "resting stop, and flatten the position by hand."
+            )
+            # Throttled: check_session_end runs ~1 Hz, and an unthrottled CRITICAL here
+            # reproduces the log flood the recovery latch was added to stop.
+            last = getattr(self, "_last_flatten_block_alert", {}).get(trade.id, 0.0)
+            if time.time() - last >= 60.0:
+                if not hasattr(self, "_last_flatten_block_alert"):
+                    self._last_flatten_block_alert = {}
+                self._last_flatten_block_alert[trade.id] = time.time()
+                logger.critical(
+                    f"FLATTEN BLOCKED {seen}x for {trade.trading_symbol}: neither exiting "
+                    "nor leaving the position is provably safe. Manual reconciliation required."
+                )
+        self._mark_recovery(trade, note)
+        return True
+
+    def _inspect_existing_stop(self, trade: Trade, side: str, qty: int, trigger: float = 0.0):
+        """(state, order_id, resting_trigger) for a stop already on this contract.
+
+        Prefers the tri-state inspector and passes the position's own size/product, so
+        the broker's quantity/product discrimination is actually exercised — the
+        collapsed find_working_protective_stop() reports "" for AMBIGUOUS and CONFLICT
+        alike, which reads as "nothing there, go ahead and place one".
+        """
+        inspector = getattr(self.broker, "inspect_working_protective_stop", None)
+        if callable(inspector):
+            try:
+                found = inspector(
+                    trade.trading_symbol, trade.symbol_token, side,
+                    quantity=int(qty or 0), product_type=self.product_type,
+                    trigger_price=float(trigger or 0.0),
+                ) or {}
+            except Exception as exc:
+                logger.warning(
+                    f"Protective-stop idempotency scan failed for {trade.trading_symbol}: {exc}"
+                )
+                return "UNKNOWN", "", None
+            level = found.get("trigger_price")
+            try:
+                level = float(level) if level is not None else None
+            except (TypeError, ValueError):
+                level = None
+            return (
+                str(found.get("state") or "UNKNOWN").upper(),
+                str(found.get("order_id") or ""),
+                level,
+            )
+        finder = getattr(self.broker, "find_working_protective_stop", None)
+        if not callable(finder):
+            return "NONE", "", None
+        try:
+            oid = str(finder(trade.trading_symbol, trade.symbol_token, side) or "")
+        except Exception as exc:
+            logger.warning(
+                f"Protective-stop idempotency scan failed for {trade.trading_symbol}: {exc}"
+            )
+            return "UNKNOWN", "", None
+        return ("FOUND", oid, None) if oid else ("NONE", "", None)
+
+    def _trade_owning_protective_order(self, order_id: str, exclude_id: str = ""):
+        """The open trade that holds this protective order id, if any."""
+        if not order_id:
+            return None
+        # Partially-constructed managers are a real pattern here (recovery paths and
+        # tests), and an AttributeError would abort a flatten mid-way.
+        with self._lock:
+            for other in list(getattr(self, "open_trades", {}).values()):
+                if other.id == exclude_id:
+                    continue
+                if str(getattr(other, "protective_order_id", "") or "") == str(order_id):
+                    return other
+        return None
+
+    def _unowned_protective_stop_blocks_flatten(self, trade: Trade, reason: str) -> bool:
+        """Deal with a working stop this trade has no order id for.
+
+        Returns True when the flatten must be WITHHELD. Only a scan that definitively
+        reports no stop, or one whose stop we successfully cancelled, may proceed —
+        UNKNOWN/AMBIGUOUS/CONFLICT all mean we cannot prove the position is unprotected,
+        and exiting on that basis is how a position gets closed twice.
+        """
+        inspector = getattr(self.broker, "inspect_working_protective_stop", None)
+        if not callable(inspector):
+            return False
+        side = self._protective_exit_side(trade)
+        try:
+            found = inspector(
+                trade.trading_symbol,
+                trade.symbol_token,
+                side,
+                quantity=int(trade.broker_quantity or trade.quantity or 0),
+                product_type=self.product_type,
+            )
+        except Exception as exc:
+            return self._withhold_flatten(
+                trade,
+                f"{reason}; protective-stop scan failed ({exc}), market flatten withheld "
+                "to avoid exiting over a stop that may be resting",
+            )
+        state = str((found or {}).get("state") or "UNKNOWN").upper()
+        if state == "NONE":
+            # Only a scan that actually cleared the contract resets the counter. Doing it
+            # for FOUND too let an alternating UNKNOWN / FOUND-but-uncancellable sequence
+            # withhold the flatten forever without ever reaching the escalation.
+            self._clear_flatten_block(trade)
+            return False
+        if state == "FOUND":
+            order_id = str((found or {}).get("order_id") or "")
+            # Two trades on one strike is a supported configuration (same index, different
+            # timeframes produce the same option symbol and the same exit side), and the
+            # order-book scan matches on contract, not on trade. Cancelling a stop that
+            # another OPEN trade is actively managing would strip its protection.
+            owner = self._trade_owning_protective_order(order_id, exclude_id=trade.id)
+            if owner is not None:
+                return self._withhold_flatten(
+                    trade,
+                    f"{reason}; the only working stop on {trade.trading_symbol} belongs to "
+                    f"trade {owner.id}, market flatten withheld to avoid stripping its protection",
+                )
+            try:
+                cancelled = bool(order_id) and self.broker.cancel_order(order_id, "STOPLOSS")
+            except (BrokerOrderRejected, PermissionError) as exc:
+                # cancel_order takes the account lease and raises when another instance
+                # holds it. Bare, this unwound out of check_session_end's per-trade loop
+                # and aborted the EOD flatten for every remaining trade.
+                return self._withhold_flatten(
+                    trade, f"{reason}; orphan stop cancellation refused ({exc})"
+                )
+            if cancelled:
+                logger.warning(
+                    f"Cancelled orphan SL-M {order_id} for {trade.trading_symbol} before "
+                    "flattening; the trade never held its order id."
+                )
+                return False
+            return self._withhold_flatten(
+                trade,
+                f"{reason}; orphan protective stop {order_id or '(no id)'} could not be "
+                "cancelled, market flatten withheld to avoid over-exit",
+            )
+        return self._withhold_flatten(
+            trade,
+            f"{reason}; protective-stop state is {state}, market flatten withheld to "
+            "avoid double-exiting the position",
+        )
 
     def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
         """Flatten a confirmed recovery position after safely cancelling its SL-M."""
@@ -1160,28 +1521,66 @@ class TradeManager:
             )
             return False
         if trade.protective_order_id:
-            if not self.broker.cancel_order(trade.protective_order_id, "STOPLOSS"):
-                self._mark_recovery(
+            try:
+                cancelled = self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
+            except (BrokerOrderRejected, PermissionError) as exc:
+                # cancel_order takes the account lease and raises when it is held
+                # elsewhere. check_session_end has no per-trade try, so an escape here
+                # aborted the EOD flatten for every remaining trade in the snapshot.
+                # ensure_broker_protection was hardened against exactly this; this path
+                # was not.
+                # _withhold_flatten returns False once the operator's blocked-flatten
+                # deadline elapses ("stop withholding"). Discarding that logged
+                # "exiting anyway", set reversal_watch_required — and then did not exit.
+                if self._withhold_flatten(
+                    trade, f"{reason}; protective stop cancellation refused ({exc})"
+                ):
+                    return False
+            if not cancelled:
+                if self._withhold_flatten(
                     trade,
-                    f"{reason}; protective stop cancellation unconfirmed, market flatten withheld to avoid over-exit",
-                )
-                return False
+                    f"{reason}; protective stop cancellation unconfirmed, market flatten "
+                    "withheld to avoid over-exit",
+                ):
+                    return False
             trade.protective_order_id = ""
+        elif self._unowned_protective_stop_blocks_flatten(trade, reason):
+            # Holding no stop id is NOT proof that no stop exists. A lost acknowledgement
+            # leaves an SL-M resting that we never learned the id of; market-exiting on
+            # top of it flattens the position while the stop is still live, and when the
+            # stop later triggers it opens a naked reversed leg.
+            return False
         # Same rule for the server-side trigger: a GTT that survives this flatten will
         # fire later against a flat book and open a naked reversed leg.
         if not self._release_gtt_fallback(trade, "flattening the position"):
-            self._mark_recovery(
+            if self._withhold_flatten(
                 trade,
                 f"{reason}; GTT cancellation unconfirmed, market flatten withheld to avoid over-exit",
-            )
-            return False
+            ):
+                return False
         qty = int(trade.broker_quantity or trade.quantity)
         side = self._protective_exit_side(trade)
-        order_id = self.broker.close_order(
-            trade.trading_symbol, trade.symbol_token, qty, side, self.product_type,
-        )
+        try:
+            order_id = self.broker.close_order(
+                trade.trading_symbol, trade.symbol_token, qty, side, self.product_type,
+            )
+        except (BrokerOrderRejected, PermissionError) as exc:
+            # close_order takes the account lease and needs a session, so it raises just
+            # like the cancels above. Bare, it unwound out of check_session_end's
+            # per-trade loop and aborted the EOD flatten for every remaining trade.
+            self._withhold_flatten(trade, f"{reason}; emergency flatten refused ({exc})")
+            return False
+        except BrokerOrderAmbiguous as exc:
+            # The exit MAY have reached the exchange; never re-send it blind.
+            self._mark_recovery(
+                trade,
+                f"{reason}; emergency flatten acknowledgement ambiguous ({exc}). The exit "
+                "may be live — reconcile before acting.",
+            )
+            self.save_state()
+            return False
         if not order_id:
-            self._mark_recovery(trade, f"{reason}; emergency flatten order failed")
+            self._withhold_flatten(trade, f"{reason}; emergency flatten order failed")
             return False
         trade.exit_order_id = str(order_id)
         trade.pending_exit = True
@@ -1189,6 +1588,7 @@ class TradeManager:
         trade.execution_status = "EXIT_PENDING"
         trade.execution_error = reason
         trade.exit_reason = "RECOVERY_AUTO_FLATTEN"
+        self._clear_flatten_block(trade)
         self.save_state()
         logger.critical(f"Recovery fallback flatten submitted for {trade.trading_symbol}: {order_id}")
         return True

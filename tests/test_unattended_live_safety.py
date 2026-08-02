@@ -1,12 +1,17 @@
+from collections import deque
 from datetime import datetime, timedelta
 import importlib.util
 from pathlib import Path
 import threading
+import time
+
+import pytest
 
 from config.settings import get_settings
 import scanner as scanner_module
 from scanner import Scanner
-from trading.broker import SmartApiBroker
+from trading.kite_broker import KiteBroker, OrderException
+from trading.order_retry import BrokerOrderRejected
 from trading.trade_manager import IST, Trade, TradeManager
 
 
@@ -15,28 +20,25 @@ class BrokerApi:
         self.placed = []
         self.modified = []
         self.cancelled = []
-        self.orders = []
+        self.order_book = []
 
-    def placeOrderFullResponse(self, params):
+    def place_order(self, **params):
         self.placed.append(dict(params))
-        return {"status": True, "data": {"orderid": f"O{len(self.placed)}"}}
+        return f"O{len(self.placed)}"
 
-    def placeOrder(self, params):
-        return self.placeOrderFullResponse(params)
-
-    def modifyOrder(self, params):
+    def modify_order(self, **params):
         self.modified.append(dict(params))
-        return {"status": True}
+        return params.get("order_id")
 
-    def cancelOrder(self, order_id, variety):
-        self.cancelled.append((order_id, variety))
-        return {"status": True}
+    def cancel_order(self, **params):
+        self.cancelled.append(params)
+        return params.get("order_id")
 
-    def orderBook(self):
-        return {"status": True, "data": list(self.orders)}
+    def orders(self):
+        return list(self.order_book)
 
-    def position(self):
-        return {"status": True, "data": []}
+    def positions(self):
+        return {"net": []}
 
 
 def test_broker_places_and_tightens_slm_and_rate_limits_entries():
@@ -47,29 +49,136 @@ def test_broker_places_and_tightens_slm_and_rate_limits_entries():
         settings.max_entry_orders_per_minute = 2
         settings.entry_order_kill_latch_seconds = 10
         api = BrokerApi()
-        broker = SmartApiBroker(api)
-        broker._api_limiter.min_interval_seconds = 0.001
+        broker = KiteBroker(kite=api)
+        broker._min_call_interval = 0.001
 
         stop_id = broker.place_protective_stop(
             "NIFTYTESTFUT", "1", 10, "SELL", 95.03
         )
         assert stop_id == "O1"
-        assert api.placed[-1]["variety"] == "STOPLOSS"
-        assert api.placed[-1]["ordertype"] == "STOPLOSS_MARKET"
-        assert float(api.placed[-1]["triggerprice"]) == 95.05
+        assert api.placed[-1]["order_type"] == "SL-M"
+        # The exchange rejects an off-tick trigger outright, so 95.03 must round.
+        assert float(api.placed[-1]["trigger_price"]) == 95.05
         assert broker.modify_protective_stop(
             stop_id, "NIFTYTESTFUT", "1", 10, "SELL", 96.0
         )
-        assert float(api.modified[-1]["triggerprice"]) == 96.0
+        assert float(api.modified[-1]["trigger_price"]) == 96.0
 
         assert broker.place_order("NIFTYTESTFUT", "1", 10, "BUY")
         assert broker.place_order("BANKNIFTYTESTFUT", "2", 10, "BUY")
+        # Third entry inside the window latches the kill-switch. Without this the
+        # only bound on live entries is however fast the signal loop can call.
         assert broker.place_order("SENSEXTESTFUT", "3", 10, "BUY") is None
         # Risk-reducing exits are intentionally never blocked by the entry latch.
         assert broker.close_order("NIFTYTESTFUT", "1", 10, "SELL")
+        # Nor are protective stops: a latched runaway must not also go unprotected.
+        assert broker.place_protective_stop("NIFTYTESTFUT", "1", 10, "SELL", 94.0)
     finally:
         settings.max_entry_orders_per_minute = old_limit
         settings.entry_order_kill_latch_seconds = old_latch
+
+
+class _SlowDeque(deque):
+    """Widens the gap between the size check and the record, so the race is forced.
+
+    Threads racing on a real deque interleave only if the GIL happens to switch inside
+    the ~5 bytecodes between `len(...)` and `append(...)`, which it effectively never
+    does — a test built on hope passes with or without the lock and pins nothing.
+
+    The delay has to sit at the START of append, not in __len__: sleeping before a read
+    just returns a fresher value and every thread still sees the appends that landed
+    while it waited. Holding threads inside append is what puts them all past the size
+    check at once, which is exactly the window the lock closes.
+    """
+
+    def append(self, item):
+        time.sleep(0.05)
+        super().append(item)
+
+
+def test_entry_kill_switch_holds_under_concurrent_entries():
+    """Entries are placed from one background thread per trade.
+
+    Unsynchronised, several threads each read "still under the cap", all pass, and the
+    cap the kill-switch exists to enforce is overshot — live orders, not a counter.
+    """
+    settings = get_settings()
+    old_limit = settings.max_entry_orders_per_minute
+    old_latch = settings.entry_order_kill_latch_seconds
+    try:
+        settings.max_entry_orders_per_minute = 3
+        settings.entry_order_kill_latch_seconds = 10
+        api = BrokerApi()
+        broker = KiteBroker(kite=api)
+        broker._min_call_interval = 0.0
+        broker._entry_order_times = _SlowDeque()
+
+        start = threading.Barrier(12)
+        results = []
+        lock = threading.Lock()
+
+        def fire(n):
+            start.wait()
+            got = broker.place_order(f"NIFTYTESTFUT{n}", str(n), 10, "BUY")
+            with lock:
+                results.append(got)
+
+        threads = [threading.Thread(target=fire, args=(i,)) for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        placed = [r for r in results if r]
+        assert len(placed) == 3, f"kill-switch let {len(placed)} entries through a cap of 3"
+        assert len(api.placed) == 3, "more orders reached the broker than the cap allows"
+    finally:
+        settings.max_entry_orders_per_minute = old_limit
+        settings.entry_order_kill_latch_seconds = old_latch
+
+
+def test_a_refused_entry_does_not_spend_the_runaway_budget():
+    """Entries retry ~7x over 36s, all inside the 60s window.
+
+    Counting attempts rather than placements means one RMS refusal on ONE trade eats
+    the whole default budget of 6 and latches every entry off for 300s, without a
+    single order having reached the exchange.
+    """
+    settings = get_settings()
+    old_limit = settings.max_entry_orders_per_minute
+    try:
+        settings.max_entry_orders_per_minute = 3
+
+        class _Refusing:
+            def __init__(self):
+                self.calls = 0
+
+            def place_order(self, **_kw):
+                self.calls += 1
+                raise OrderException("RMS:Margin exceeds available")
+
+            def orders(self):
+                return []
+
+        api = _Refusing()
+        broker = KiteBroker(kite=api)
+        broker._min_call_interval = 0.0
+
+        for _ in range(6):
+            with pytest.raises(BrokerOrderRejected):
+                broker.place_order("NIFTYTESTFUT", "1", 10, "BUY")
+
+        # None of those reached the exchange, so a good order must still go through.
+        ok = KiteBroker(kite=BrokerApi())
+        ok._min_call_interval = 0.0
+        ok._entry_order_times = broker._entry_order_times
+        ok._entry_rate_lock = broker._entry_rate_lock
+        ok._entry_kill_latched_until = broker._entry_kill_latched_until
+        assert ok.place_order("NIFTYTESTFUT", "1", 10, "BUY"), (
+            "six refusals that never reached the exchange latched the kill-switch"
+        )
+    finally:
+        settings.max_entry_orders_per_minute = old_limit
 
 
 class LifecycleBroker:
@@ -300,3 +409,36 @@ def test_trade_loss_cap_is_clamped_to_segment_daily_budget():
     expected_opt = opt_budget if abs_cap <= 0 else min(abs_cap, opt_budget)
     assert settings.effective_trade_loss_cap("FUT") == expected_fut
     assert settings.effective_trade_loss_cap("OPT") == expected_opt
+
+
+def test_concurrent_reservation_releases_do_not_over_release():
+    """_release_entry_reservation is check-then-mutate on a shared deque.
+
+    Unsynchronised, two threads releasing when one slot remains both pass the check and
+    the second pop() raises IndexError — which would escape place_order's except-block in
+    place of the classified BrokerOrderRejected/BrokerOrderAmbiguous the caller depends
+    on. It must also never give back more slots than were taken: an over-release makes
+    the kill-switch count fewer orders than are actually live.
+    """
+    broker = KiteBroker(kite=BrokerApi())
+    broker._min_call_interval = 0.0
+    broker._entry_order_times = _SlowDeque([1.0, 2.0])   # exactly two slots held
+
+    errors = []
+    start = threading.Barrier(8)
+
+    def release():
+        start.wait()
+        try:
+            broker._release_entry_reservation()
+        except BaseException as exc:      # noqa: BLE001 - the point is to catch anything
+            errors.append(exc)
+
+    threads = [threading.Thread(target=release) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"release raised instead of degrading safely: {errors}"
+    assert len(broker._entry_order_times) == 0

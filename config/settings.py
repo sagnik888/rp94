@@ -396,6 +396,17 @@ class Settings(BaseSettings):
     entry_margin_buffer_pct: float = 10.0
     entry_margin_cache_seconds: float = 2.0
     recovery_auto_flatten_seconds: float = 5.0
+    # When the order book cannot be read we cannot prove a position is unprotected, so a
+    # flatten is withheld — a double exit (stop still resting + our market exit) opens a
+    # naked reversed leg, which is worse than a late exit. That is safe intraday but it
+    # can carry an NRML position past the close with only an alert.
+    #
+    # 0 (default) keeps that behaviour: withhold indefinitely and escalate to the operator.
+    # Set >0 to accept the double-exit risk after that many seconds of being blocked and
+    # flatten anyway; the trade is then flagged for a reversal watch, because a stop that
+    # fires afterwards opens a position in the opposite direction. This is a deliberate
+    # risk trade-off and is left switched off until an operator chooses it.
+    recovery_flatten_block_deadline_seconds: float = 0.0
     max_entry_orders_per_minute: int = 6
     entry_order_rate_window_seconds: float = 60.0
     entry_order_kill_latch_seconds: float = 300.0

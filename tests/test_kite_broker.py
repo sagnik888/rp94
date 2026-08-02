@@ -18,17 +18,17 @@ import threading
 
 import pytest
 
-from kiteconnect.exceptions import (
+from trading.kite_broker import (
     DataException,
     GeneralException,
     InputException,
+    KiteBroker,
     NetworkException,
     OrderException,
     PermissionException,
     TokenException,
+    classify_kite_exception,
 )
-
-from trading.kite_broker import KiteBroker, classify_kite_exception
 from trading.order_retry import BrokerOrderAmbiguous, BrokerOrderRejected
 
 
@@ -375,3 +375,68 @@ def test_dead_token_invalidates_the_session_for_the_watchdog():
     with pytest.raises(BrokerOrderRejected):
         b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45)
     assert "Invalid access token" in auth.reason
+
+
+# ── every account write needs the lease ──────────────────────────────────────
+class _DeniedLease:
+    """Stands in for a lease this process could not take."""
+    held = False
+    owner_metadata = {"instance_id": "UT1:other", "pid": 4242, "host": "box"}
+
+    def acquire(self):
+        return False
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda b: b.place_protective_stop("NIFTYFUT", "1", 10, "SELL", 95.0),
+        lambda b: b.modify_protective_stop("OID-1", "NIFTYFUT", "1", 10, "SELL", 96.0),
+        lambda b: b.place_gtt_stop("NIFTYFUT", 10, "SELL", 95.0, 100.0),
+        lambda b: b.cancel_order("OID-1"),
+    ],
+    ids=["place-stop", "modify-stop", "place-gtt", "cancel"],
+)
+def test_account_writes_refuse_without_the_execution_lease(call):
+    """A GTT and a stop-modify are real orders on the account, not local state.
+
+    modify_protective_stop and place_gtt_stop each shipped without this guard, so a
+    second instance that did NOT own the account could rewrite or stack on the stop the
+    true holder was managing.
+    """
+    b = _broker(_Kite(place="OID-9"))
+    b._execution_lease = _DeniedLease()
+    with pytest.raises((PermissionError, BrokerOrderRejected)):
+        call(b)
+
+
+def test_a_lost_gtt_acknowledgement_adopts_the_live_trigger():
+    """A GTT rests on Zerodha's servers, so an incomplete call may still have armed one.
+
+    Reporting that as a clean refusal leaves no local id and the next cycle arms a
+    SECOND trigger; one fires and exits, the other fires against a flat book.
+    """
+    class _Kite2:
+        def place_gtt(self, **_kw):
+            raise NetworkException("gateway timeout")
+
+        def get_gtts(self):
+            return [{
+                "id": 55501, "status": "active",
+                "condition": {"tradingsymbol": "NIFTYFUT", "trigger_values": [95.0]},
+            }]
+
+    b = _broker(_Kite2())
+    assert b.place_gtt_stop("NIFTYFUT", 10, "SELL", 95.0, 100.0) == "55501"
+
+
+def test_an_unreadable_trigger_list_after_a_lost_gtt_ack_stays_ambiguous():
+    class _Kite3:
+        def place_gtt(self, **_kw):
+            raise NetworkException("gateway timeout")
+
+        def get_gtts(self):
+            raise NetworkException("trigger list unreadable")
+
+    with pytest.raises(BrokerOrderAmbiguous):
+        _broker(_Kite3()).place_gtt_stop("NIFTYFUT", 10, "SELL", 95.0, 100.0)

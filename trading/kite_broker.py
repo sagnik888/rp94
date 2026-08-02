@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -106,6 +107,15 @@ class KiteBroker(Broker):
         self._order_lock = threading.Lock()
         self._last_call_at = 0.0
         self._min_call_interval = 0.34      # Kite allows ~3 order req/s; stay under it
+        self._entry_order_times: deque = deque()
+        self._entry_kill_latched_until = 0.0
+        # Entries are placed from background threads (one per trade), so the window
+        # bookkeeping below is genuinely concurrent. Without this lock two threads can
+        # both read len()==limit-1, both pass, and both place — overshooting the cap the
+        # kill-switch exists to enforce.
+        self._entry_rate_lock = threading.Lock()
+        self._position_backoff_until = 0.0
+        self._position_backoff_failures = 0
         self._execution_lease = (
             AccountExecutionLease(account_id, instance_id)
             if str(account_id or "").strip()
@@ -128,10 +138,21 @@ class KiteBroker(Broker):
         return self.api
 
     def _api_call(self, context: str, fn, timeout: float = 5.0):
+        # `timeout` bounds the SDK's own HTTP wait. It was accepted and ignored, so every
+        # caller's stated budget (2s for reads, 5s for writes) was silently the SDK
+        # default — and an unbounded call is what lets an entry-rate reservation outlive
+        # its own window.
+        api = self.api
+        previous = getattr(api, "timeout", None) if api is not None else None
         with self._order_lock:
             gap = time.monotonic() - self._last_call_at
             if gap < self._min_call_interval:
                 time.sleep(self._min_call_interval - gap)
+            if api is not None and previous is not None and timeout:
+                try:
+                    api.timeout = float(timeout)
+                except Exception:
+                    previous = None
             try:
                 return fn()
             except TokenException as exc:
@@ -142,6 +163,11 @@ class KiteBroker(Broker):
                 raise
             finally:
                 self._last_call_at = time.monotonic()
+                if api is not None and previous is not None:
+                    try:
+                        api.timeout = previous
+                    except Exception:
+                        pass
 
     # ── execution lease (unchanged semantics from the AngelOne broker) ────────
     def acquire_execution_lease(self) -> bool:
@@ -172,6 +198,58 @@ class KiteBroker(Broker):
             )
             return
         raise PermissionError(f"{action} blocked: {self.execution_lease_block_reason()}")
+
+    # ── runaway-entry kill switch ────────────────────────────────────────────
+    def _entry_rate_allowed(self) -> bool:
+        """Latch entries off once too many fire inside the configured window.
+
+        Nothing else in the system bounds how many live entry orders a signal loop
+        can send, so this is the only backstop against a runaway. It counts entries
+        only — risk-reducing exits and protective stops are never gated by it,
+        because blocking those would turn a runaway into an unprotected position.
+        """
+        from config.settings import get_settings
+
+        settings = get_settings()
+        window = max(1.0, float(getattr(settings, "entry_order_rate_window_seconds", 60.0) or 60.0))
+        limit = max(1, int(getattr(settings, "max_entry_orders_per_minute", 6) or 6))
+        latch = max(10.0, float(getattr(settings, "entry_order_kill_latch_seconds", 300.0) or 300.0))
+        # Read-decide-record must be atomic, or concurrent entry threads each see room
+        # under the cap and collectively exceed it.
+        with self._entry_rate_lock:
+            now = time.monotonic()
+            if now < self._entry_kill_latched_until:
+                return False
+            while self._entry_order_times and now - self._entry_order_times[0] >= window:
+                self._entry_order_times.popleft()
+            if len(self._entry_order_times) >= limit:
+                self._entry_kill_latched_until = now + latch
+                logger.critical(
+                    f"ENTRY ORDER RATE KILL-SWITCH: {len(self._entry_order_times)} orders "
+                    f"inside {window:.0f}s; entries blocked for {latch:.0f}s."
+                )
+                return False
+            self._entry_order_times.append(now)
+            return True
+
+    def _release_entry_reservation(self) -> None:
+        """Give back the slot taken by an order that provably never reached the exchange.
+
+        Entries retry through execute_order_with_retry — 7 attempts over ~36s, all inside
+        the 60s window. Counting each ATTEMPT means a single RMS refusal on one trade
+        consumes the whole default budget of 6 and latches every entry off for 300s,
+        without a single order having reached the market. The cap is on live orders, so
+        only a definitive non-placement releases; an ambiguous one keeps its slot,
+        because that order may well be resting.
+        """
+        with self._entry_rate_lock:
+            try:
+                self._entry_order_times.pop()
+            except IndexError:
+                # Racing releases on the last element would otherwise raise IndexError
+                # out of place_order's except-block, replacing the classified
+                # BrokerOrderRejected/BrokerOrderAmbiguous the caller depends on.
+                pass
 
     # ── mapping helpers ──────────────────────────────────────────────────────
     @staticmethod
@@ -263,6 +341,12 @@ class KiteBroker(Broker):
         side: str,
         product_type: str = "CARRYFORWARD",
         price: float = 0.0,
+        # Accepted and deliberately IGNORED. trade_manager still computes and passes a
+        # touch quote, which fed AngelOne's bid/ask-anchored limit policy; that policy
+        # was retired here in favour of confidence-gated MARKET/LIMIT. Kept in the
+        # signature so the existing call site keeps working — the caller-side plumbing
+        # (and the option_*/execution_touch_* settings behind it) is now dead and wants
+        # its own removal pass.
         touch_quote: Optional[Dict[str, Any]] = None,
         trade_id: str = "",
         confidence: float = 0.0,
@@ -272,7 +356,28 @@ class KiteBroker(Broker):
         except PermissionError as exc:
             raise BrokerOrderRejected(str(exc), terminal=True) from exc
         api = self._require_api("entry order")
+        # Checked after the session, so a dead-token failure does not consume the
+        # entry budget for an order that was never going to be sent.
+        if not self._entry_rate_allowed():
+            return None
 
+        try:
+            return self._submit_entry(
+                api, symbol, token, qty, side, product_type, price, trade_id, confidence,
+            )
+        except (BrokerOrderRejected, BrokerOrderAmbiguous):
+            raise
+        except Exception:
+            # Anything unclassified between taking the slot and submitting means no
+            # order went out, so the reservation must go back — otherwise a repeated
+            # local failure latches the kill-switch with nothing at the exchange.
+            self._release_entry_reservation()
+            raise
+
+    def _submit_entry(
+        self, api, symbol: str, token: str, qty: int, side: str, product_type: str,
+        price: float, trade_id: str, confidence: float,
+    ) -> Optional[str]:
         exchange = self._exchange_for_symbol(symbol)
         # Take the market unless the signal is strong enough to justify waiting for a
         # price. On 2026-07-31 every entry went out as a blind LTP mark-up limit
@@ -315,6 +420,10 @@ class KiteBroker(Broker):
         try:
             order_id = self._api_call("place entry order", lambda: api.place_order(**params))
         except Exception as exc:
+            if classify_kite_exception(exc) != "AMBIGUOUS":
+                # Refused outright: nothing is live, so this attempt must not count
+                # against the runaway-entry budget it never used.
+                self._release_entry_reservation()
             self._raise_for("entry order", symbol, exc)
 
         order_id = str(order_id or "")
@@ -325,6 +434,7 @@ class KiteBroker(Broker):
             resting = self.inspect_recent_entry_order(symbol, token, side, qty)
             state = str(resting.get("state") or "UNKNOWN").upper()
             if state == "ABSENT":
+                self._release_entry_reservation()
                 raise BrokerOrderRejected(
                     "Kite returned no order id and the order book confirms nothing was placed",
                     terminal=False,
@@ -414,7 +524,18 @@ class KiteBroker(Broker):
                 ) from exc
             logger.error(f"Kite rejected protective stop for {symbol}: {exc}")
             return None
-        return str(order_id or "") or None
+        order_id = str(order_id or "")
+        if not order_id or order_id == "None":
+            # Kite returns an id on success, so an empty one is unexplained — NOT a
+            # refusal. Returning None here is audit BLOCKER-1 (2026-07-24) verbatim:
+            # the caller cannot tell it from a clean reject, re-places, and two SL-M
+            # orders rest at the exchange. When both trigger, the second fires against
+            # a flat book and opens a naked reversed leg.
+            raise BrokerOrderAmbiguous(
+                f"Protective stop for {symbol} returned no order id; it may be resting "
+                "at the exchange. Reconcile before placing another."
+            )
+        return order_id
 
     # ── GTT: protection that outlives this process ───────────────────────────
     # A regular SL-M lives in the order book, so it dies with the session and cannot be
@@ -427,6 +548,10 @@ class KiteBroker(Broker):
         last_price: float, product_type: str = "CARRYFORWARD",
     ) -> Optional[str]:
         """Create a single-leg GTT stop. Returns the trigger id, or None."""
+        # A GTT is a real resting order on the account, so it needs the same lease as
+        # every other write. Without this a process that does NOT own the account could
+        # arm a trigger on top of the stop the true holder is managing, and both fire.
+        self._require_account_execution_lease("GTT stop")
         api = self._require_api("GTT stop")
         trigger = self._tick_price(trigger_price)
         exchange = self._exchange_for_symbol(symbol)
@@ -455,6 +580,25 @@ class KiteBroker(Broker):
                 ),
             )
         except Exception as exc:
+            # A GTT is a resting order on Zerodha's servers, so a call that did not
+            # complete may still have created one. Reporting that as a clean refusal
+            # leaves gtt_trigger_id empty and the next cycle arms a SECOND trigger:
+            # one fires and exits, the other fires against a flat book and opens a
+            # naked reversed leg. Ask the server what actually exists before deciding.
+            if classify_kite_exception(exc) == "AMBIGUOUS":
+                existing = self.find_gtt_stop(symbol)
+                if str(existing.get("state") or "") == "FOUND":
+                    found_id = str(existing.get("trigger_id") or "")
+                    logger.warning(
+                        f"Recovered GTT {found_id} for {symbol} after a lost "
+                        "acknowledgement; not arming a second trigger."
+                    )
+                    return found_id or None
+                if str(existing.get("state") or "") == "UNKNOWN":
+                    raise BrokerOrderAmbiguous(
+                        f"GTT for {symbol} did not complete and the trigger list could "
+                        f"not be read ({exc}); it may be armed."
+                    ) from exc
             logger.error(f"Kite refused GTT stop for {symbol}: {type(exc).__name__}: {exc}")
             return None
         trigger_id = str((result or {}).get("trigger_id") or "")
@@ -468,6 +612,13 @@ class KiteBroker(Broker):
     def cancel_gtt_stop(self, trigger_id: str) -> bool:
         if not trigger_id:
             return True
+        # The last account write without the lease, and the worst polarity of the set:
+        # this STRIPS protection rather than adding or rewriting it.
+        try:
+            self._require_account_execution_lease("GTT cancellation")
+        except PermissionError as exc:
+            logger.error(f"GTT cancellation refused for {trigger_id}: {exc}")
+            return False
         api = self.api
         if api is None:
             return False
@@ -509,6 +660,12 @@ class KiteBroker(Broker):
         self, order_id: str, symbol: str, token: str, qty: int, side: str,
         trigger_price: float, product_type: str = "CARRYFORWARD",
     ) -> bool:
+        # Same lease as every other account write. SmartApiBroker required it here and
+        # KiteBroker did not, so a second instance that did NOT own the account could
+        # rewrite the trigger and quantity of the stop the true holder was managing —
+        # and the holder's local protective_trigger would keep its own stale value, so
+        # it would never notice or correct the divergence.
+        self._require_account_execution_lease("protective stop modification")
         api = self._require_api("protective stop modify")
         try:
             self._api_call(
@@ -568,16 +725,49 @@ class KiteBroker(Broker):
                 return row
         return None
 
+    @staticmethod
+    def _position_should_backoff(payload) -> bool:
+        text = str(payload or "").lower()
+        markers = (
+            "too many requests",
+            "exceeding access rate",
+            "access rate",
+            "rate limit",
+            "read timed out",
+            "connect timeout",
+            "connection timed out",
+            "timed out",
+            "timeout",
+        )
+        return any(marker in text for marker in markers)
+
+    def _mark_position_backoff(self, payload) -> None:
+        failures = int(getattr(self, "_position_backoff_failures", 0) or 0) + 1
+        delay = min(60.0, 12.0 * (2 ** max(0, failures - 1)))
+        self._position_backoff_failures = failures
+        self._position_backoff_until = time.time() + delay
+        logger.warning(f"Broker position REST backoff {delay:.1f}s after failure: {payload}")
+
     def get_positions(self) -> Optional[Dict]:
         """Normalised to {"data": [...]} with netqty, as the reconciler expects."""
         api = self.api
         if api is None:
             return None
+        # Without this cooldown a throttled positions endpoint is re-hit on every
+        # reconcile tick, which is what keeps the throttle alive.
+        remaining = float(getattr(self, "_position_backoff_until", 0.0) or 0.0) - time.time()
+        if remaining > 0:
+            logger.debug(f"Skipping broker positions; backoff active for {remaining:.1f}s")
+            return None
         try:
             book = self._api_call("fetch positions", lambda: api.positions(), timeout=2.0)
         except Exception as exc:
+            if self._position_should_backoff(exc):
+                self._mark_position_backoff(exc)
             logger.error(f"Kite positions read failed: {exc}")
             return None
+        self._position_backoff_failures = 0
+        self._position_backoff_until = 0.0
         net = (book or {}).get("net", []) if isinstance(book, dict) else []
         rows = []
         for row in net or []:
@@ -593,6 +783,26 @@ class KiteBroker(Broker):
             rows.append(row)
         return {"data": rows}
 
+    @staticmethod
+    def _quantity_could_match(row: Dict[str, Any], wanted_qty: int) -> bool:
+        """False ONLY when the row's size is known and differs.
+
+        Asymmetric on purpose. Adopting a differently-sized order books this trade
+        against a stranger's position and leaves the difference unprotected — but
+        answering "no match" from a size we could not read is the worse error, because
+        it reaches the caller as ABSENT and re-places a possibly-live order. An
+        unparseable size therefore stays adoptable.
+        """
+        if wanted_qty <= 0:
+            return True
+        raw = row.get("quantity")
+        if raw is None or raw == "":
+            return True
+        try:
+            return int(float(raw)) == wanted_qty
+        except (TypeError, ValueError):
+            return True
+
     def inspect_recent_entry_order(
         self, symbol: str, token: str = "", side: str = "", quantity: int = 0,
     ) -> Dict[str, Any]:
@@ -603,13 +813,23 @@ class KiteBroker(Broker):
                 "state": "UNKNOWN", "order_id": "", "matches": [],
                 "reason": "order book could not be read",
             }
+        if not symbol:
+            # Cannot identify the contract, so nothing can be concluded. Falling through
+            # would match no rows and answer ABSENT — "definitively not placed" — from a
+            # scan that never had a chance to look.
+            return {
+                "state": "UNKNOWN", "order_id": "", "matches": [],
+                "reason": "entry symbol is empty",
+            }
         wanted_symbol = str(symbol or "").upper()
         wanted_side = str(side or "").upper()
+        wanted_qty = max(0, int(quantity or 0))
         matches = [
             row for row in rows
             if str(row.get("tradingsymbol") or "").upper() == wanted_symbol
             and (not wanted_side or str(row.get("transactiontype") or "").upper() == wanted_side)
             and str(row.get("ordertype") or "").upper() not in {"SL", "SL-M"}
+            and self._quantity_could_match(row, wanted_qty)
         ]
         if not matches:
             return {"state": "ABSENT", "order_id": "", "reason": "no such order", "matches": []}
@@ -636,26 +856,107 @@ class KiteBroker(Broker):
                 "state": "UNKNOWN", "order_id": "", "matches": [],
                 "reason": "order book could not be read",
             }
+        if not symbol:
+            return {
+                "state": "UNKNOWN", "order_id": "", "matches": [],
+                "reason": "protective-order symbol is empty",
+            }
         wanted_symbol = str(symbol or "").upper()
         wanted_side = str(side or "").upper()
-        matches = [
+        wanted_qty = max(0, int(quantity or 0))
+        wanted_product = self._product(product_type) if product_type else ""
+        working = [
             row for row in rows
             if str(row.get("tradingsymbol") or "").upper() == wanted_symbol
             and str(row.get("ordertype") or "").upper() in {"SL", "SL-M"}
             and str(row.get("orderstatus") or "").lower() in _WORKING_STATUSES
             and (not wanted_side or str(row.get("transactiontype") or "").upper() == wanted_side)
         ]
-        if not matches:
+        if not working:
             return {"state": "NONE", "order_id": "", "reason": "no working stop", "matches": []}
+
+        # Split on metadata rather than taking working[0]. A caller that cancels the
+        # first match and then acts as if the contract is clear will cancel ONE of two
+        # resting stops and exit over the other — the duplicate-SL-M hazard this whole
+        # subsystem exists to prevent. The AngelOne broker made these distinctions and
+        # they were lost when it was deleted; T2 in trade_manager depends on them.
+        wanted_token = str(token or "").strip()
+        wanted_trigger = self._tick_price(trigger_price) if float(trigger_price or 0.0) > 0 else 0.0
+        exact, conflicts, stale_trigger = [], [], []
+        for row in working:
+            # One rule for "is this row my size", shared with the entry scan. The
+            # inline version here read a missing quantity as 0 and so as a CONFLICT,
+            # while an unparseable string counted as a match — two contradictory
+            # answers to the same question in one file.
+            ok = self._quantity_could_match(row, wanted_qty)
+            if ok and wanted_product:
+                row_product = str(row.get("producttype") or "").upper()
+                ok = not row_product or row_product == wanted_product
+            if ok and wanted_token:
+                row_token = str(row.get("instrument_token") or row.get("symboltoken") or "").strip()
+                ok = not row_token or row_token == wanted_token
+            if not ok:
+                conflicts.append(row)
+                continue
+            # The stop is the right one but armed at the wrong level. That is neither a
+            # clean FOUND (adopting it silently accepts a trigger the caller did not ask
+            # for) nor a CONFLICT (it IS this position's stop, and modifying it is the
+            # correct repair). Callers that pass no trigger_price never see this state.
+            if wanted_trigger:
+                row_trigger = row.get("triggerprice")
+                try:
+                    matches_level = abs(float(row_trigger) - wanted_trigger) <= 0.051
+                except (TypeError, ValueError):
+                    matches_level = True        # unreadable level is not proof of drift
+                if not matches_level:
+                    stale_trigger.append(row)
+                    continue
+            exact.append(row)
+
+        if (
+            len(exact) > 1
+            or len(stale_trigger) > 1
+            or (exact and (conflicts or stale_trigger))
+            or (stale_trigger and conflicts)
+        ):
+            return {
+                "state": "AMBIGUOUS", "order_id": "", "matches": working,
+                "reason": f"{len(working)} working protective stops for this contract",
+            }
+        if stale_trigger:
+            row = stale_trigger[0]
+            return {
+                "state": "FOUND_STALE_TRIGGER",
+                "order_id": str(row.get("orderid") or ""),
+                "trigger_price": row.get("triggerprice"),
+                "reason": "this position's stop is armed at a different trigger",
+                "matches": stale_trigger,
+            }
+        if exact:
+            return {
+                "state": "FOUND", "order_id": str(exact[0].get("orderid") or ""),
+                "reason": "working protective stop found", "matches": exact,
+            }
+        if len(conflicts) > 1:
+            return {
+                "state": "AMBIGUOUS", "order_id": "", "matches": conflicts,
+                "reason": "multiple working stops, none matching this position",
+            }
         return {
-            "state": "FOUND", "order_id": str(matches[0].get("orderid") or ""),
-            "reason": "working protective stop found", "matches": matches,
+            "state": "CONFLICT", "order_id": "", "matches": conflicts,
+            "reason": "a working stop exists but its quantity/product does not match",
         }
 
     def find_working_protective_stop(
-        self, symbol: str, token: str, side: str, quantity: int = 0
+        self, symbol: str, token: str, side: str, quantity: int = 0,
+        product_type: str = "",
     ) -> str:
-        result = self.inspect_working_protective_stop(symbol, token, side, quantity=quantity)
+        # product_type is forwarded rather than left to the inspector's CARRYFORWARD
+        # default: with an INTRADAY/MIS position that default classifies a perfectly
+        # good MIS stop as CONFLICT, which reads here as "no stop".
+        result = self.inspect_working_protective_stop(
+            symbol, token, side, quantity=quantity, product_type=product_type,
+        )
         return str(result.get("order_id") or "") if result.get("state") == "FOUND" else ""
 
     # ── fills: fact instead of inference ─────────────────────────────────────
