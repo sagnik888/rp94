@@ -51,6 +51,9 @@ def _format_time(value: dtime) -> str:
     return value.strftime("%H:%M:%S" if value.second else "%H:%M")
 
 
+from data.kite_auth import most_recent_token_cutoff  # noqa: E402
+
+
 def validate_real_mode_readiness(
     settings: Any,
     data_provider: Any = None,
@@ -72,15 +75,45 @@ def validate_real_mode_readiness(
     if not env_path.exists():
         blockers.append(".env missing")
 
-    required = {
-        "angelone_api_key": getattr(settings, "angelone_api_key", ""),
-        "angelone_client_id": getattr(settings, "angelone_client_id", ""),
-        "angelone_password": getattr(settings, "angelone_password", ""),
-        "angelone_totp_secret": getattr(settings, "angelone_totp_secret", ""),
-    }
-    for key, value in required.items():
-        if not str(value or "").strip():
+    # Execution is Zerodha Kite. This gate still demanded AngelOne credentials, which
+    # no longer place a single order — so with those left in .env it reported REAL mode
+    # READY while never once checking the Kite session. The Kite access token expires
+    # EVERY day, so "is the daily login done" is the one thing a pre-market gate has to
+    # answer, and it was the one thing it did not ask.
+    for key in ("kite_api_key", "kite_api_secret"):
+        if not str(getattr(settings, key, "") or "").strip():
             blockers.append(f"{key} missing")
+
+    try:
+        from data.kite_auth import get_kite_auth
+
+        kite_status = get_kite_auth(settings).status()
+    except Exception as exc:
+        blockers.append(f"Kite session state unavailable: {exc}")
+        kite_status = {}
+    if kite_status:
+        if kite_status.get("auth_required") or not kite_status.get("connected"):
+            blockers.append(
+                "Kite daily login required"
+                + (f" ({kite_status.get('reason')})" if kite_status.get("reason") else "")
+                + " - complete it at /api/kite_login"
+            )
+        else:
+            stamped = str(kite_status.get("token_updated_at") or "")
+            issued = None
+            if stamped:
+                try:
+                    issued = datetime.fromisoformat(stamped)
+                except ValueError:
+                    issued = None
+            if issued is not None:
+                if issued.tzinfo is None:
+                    issued = IST.localize(issued)
+                if issued < most_recent_token_cutoff(now):
+                    blockers.append(
+                        f"Kite token is stale (issued {issued:%Y-%m-%d %H:%M}); "
+                        "re-login before the session"
+                    )
 
     risk_summary_fn = getattr(settings, "risk_configuration_summary", None)
     if callable(risk_summary_fn):

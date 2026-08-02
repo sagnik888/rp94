@@ -127,11 +127,12 @@ def test_scanner_trading_day_allows_declared_special_session():
 def test_real_mode_safety_allows_special_session_but_blocks_normal_weekend(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("", encoding="ascii")
+    _use_healthy_kite_session(monkeypatch)
     settings = SimpleNamespace(
-        angelone_api_key="key",
-        angelone_client_id="client",
-        angelone_password="password",
-        angelone_totp_secret="totp",
+        # Execution is Kite; the AngelOne credentials the gate used to demand place no
+        # orders. What "ready" means now is a live Kite session with today's token.
+        kite_api_key="key",
+        kite_api_secret="secret",
     )
     provider = SimpleNamespace(
         is_connected=True,
@@ -151,14 +152,33 @@ def test_real_mode_safety_allows_special_session_but_blocks_normal_weekend(tmp_p
     assert "weekend session" in normal_weekend["blockers"]
 
 
+
+def _use_healthy_kite_session(monkeypatch):
+    """A Kite session authenticated today, so these window tests pin TIMING only."""
+    from datetime import datetime as _dt
+
+    import pytz as _pytz
+
+    class _Auth:
+        def status(self):
+            now = _dt.now(_pytz.timezone("Asia/Kolkata"))
+            return {
+                "connected": True, "auth_required": False, "reason": "",
+                "user_id": "TEST", "token_updated_at": now.isoformat(),
+            }
+
+    monkeypatch.setattr("data.kite_auth.get_kite_auth", lambda settings=None: _Auth())
+
+
 def test_real_mode_safety_allows_premarket_arming_window(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("", encoding="ascii")
+    _use_healthy_kite_session(monkeypatch)
     settings = SimpleNamespace(
-        angelone_api_key="key",
-        angelone_client_id="client",
-        angelone_password="password",
-        angelone_totp_secret="totp",
+        # Execution is Kite; the AngelOne credentials the gate used to demand place no
+        # orders. What "ready" means now is a live Kite session with today's token.
+        kite_api_key="key",
+        kite_api_secret="secret",
         real_mode_premarket_arm_start="09:00:00",
         real_mode_premarket_settle_end="09:08:00",
         real_mode_premarket_refresh_end="09:14:30",
