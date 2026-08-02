@@ -2748,6 +2748,45 @@ async def api_diagnostics():
     return make_serializable(scanner_ref._get_diagnostics_payload())
 
 
+_VOLUME_HEALTH_TTL_SECONDS = 10.0
+_volume_health_cache = None
+
+
+@app.get("/api/volume-health")
+async def api_volume_health():
+    """Which feed is actually supplying each index's volume, right now.
+
+    Index volume died on 2026-07-27 and stayed dead for days: every volume-gated path
+    (the 2.5x surge that is the only 1min entry route, the hybrid thrusts, the cascade,
+    and the fast-opposite thrust EXIT guard) reads one ratio, and all of them evaluated
+    False in silence. The futures fallback now keeps trading alive when Fyers goes
+    quiet — which also means the outage no longer announces itself. This endpoint is
+    how it stays visible.
+    """
+    if not scanner_ref:
+        return {"status": "starting", "healthy": None, "instruments": {}}
+    if not hasattr(scanner_ref, "volume_source_health"):
+        return {"status": "unsupported", "healthy": None, "instruments": {}}
+    # This reaches the broker (a Kite quote per index, plus a possible Fyers REST probe)
+    # on the same API key that places orders. Two guards: serve a short-lived cache so a
+    # dashboard poller cannot turn into an unthrottled quote loop, and run the blocking
+    # calls off the event loop so a slow broker cannot stall every other route and the
+    # websocket alongside it.
+    global _volume_health_cache
+    now = time.time()
+    cached = _volume_health_cache
+    if cached and now - cached[0] < _VOLUME_HEALTH_TTL_SECONDS:
+        return cached[1]
+    try:
+        payload = make_serializable(
+            await asyncio.to_thread(scanner_ref.volume_source_health)
+        )
+    except Exception as exc:
+        return {"status": "error", "healthy": None, "instruments": {}, "error": str(exc)}
+    _volume_health_cache = (now, payload)
+    return payload
+
+
 @app.get("/api/calibration-status")
 async def api_calibration_status():
     if not scanner_ref or not hasattr(scanner_ref, "outcome_calibration"):
