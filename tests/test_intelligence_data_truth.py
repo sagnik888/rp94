@@ -170,10 +170,16 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     aggregate = result["aggregate"]
     assert aggregate["score_before_regime_dampening"] == 0.5
     assert aggregate["regime_score_multiplier"] == 0.15
-    # 3.8, not 3.75: a non-authoritative option chain (here options_chain=None) no
-    # longer feeds the OI/PCR components into the intelligence score, and the published
-    # score is rounded to 1dp. The dampening chain itself is unchanged (asserted above).
-    assert aggregate["score"] == 3.8
+    # A non-authoritative option chain (here options_chain=None) does not feed the
+    # OI/PCR components into the score, and the published value is rounded to 1dp.
+    # The dampening chain itself is unchanged, which the two assertions above pin.
+    #
+    # 2.5, previously 3.8: this candle set trips the divergence detector, and the
+    # divergence vote (+/-0.30, larger than any counted pillar) now increments
+    # `components` like every other vote of its size. Denominator 2 -> 3, so
+    # 0.5 * 0.15 / 3 = 0.025 -> 2.5. Before the fix that vote's weight moved with how
+    # many UNRELATED pillars happened to have data.
+    assert aggregate["score"] == 2.5
     assert aggregate["signal"] == "HOLD"
 
 

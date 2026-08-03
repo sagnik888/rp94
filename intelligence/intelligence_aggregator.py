@@ -432,6 +432,16 @@ class IntelligenceAggregator:
                 f"⚠️ DIVERGENCE: {instrument} Price falling but Order Flow shows Accumulation (Shakeout?)",
             )
         
+        if divergence_detected:
+            # The divergence vote is +/-0.30 — LARGER than any counted pillar (regime is
+            # +/-0.25) — but it was the only term of that size never to increment
+            # `components`. Since averaged_score = score / components, that made its
+            # influence depend on how many UNRELATED pillars happened to have data:
+            # measured +0.043 with seven pillars available versus +0.100 with three, a
+            # 2.3x swing driven by option-chain availability rather than by the market.
+            # It is an independent stress-test vote, so it carries its own weight.
+            components += 1
+
         results["divergence_alert"] = divergence_detected
 
         # ═══ STRESS TEST: System CA OI (Cumulative Analysis) ═══
