@@ -1650,6 +1650,25 @@ class TradeManager:
             symbol = str(trade.trading_symbol or trade.instrument)
             local_symbols.add(symbol)
             position = broker_pos.get(symbol)
+            # Kite keeps a squared-off day position in `net` with quantity 0 for the rest
+            # of the session. For a trade whose entry has NOT been confirmed filled, that
+            # row is the residue of an EARLIER trade on this contract and says nothing
+            # about this order. Reading it as "the position went flat" closed a trade
+            # whose entry was still working at the exchange: it booked the earlier
+            # trade's realised P&L onto the new trade (feeding the daily loss breaker),
+            # threw away the live order id, and left a real position with no stop that
+            # even the EOD force-exit could not see.
+            #
+            # Treat it as "no position" so the stale-entry logic below handles it — that
+            # branch already consults the order book, cancel/replaces a stale working
+            # order, and marks RECOVERY_REQUIRED past the timeout.
+            if (
+                position is not None
+                and self._position_quantity(position) == 0
+                and self._entry_still_confirming(trade)
+                and self._confirmed_broker_quantity(trade) <= 0
+            ):
+                position = None
             order_status = None
             if trade.execution_status == "ENTRY_SUBMITTED" and trade.broker_order_id:
                 getter = getattr(self.broker, "get_order_status", None)
