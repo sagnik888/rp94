@@ -1575,6 +1575,10 @@ class TradeManager:
                 "the system cannot act on it and will stop retrying.",
             )
             return False
+        if trade.id in getattr(self, "_flatten_ambiguous_latched", set()):
+            # A previous exit for this trade was never acknowledged. Sending another is
+            # how one ambiguous exit becomes two real ones.
+            return False
         if trade.protective_order_id:
             try:
                 cancelled = self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
@@ -1626,11 +1630,26 @@ class TradeManager:
             self._withhold_flatten(trade, f"{reason}; emergency flatten refused ({exc})")
             return False
         except BrokerOrderAmbiguous as exc:
-            # The exit MAY have reached the exchange; never re-send it blind.
+            # The exit MAY have reached the exchange, so it must never be re-sent blind.
+            # Marking recovery alone did NOT achieve that: check_session_end re-dispatches
+            # every RECOVERY_REQUIRED row to this method on each pass (~1 Hz), so a fresh
+            # MARKET exit went out every second until the close. If the first one had in
+            # fact filled, the account ends up SHORT and naked in an NRML product the
+            # broker will not square off. Latch it: only a reconciliation that reads the
+            # real net quantity may release it.
+            if not hasattr(self, "_flatten_ambiguous_latched"):
+                self._flatten_ambiguous_latched = set()
+            self._flatten_ambiguous_latched.add(trade.id)
             self._mark_recovery(
                 trade,
                 f"{reason}; emergency flatten acknowledgement ambiguous ({exc}). The exit "
-                "may be live — reconcile before acting.",
+                "may be live — no further exit will be sent until broker positions "
+                "confirm the real quantity. Reconcile this position manually.",
+            )
+            logger.critical(
+                f"FLATTEN AMBIGUOUS for {trade.trading_symbol}: an exit may already be "
+                "resting at the exchange. Further automatic exits are latched off for "
+                "this trade until reconciliation proves its net quantity."
             )
             self.save_state()
             return False
@@ -1747,21 +1766,52 @@ class TradeManager:
                         and trade.entry_replace_count < 1
                         and _setting_enabled(getattr(settings, "broker_cancel_replace_enabled", True), True)
                     ):
-                        cancelled = self.broker.cancel_order(trade.broker_order_id, "NORMAL")
-                        if cancelled:
+                        # PROVE the cancel, do not just acknowledge it. cancel_order
+                        # returns True on the API acknowledgement alone, and this order is
+                        # being replaced precisely BECAUSE price is moving toward its
+                        # limit — so the fill routinely wins the race against the cancel.
+                        # Acting on the ack then leaves the original filled AND a MARKET
+                        # replacement live: double the intended size, with the stop later
+                        # armed for the doubled quantity, so one stop-out costs twice the
+                        # per-trade risk the sizer approved.
+                        #
+                        # cancel_order_confirmed returns True only for a broker-confirmed
+                        # terminal non-fill, False when the order actually filled, and
+                        # None when it cannot tell. It has existed unused since the
+                        # AngelOne era with exactly this docstring.
+                        confirm = getattr(self.broker, "cancel_order_confirmed", None)
+                        if callable(confirm):
+                            try:
+                                cancelled = confirm(trade.broker_order_id, "NORMAL")
+                            except (BrokerOrderRejected, PermissionError) as exc:
+                                logger.error(
+                                    f"Stale-entry cancel refused for {trade.trading_symbol}: {exc}"
+                                )
+                                cancelled = None
+                        else:
+                            cancelled = self.broker.cancel_order(trade.broker_order_id, "NORMAL")
+                        if cancelled is True:
                             entry_side = (
                                 "BUY"
                                 if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}
                                 else "SELL"
                             )
-                            replacement = self.broker.place_order(
-                                trade.trading_symbol,
-                                trade.symbol_token,
-                                trade.quantity,
-                                entry_side,
-                                self.product_type,
-                                price=0.0,
-                            )
+                            try:
+                                replacement = self.broker.place_order(
+                                    trade.trading_symbol,
+                                    trade.symbol_token,
+                                    trade.quantity,
+                                    entry_side,
+                                    self.product_type,
+                                    price=0.0,
+                                )
+                            except (BrokerOrderAmbiguous, BrokerOrderRejected, PermissionError) as exc:
+                                # Unguarded, this unwound out of reconcile and abandoned
+                                # every remaining trade in the snapshot.
+                                logger.error(
+                                    f"Stale-entry replacement failed for {trade.trading_symbol}: {exc}"
+                                )
+                                replacement = None
                             if replacement:
                                 trade.broker_order_id = str(replacement)
                                 trade.entry_submitted_at = datetime.now(IST)
@@ -1769,6 +1819,13 @@ class TradeManager:
                                 trade.execution_error = "Stale limit cancelled and replaced with MARKET"
                                 changed = True
                                 continue
+                        if cancelled is False:
+                            # The order FILLED while we were cancelling. Nothing is
+                            # stale and nothing needs replacing — let the next reconcile
+                            # confirm the fill normally.
+                            trade.pending_execution = True
+                            changed = True
+                            continue
                         self._mark_recovery(trade, "Stale entry could not be safely cancelled/replaced")
                         trade.pending_execution = True
                         changed = True
@@ -1792,6 +1849,11 @@ class TradeManager:
                 )
                 changed = True
                 continue
+            # A position row IS the reconciliation an ambiguous flatten was waiting for:
+            # the broker has told us the real net quantity, so automatic exits may resume.
+            latched = getattr(self, "_flatten_ambiguous_latched", None)
+            if latched:
+                latched.discard(trade_id)
             trade.broker_quantity = abs(net_qty)
             expected_qty = max(1, trade.quantity)
             if net_qty == 0:
@@ -2959,7 +3021,16 @@ class TradeManager:
             
         for tid, trade in snapshot:
             # Strategy-owned square-off. CARRYFORWARD avoids broker intraday auto-squareoff.
-            if str(getattr(trade, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
+            status = str(getattr(trade, "execution_status", "") or "").upper()
+            # PARTIAL_EXIT joins RECOVERY_REQUIRED here. close_trade REFUSES that status
+            # (and refuses pending_exit), so routing it there meant the unfilled remainder
+            # of a partially filled exit was never squared off: its protective stop had
+            # already been cancelled before the exit was sent, so the residual carried
+            # overnight naked in a product the broker will not auto-square-off.
+            # emergency_flatten_trade is the right path — it scans for a stop it does not
+            # own, withholds when it cannot prove the position is unprotected, and latches
+            # after an ambiguous acknowledgement.
+            if status in {"RECOVERY_REQUIRED", "PARTIAL_EXIT"}:
                 self.emergency_flatten_trade(trade, "FORCE_EOD_KILL")
             else:
                 self.close_trade(tid, trade.current_price, "FORCE_EOD_KILL", exit_time=now)
