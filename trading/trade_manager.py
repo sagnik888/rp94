@@ -439,6 +439,27 @@ class Trade:
         return self.lots * self.lot_size
 
     @property
+    def pnl_quantity(self) -> int:
+        """The size P&L should be measured on: what the broker actually filled.
+
+        `quantity` is the INTENDED size (lots * lot_size). On a partial fill the broker
+        confirms less, and reconcile records that in broker_quantity while flagging the
+        trade PARTIAL. broker_quantity is already authoritative for order sizing — exit
+        quantity, protective-stop quantity — but P&L was still computed on the intended
+        size, overstating it by the fill ratio. A 65-intended / 30-filled option trade
+        reported -860 against a true -440.
+
+        That number feeds the daily loss cap and the loss guard, so an overstatement
+        halts trading early on money that was never at risk. Falls back to the intended
+        size when nothing is confirmed yet, which is the pre-fill estimate.
+        """
+        try:
+            confirmed = int(getattr(self, "broker_quantity", 0) or 0)
+        except (TypeError, ValueError):
+            confirmed = 0
+        return confirmed if confirmed > 0 else self.quantity
+
+    @property
     def unrealized_pnl(self) -> float:
         """Net P&L including estimated charges and instrument multipliers"""
         if self.status != "OPEN":
@@ -447,26 +468,29 @@ class Trade:
         from config.settings import get_settings
         settings = get_settings()
         from engine.trade_accounting import estimate_trade_charges
+        # Size on what the broker actually filled, not on what was intended — see
+        # pnl_quantity. Charges too: brokerage and taxes scale with the filled lot.
+        sized = self.pnl_quantity
         est_charges = estimate_trade_charges(
             self.entry_price,
             self.current_price,
-            self.quantity,
+            sized,
             self.inst_type,
             settings,
             self.instrument_multiplier,
             instrument=self.instrument,
         )
-        
+
         # NOTE: self.current_price is ALREADY adjusted for Delta in update_trade()
         # For Options, we are always LONG (buying CE or PE).
         if self.inst_type == "OPT":
-            gross = (self.current_price - self.entry_price) * self.quantity
+            gross = (self.current_price - self.entry_price) * sized
         else:
             # For Futures, it depends on direction
             if self.direction == "LONG":
-                gross = (self.current_price - self.entry_price) * self.quantity
+                gross = (self.current_price - self.entry_price) * sized
             else:
-                gross = (self.entry_price - self.current_price) * self.quantity
+                gross = (self.entry_price - self.current_price) * sized
             
         return gross - est_charges
 
@@ -673,16 +697,21 @@ class TradeManager:
             trade.exit_reason = reason
             if getattr(trade, "exit_order_id", ""):
                 self._record_exit_slippage(trade, exit_decision_price, trade.exit_price)
+            # Realised P&L on the size the broker actually filled, not the intended
+            # size. A partial fill otherwise books a loss (or gain) proportionally
+            # larger than the position ever was, and that figure is what the daily
+            # loss cap and the session summary are built from.
+            sized = trade.pnl_quantity
             if trade.inst_type == "OPT":
-                gross = (trade.exit_price - trade.entry_price) * trade.quantity
+                gross = (trade.exit_price - trade.entry_price) * sized
             elif trade.direction == "LONG":
-                gross = (trade.exit_price - trade.entry_price) * trade.quantity
+                gross = (trade.exit_price - trade.entry_price) * sized
             else:
-                gross = (trade.entry_price - trade.exit_price) * trade.quantity
+                gross = (trade.entry_price - trade.exit_price) * sized
             trade.charges = estimate_trade_charges(
                 trade.entry_price,
                 trade.exit_price,
-                trade.quantity,
+                sized,
                 trade.inst_type,
                 get_settings(),
                 trade.instrument_multiplier,
