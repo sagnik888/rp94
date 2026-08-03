@@ -23667,6 +23667,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 trade.current_price = float(mark)
                 setattr(trade, "quote_source", mark_source)
                 setattr(trade, "quote_verified", bool(quote_verified))
+                if real_premium is not None:
+                    # Hand TradeManager the VETTED mark, not the raw LTP.
+                    # _active_option_decision_mark exists to reject a stale contract
+                    # quote and substitute a synthetic one, and this scanner honours it
+                    # for its own stop check below. But update_trade was still being
+                    # passed the raw premium, and trade_manager.py overwrites
+                    # trade.current_price with it — its only guard there is an upper
+                    # plausibility bound (~spot*0.12), not a staleness test, so a
+                    # rejected quote sailed through and could trigger EARLY_LOSS_CUT or
+                    # TRAILING_STOP at a price this function had already refused.
+                    # Both directions cost money: a stale low stops out a winner, a
+                    # stale high suppresses a stop that should fire.
+                    real_premium = float(mark)
 
             opt_val = trade.current_price if getattr(trade, "inst_type", "FUT") == "OPT" else trade_price
 
