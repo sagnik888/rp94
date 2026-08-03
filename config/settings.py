@@ -399,6 +399,11 @@ class Settings(BaseSettings):
     # checks while preventing a stale balance from authorising later entries.
     entry_margin_buffer_pct: float = 10.0
     entry_margin_cache_seconds: float = 2.0
+    # Pre-market warning floor for broker free cash. Index option lot margins run
+    # ~37k-56k, so an account below this cannot fund a single lot and every entry will
+    # be refused by RMS with a generic rejection. Advisory only: it warns, never blocks,
+    # because margin moves intraday and the operator may fund mid-session.
+    entry_funds_warning_floor: float = 50000.0
     recovery_auto_flatten_seconds: float = 5.0
     # When the order book cannot be read we cannot prove a position is unprotected, so a
     # flatten is withheld — a double exit (stop still resting + our market exit) opens a

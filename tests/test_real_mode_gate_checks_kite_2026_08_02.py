@@ -105,3 +105,65 @@ def test_the_gate_no_longer_demands_retired_angelone_credentials():
     for retired in ("angelone_api_key", "angelone_client_id",
                     "angelone_password", "angelone_totp_secret"):
         assert retired not in src, f"{retired} is still a REAL-mode requirement"
+
+
+# ───────── An underfunded account must fail fast with the real reason ─────────
+# preflight_entry_margin computed this correctly and had NO caller, so an account that
+# could not fund a single lot fired a doomed order per signal and got back a generic RMS
+# rejection. The cause was knowable before sending and was not being asked for.
+
+import threading as _threading
+from datetime import datetime as _dt
+
+from trading.order_retry import BrokerOrderRejected as _Rejected
+from trading.trade_manager import TradeManager as _TM
+
+
+class _MarginBroker:
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.calls = []
+
+    def preflight_entry_margin(self, **kw):
+        self.calls.append(kw)
+        if isinstance(self.verdict, Exception):
+            raise self.verdict
+        return self.verdict
+
+
+def _margin_manager(broker):
+    m = _TM.__new__(_TM)
+    m.broker = broker
+    m.product_type = "CARRYFORWARD"
+    m.ui_logger = None
+    return m
+
+
+def test_an_unaffordable_entry_is_refused_before_it_is_sent():
+    broker = _MarginBroker({
+        "ok": False, "basis": "KITE_ORDER_MARGIN",
+        "available": 30_504.0, "required": 45_825.0,
+        "limitation": "insufficient funds: 45,825.00 required, 30,504.00 available",
+    })
+    verdict = _margin_manager(broker)._entry_margin_verdict("NIFTY2680423900CE", 65, "BUY", 705.7)
+    assert verdict["ok"] is False
+    assert "insufficient funds" in verdict["limitation"]
+    assert broker.calls and broker.calls[0]["qty"] == 65
+
+
+def test_an_affordable_entry_passes():
+    broker = _MarginBroker({"ok": True, "available": 500_000.0, "required": 45_825.0})
+    assert _margin_manager(broker)._entry_margin_verdict("NIFTY2680423900CE", 65, "BUY", 705.7)["ok"]
+
+
+def test_an_unavailable_margin_endpoint_never_blocks_trading():
+    """Fail OPEN. A broker that cannot answer must not halt a funded account."""
+    broker = _MarginBroker(RuntimeError("margins endpoint down"))
+    assert _margin_manager(broker)._entry_margin_verdict("NIFTY", 65, "BUY", 700.0) is None
+
+
+def test_a_broker_without_preflight_support_is_not_blocked():
+    class _Bare:
+        pass
+
+    assert _margin_manager(_Bare())._entry_margin_verdict("NIFTY", 65, "BUY", 700.0) is None

@@ -1412,6 +1412,32 @@ class TradeManager:
             return "UNKNOWN", "", None
         return ("FOUND", oid, None) if oid else ("NONE", "", None)
 
+    def _entry_margin_verdict(self, symbol: str, qty: int, side: str, price: float):
+        """Can this entry be funded? None when the broker cannot answer.
+
+        Deliberately fail-OPEN: a missing or erroring margin endpoint must never stop
+        trading, only a definitive "not enough money" may. The check is one broker
+        round-trip per entry attempt, which is cheap next to sending an order that is
+        certain to be refused.
+        """
+        preflight = getattr(self.broker, "preflight_entry_margin", None)
+        if not callable(preflight):
+            return None
+        try:
+            verdict = preflight(
+                symbol=symbol, qty=int(qty or 0), side=str(side or "BUY"),
+                product_type=self.product_type, price=float(price or 0.0),
+            ) or {}
+        except Exception as exc:
+            logger.debug(f"Entry margin preflight unavailable for {symbol}: {exc}")
+            return None
+        if not verdict.get("ok", True):
+            logger.critical(
+                f"ENTRY BLOCKED (funds) {symbol} x{qty}: "
+                f"{verdict.get('limitation') or verdict.get('reason') or 'insufficient margin'}"
+            )
+        return verdict
+
     def _trade_owning_protective_order(self, order_id: str, exclude_id: str = ""):
         """The open trade that holds this protective order id, if any."""
         if not order_id:
@@ -2270,6 +2296,22 @@ class TradeManager:
             
             def place_bg():
                 def place_order():
+                    # Ask the broker whether this order can be funded BEFORE sending it.
+                    # preflight_entry_margin was written for exactly this and had no
+                    # caller, so an underfunded account fired a doomed order per signal
+                    # and got back a generic RMS rejection with no stated cause. It fails
+                    # OPEN when it cannot verify, so an unavailable margin endpoint never
+                    # blocks trading.
+                    preflight = self._entry_margin_verdict(
+                        trading_symbol, trade.quantity, order_side, price
+                    )
+                    if preflight is not None and not preflight.get("ok", True):
+                        raise BrokerOrderRejected(
+                            preflight.get("limitation")
+                            or preflight.get("reason")
+                            or "entry margin preflight failed",
+                            terminal=True,
+                        )
                     try:
                         return self.broker.place_order(
                             symbol=trading_symbol,

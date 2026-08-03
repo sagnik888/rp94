@@ -138,21 +138,19 @@ class KiteBroker(Broker):
         return self.api
 
     def _api_call(self, context: str, fn, timeout: float = 5.0):
-        # `timeout` bounds the SDK's own HTTP wait. It was accepted and ignored, so every
-        # caller's stated budget (2s for reads, 5s for writes) was silently the SDK
-        # default — and an unbounded call is what lets an entry-rate reservation outlive
-        # its own window.
+        # `timeout` is advisory and deliberately NOT applied to the SDK client.
+        # KiteConnect.timeout is a single mutable attribute on a client this process
+        # SHARES with data/kite_market_data.py, which guards it with a different lock.
+        # Setting it here per-call raced the data path: a quote in flight could inherit
+        # this call's 2s budget instead of the client default, and the restore could put
+        # back a value another thread had just changed. The SDK default (7s) applies to
+        # every call; bound a slow broker at a higher level, not by mutating shared state.
         api = self.api
-        previous = getattr(api, "timeout", None) if api is not None else None
+        previous = None
         with self._order_lock:
             gap = time.monotonic() - self._last_call_at
             if gap < self._min_call_interval:
                 time.sleep(self._min_call_interval - gap)
-            if api is not None and previous is not None and timeout:
-                try:
-                    api.timeout = float(timeout)
-                except Exception:
-                    previous = None
             try:
                 return fn()
             except TokenException as exc:
@@ -163,11 +161,6 @@ class KiteBroker(Broker):
                 raise
             finally:
                 self._last_call_at = time.monotonic()
-                if api is not None and previous is not None:
-                    try:
-                        api.timeout = previous
-                    except Exception:
-                        pass
 
     # ── execution lease (unchanged semantics from the AngelOne broker) ────────
     def acquire_execution_lease(self) -> bool:

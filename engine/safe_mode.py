@@ -149,6 +149,25 @@ def validate_real_mode_readiness(
         except Exception as exc:
             warnings.append(f"holiday calendar check unavailable: {exc}")
 
+    # Free cash vs what one lot actually costs. An account that cannot fund a single
+    # lot will have EVERY entry refused by RMS, which surfaces only as a generic
+    # rejection per signal. Warn rather than block: margin moves intraday and a stale
+    # reading must not veto a session the operator can still fund.
+    try:
+        from data.kite_auth import get_kite_auth as _auth_for_funds
+        from trading.kite_broker import KiteBroker as _KB
+
+        _probe = _KB(kite=_auth_for_funds(settings).kite)
+        _cash = _probe.available_funds()
+        _floor = float(getattr(settings, "entry_funds_warning_floor", 50000.0) or 0.0)
+        if _cash is not None and _floor > 0 and _cash < _floor:
+            warnings.append(
+                f"broker free cash is {_cash:,.2f}, below the {_floor:,.0f} floor for one "
+                "index lot - RMS will refuse entries until the account is funded"
+            )
+    except Exception:
+        pass
+
     token_warning = fyers_token_freshness_warning(now)
     if token_warning:
         if require_option_chains:
