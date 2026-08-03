@@ -7145,13 +7145,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception:
                 candle_tick_count = 0
 
-        activity = {}
-        try:
-            if hasattr(data, "get_index_activity"):
-                activity = data.get_index_activity(name) or {}
-        except Exception:
-            activity = {}
-        futures_activity = (activity or {}).get("futures") or {}
+        # In-memory ONLY. This runs per instrument on the 1s scan interval, so calling
+        # get_index_activity here meant a Fyers REST probe plus a Kite quote per index
+        # EVERY SECOND, blocking the event loop — the scan cycle, the LTP worker, the
+        # intel worker and the HFT monitor all wait behind it. The tick path already
+        # maintains which feed supplied the last cumulative total; read that instead.
+        volume_source = str(getattr(data, "_index_cum_volume_source", {}).get(name, "") or "")
+        cum_volume = float(getattr(data, "_index_cum_volume", {}).get(name, 0.0) or 0.0)
+        on_futures = volume_source == "kite_index_futures"
 
         diag_tick_count = int(float((diag or {}).get("tick_count_current_minute") or 0))
         volume_available = bool(latest_volume > 0.0 or (diag or {}).get("volume_available"))
@@ -7168,13 +7169,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Was hardcoded False, so the one diagnostic that could have revealed the
             # index-volume outage always reported the fallback as unavailable — even
             # once the fallback existed. Report what the provider actually resolved.
-            "futures_volume_available": bool(futures_activity.get("available")),
-            "futures_volume": float(futures_activity.get("volume") or 0.0),
-            "futures_oi": float(futures_activity.get("oi") or 0.0),
-            "volume_unit": str(activity.get("unit") or "shares"),
-            "volume_comparable_to_thresholds": bool(
-                activity.get("comparable_to_thresholds", True)
-            ),
+            "futures_volume_available": on_futures,
+            "futures_volume": cum_volume if on_futures else 0.0,
+            # Distinct from "volume_source" above, which reports the per-tick diagnostic
+            # ("kite_ws"/"fyers_ws"). This is which FEED supplied the cumulative total,
+            # and therefore which unit the numbers are in.
+            "cumulative_volume_source": volume_source,
+            "volume_unit": "contracts" if on_futures else "shares",
+            "volume_comparable_to_thresholds": not on_futures,
         }
 
     def _log_pre_candle_prediction(self, instrument: str, timeframe: str, prediction: Dict[str, Any]) -> None:
