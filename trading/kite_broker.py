@@ -267,12 +267,28 @@ class KiteBroker(Broker):
 
     @staticmethod
     def _entry_limit_confidence_threshold() -> float:
+        """The conviction floor for a LIMIT entry, normalised to the 0-1 scale.
+
+        Every other confidence setting in this system is a fraction (0.5, 0.62, 0.7,
+        0.72 ...) and `trade.confidence` is a fraction too — it is printed as
+        `{confidence:.0%}` throughout the engine. This one shipped as 95.0, so
+        `confidence >= threshold` was comparing at most 1.0 against 95.0 and was ALWAYS
+        false: the LIMIT path was unreachable and every entry went out as MARKET,
+        however strong the signal.
+
+        A value above 1 is read as a percentage so an existing 95.0 in .env or in a
+        persisted settings file keeps meaning "95%" rather than silently disabling the
+        gate again.
+        """
         try:
             from config.settings import get_settings
 
-            return float(getattr(get_settings(), "entry_limit_confidence_threshold", 95.0) or 95.0)
+            raw = float(getattr(get_settings(), "entry_limit_confidence_threshold", 0.95) or 0.95)
         except Exception:
-            return 95.0
+            return 0.95
+        if raw <= 0:
+            return 0.95
+        return raw / 100.0 if raw > 1.0 else raw
 
     @staticmethod
     def _entry_limit_ttl_minutes() -> int:

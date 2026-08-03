@@ -84,7 +84,7 @@ def test_entry_limit_carries_ttl_and_tag():
     """TTL only applies to limits — a market order fills or rejects immediately."""
     b = _param_broker()
     b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45,
-                  trade_id="T0003_NIFTY_08010930", confidence=99.0)
+                  trade_id="T0003_NIFTY_08010930", confidence=0.99)
     sent = b.api.sent
     assert sent["order_type"] == "LIMIT"
     assert sent["validity"] == "TTL" and sent["validity_ttl"] > 0
@@ -95,7 +95,7 @@ def test_market_entry_is_tagged_too():
     """Tagging is what maps an order back to its trade, whatever the order type."""
     b = _param_broker()
     b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45,
-                  trade_id="T0003_NIFTY_08010930", confidence=50.0)
+                  trade_id="T0003_NIFTY_08010930", confidence=0.50)
     sent = b.api.sent
     assert sent["order_type"] == "MARKET"
     assert sent["tag"] == "T0003_08010930"

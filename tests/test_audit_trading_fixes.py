@@ -78,7 +78,7 @@ def test_option_entry_takes_the_market_unless_conviction_is_high():
             captured.update(params)
             return "X1"
 
-    threshold = get_settings().entry_limit_confidence_threshold
+    threshold = KiteBroker._entry_limit_confidence_threshold()
     broker = KiteBroker(kite=_Api())
     broker._min_call_interval = 0.0
     broker.place_order("NIFTY25JUN24000CE", "111", 75, "BUY",

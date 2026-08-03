@@ -124,7 +124,7 @@ def test_entries_take_the_market_by_default():
     would take the market under this policy.
     """
     kite = _Kite(place="OID")
-    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45, confidence=93.0)
+    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45, confidence=0.93)   # 0-1: the scale the live caller uses
     sent = kite.placed[0]
     assert sent["order_type"] == "MARKET"
     assert sent["market_protection"] == -1
@@ -133,7 +133,7 @@ def test_entries_take_the_market_by_default():
 
 def test_only_a_high_conviction_signal_waits_for_a_price():
     kite = _Kite(place="OID")
-    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45, confidence=97.0)
+    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45, confidence=0.97)
     sent = kite.placed[0]
     assert sent["order_type"] == "LIMIT" and sent["price"] == 124.45
     # A protection band is meaningless on a limit — the limit IS the bound.
@@ -142,7 +142,7 @@ def test_only_a_high_conviction_signal_waits_for_a_price():
 
 def test_an_entry_without_a_reference_price_is_always_market():
     kite = _Kite(place="OID")
-    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=0.0, confidence=99.0)
+    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=0.0, confidence=0.99)
     assert kite.placed[0]["order_type"] == "MARKET"
 
 
@@ -440,3 +440,41 @@ def test_an_unreadable_trigger_list_after_a_lost_gtt_ack_stays_ambiguous():
 
     with pytest.raises(BrokerOrderAmbiguous):
         _broker(_Kite3()).place_gtt_stop("NIFTYFUT", 10, "SELL", 95.0, 100.0)
+
+
+# ── the LIMIT gate must be reachable with the confidence the LIVE caller passes ──
+def test_limit_entry_is_reachable_with_a_real_zero_to_one_confidence():
+    """trade.confidence is a FRACTION; the threshold shipped as 95.0.
+
+    `confidence >= 95.0` can never be true for a value <= 1.0, so the LIMIT path was
+    dead and every entry went out MARKET however strong the signal — the exact opposite
+    of the documented policy.
+    """
+    kite = _Kite(place="OID")
+    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45,
+                              confidence=0.97)
+    assert kite.placed[0]["order_type"] == "LIMIT"
+
+
+def test_an_ordinary_conviction_fraction_still_takes_the_market():
+    kite = _Kite(place="OID")
+    _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45,
+                              confidence=0.93)
+    assert kite.placed[0]["order_type"] == "MARKET"
+
+
+def test_a_percentage_scale_threshold_is_still_honoured(monkeypatch):
+    """An existing 95.0 in .env must keep meaning 95%, not disable the gate."""
+    from config.settings import get_settings
+
+    settings = get_settings()
+    old = settings.entry_limit_confidence_threshold
+    try:
+        settings.entry_limit_confidence_threshold = 95.0
+        assert KiteBroker._entry_limit_confidence_threshold() == pytest.approx(0.95)
+        kite = _Kite(place="OID")
+        _broker(kite).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45,
+                                  confidence=0.97)
+        assert kite.placed[0]["order_type"] == "LIMIT"
+    finally:
+        settings.entry_limit_confidence_threshold = old

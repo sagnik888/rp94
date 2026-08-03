@@ -100,7 +100,11 @@ class Settings(BaseSettings):
     # A LIMIT is used only when the signal clears this confidence bar, where waiting
     # for a price is worth the risk of not being filled at all. 100 disables limits
     # entirely; 0 makes every priced entry a limit (the old behaviour).
-    entry_limit_confidence_threshold: float = 95.0
+    # 0-1, like every other confidence floor here (trade.confidence is a fraction and is
+    # printed as {confidence:.0%}). This shipped as 95.0, which no confidence could ever
+    # reach, so the LIMIT entry path was dead and every order went out MARKET. Values
+    # above 1 are still accepted and read as a percentage.
+    entry_limit_confidence_threshold: float = 0.95
 
     # Server-side life span for entry LIMIT orders, in minutes. 0 disables it.
     #

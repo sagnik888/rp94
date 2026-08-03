@@ -50,7 +50,10 @@ def _broker():
 def test_high_conviction_entry_uses_a_limit():
     """A limit risks missing the fill; only a strong signal earns that trade-off."""
     broker, api = _broker()
-    threshold = get_settings().entry_limit_confidence_threshold
+    # The NORMALISED floor. The raw setting may be on either scale (95.0 or 0.95);
+    # the broker normalises it, so a test deriving a confidence from the raw value
+    # compares two different scales.
+    threshold = KiteBroker._entry_limit_confidence_threshold()
     broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY",
                        price=150.0, confidence=threshold)
     assert api.params["order_type"] == "LIMIT"
@@ -60,9 +63,12 @@ def test_high_conviction_entry_uses_a_limit():
 def test_ordinary_conviction_takes_the_market_with_a_protection_band():
     """The 2026-07-31 failure: blind mark-up limits against an empty book, no fills."""
     broker, api = _broker()
-    threshold = get_settings().entry_limit_confidence_threshold
+    # The NORMALISED floor. The raw setting may be on either scale (95.0 or 0.95);
+    # the broker normalises it, so a test deriving a confidence from the raw value
+    # compares two different scales.
+    threshold = KiteBroker._entry_limit_confidence_threshold()
     broker.place_order("NIFTY25JUL25000CE", "111", 75, "BUY",
-                       price=150.0, confidence=threshold - 1.0)
+                       price=150.0, confidence=max(0.0, threshold - 0.10))
     assert api.params["order_type"] == "MARKET"
     assert "price" not in api.params
     # The slippage control that replaced the buffer: Zerodha caps how far from the
