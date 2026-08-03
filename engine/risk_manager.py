@@ -119,8 +119,17 @@ class RiskManager:
             sl_pct = self.futures_sl_pct if inst_type == "FUT" else self.options_sl_pct
             configured_risk = entry * quantity * multiplier * max(0.0, float(sl_pct or 0.0)) / 100.0
 
-            stop = getattr(trade, "trailing_stop", None)
-            if stop is None:
+            # current_stop is the TRAILED stop; trailing_stop is documented as "Initial
+            # trailing stop at entry" and is never rewritten after open_trade (the
+            # ratchet writes current_stop). Reading the entry stop here projected every
+            # open trade at its full original risk even after the stop had trailed into
+            # profit, so projected_open_pnl looked far worse than reality and the daily
+            # loss budget blocked new entries against risk that no longer existed.
+            # trade_manager.py already resolves the stop this way.
+            stop = getattr(trade, "current_stop", None)
+            if not stop:
+                stop = getattr(trade, "trailing_stop", None)
+            if not stop:
                 stop = getattr(trade, "stop", None)
             try:
                 stop = float(stop)
