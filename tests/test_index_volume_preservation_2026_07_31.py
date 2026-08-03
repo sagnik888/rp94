@@ -73,12 +73,50 @@ def test_duplicate_prior_timestamps_do_not_explode():
     assert out["volume"].tolist() == [1000, 2000, 3000]
 
 
-def test_zero_volume_still_yields_a_zero_ratio_not_a_neutral_one():
-    """Why this matters: the gate reads 0.0, so it fails closed and the path goes dead."""
-    import inspect
+def test_missing_volume_never_yields_a_usable_ratio():
+    """Missing volume must fail CLOSED — it must never read as a neutral 1.0.
+
+    Originally asserted on the source text 'if prior_vol > 0 else 0.0'. That sentinel has
+    been replaced by returning None (no metrics) when volume cannot be measured, which
+    fails closed identically and is more honest: 0.0 asserts "measured, no surge", while
+    None says "cannot measure". The old assertion invited exactly this re-check, so the
+    invariant is now pinned by BEHAVIOUR rather than by a string that goes stale.
+
+    Zero-volume bars are additionally excluded from the average rather than counted as
+    measurements of zero — averaging them in dragged the denominator down and fabricated
+    a 4x-10x ratio out of identical live bars at session open.
+    """
+    import numpy as np
+    import pandas as pd
+
     from scanner import Scanner
-    src = inspect.getsource(Scanner._candle_thrust_metrics)
-    assert 'if prior_vol > 0 else 0.0' in src, (
-        "thrust metrics no longer report 0.0 on missing volume — re-check whether the "
-        "volume-gated entries still fail closed"
-    )
+
+    class _Candles:
+        def __init__(self, df):
+            self.df = df
+
+        def get_candles(self, instrument, timeframe):
+            return self.df
+
+    def metrics(volumes):
+        n = len(volumes)
+        idx = pd.date_range("2026-07-31 09:15", periods=n, freq="5min")
+        base = 24000 + np.arange(n) * 0.5
+        df = pd.DataFrame(
+            {"open": base, "high": base + 4, "low": base - 4, "close": base + 2,
+             "volume": volumes},
+            index=idx,
+        )
+        scanner = Scanner.__new__(Scanner)
+        scanner.candles = _Candles(df)
+        return Scanner._candle_thrust_metrics(scanner, "NIFTY", "5min", "BUY")
+
+    # The 2026-07-27 shape: Yahoo zeroed the volume for every bar.
+    assert metrics([0.0] * 21) is None, "all-zero volume produced a usable ratio"
+
+    # Too few measured bars is also unmeasurable, not a breakout.
+    assert metrics([0.0] * 18 + [500.0] * 3) is None
+
+    # And a real, measurable surge must still come through.
+    live = metrics([500.0] * 20 + [3000.0])
+    assert live is not None and live["volume_ratio"] == pytest.approx(6.0)

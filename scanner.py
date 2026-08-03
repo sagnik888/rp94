@@ -9649,6 +9649,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         return round(self._candidate_gross_pnl(candidate, exit_px) - charges, 2)
 
     @staticmethod
+    def _surge_prior_mean(prior):
+        """Average volume of the prior bars, or None when it cannot be measured.
+
+        Bars with NO volume are excluded rather than averaged in. Index history carries
+        volume 0 — that was the original outage — so a lookback at session open is mostly
+        zero-volume historical bars plus a few live ones. Averaging the zeros drags the
+        denominator down and FABRICATES a surge: 15 zero bars plus 6 identical live bars
+        produced a 4.0x ratio, and 18 plus 3 produced 10.0x, both clearing the 2.5x gate
+        that is the only route a 1min signal has into a live entry.
+
+        Requires at least 5 measured bars, matching the volume profiler's threshold, so a
+        thin window reads as unmeasurable rather than as a breakout.
+        """
+        try:
+            volumes = pd.to_numeric(prior["volume"], errors="coerce").fillna(0.0)
+        except Exception:
+            return None
+        measured = volumes[volumes > 0]
+        if len(measured) < 5:
+            return None
+        mean = float(measured.mean())
+        return mean if mean > 0 else None
+
+    @staticmethod
     def _volume_window_is_homogeneous(recent) -> bool:
         """False when the window mixes volume units, so no ratio across it is meaningful.
 
@@ -9727,8 +9751,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # route a 1min signal has into a live entry. The per-candle rebase
                 # cannot see this: it only protects the delta INSIDE one bar.
                 return False
-            prior_vol = float(prior["volume"].mean())
-            volume_ratio = (float(last["volume"]) / prior_vol) if prior_vol > 0 else 0.0
+            prior_vol = Scanner._surge_prior_mean(prior)
+            if prior_vol is None:
+                return False
+            volume_ratio = float(last["volume"]) / prior_vol
             tr = (prior["high"] - prior["low"]).abs()
             atr = float(tr.tail(14).mean()) if len(tr) else 0.0
             range_atr_ratio = (rng / atr) if atr > 0 else 0.0
@@ -9801,8 +9827,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # route a 1min signal has into a live entry. The per-candle rebase
                 # cannot see this: it only protects the delta INSIDE one bar.
                 return None
-            prior_vol = float(prior["volume"].mean())
-            volume_ratio = (float(last["volume"]) / prior_vol) if prior_vol > 0 else 0.0
+            prior_vol = Scanner._surge_prior_mean(prior)
+            if prior_vol is None:
+                return None
+            volume_ratio = float(last["volume"]) / prior_vol
             tr = (prior["high"] - prior["low"]).abs()
             atr = float(tr.tail(14).mean()) if len(tr) else 0.0
             range_atr_ratio = (rng / atr) if atr > 0 else 0.0
