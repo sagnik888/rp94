@@ -111,6 +111,13 @@ class _Provider:
     def __init__(self, source, fyers_online=True):
         self.source = source
         self.fyers_online = fyers_online
+        # The in-memory state the tick path maintains. The watchdog reads THIS rather
+        # than calling get_index_activity, because that reaches the broker and cannot
+        # run on a timer from the event loop.
+        volume = {"fyers_index": 409_000_000.0, "kite_index_futures": 250_000.0}.get(source, 0.0)
+        self._index_cum_volume = {"NIFTY": volume} if volume else {}
+        self._index_cum_volume_source = {"NIFTY": source} if source != "none" else {}
+        self._index_cum_volume_at = {"NIFTY": time.time()} if source != "none" else {}
 
     def get_index_activity(self, symbol):
         futures = {"available": True, "volume": 250_000.0, "oi": 1_200_000.0,

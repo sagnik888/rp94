@@ -5117,7 +5117,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # be noticed, and this only fires on a TRANSITION so it cannot spam.
             if is_live:
                 try:
-                    self._alert_volume_source_degradation()
+                    # to_thread even though the cheap path is in-memory: this loop drives
+                    # nothing else, and a surprise blocking call here stalls the scan
+                    # cycle, the LTP worker, the intel worker and the HFT monitor together.
+                    await asyncio.to_thread(self._alert_volume_source_degradation)
                 except Exception as exc:
                     logger.debug(f"Volume source health check failed: {exc}")
 
@@ -6998,8 +7001,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             return bars, False
 
-    def volume_source_health(self) -> Dict[str, Any]:
-        """Per-instrument volume provenance, for the dashboard and the watchdog."""
+    def volume_source_health(self, probe_broker: bool = True) -> Dict[str, Any]:
+        """Per-instrument volume provenance, for the dashboard and the watchdog.
+
+        probe_broker=False answers from in-memory state only. get_index_activity reaches
+        the broker (a Fyers REST probe plus a Kite quote PER INDEX), so calling this on a
+        timer from the scanner's event loop stalls every worker on it for the duration —
+        and when Fyers is down, which is exactly when this matters, each probe waits out
+        a full timeout. The watchdog uses the cheap path; the dashboard route and the CLI
+        script, which are already off-loop and cached, use the full one.
+        """
         data = getattr(self, "data", None)
         # ACTIVE indices only. Reporting a configured-but-inactive instrument as
         # "degraded" is a false alarm about a feed nobody is trading.
@@ -7012,11 +7023,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         degraded: List[str] = []
         for name in indices:
             activity: Dict[str, Any] = {}
-            try:
-                if data is not None and hasattr(data, "get_index_activity"):
-                    activity = data.get_index_activity(name) or {}
-            except Exception as exc:
-                activity = {"source": "none", "error": str(exc)}
+            if probe_broker:
+                try:
+                    if data is not None and hasattr(data, "get_index_activity"):
+                        activity = data.get_index_activity(name) or {}
+                except Exception as exc:
+                    activity = {"source": "none", "error": str(exc)}
+            else:
+                # In-memory only: the tick path already maintains which feed last
+                # supplied a cumulative total, and when.
+                source = str(getattr(data, "_index_cum_volume_source", {}).get(name, "") or "")
+                stamped = float(getattr(data, "_index_cum_volume_at", {}).get(name, 0.0) or 0.0)
+                fresh = stamped > 0 and (time.time() - stamped) <= 120.0
+                activity = {
+                    "source": source if (source and fresh) else "none",
+                    "unit": "contracts" if source == "kite_index_futures" else "shares",
+                    "volume": float(getattr(data, "_index_cum_volume", {}).get(name, 0.0) or 0.0),
+                    "comparable_to_thresholds": source != "kite_index_futures",
+                    "fyers_online": source == "fyers_index" and fresh,
+                    "futures": {},
+                    "confirmation": "cached",
+                }
             futures = (activity or {}).get("futures") or {}
             source = str(activity.get("source") or "none")
             row = {
@@ -7068,7 +7095,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def _alert_volume_source_degradation(self) -> None:
         """Warn once per transition when an index loses its primary volume feed."""
         try:
-            health = self.volume_source_health()
+            # Cheap path: this runs on a timer and must never block the event loop.
+            health = self.volume_source_health(probe_broker=False)
         except Exception:
             return
         previous = getattr(self, "_volume_degraded_seen", set())

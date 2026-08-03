@@ -386,14 +386,29 @@ class CandleBuilder:
             'close': 'last',
             'volume': 'sum',
         }
-        # Carry the volume unit up with the volume. Dropping it here left 5min/15min
-        # frames with no volume_basis at all, and the mixed-unit surge guard treats a
-        # missing column as "one unit" — so the guard was inert on exactly the
-        # timeframes _detect_power_move runs on. A bucket spanning a feed failover is
-        # marked MIXED so the guard fires instead of comparing shares against contracts.
+        # Carry the volume unit up with the volume. Dropping it left 5min/15min frames
+        # with no volume_basis at all, and the mixed-unit surge guard treats a missing
+        # column as "one unit" — so the guard was inert on exactly the timeframes
+        # _detect_power_move runs on.
+        #
+        # A python-level agg function here costs ~3.7x the whole resample at 2000 rows,
+        # and this runs on EVERY tick for two timeframes. The overwhelmingly common case
+        # is one unit for the entire frame, so detect that with a vectorised nunique()
+        # and assign a scalar; only a frame that actually spans a failover pays for the
+        # per-bucket function.
+        basis_col = None
         if 'volume_basis' in df.columns:
-            agg['volume_basis'] = _basis_of_bucket
+            basis_col = df['volume_basis']
+            labelled = basis_col[basis_col.astype(str).str.strip().ne('')
+                                 & basis_col.notna()]
+            if labelled.nunique() <= 1:
+                single = str(labelled.iloc[0]) if len(labelled) else ''
+            else:
+                single = None
+                agg['volume_basis'] = _basis_of_bucket
         resampled = df.resample(pd_freq, label='left', closed='left').agg(agg)
+        if basis_col is not None and 'volume_basis' not in resampled.columns:
+            resampled['volume_basis'] = single
         # dropna() must not discard a bar merely because its basis is unknown.
         return resampled.dropna(subset=[c for c in ('open', 'high', 'low', 'close') if c in resampled])
 
