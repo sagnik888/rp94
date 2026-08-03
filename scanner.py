@@ -9183,7 +9183,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         regime = intel_result.get("regime", {}).get("regime", "UNKNOWN")
         if self._intel_result_cacheable(intel_result):
-            self._cache_timeframe_intel(name, "5min", intel_result, at=now, mirror_legacy=True)
+            # `at=now` only when this is a FRESH computation. On the cache-hit path
+            # intel_result IS cached_intel, and re-stamping it renewed the TTL on every
+            # read — a 90s bound that a 1s scan loop could push out indefinitely, so
+            # intel had no enforced age at all. Preserve the original stamp instead:
+            # _get_timeframe_intel already returns a hit without re-caching, which is
+            # the correct pattern.
+            self._cache_timeframe_intel(
+                name, "5min", intel_result,
+                at=(cached_intel_time if intel_is_fresh else now),
+                mirror_legacy=True,
+            )
         else:
             self.latest_regimes[name] = str(regime or "UNKNOWN").upper()
 

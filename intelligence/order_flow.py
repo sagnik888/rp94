@@ -8,6 +8,19 @@ from loguru import logger
 
 
 class OrderFlowAnalyzer:
+    @staticmethod
+    def _current_session(df: pd.DataFrame) -> pd.DataFrame:
+        """Rows belonging to the latest calendar date in the frame.
+
+        Falls through unchanged for a non-datetime index (tests and any RangeIndex
+        caller), so nothing that already worked starts behaving differently.
+        """
+        try:
+            dates = pd.Series(df.index.date, index=df.index)
+            return df[dates == dates.iloc[-1]]
+        except Exception:
+            return df
+
     def analyze(
         self,
         df: pd.DataFrame,
@@ -16,7 +29,25 @@ class OrderFlowAnalyzer:
         strike_interval: int = 50,
         market_context: Optional[Dict] = None,
     ) -> Dict:
+        # NOTE ON THE WINDOW: callers hand this a warm-up frame.
+        # scanner._live_analysis_window prepends up to 180 prior-session 1min bars,
+        # which the rolling-window consumers (regime detector, volume profiler) need.
+        # Order flow is an INTRADAY statistic, so summing the whole frame described
+        # yesterday as much as today: buy/sell pressure was diluted toward 1.0 and the
+        # aggregator's divergence gate disagreed with a clean read on ~33% of samples.
+        # The trim below is deliberately inside this analyzer rather than in
+        # _live_analysis_window, so live, historical replay and re-simulation all get
+        # the same correction.
         if df is None or len(df) < 5:
+            return self._empty_result(market_context)
+        df = self._current_session(df)
+        # Re-checked AFTER trimming. This is the sharp case: in the first four minutes
+        # of the session the frame still has hundreds of rows, so the guard above passes,
+        # but `pos.iloc[-5:]` is 1-4 of today's bars padded with YESTERDAY'S CLOSING
+        # bars — and that emitted BULLISH/BEARISH readings built from the prior session
+        # where a clean read is NEUTRAL. The flow signal is a hard entry veto and a
+        # loss-guard vote, so fewer than five live bars must mean "no reading".
+        if len(df) < 5:
             return self._empty_result(market_context)
         try:
             depth_flow = self._depth_flow(market_context)
