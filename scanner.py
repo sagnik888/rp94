@@ -23683,11 +23683,143 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         report["files"] = {"json": str(json_path), "csv": str(csv_path)}
         return report
 
+    # Exits that must NEVER be delayed for any reason. Matched as substrings, so
+    # "TRAILING_STOP", "SL_HIT" and "FORCE_EOD_KILL" all bypass. This list is the whole
+    # safety property of the spread deferral below: everything protective leaves
+    # immediately, and only a marginal PROFIT-taking exit can ever wait.
+    _HARD_EXIT_MARKERS = (
+        "STOP", "SL_HIT", "EARLY_LOSS", "LOSS_THREAT", "RUPEE_LOSS", "RECOVERY",
+        "SESSION_END", "FORCE", "KILL", "EXPIRY", "REPAINT_ABORT", "LTP_SHOCK",
+        "BROKER", "MANUAL", "SIGNAL_INVALIDATED",
+    )
+    # Only these may be held back, and only while the bid is eating the edge.
+    _MARGINAL_EXIT_REASONS = {
+        "SMART_PROFIT_LOCK", "MAJOR_WIN_GUARD", "PEAK_THREAT_EXIT", "LOW_GAIN_PROTECT",
+        "OI_PCR_REVERSAL", "OPPOSITE_SIGNAL", "REGIME_REVERSAL_PROFIT",
+        "LIVE_REVERSAL_EXIT", "CROSS_INDEX_REVERSAL_EXIT", "PROFIT_GIVEBACK",
+        "PROFIT_GIVEBACK_GUARD", "REPAINT_GIVEBACK_GUARD", "TREND_FADE_EXIT",
+    }
+
+    def _spread_aware_exit_decision(
+        self, trade, exit_price: float, reason: str
+    ) -> Tuple[bool, str]:
+        """Hold a MARGINAL profit-taking option exit while the bid would eat the edge.
+
+        On an index option the quoted spread is frequently wider than the profit a
+        marginal lock is trying to capture, so exiting at the bid converts a small win
+        into a small loss. This waits a few seconds for the book to tighten.
+
+        Everything that keeps the account safe bypasses it: any protective, loss, forced,
+        expiry, broker or manual exit leaves immediately, as does any exit on a losing
+        position. And an exchange stop that is already armed AND crossed outranks this
+        entirely — Kite fires that SL-M regardless, so delaying locally would only
+        desynchronise the book from the broker.
+        """
+        settings = get_settings()
+        if (
+            not self._setting_enabled(getattr(settings, "spread_aware_exit_enabled", False), False)
+            or str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or str(getattr(trade, "inst_type", "") or "").upper() != "OPT"
+            or bool(getattr(trade, "is_ghost", False))
+        ):
+            return False, "not_applicable"
+        normalized = str(reason or "").upper().replace(" ", "_")
+        if any(marker in normalized for marker in self._HARD_EXIT_MARKERS):
+            return False, "hard_exit"
+        if normalized not in self._MARGINAL_EXIT_REASONS:
+            return False, "reason_not_marginal"
+
+        armed_check = getattr(self, "_armed_broker_stop_crossed", None)
+        if callable(armed_check) and armed_check(trade, exit_price):
+            return False, "exchange_stop_armed"
+
+        try:
+            qty = max(
+                1,
+                int(getattr(trade, "broker_quantity", 0) or 0)
+                or (int(getattr(trade, "lots", 1) or 1) * int(getattr(trade, "lot_size", 1) or 1)),
+            )
+            entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+            mark = float(exit_price or 0.0)
+            current_pnl = (mark - entry) * qty      # options here are always long premium
+        except (TypeError, ValueError):
+            return False, "unmeasurable"
+        if current_pnl <= 0:
+            # Never hold a losing position for a better price. That is how a small loss
+            # becomes a large one.
+            return False, "non_profitable"
+
+        symbol = str(getattr(trade, "trading_symbol", "") or "")
+        token = str(getattr(trade, "symbol_token", "") or "")
+        quoter = getattr(getattr(self, "data", None), "get_contract_touch_quote", None)
+        if not symbol or not token or not callable(quoter):
+            return False, "quote_unavailable"
+        instrument = str(getattr(trade, "instrument", "") or "").split()
+        exchange = "BFO" if instrument and instrument[0].upper() in {"SENSEX", "BANKEX"} else "NFO"
+        try:
+            quote = quoter(
+                exchange, symbol, token,
+                max_age_seconds=float(
+                    getattr(settings, "execution_touch_quote_max_age_seconds", 1.5) or 1.5
+                ),
+            )
+        except Exception as exc:
+            logger.debug(f"Spread-aware exit quote unavailable for {symbol}: {exc}")
+            return False, "quote_unavailable"
+        if not isinstance(quote, dict) or not quote.get("usable"):
+            return False, f"quote_{str((quote or {}).get('reason') or 'unavailable')}"
+        bid = float(quote.get("bid", 0.0) or 0.0)
+        ask = float(quote.get("ask", 0.0) or 0.0)
+        if bid <= 0 or ask < bid:
+            return False, "invalid_book"
+        mid = (bid + ask) / 2.0
+        spread_pct = float(
+            quote.get("spread_pct", 0.0) or ((ask - bid) / mid * 100.0 if mid > 0 else 0.0)
+        )
+        min_spread = max(0.0, float(getattr(settings, "spread_exit_deferral_min_spread_pct", 0.35) or 0.0))
+        if spread_pct < min_spread:
+            setattr(trade, "_spread_exit_defer_started", 0.0)
+            return False, "spread_tight"
+
+        executable_pnl = (bid - entry) * qty
+        spread_cost = max(0.0, mid - bid) * qty
+        min_net = max(0.0, float(getattr(settings, "spread_exit_min_net_profit_rs", 250.0) or 0.0))
+        max_ratio = max(0.0, float(getattr(settings, "spread_exit_max_cost_to_profit_ratio", 0.35) or 0.0))
+        cost_ratio = spread_cost / max(1.0, current_pnl)
+        if not (executable_pnl <= min_net or cost_ratio >= max_ratio):
+            setattr(trade, "_spread_exit_defer_started", 0.0)
+            return False, "edge_survives_spread"
+
+        # BOUNDED. Without a ceiling this becomes an open-ended hold on a position the
+        # strategy has already decided to leave.
+        now_mono = time.monotonic()
+        started = float(getattr(trade, "_spread_exit_defer_started", 0.0) or 0.0)
+        if started <= 0:
+            started = now_mono
+            setattr(trade, "_spread_exit_defer_started", started)
+        max_seconds = max(0.0, float(getattr(settings, "spread_exit_deferral_max_seconds", 8.0) or 0.0))
+        if now_mono - started >= max_seconds:
+            setattr(trade, "_spread_exit_defer_started", 0.0)
+            return False, f"timeout_release spread={spread_pct:.2f}%"
+        return True, (
+            f"spread={spread_pct:.2f}% bid={bid:.2f} ask={ask:.2f} "
+            f"bidPnL=Rs.{executable_pnl:.0f} cost/edge={cost_ratio:.0%}"
+        )
+
     def _close_and_record(self, tid: str, exit_price: float, reason: str, exit_time: Optional[datetime] = None):
         """Wraps trade closure to track over-trading metrics"""
         self._reset_daily_counters()
         trade = self.trades.open_trades.get(tid)
         if not trade: return
+        defer, spread_context = self._spread_aware_exit_decision(trade, exit_price, reason)
+        if defer:
+            marker = f"{reason}|{spread_context}"
+            if getattr(trade, "_last_spread_defer_log", "") != marker:
+                setattr(trade, "_last_spread_defer_log", marker)
+                self.log_event(
+                    f"Held {reason} for {trade.instrument}: {spread_context}.", "info"
+                )
+            return
         if str(getattr(trade, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
             self.trades.emergency_flatten_trade(
                 trade,

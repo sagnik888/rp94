@@ -1297,6 +1297,19 @@ class Settings(BaseSettings):
     # It earns its keep once several lots run across several indices with cascade scaling
     # on — which is exactly when the breaker's after-the-fact halt arrives too late.
     entry_risk_budget_enabled: bool = False
+    # Hold a MARGINAL profit-taking option exit for a few seconds while the quoted spread
+    # is wider than the edge being captured — on an index option, exiting at the bid
+    # routinely converts a small win into a small loss.
+    # Off by default: it DELAYS an exit, and every deferral is a risk the position moves
+    # against you while it waits. Bounded by spread_exit_deferral_max_seconds, restricted
+    # to profitable positions and to the reasons in Scanner._MARGINAL_EXIT_REASONS, and
+    # bypassed entirely by every protective/loss/forced/expiry/broker/manual exit and by
+    # an exchange stop that is already armed and crossed.
+    spread_aware_exit_enabled: bool = False
+    spread_exit_deferral_min_spread_pct: float = 0.35   # below this the book is fine
+    spread_exit_min_net_profit_rs: float = 250.0        # bid-side profit worth waiting for
+    spread_exit_max_cost_to_profit_ratio: float = 0.35  # spread cost vs the edge
+    spread_exit_deferral_max_seconds: float = 8.0       # hard ceiling on any hold
     # Tape hygiene: a 1min signal can ONLY enter via the volume-spike/scalp
     # filter, so 1min signals that never cleared it cannot trade. When True, the
     # raw-detection and rejection lines for such no-spike 1min signals are kept off
