@@ -8044,18 +8044,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return max(0.5, premium * (tight_stop_pct / 100.0))
 
         opt_sl_pct = Scanner._configured_option_sl_pct(self)
-        try:
-            if self.expiry.in_gamma_window(candidate.instrument, self._session_squareoff_clock()):
-                gamma_sl = float(getattr(get_settings(), "expiry_day_gamma_sl_pct", 10.0) or 10.0)
-                opt_sl_pct = min(opt_sl_pct, gamma_sl)
-        except Exception:
-            pass
 
         # Keep the legacy choppy/ranging breathing behavior from SignalProcessor,
         # but only after the saved setting has been corrected to mean per-trade SL.
         regime = Scanner._candidate_market_regime(self, candidate)
         if is_risky_regime(regime):
             opt_sl_pct = max(opt_sl_pct, 15.0)
+
+        # The expiry-day gamma clamp is applied LAST so it actually binds. It used to sit
+        # above the risky-regime floor, which then raised the stop straight back to 15% —
+        # and a choppy/ranging read is the normal condition on a 0DTE afternoon, i.e. the
+        # tightening was discarded on exactly the trades it was written for. Wider is not
+        # safer here: an expiring option decays to zero regardless, so a loose stop just
+        # means more of the premium is gone before the exit fires.
+        try:
+            if self.expiry.in_gamma_window(candidate.instrument, self._session_squareoff_clock()):
+                gamma_sl = float(getattr(get_settings(), "expiry_day_gamma_sl_pct", 10.0) or 10.0)
+                opt_sl_pct = min(opt_sl_pct, gamma_sl)
+        except Exception:
+            pass
         return max(0.5, premium * (opt_sl_pct / 100.0))
 
     def _execution_levels(self, candidate: TradeCandidate) -> Tuple[float, float, float]:
