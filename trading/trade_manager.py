@@ -1732,6 +1732,89 @@ class TradeManager:
         logger.critical(f"Recovery fallback flatten submitted for {trade.trading_symbol}: {order_id}")
         return True
 
+    def _contract_is_no_longer_listed(self, trade: Trade) -> Optional[bool]:
+        """Is this trade's contract absent from the current instrument master?
+
+        None when the question cannot be answered — the master is not loaded, or the
+        lookup itself failed. The caller must treat None as "unknown", never as "gone":
+        concluding a contract has expired from a master we could not read is the same
+        mistake as concluding a position is flat from an order-book scan that errored.
+        """
+        try:
+            from engine.expiry_manager import expiry_manager
+        except Exception:
+            return None
+        df = getattr(expiry_manager, "df", None)
+        if df is None or getattr(df, "empty", True):
+            return None
+        symbol = str(getattr(trade, "trading_symbol", "") or "").upper()
+        token = str(getattr(trade, "symbol_token", "") or "")
+        if not symbol and not token:
+            return None
+        try:
+            if token and (df["token"].astype(str) == token).any():
+                return False
+            if symbol and (df["symbol"].astype(str).str.upper() == symbol).any():
+                return False
+        except Exception:
+            return None
+        return True
+
+    def _settle_expired_contract(self, trade_id: str, trade: Trade) -> bool:
+        """Close a row whose option contract has expired and left the broker's book.
+
+        An expired contract never returns to the positions book, so reconciliation can
+        never close this row on its own: it sat OPEN at a stale premium indefinitely,
+        counted against exposure and position slots, and emergency_flatten_trade kept
+        submitting exits against a contract that no longer trades.
+
+        The settlement VALUE is genuinely unknowable here — the contract cash-settles at
+        intrinsic against the closing spot, and by the time we notice, that spot is not
+        something this object can reconstruct. So it books the conservative case (expired
+        worthless, the worst outcome for a bought option, which can never overstate the
+        account), marks the P&L as estimated, and escalates. Options are always BOUGHT
+        here, so this cannot hide a liability — only understate a gain.
+        """
+        if str(getattr(trade, "inst_type", "") or "").upper() != "OPT":
+            return False
+        entry = getattr(trade, "entry_time", None)
+        if entry is None:
+            return False
+        entry_ist = IST.localize(entry) if entry.tzinfo is None else entry.astimezone(IST)
+        now = datetime.now(IST)
+        # Never intraday on the entry's own session: a contract missing from one
+        # positions read is far more likely to be a slow book than an expired contract.
+        if entry_ist.date() >= now.date() and now.time() < self._parse_time("15:35"):
+            return False
+        if self._contract_is_no_longer_listed(trade) is not True:
+            return False
+
+        trade.status = "CLOSED"
+        trade.pending_exit = False
+        trade.pending_execution = False
+        trade.execution_status = "CLOSED"
+        trade.exit_reason = "EXPIRY_SETTLED"
+        trade.exit_time = now
+        trade.exit_price = 0.0
+        trade.execution_error = (
+            "Contract expired and was cash-settled at the exchange; it is gone from the "
+            "instrument master and will never return to the positions book. Booked as "
+            "expired worthless — the P&L here is an ESTIMATE and must be verified against "
+            "the broker's own statement."
+        )
+        trade.protective_order_id = ""
+        trade.gtt_trigger_id = ""
+        with self._lock:
+            if self.open_trades.pop(trade_id, None) is trade:
+                self.closed_trades.append(trade)
+        logger.critical(
+            f"EXPIRY SETTLED: {trade.trading_symbol} left open through expiry and has "
+            "been closed locally as worthless. Verify the realised amount against your "
+            "Zerodha P&L — if it settled in the money, this row understates it."
+        )
+        self.save_state()
+        return True
+
     def reconcile_broker_positions(self, positions_resp: Optional[Dict] = None) -> Dict:
         """Reconcile local trades and broker-only positions in both directions."""
         if not self.broker:
@@ -1788,6 +1871,14 @@ class TradeManager:
                 if callable(getter):
                     order_status = getter(trade.broker_order_id)
             if position is None:
+                # Before anything else: if the contract itself has expired, no future
+                # reconcile can ever resolve this row. Only the ENTRY_SUBMITTED case was
+                # handled below, so every other status fell through to the bare `continue`
+                # at the end of this branch and the trade stayed OPEN forever.
+                if self._settle_expired_contract(trade_id, trade):
+                    closed += 1
+                    changed = True
+                    continue
                 if (
                     trade.execution_status == "ENTRY_SUBMITTED"
                     and trade.entry_submitted_at is not None
@@ -3132,8 +3223,21 @@ class TradeManager:
     def check_expiry_gamma_time_exit(self, current_time: Optional[datetime] = None):
         """Square off expiry-day current-expiry (gamma) OPTION trades at the configured
         gamma time-exit, so an expiring ATM never bleeds into the afternoon theta crush.
-        Gated behind expiry_day_trade_current_week (default off) and only touches OPT
-        trades ENTERED before the cutoff on an expiry day (i.e. genuine gamma trades)."""
+        Gated behind expiry_day_trade_current_week and covers BOTH cohorts of expiry-day
+        current-expiry trades:
+
+          * the morning gamma cohort, entered before expiry_day_gamma_cutoff, closed at
+            expiry_day_gamma_time_exit;
+          * the LATE-WINDOW cohort, entered inside expiry_day_late_window (14:00-15:15),
+            closed at expiry_day_late_window_time_exit.
+
+        The late cohort previously had no time exit at all. It was unreachable twice over:
+        the gamma time exit is 13:30, already past when the window opens, and the
+        entry-time filter below dropped every trade entered at/after the 13:00 cutoff --
+        i.e. structurally every trade the late window can create. That left a position on
+        a contract expiring at 15:30 with nothing but the 15:25 force exit between it and
+        settlement, in the least liquid minutes of an expiring option's life.
+        """
         from config.settings import get_settings
         s = get_settings()
         if not bool(getattr(s, "expiry_day_trade_current_week", False)):
@@ -3141,7 +3245,11 @@ class TradeManager:
         now = current_time or datetime.now(IST)
         now = IST.localize(now) if now.tzinfo is None else now.astimezone(IST)
         time_exit = self._parse_time(str(getattr(s, "expiry_day_gamma_time_exit", "13:30") or "13:30"))
-        if now.time() < time_exit:
+        late_exit = self._parse_time(
+            str(getattr(s, "expiry_day_late_window_time_exit", "15:20") or "15:20")
+        )
+        # Whichever cohort comes due first decides when this method starts doing work.
+        if now.time() < min(time_exit, late_exit):
             return
         cutoff = self._parse_time(str(getattr(s, "expiry_day_gamma_cutoff", "13:00") or "13:00"))
         try:
@@ -3161,10 +3269,31 @@ class TradeManager:
                 is_exp = expiry_manager.is_expiry_day(trade.instrument, et_ist.date())
             except Exception:
                 is_exp = False
-            # genuine T-0 gamma trade: entered on expiry day, before the morning cutoff
-            if not is_exp or et_ist.time() >= cutoff:
+            if not is_exp:
                 continue
-            self.close_trade(tid, trade.current_price, "EXPIRY_GAMMA_TIME_EXIT", exit_time=now)
+            # genuine T-0 gamma trade: entered on expiry day, before the morning cutoff
+            if et_ist.time() < cutoff:
+                if now.time() >= time_exit:
+                    self.close_trade(
+                        tid, trade.current_price, "EXPIRY_GAMMA_TIME_EXIT", exit_time=now
+                    )
+                continue
+            # Entered at/after the cutoff. Only some of those sit on a contract expiring
+            # TODAY -- after the cutoff the default mode rolls to the next expiry, and it
+            # is the late window that re-engages the current one. in_gamma_window is the
+            # exact predicate the ENTRY side used to make that choice, so asking it about
+            # the entry timestamp identifies the expiring-contract cohort without
+            # re-deriving the rule or touching rolled next-expiry trades.
+            try:
+                on_expiring_contract = bool(
+                    expiry_manager.in_gamma_window(trade.instrument, et_ist)
+                )
+            except Exception:
+                on_expiring_contract = False
+            if on_expiring_contract and now.time() >= late_exit:
+                self.close_trade(
+                    tid, trade.current_price, "EXPIRY_LATE_WINDOW_TIME_EXIT", exit_time=now
+                )
 
     def expire_stale_open_trades(self, now: Optional[datetime] = None, reason: str = "STALE_SESSION_END") -> int:
         """Retain previous-session trades until broker reconciliation proves closure."""

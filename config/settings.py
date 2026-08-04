@@ -1106,6 +1106,14 @@ class Settings(BaseSettings):
     expiry_day_late_window: bool = True
     expiry_day_late_window_start: str = "14:00"
     expiry_day_late_window_end: str = "15:15"
+    # Time exit for the late cohort. The comment above said "the EOD square-off still
+    # flattens everything by force-exit", and that was literally all that stood between a
+    # late-window position and settlement: the 13:30 gamma exit is already past when this
+    # window opens, and its entry-time filter drops everything entered after the 13:00
+    # cutoff. Defaults ahead of ut_force_exit_time (15:25) so an expiring contract is
+    # closed on its own schedule rather than in the final-minutes liquidity crunch,
+    # alongside every other force-exited position.
+    expiry_day_late_window_time_exit: str = "15:20"
 
     # ─── UT Bot Core Settings ────────────────────────────────
     ut_preset: str = "AGGRESSIVE"
