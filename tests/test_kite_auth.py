@@ -149,7 +149,14 @@ def test_completed_login_persists_a_token_without_the_secret(tmp_path, monkeypat
     auth = _auth(tmp_path)
 
     class _Client:
-        def __init__(self, api_key=None): self.api_key = api_key
+        # Mirrors the real KiteConnect signature rather than swallowing **kwargs, so a
+        # wrong argument name here still fails instead of being silently absorbed.
+        # proxies is what routes order traffic through a fixed address when the operator
+        # configures one; a client built without it would quietly bypass that.
+        def __init__(self, api_key=None, access_token=None, root=None, debug=False,
+                     timeout=None, proxies=None, pool=None, disable_ssl=False):
+            self.api_key = api_key
+            self.proxies = proxies
         def generate_session(self, request_token, api_secret):
             assert request_token == "RT-1" and api_secret == "SECRET456"
             return {"access_token": "AT-NEW", "user_id": "JOQ915", "public_token": "PT"}

@@ -135,3 +135,49 @@ def test_an_unavailable_lookup_does_not_invent_a_warning():
     """No network is 'unknown', not 'drifted'."""
     result = _readiness("49.37.34.13", "")
     assert not any("whitelisted for the Kite app" in w for w in result["warnings"])
+
+
+# ── optional proxy for the order path ────────────────────────────────────────
+
+def _proxies_for(value):
+    import config.settings as cs
+
+    class _S:
+        kite_http_proxy = value
+
+    original = cs.get_settings
+    cs.get_settings = lambda: _S()
+    try:
+        return kite_auth.kite_proxies()
+    finally:
+        cs.get_settings = original
+
+
+def test_no_proxy_configured_means_direct():
+    """Blank must change nothing — this is opt-in infrastructure."""
+    assert _proxies_for("") is None
+    assert _proxies_for("   ") is None
+
+
+def test_a_configured_proxy_is_applied_to_both_schemes():
+    assert _proxies_for("http://10.0.0.5:3128") == {
+        "http": "http://10.0.0.5:3128",
+        "https": "http://10.0.0.5:3128",
+    }
+
+
+def test_a_socks_proxy_is_passed_through_untouched():
+    """requests understands socks5h:// with PySocks; do not rewrite it."""
+    assert _proxies_for("socks5h://10.0.0.5:1080")["https"] == "socks5h://10.0.0.5:1080"
+
+
+def test_every_kite_client_is_built_with_the_proxy():
+    """A client constructed without it would silently bypass the stable address."""
+    import inspect
+
+    src = inspect.getsource(kite_auth)
+    constructions = src.count("KiteConnect(api_key=self.api_key")
+    with_proxy = src.count("KiteConnect(api_key=self.api_key, proxies=kite_proxies())")
+    assert constructions == with_proxy, (
+        f"{constructions - with_proxy} KiteConnect client(s) bypass the configured proxy"
+    )

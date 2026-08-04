@@ -63,6 +63,30 @@ def pin_kite_to_ipv4(enabled: bool = True) -> bool:
     return True
 
 
+def kite_proxies() -> Optional[Dict[str, str]]:
+    """Proxy map for Kite REST calls, or None.
+
+    Kite validates the TCP source address on ORDER PLACEMENT only, so the address that
+    has to be stable is the one the REST client uses — not the one the tick socket uses.
+    Routing just these calls through a host with a fixed address therefore fixes the
+    whitelist problem without putting the market-data feed behind an extra hop, which
+    matters here: the tick path is on a 1s loop and has already been the source of one
+    latency regression.
+
+    KiteConnect passes this straight to requests, so any form requests understands works
+    (http://host:port, socks5h://host:port with PySocks installed).
+    """
+    try:
+        from config.settings import get_settings
+
+        proxy = str(getattr(get_settings(), "kite_http_proxy", "") or "").strip()
+    except Exception:
+        return None
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
 def current_egress_ip(family: str = "v4", timeout: float = 4.0) -> str:
     """This machine's public address as a server sees it, or "" when unavailable.
 
@@ -231,7 +255,7 @@ class KiteAuth:
             raise ValueError(message)
         from kiteconnect import KiteConnect
 
-        return KiteConnect(api_key=self.api_key).login_url()
+        return KiteConnect(api_key=self.api_key, proxies=kite_proxies()).login_url()
 
     def complete_login(self, request_token: str) -> Dict[str, Any]:
         """Exchange a browser-issued request_token for a daily access token."""
@@ -244,7 +268,7 @@ class KiteAuth:
 
         from kiteconnect import KiteConnect
 
-        client = KiteConnect(api_key=self.api_key)
+        client = KiteConnect(api_key=self.api_key, proxies=kite_proxies())
         # generate_session computes the SHA-256 checksum internally; the api_secret
         # never leaves this process and is never written to the token cache.
         session = client.generate_session(request_token, api_secret=self._api_secret)
@@ -315,7 +339,7 @@ class KiteAuth:
 
         from kiteconnect import KiteConnect
 
-        client = KiteConnect(api_key=self.api_key)
+        client = KiteConnect(api_key=self.api_key, proxies=kite_proxies())
         client.set_access_token(access_token)
 
         # Ask Kite whether the token is alive rather than inferring it from the clock.

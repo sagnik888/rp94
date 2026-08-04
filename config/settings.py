@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # dies. Leave blank to skip the check (correct if the console's IP list is empty,
     # which is the right setup for a dynamic home connection).
     kite_registered_ip: str = ""
+    # Optional proxy for Kite REST calls ONLY (orders, margins, order book). Kite checks
+    # the source address on order PLACEMENT, so this is the one path that needs a stable
+    # address — point it at a host with a fixed IP and whitelist that IP instead of a
+    # home connection that keeps moving. The tick WebSocket deliberately stays direct, so
+    # market data does not take an extra hop; the added latency lands only on order
+    # submission, where a few ms is irrelevant.
+    # Any form requests understands: http://host:3128, socks5h://host:1080 (needs PySocks).
+    # Blank = direct, unchanged behaviour.
+    kite_http_proxy: str = ""
     kite_user_id: str = ""
     # Where the daily access token is cached. Kept out of .env because it rotates.
     kite_token_file: str = "kite_token.json"
