@@ -1248,6 +1248,16 @@ class Settings(BaseSettings):
     volume_spike_depth_ofr_bullish: float = 1.08
     volume_spike_depth_ofr_bearish: float = 0.92
     stabilization_momentum_override_enabled: bool = True # Re-admit flickered signals when thrust keeps confirming direction
+    # Drop the weakest branch of that override without disabling the whole mechanism.
+    # The override is a chain of ALTERNATIVES (first match wins), and "regime flip" —
+    # trending regime pointing the same way as the signal, with no price, volume or
+    # structure test — accounted for 653 of 1327 re-admissions across every session log
+    # (49%), versus 3 from the strict directional-thrust branch. Turning this ON keeps
+    # thrust, cascade, late-reclaim, market-wide-reversal, VWAP and structure while
+    # removing the branch that is nearly always true in a trending tape.
+    # Default False: the measured edge against clean signals was NOT significant
+    # (39% vs 50% win rate, median -151, N=56, p=0.21), so this is a deliberate opt-in.
+    stabilization_override_drop_regime_flip: bool = False
     # Tape hygiene: a 1min signal can ONLY enter via the volume-spike/scalp
     # filter, so 1min signals that never cleared it cannot trade. When True, the
     # raw-detection and rejection lines for such no-spike 1min signals are kept off

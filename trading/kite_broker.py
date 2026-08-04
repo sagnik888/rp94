@@ -15,6 +15,7 @@ trade_manager and the Broker base class already read, so this is a drop-in.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import deque
@@ -339,7 +340,39 @@ class KiteBroker(Broker):
                 f"the exchange ({detail}). Reconcile before any further action."
             ) from exc
         logger.error(f"Kite refused {action} for {symbol}: {detail}")
+        self._escalate_if_ip_blocked(detail)
         raise BrokerOrderRejected(detail, terminal=(kind == "TERMINAL")) from exc
+
+    # Markers for the one refusal that is not about the order at all.
+    _IP_BLOCK_MARKERS = ("is not allowed to place orders", "allowed ips")
+
+    def _escalate_if_ip_blocked(self, detail: str) -> None:
+        """Shout once when the broker is refusing EVERY order on account configuration.
+
+        An IP-permission refusal is not an order problem: nothing about the symbol, size
+        or price can change it, and it will refuse every order until a human edits the
+        Kite developer console. It was logged at ERROR next to ordinary per-order
+        refusals, so on 2026-08-04 three dead signals read as three unrelated failures
+        rather than one blanket block, and the cause was only findable by grepping logs.
+
+        Latched on the ADDRESS rather than a bare flag, so a changed egress IP -- the
+        usual way this shows up -- escalates again instead of being swallowed by the latch.
+        """
+        text = str(detail or "").lower()
+        if not any(marker in text for marker in self._IP_BLOCK_MARKERS):
+            return
+        match = re.search(r"IP \(([^)]+)\)", str(detail))
+        address = match.group(1) if match else "unknown"
+        if getattr(self, "_ip_block_alerted", "") == address:
+            return
+        self._ip_block_alerted = address
+        logger.critical(
+            f"ORDERS BLOCKED AT THE BROKER: Kite is refusing EVERY order because this "
+            f"machine's outbound address {address} is not whitelisted for the app. No "
+            "order can reach the exchange until it is added on the Kite developer "
+            "console. Check the address family: a whitelisted IPv4 does NOT cover an "
+            "IPv6 egress, and the address above is what Kite actually saw."
+        )
 
     # ── entry ────────────────────────────────────────────────────────────────
     def place_order(

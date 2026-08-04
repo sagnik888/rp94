@@ -10801,13 +10801,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ctx["type"] = "cross_index_rollover" if sig == "SELL" else "cross_index_reversal"
             return ctx
 
-        reg = str(regime or getattr(self, "latest_regimes", {}).get(instrument, "") or "").upper()
-        if reg and is_trending_regime(reg) and regime_aligns(reg, sig):
-            return {
-                "type": "regime_flip",
-                "reason": f"regime flip aligns with {sig} ({reg})",
-                "regime": reg,
-            }
+        # The weakest branch in this chain, and the one that fires most: 653 of 1327
+        # re-admissions across every session log (49%), against 3 from the strict
+        # directional-thrust branch below. It asks only "is the regime trending, and does
+        # it point the same way as the signal" — no price, volume or structure test at
+        # all — so it re-admits a flickering arrow on a condition that is true for most of
+        # any trending session. Override-admitted signals ran a 39% win rate against 50%
+        # for clean ones with a median of -151, though at N=56 that gap is not
+        # statistically significant (p=0.21), which is why dropping this branch is opt-in
+        # rather than the default.
+        if not self._setting_enabled(
+            getattr(settings, "stabilization_override_drop_regime_flip", False), False
+        ):
+            reg = str(regime or getattr(self, "latest_regimes", {}).get(instrument, "") or "").upper()
+            if reg and is_trending_regime(reg) and regime_aligns(reg, sig):
+                return {
+                    "type": "regime_flip",
+                    "reason": f"regime flip aligns with {sig} ({reg})",
+                    "regime": reg,
+                }
 
         thrust = self._candle_thrust_metrics(instrument, timeframe, sig, as_of=signal_timestamp)
         if thrust:
