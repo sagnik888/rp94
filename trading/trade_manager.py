@@ -2851,7 +2851,32 @@ class TradeManager:
                     on_execution_result(trade, False)
             
             from engine.async_queue import execution_queue
-            execution_queue.submit(f"PlaceOrder_{trading_symbol}", place_bg)
+            # `is False` and not `not ...`: submit() is documented -> bool, and a test
+            # double or simulation stub that returns None means "I do not signal", not
+            # "I refused". Treating None as refusal closed 20 healthy trades outright.
+            if execution_queue.submit(f"PlaceOrder_{trading_symbol}", place_bg) is False:
+                # place_bg never runs, so NO order is sent. Ignoring this left the row
+                # pending_execution forever: it held a position slot, counted against
+                # exposure and looked live on the dashboard while the broker had never
+                # heard of it. Nothing is resting at the exchange, so unlike the exit
+                # path this can be closed outright rather than escalated.
+                error = "Execution queue refused the entry task; no order was sent"
+                logger.error(f"❌ {error} for {trading_symbol}")
+                self._log_ui(f"❌ {error} for {trading_symbol}", "error")
+                with self._lock:
+                    if trade.id in self.open_trades:
+                        trade.status = "CLOSED"
+                        trade.exit_reason = "BROKER_ERROR"
+                        trade.exit_time = datetime.now(IST)
+                        trade.exit_price = trade.entry_price
+                        trade.pending_execution = False
+                        trade.execution_status = "REJECTED"
+                        trade.execution_error = error
+                        self.closed_trades.append(trade)
+                        del self.open_trades[trade.id]
+                self.save_state()
+                if on_execution_result:
+                    on_execution_result(trade, False)
         else:
             if (
                 getattr(self, "mode", "HISTORICAL") == "REAL"
@@ -3239,7 +3264,26 @@ class TradeManager:
                 on_exit_result(trade, False)
 
         from engine.async_queue import execution_queue
-        execution_queue.submit(f"CloseOrder_{trade.trading_symbol}", close_bg)
+        if execution_queue.submit(f"CloseOrder_{trade.trading_symbol}", close_bg) is False:
+            # submit() returns False on shutdown and when the queue is still full after a
+            # bounded 2s wait. Both were being ignored, so close_bg simply never ran: no
+            # order was sent, nothing raised, and the row sat pending_exit forever with a
+            # LIVE position behind it. The queue drains at shutdown and at EOD — exactly
+            # when an unexited position matters most.
+            trade.pending_exit = False
+            self._mark_recovery(
+                trade,
+                "Execution queue refused the exit task, so no exit order was ever sent. "
+                "The position is still open at the broker.",
+            )
+            self.save_state()
+            logger.critical(
+                f"[EXIT NEVER QUEUED] {trade.trading_symbol} still holds a live position: "
+                "the execution queue rejected the close task, so no order reached the "
+                "broker. Flatten it manually if the automatic recovery does not."
+            )
+            if on_exit_result:
+                on_exit_result(trade, False)
 
     def close_trade(
         self,

@@ -18,10 +18,17 @@ import pytest
 from data.kite_market_data import KiteDataSource
 
 
+# Relative to today on purpose. This was hardcoded to date(2026, 8, 4) and every chain
+# test began failing at midnight on 2026-08-05: get_option_chain filters to LIVE expiries,
+# so a past date yields an empty chain and PCR reads 0.0. The symbols below are opaque
+# identifiers here and are matched on the expiry FIELD, so they need not encode the date.
+_FIXTURE_EXPIRY = date.today() + timedelta(days=7)
+
+
 def _instrument(**over):
     row = {
         "instrument_token": 12345, "tradingsymbol": "NIFTY2680424350CE", "name": "NIFTY",
-        "expiry": date(2026, 8, 4), "strike": 24350.0, "instrument_type": "CE",
+        "expiry": _FIXTURE_EXPIRY, "strike": 24350.0, "instrument_type": "CE",
         "exchange": "NFO", "lot_size": 65,
     }
     row.update(over)
@@ -62,7 +69,7 @@ def _source(kite):
 def test_option_is_resolved_from_the_contract_master():
     src = _source(_Kite(instruments={"NFO": [_instrument()], "BFO": [], "NSE": [], "BSE": []}))
     src.load_instruments()
-    row = src.resolve_option("NIFTY", 24350, "CE", expiry=date(2026, 8, 4))
+    row = src.resolve_option("NIFTY", 24350, "CE", expiry=_FIXTURE_EXPIRY)
     assert row["tradingsymbol"] == "NIFTY2680424350CE"
     assert row["instrument_token"] == 12345
 
@@ -71,27 +78,29 @@ def test_a_contract_that_does_not_exist_returns_none_not_a_guessed_symbol():
     """The AngelOne path would have happily constructed a symbol for this."""
     src = _source(_Kite(instruments={"NFO": [_instrument()], "BFO": [], "NSE": [], "BSE": []}))
     src.load_instruments()
-    assert src.resolve_option("NIFTY", 99999, "CE", expiry=date(2026, 8, 4)) is None
+    assert src.resolve_option("NIFTY", 99999, "CE", expiry=_FIXTURE_EXPIRY) is None
 
 
 def test_expired_contracts_are_never_offered():
     """SENSEX26JUL77700CE lived on in the AngelOne path for a whole session."""
-    dead = _instrument(expiry=date(2026, 7, 28), tradingsymbol="NIFTY2672824350CE")
-    live = _instrument(expiry=date(2026, 8, 4))
+    dead = _instrument(expiry=date.today() - timedelta(days=7),
+                       tradingsymbol="NIFTY2672824350CE")
+    live = _instrument(expiry=_FIXTURE_EXPIRY)
     src = _source(_Kite(instruments={"NFO": [dead, live], "BFO": [], "NSE": [], "BSE": []}))
     src.load_instruments()
-    expiries = src.expiries_for("NIFTY", on_or_after=date(2026, 7, 31))
-    assert expiries == [date(2026, 8, 4)]
+    expiries = src.expiries_for("NIFTY", on_or_after=_FIXTURE_EXPIRY - timedelta(days=4))
+    assert expiries == [_FIXTURE_EXPIRY]
     # With no explicit expiry it must pick the nearest LIVE one, never the dead one.
-    assert src.resolve_option("NIFTY", 24350, "CE", on_or_after=date(2026, 7, 31))["expiry"] == date(2026, 8, 4)
+    assert src.resolve_option("NIFTY", 24350, "CE", on_or_after=_FIXTURE_EXPIRY - timedelta(days=4))["expiry"] == _FIXTURE_EXPIRY
 
 
 def test_nearest_live_expiry_is_chosen_by_default():
-    near = _instrument(expiry=date(2026, 8, 4))
-    far = _instrument(expiry=date(2026, 8, 11), tradingsymbol="NIFTY2681124350CE", instrument_token=999)
+    near = _instrument(expiry=_FIXTURE_EXPIRY)
+    far = _instrument(expiry=_FIXTURE_EXPIRY + timedelta(days=7),
+                      tradingsymbol="NIFTY2681124350CE", instrument_token=999)
     src = _source(_Kite(instruments={"NFO": [far, near], "BFO": [], "NSE": [], "BSE": []}))
     src.load_instruments()
-    assert src.resolve_option("NIFTY", 24350, "CE", on_or_after=date(2026, 7, 31))["expiry"] == date(2026, 8, 4)
+    assert src.resolve_option("NIFTY", 24350, "CE", on_or_after=_FIXTURE_EXPIRY - timedelta(days=4))["expiry"] == _FIXTURE_EXPIRY
 
 
 def test_a_failed_exchange_dump_keeps_the_previous_cache():
@@ -101,14 +110,14 @@ def test_a_failed_exchange_dump_keeps_the_previous_cache():
     assert src.load_instruments() == 1
     src._kite = _Kite(instruments={"NFO": RuntimeError("dump down"), "BFO": [], "NSE": [], "BSE": []})
     src.load_instruments(force=True)
-    assert src.resolve_option("NIFTY", 24350, "CE", expiry=date(2026, 8, 4)) is not None
+    assert src.resolve_option("NIFTY", 24350, "CE", expiry=_FIXTURE_EXPIRY) is not None
 
 
 def test_sensex_options_are_looked_up_on_bfo():
     row = _instrument(name="SENSEX", tradingsymbol="SENSEX2680678100CE", strike=78100.0, exchange="BFO")
     src = _source(_Kite(instruments={"NFO": [], "BFO": [row], "NSE": [], "BSE": []}))
     src.load_instruments()
-    assert src.resolve_option("SENSEX", 78100, "CE", expiry=date(2026, 8, 4))["exchange"] == "BFO"
+    assert src.resolve_option("SENSEX", 78100, "CE", expiry=_FIXTURE_EXPIRY)["exchange"] == "BFO"
 
 
 def test_instrument_token_lookup_by_symbol():
