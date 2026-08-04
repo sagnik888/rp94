@@ -11,6 +11,7 @@ Handles:
 """
 
 import uuid
+import inspect
 import re
 import threading
 import time
@@ -1283,14 +1284,20 @@ class TradeManager:
             try:
                 order_id = self.broker.place_protective_stop(
                     trade.trading_symbol, trade.symbol_token, qty, side, trigger, self.product_type,
+                    **self._tag_kwargs(
+                        self.broker.place_protective_stop, trade, "PROTECTIVE"
+                    ),
                 )
             except BrokerOrderAmbiguous as exc:
                 # The SL-M may already rest at the exchange despite the lost ack. NEVER
                 # blindly re-place. Re-scan and adopt if found, else fail closed to
                 # RECOVERY_REQUIRED for supervised reconciliation.
                 self._last_protective_sync[trade.id] = now
-                recovered = ""
-                if callable(finder):
+                # Ask the TAG first. The symbol/side scan below can only answer "some
+                # SL-M for this contract exists", which is already wrong when two trades
+                # sit on one strike; the tag identifies this trade's own order exactly.
+                recovered = self._recover_order_id_from_tag(trade, "PROTECTIVE")
+                if not recovered and callable(finder):
                     try:
                         recovered = str(finder(trade.trading_symbol, trade.symbol_token, side) or "")
                     except Exception as scan_exc:
@@ -1568,6 +1575,102 @@ class TradeManager:
             "avoid double-exiting the position",
         )
 
+    @staticmethod
+    def _accepts_kwarg(func, name: str) -> bool:
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return False
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+            return True
+        return name in signature.parameters
+
+    def _tag_kwargs(self, func, trade: Trade, leg: str, attempt: int = 0) -> Dict[str, str]:
+        """`{"tag": ...}` only when the broker actually accepts it.
+
+        SignalSimBroker and every test double predate the argument, and an unexpected
+        keyword is a TypeError that aborts the whole order path — which is worse than
+        going untagged. Tagging is an enhancement to recovery, so it must degrade to
+        nothing rather than take the order down with it.
+        """
+        if not callable(func) or not self._accepts_kwarg(func, "tag"):
+            return {}
+        tag = self._broker_order_tag(trade, leg, attempt)
+        return {"tag": tag} if tag else {}
+
+    def _broker_order_tag(self, trade: Trade, leg: str, attempt: int = 0) -> str:
+        """The exact tag this trade's `leg` order carries, or "" when unsupported."""
+        tagger = getattr(self.broker, "order_tag", None)
+        if not callable(tagger):
+            return ""
+        try:
+            return str(tagger(trade.id, leg, attempt) or "")
+        except TypeError:
+            # Simulation brokers still on the single-argument form.
+            try:
+                return str(tagger(trade.id) or "")
+            except Exception:
+                return ""
+        except Exception:
+            return ""
+
+    def _recover_order_id_from_tag(self, trade: Trade, leg: str) -> str:
+        """Ask the broker whether this leg's tagged order actually reached the exchange.
+
+        This is what a tag is FOR. Tags were already being written on entry orders and
+        read by nothing, so a lost acknowledgement stayed unknowable and every caller had
+        to latch and escalate to a human. The order book echoes the tag, so the question
+        has a real answer: either an order carrying this exact tag exists or it does not.
+
+        Returns the order id when exactly one match exists. Everything else returns "" --
+        and the distinction matters to the caller, so AMBIGUOUS (two orders sharing a
+        tag) escalates rather than being quietly treated as absent.
+        """
+        inspector = getattr(self.broker, "inspect_order_by_tag", None)
+        if not callable(inspector):
+            return ""
+        attempt = (
+            int(getattr(trade, "entry_replace_count", 0) or 0)
+            if str(leg).upper() == "ENTRY"
+            else 0
+        )
+        tag = self._broker_order_tag(trade, leg, attempt)
+        if not tag:
+            return ""
+        try:
+            result = inspector(tag) or {}
+        except Exception as exc:
+            logger.warning(f"Tagged {leg.lower()} recovery failed for {trade.id}: {exc}")
+            return ""
+        state = str(result.get("state") or "UNKNOWN").upper()
+        if state == "AMBIGUOUS":
+            self._mark_recovery(
+                trade, f"Multiple broker orders share the exact {leg.lower()} tag {tag}"
+            )
+            return ""
+        if state != "FOUND":
+            return ""
+        order_id = str(result.get("order_id") or "")
+        if not order_id:
+            self._mark_recovery(
+                trade, f"Exact {leg.lower()} tag {tag} was found without an order id"
+            )
+        return order_id
+
+    def _tagged_exit_state(self, trade: Trade) -> str:
+        """FOUND / ABSENT / UNKNOWN for this trade's exit order, by tag."""
+        inspector = getattr(self.broker, "inspect_order_by_tag", None)
+        if not callable(inspector):
+            return "UNKNOWN"
+        tag = self._broker_order_tag(trade, "EXIT", 0)
+        if not tag:
+            return "UNKNOWN"
+        try:
+            return str((inspector(tag) or {}).get("state") or "UNKNOWN").upper()
+        except Exception as exc:
+            logger.warning(f"Tagged exit lookup failed for {trade.id}: {exc}")
+            return "UNKNOWN"
+
     # The states a Kite order can finish in having NOT filled the rest of its quantity.
     # COMPLETE is deliberately absent: it means the full quantity did fill, so a residual
     # sitting alongside it is stale position data, and exiting on that would sell a
@@ -1687,6 +1790,7 @@ class TradeManager:
         try:
             order_id = self.broker.close_order(
                 trade.trading_symbol, trade.symbol_token, qty, side, self.product_type,
+                **self._tag_kwargs(self.broker.close_order, trade, "EXIT"),
             )
         except (BrokerOrderRejected, PermissionError) as exc:
             # close_order takes the account lease and needs a session, so it raises just
@@ -1702,6 +1806,42 @@ class TradeManager:
             # fact filled, the account ends up SHORT and naked in an NRML product the
             # broker will not square off. Latch it: only a reconciliation that reads the
             # real net quantity may release it.
+            #
+            # But "may be live" is now a question with a real answer. The exit carries an
+            # exact tag, so the order book can be asked directly instead of freezing and
+            # escalating to a human:
+            #   FOUND  -> it DID reach the exchange. Adopt the id and treat it as the
+            #             submission it actually is; nothing to latch and nobody to call.
+            #   ABSENT -> a SUCCESSFUL read that found no such tag proves it never
+            #             arrived, so the next pass may retry safely. Still recovery, but
+            #             not latched — latching here is what strands a live position.
+            # Only UNKNOWN (unreadable book) and AMBIGUOUS fall through to the latch,
+            # which is the honest outcome when the question genuinely cannot be answered.
+            recovered_exit = self._recover_order_id_from_tag(trade, "EXIT")
+            if recovered_exit:
+                trade.exit_order_id = recovered_exit
+                trade.pending_exit = True
+                trade.pending_execution = False
+                trade.execution_status = "EXIT_PENDING"
+                trade.execution_error = reason
+                trade.exit_reason = "RECOVERY_AUTO_FLATTEN"
+                self._clear_flatten_block(trade)
+                self.save_state()
+                logger.warning(
+                    f"Flatten acknowledgement was lost for {trade.trading_symbol}, but "
+                    f"its exit tag resolved to order {recovered_exit} — adopted instead "
+                    "of latching."
+                )
+                return True
+            if self._tagged_exit_state(trade) == "ABSENT":
+                self._mark_recovery(
+                    trade,
+                    f"{reason}; flatten acknowledgement was lost ({exc}), but the exit "
+                    "tag is absent from the order book, so nothing reached the exchange. "
+                    "A retry is safe.",
+                )
+                self.save_state()
+                return False
             if not hasattr(self, "_flatten_ambiguous_latched"):
                 self._flatten_ambiguous_latched = set()
             self._flatten_ambiguous_latched.add(trade.id)
@@ -3038,6 +3178,8 @@ class TradeManager:
                 trade.protective_order_id = ""
                 self.save_state()
 
+            exit_tag_kwargs = self._tag_kwargs(broker.close_order, trade, "EXIT")
+
             def close_order():
                 return broker.close_order(
                         symbol=trade.trading_symbol,
@@ -3045,6 +3187,7 @@ class TradeManager:
                         qty=exit_quantity,
                         side=exit_side,
                         product_type=product_type,
+                        **exit_tag_kwargs,
                     )
 
             order_id, last_error, attempts = execute_order_with_retry(

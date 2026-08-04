@@ -15,6 +15,7 @@ trade_manager and the Broker base class already read, so this is a drop-in.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import time
@@ -294,8 +295,8 @@ class KiteBroker(Broker):
             return 0
 
     @staticmethod
-    def order_tag(trade_id: str) -> str:
-        """A <=20 char Kite tag that maps an order back to its trade deterministically.
+    def order_tag(trade_id: str, leg: str = "ENTRY", attempt: int = 0) -> str:
+        """A <=20 char Kite tag that maps ONE order leg back to one trade exactly.
 
         Kite echoes the tag on the order book, on trades, and on every postback. That
         turns order->trade matching from a heuristic (symbol + side + quantity, which
@@ -304,16 +305,69 @@ class KiteBroker(Broker):
 
         Trade ids look like T0005_MIDCPNIFTY_07311451 (25 chars), so the instrument is
         dropped: the counter and timestamp are what make it unique.
+
+        The ENTRY/attempt-0 form is deliberately byte-identical to the single-argument
+        version this replaced, so a tagged order already resting at the exchange stays
+        findable across this change. Every other leg gets a distinct U1-prefixed tag —
+        without that, an exit and its entry would collide on one string and the lookup
+        would return AMBIGUOUS exactly when it is needed most. The attempt code keeps a
+        replaced entry distinct from the one it replaced, so a cancel/replace race
+        cannot make two live orders share a tag.
         """
         raw = str(trade_id or "").strip()
         if not raw:
             return ""
+        leg_code = {
+            "ENTRY": "E", "EXIT": "X", "PROTECTIVE": "S", "STOP": "S",
+        }.get(str(leg or "").strip().upper())
+        if not leg_code:
+            raise ValueError(f"unsupported order-tag leg: {leg!r}")
         parts = raw.split("_")
-        if len(parts) >= 3:
-            candidate = f"{parts[0]}_{parts[-1]}"      # T0005_07311451
-        else:
-            candidate = raw
-        return candidate[:20]
+        if leg_code == "E" and int(attempt or 0) == 0:
+            candidate = f"{parts[0]}_{parts[-1]}" if len(parts) >= 3 else raw
+            return candidate[:20]
+        compact = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+        if not compact or len(compact) > 15:
+            compact = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:15].upper()
+        attempt_code = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[max(0, int(attempt or 0)) % 36]
+        return f"U1{leg_code}{attempt_code}{compact[:14]}"[:20]
+
+    def inspect_order_by_tag(self, tag: str) -> Dict[str, Any]:
+        """Find an order by its EXACT echoed tag. The point of tagging at all.
+
+        Tags were already being written on entry orders and read by nothing, so an
+        unacknowledged submission still had to be treated as unknowable — which is what
+        every latch and withhold in trade_manager works around. This closes that loop:
+        after a lost acknowledgement, ask the order book whether the tag exists.
+
+        Tri-state on purpose, and ABSENT is never inferred from a failed read: an order
+        book we could not fetch is UNKNOWN. Concluding "the order was never placed" from
+        a scan that errored is precisely how a live position gets duplicated.
+        """
+        wanted = str(tag or "").strip()
+        if not wanted:
+            return {"state": "UNKNOWN", "order_id": "", "matches": [],
+                    "reason": "order tag is empty"}
+        rows = self._order_book()
+        if rows is None:
+            return {"state": "UNKNOWN", "order_id": "", "matches": [],
+                    "reason": "order book could not be read"}
+        matches = [row for row in rows if str(row.get("tag") or "").strip() == wanted]
+        if not matches:
+            return {"state": "ABSENT", "order_id": "", "matches": [],
+                    "reason": "exact order tag not found"}
+        if len(matches) != 1:
+            return {"state": "AMBIGUOUS", "order_id": "", "matches": matches,
+                    "reason": f"{len(matches)} orders share exact tag {wanted}"}
+        row = matches[0]
+        return {
+            "state": "FOUND",
+            "order_id": str(row.get("orderid") or ""),
+            "status": str(row.get("orderstatus") or ""),
+            "order": row,
+            "matches": matches,
+            "reason": "exact order tag found",
+        }
 
     @staticmethod
     def _normalise_order(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -525,6 +579,11 @@ class KiteBroker(Broker):
     def close_order(
         self, symbol: str, token: str, qty: int, side: str,
         product_type: str = "CARRYFORWARD", price: float = 0.0,
+        # Optional so simulation brokers and older call sites keep working. When set, an
+        # exit whose acknowledgement is lost stops being unknowable — inspect_order_by_tag
+        # can say whether it reached the exchange, instead of the caller having to latch
+        # and wait for a human.
+        tag: str = "",
     ) -> Optional[str]:
         self._require_account_execution_lease("exit order")
         api = self._require_api("exit order")
@@ -545,6 +604,7 @@ class KiteBroker(Broker):
                     # automatic protection band, capping that slippage. AngelOne had
                     # no equivalent; every exit was unbounded.
                     market_protection=-1,
+                    **({"tag": str(tag)[:20]} if tag else {}),
                 ),
             )
         except Exception as exc:
@@ -565,7 +625,7 @@ class KiteBroker(Broker):
     # ── protective stop ──────────────────────────────────────────────────────
     def place_protective_stop(
         self, symbol: str, token: str, qty: int, side: str, trigger_price: float,
-        product_type: str = "CARRYFORWARD",
+        product_type: str = "CARRYFORWARD", tag: str = "",
     ) -> Optional[str]:
         self._require_account_execution_lease("protective stop")
         api = self._require_api("protective stop")
@@ -583,6 +643,7 @@ class KiteBroker(Broker):
                     order_type="SL-M",
                     trigger_price=trigger,
                     validity="DAY",
+                    **({"tag": str(tag)[:20]} if tag else {}),
                 ),
             )
         except Exception as exc:
