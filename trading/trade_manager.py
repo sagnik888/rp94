@@ -72,6 +72,13 @@ class Trade:
     # the original exit order died. Bounded so a contract the broker keeps rejecting
     # cannot spin a fresh market order on every reconcile pass.
     partial_exit_flatten_count: int = 0
+    # Deliberate scale-out state. partial_derisk_done latches only on a BOOKED success, so
+    # a reduce that failed can be retried on the next tick; the other two persist an
+    # in-flight reduce so a restart reconciles it from broker positions instead of
+    # submitting a second one against the same lots.
+    partial_derisk_done: bool = False
+    partial_reduce_order_id: str = ""
+    partial_reduce_requested_quantity: int = 0
     exit_order_id: str = ""
     protective_order_id: str = ""
     protective_trigger: float = 0.0
@@ -214,6 +221,9 @@ class Trade:
             "entry_submitted_at": self.entry_submitted_at.isoformat() if self.entry_submitted_at else "",
             "entry_replace_count": self.entry_replace_count,
             "partial_exit_flatten_count": self.partial_exit_flatten_count,
+            "partial_derisk_done": self.partial_derisk_done,
+            "partial_reduce_order_id": self.partial_reduce_order_id,
+            "partial_reduce_requested_quantity": self.partial_reduce_requested_quantity,
             # Both of these were absent from the round trip, so a restart silently reset
             # them. reversal_watch_required is the one that matters to an operator: it
             # marks a contract whose stop MAY still be resting after a flatten, and the
@@ -404,6 +414,11 @@ class Trade:
             entry_submitted_at=entry_submitted_at,
             entry_replace_count=int(data.get("entry_replace_count", 0) or 0),
             partial_exit_flatten_count=int(data.get("partial_exit_flatten_count", 0) or 0),
+            partial_derisk_done=bool(data.get("partial_derisk_done", False)),
+            partial_reduce_order_id=data.get("partial_reduce_order_id", "") or "",
+            partial_reduce_requested_quantity=int(
+                data.get("partial_reduce_requested_quantity", 0) or 0
+            ),
             reversal_watch_required=bool(data.get("reversal_watch_required", False)),
             is_reversion_scalp=bool(data.get("is_reversion_scalp", False)),
             pending_exit=bool(data.get("pending_exit", False)),
@@ -1488,6 +1503,265 @@ class TradeManager:
                 f"{verdict.get('limitation') or verdict.get('reason') or 'insufficient margin'}"
             )
         return verdict
+
+    def _live_position_for_trade(self, trade: Trade):
+        """This trade's broker position row, or None when the book says flat.
+
+        Returns (row, readable). `readable` is False when the positions call itself
+        failed — the caller must not read that as flat, which is the same rule every
+        other scan in this file follows.
+        """
+        getter = getattr(self.broker, "get_positions", None)
+        if not callable(getter):
+            return None, False
+        try:
+            response = getter()
+        except Exception as exc:
+            logger.debug(f"Positions read failed during partial reduce: {exc}")
+            return None, False
+        if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+            return None, False
+        symbol = str(getattr(trade, "trading_symbol", "") or "").upper()
+        for row in response["data"]:
+            if str(row.get("tradingsymbol") or "").upper() == symbol:
+                return row, True
+        return None, True
+
+    def _confirmed_reduced_quantity(
+        self, trade: Trade, expected_quantity: int, timeout: float = 2.0
+    ) -> Optional[int]:
+        """Wait briefly for POSITIONS — not an order ack — to prove the reduce landed.
+
+        An acknowledgement says the order was accepted, not that it filled. Booking a
+        realised child off an ack is how a phantom P&L row gets written for lots that
+        never left. None means unproven.
+        """
+        deadline = time.monotonic() + max(0.5, float(timeout or 0.5))
+        while time.monotonic() < deadline:
+            position, readable = self._live_position_for_trade(trade)
+            if readable:
+                if position is None:
+                    return 0
+                signed = self._position_quantity(position)
+                if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
+                    return None          # direction flipped: not our reduce
+                if abs(signed) <= expected_quantity:
+                    return abs(signed)
+            time.sleep(0.2)
+        return None
+
+    def _book_partial_child(
+        self, trade: Trade, close_lots: int, exit_price: float, reason: str,
+        exit_time: Optional[datetime] = None,
+    ) -> None:
+        """Realise `close_lots` as a closed child row and shrink the parent."""
+        from dataclasses import replace as _replace
+
+        child = _replace(trade)
+        child.id = f"{trade.id}#P{int(close_lots)}"
+        child.lots = int(close_lots)
+        child.status = "CLOSED"
+        child.execution_status = "CLOSED"
+        child.pending_exit = False
+        child.pending_execution = False
+        child.exit_reason = reason
+        child.exit_time = exit_time or datetime.now(IST)
+        child.exit_price = float(exit_price)
+        child.broker_quantity = int(close_lots) * int(trade.lot_size or 1)
+        child.protective_order_id = ""
+        child.gtt_trigger_id = ""
+        gross = (float(exit_price) - float(trade.entry_price)) * child.broker_quantity
+        if trade.inst_type != "OPT" and str(trade.direction or "").upper() == "SHORT":
+            gross = -gross
+        try:
+            from engine.trade_accounting import estimate_trade_charges
+            from config.settings import get_settings
+
+            child.charges = estimate_trade_charges(
+                trade.entry_price, exit_price, child.broker_quantity, trade.inst_type,
+                get_settings(), trade.instrument_multiplier, instrument=trade.instrument,
+            )
+        except Exception:
+            child.charges = 0.0
+        child.pnl = gross - float(child.charges or 0.0)
+        self.closed_trades.append(child)
+
+        remaining = max(1, int(trade.lots or 1) - int(close_lots))
+        trade.lots = remaining
+        trade.broker_quantity = remaining * int(trade.lot_size or 1)
+
+    def partial_close_trade(
+        self, trade_id: str, close_lots: int, exit_price: float,
+        reason: str = "PARTIAL_DERISK", exit_time: Optional[datetime] = None,
+    ) -> bool:
+        """Bank part of a multi-lot winner and let the remainder run.
+
+        Refuses unless the trade is cleanly OPEN with no exit already in flight, and only
+        once per trade — partial_derisk_done latches on BOOKED success, so a reduce that
+        failed can be retried on the next tick while one that worked cannot be repeated.
+
+        On a REAL position the broker work is ordered so the position can never be
+        over-exited or left naked; see _request_broker_partial_reduce. Simulated and ghost
+        books are booked synchronously at the decision price.
+        """
+        with self._lock:
+            trade = self.open_trades.get(trade_id)
+            if not trade or trade.status != "OPEN":
+                return False
+            if trade.pending_exit or str(trade.execution_status or "").upper() in {
+                "EXIT_PENDING", "PARTIAL_EXIT", "RECOVERY_REQUIRED",
+            }:
+                return False
+            if bool(getattr(trade, "partial_derisk_done", False)):
+                return False
+            if (
+                str(getattr(trade, "partial_reduce_order_id", "") or "")
+                or int(getattr(trade, "partial_reduce_requested_quantity", 0) or 0) > 0
+            ):
+                # A persisted in-flight reduce must be reconciled against broker positions
+                # before a second one may be submitted against the same lots.
+                return False
+            total = max(1, int(trade.lots or 1))
+            close_lots = int(close_lots or 0)
+            if close_lots < 1 or close_lots >= total:
+                # Closing everything is an exit, not a de-risk; that path has its own
+                # protective-stop handling and must not be reached through here.
+                return False
+            price = float(exit_price or trade.current_price or trade.entry_price or 0.0)
+            if price <= 0:
+                return False
+            is_real = bool(
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and self.broker
+                and getattr(trade, "symbol_token", "")
+                and not getattr(trade, "is_ghost", False)
+            )
+            if is_real:
+                if bool(getattr(trade, "_partial_reduce_inflight", False)):
+                    return False
+                setattr(trade, "_partial_reduce_inflight", True)
+            else:
+                self._book_partial_child(trade, close_lots, price, reason, exit_time)
+                trade.partial_derisk_done = True
+                self.save_state()
+                return True
+
+        self._request_broker_partial_reduce(trade, close_lots, price, reason, exit_time)
+        return True
+
+    def _request_broker_partial_reduce(
+        self, trade: Trade, close_lots: int, exit_price: float, reason: str,
+        exit_time: Optional[datetime],
+    ) -> None:
+        """Reduce a REAL position by `close_lots`, in the only safe order.
+
+          1. Cancel the full-size protective stop and PROVE it. An unproven cancel means
+             the SL-M may still rest for the full size, and the partial exit on top of it
+             double-exits — so an unproven cancel aborts and changes nothing.
+          2. Place the partial exit. If it fails, re-arm the full-size stop before
+             returning: the position is unchanged, so it must not be left unprotected.
+          3. Only once POSITIONS prove the reduce, book the child and re-arm a stop for
+             the remainder. If that re-arm fails the trade is marked for recovery rather
+             than left running naked.
+        """
+        quantity = int(close_lots) * int(trade.lot_size or 1)
+
+        def reduce_bg():
+            try:
+                self._run_partial_reduce(trade, close_lots, quantity, exit_price, reason, exit_time)
+            except Exception as exc:
+                logger.error(f"Partial reduce crashed for {trade.trading_symbol}: {exc}")
+                self._mark_recovery(trade, f"Partial de-risk failed unexpectedly: {exc}")
+            finally:
+                setattr(trade, "_partial_reduce_inflight", False)
+                trade.partial_reduce_order_id = ""
+                trade.partial_reduce_requested_quantity = 0
+                self.save_state()
+
+        from engine.async_queue import execution_queue
+
+        if execution_queue.submit(f"PartialReduce_{trade.trading_symbol}", reduce_bg) is False:
+            setattr(trade, "_partial_reduce_inflight", False)
+            logger.warning(
+                f"Partial de-risk for {trade.trading_symbol} was refused by the execution "
+                "queue; the position is untouched and fully protected."
+            )
+
+    def _run_partial_reduce(
+        self, trade: Trade, close_lots: int, quantity: int, exit_price: float,
+        reason: str, exit_time: Optional[datetime],
+    ) -> None:
+        existing_stop = str(getattr(trade, "protective_order_id", "") or "")
+        if existing_stop:
+            confirm = getattr(self.broker, "cancel_order_confirmed", None)
+            cancelled = None
+            if callable(confirm):
+                try:
+                    cancelled = confirm(existing_stop, "STOPLOSS")
+                except (BrokerOrderRejected, PermissionError) as exc:
+                    logger.error(f"Partial-reduce stop cancel refused: {exc}")
+                    cancelled = None
+            if cancelled is not True:
+                # Unproven cancel: the full-size SL-M may still be resting, and a partial
+                # exit on top of it exits the position twice.
+                logger.warning(
+                    f"Partial de-risk aborted for {trade.trading_symbol}: the full-size "
+                    "protective stop could not be confirmed cancelled."
+                )
+                return
+            trade.protective_order_id = ""
+
+        side = self._protective_exit_side(trade)
+        try:
+            order_id = self.broker.close_order(
+                trade.trading_symbol, trade.symbol_token, quantity, side,
+                self.product_type,
+                **self._tag_kwargs(self.broker.close_order, trade, "EXIT"),
+            )
+        except (BrokerOrderRejected, PermissionError) as exc:
+            logger.error(f"Partial exit refused for {trade.trading_symbol}: {exc}")
+            self.ensure_broker_protection(trade, trade.broker_quantity)
+            return
+        except BrokerOrderAmbiguous as exc:
+            # The reduce MAY be live. Do not re-arm a full-size stop on top of it and do
+            # not book anything; let reconciliation read the real quantity.
+            self._mark_recovery(
+                trade,
+                f"Partial de-risk acknowledgement ambiguous ({exc}); broker quantity "
+                "must be reconciled before this position is managed further.",
+            )
+            return
+        if not order_id:
+            self.ensure_broker_protection(trade, trade.broker_quantity)
+            return
+
+        trade.partial_reduce_order_id = str(order_id)
+        trade.partial_reduce_requested_quantity = quantity
+        self.save_state()
+
+        expected_remaining = max(0, int(trade.broker_quantity or 0) - quantity)
+        confirmed = self._confirmed_reduced_quantity(trade, expected_remaining)
+        if confirmed is None:
+            self._mark_recovery(
+                trade,
+                "Partial de-risk could not be confirmed from broker positions; the "
+                "protective stop is NOT re-armed until the real quantity is known.",
+            )
+            return
+
+        with self._lock:
+            self._book_partial_child(trade, close_lots, exit_price, reason, exit_time)
+            trade.broker_quantity = confirmed or trade.broker_quantity
+            trade.partial_derisk_done = True
+        self.save_state()
+        logger.success(
+            f"Partial de-risk booked for {trade.trading_symbol}: {close_lots} lot(s) "
+            f"realised, {trade.lots} running."
+        )
+        if not self.ensure_broker_protection(trade, trade.broker_quantity):
+            self._mark_recovery(
+                trade, "Remainder of a partial de-risk could not be re-protected"
+            )
 
     def _entry_risk_admission(
         self, *, inst_type: str, direction: str, price: float, trailing_stop: float,

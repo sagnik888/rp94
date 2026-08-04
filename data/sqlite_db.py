@@ -60,6 +60,10 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # protective stop may still be resting after a flatten — the operator-facing half of
     # a hazard the logs shout about.
     "partial_exit_flatten_count", "reversal_watch_required", "is_reversion_scalp",
+    # Scale-out state. An in-flight reduce that did not survive a restart would be
+    # re-submitted against lots that are already gone.
+    "partial_derisk_done", "partial_reduce_order_id",
+    "partial_reduce_requested_quantity",
 })
 
 
@@ -231,6 +235,9 @@ class DatabaseManager:
                     "partial_exit_flatten_count": "INTEGER",
                     "reversal_watch_required": "INTEGER",
                     "is_reversion_scalp": "INTEGER",
+                    "partial_derisk_done": "INTEGER",
+                    "partial_reduce_order_id": "TEXT",
+                    "partial_reduce_requested_quantity": "INTEGER",
                 },
             )
             
