@@ -76,6 +76,51 @@ def test_a_changed_address_escalates_again():
     assert len(seen) == 2
 
 
+EMPTY_LIST_REFUSAL = (
+    "PermissionException: No IPs configured for this app. Add allowed IPs on the Kite "
+    "developer console."
+)
+
+
+def test_an_empty_allow_list_is_escalated_and_names_the_address_to_add():
+    """An empty list DENIES every order rather than allowing all.
+
+    That inversion is a trap: clearing the list looks like the right move for a dynamic
+    connection and is the opposite. Kite's message names no address either, so the
+    operator is told to add an IP without being told which one — the alert has to supply
+    the machine's own address or it is not actionable.
+    """
+    import loguru
+
+    import trading.kite_broker as kb
+
+    broker = _broker()
+    original = None
+    try:
+        import data.kite_auth as ka
+
+        original = ka.current_egress_ip
+        ka.current_egress_ip = lambda family="v4", timeout=4.0: "49.37.32.15"
+    except Exception:
+        pass
+
+    seen = []
+    sink = loguru.logger.add(lambda m: seen.append(m), level="CRITICAL")
+    try:
+        broker._escalate_if_ip_blocked(EMPTY_LIST_REFUSAL)
+    finally:
+        loguru.logger.remove(sink)
+        if original is not None:
+            import data.kite_auth as ka
+
+            ka.current_egress_ip = original
+
+    text = "".join(str(m) for m in seen)
+    assert seen, "an empty allow-list blocks every order and was not escalated"
+    assert "49.37.32.15" in text, "the alert must name the address to paste into the console"
+    assert "DENIES" in text or "denies" in text, "the inversion must be stated explicitly"
+
+
 @pytest.mark.parametrize("detail", [
     "InputException: Trigger price is out of range",
     "OrderException: Insufficient funds",

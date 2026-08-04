@@ -343,8 +343,15 @@ class KiteBroker(Broker):
         self._escalate_if_ip_blocked(detail)
         raise BrokerOrderRejected(detail, terminal=(kind == "TERMINAL")) from exc
 
-    # Markers for the one refusal that is not about the order at all.
-    _IP_BLOCK_MARKERS = ("is not allowed to place orders", "allowed ips")
+    # Markers for the one refusal that is not about the order at all. Two shapes: an
+    # address Kite rejected, and an app with an EMPTY allow-list. The second is the
+    # nastier one — an empty list denies every order rather than allowing all, so
+    # "clear the list" looks like a fix for a dynamic connection and is the opposite.
+    _IP_BLOCK_MARKERS = (
+        "is not allowed to place orders",
+        "allowed ips",
+        "no ips configured",
+    )
 
     def _escalate_if_ip_blocked(self, detail: str) -> None:
         """Shout once when the broker is refusing EVERY order on account configuration.
@@ -362,17 +369,38 @@ class KiteBroker(Broker):
         if not any(marker in text for marker in self._IP_BLOCK_MARKERS):
             return
         match = re.search(r"IP \(([^)]+)\)", str(detail))
-        address = match.group(1) if match else "unknown"
-        if getattr(self, "_ip_block_alerted", "") == address:
+        refused = match.group(1) if match else ""
+        # The "no IPs configured" variant names no address at all, so the operator is
+        # told to add an IP without being told WHICH. Look up what this machine actually
+        # presents, so the alert carries the value to paste into the console.
+        own = ""
+        if not refused:
+            try:
+                from data.kite_auth import current_egress_ip
+
+                own = current_egress_ip("v4")
+            except Exception as exc:
+                logger.debug(f"Egress lookup for the IP-block alert failed: {exc}")
+        key = refused or own or "unknown"
+        if getattr(self, "_ip_block_alerted", "") == key:
             return
-        self._ip_block_alerted = address
-        logger.critical(
-            f"ORDERS BLOCKED AT THE BROKER: Kite is refusing EVERY order because this "
-            f"machine's outbound address {address} is not whitelisted for the app. No "
-            "order can reach the exchange until it is added on the Kite developer "
-            "console. Check the address family: a whitelisted IPv4 does NOT cover an "
-            "IPv6 egress, and the address above is what Kite actually saw."
-        )
+        self._ip_block_alerted = key
+        if refused:
+            logger.critical(
+                f"ORDERS BLOCKED AT THE BROKER: Kite is refusing EVERY order because "
+                f"this machine's outbound address {refused} is not whitelisted for the "
+                "app. No order can reach the exchange until it is added on the Kite "
+                "developer console. Check the address family: a whitelisted IPv4 does "
+                "NOT cover an IPv6 egress, and the address above is what Kite saw."
+            )
+        else:
+            logger.critical(
+                "ORDERS BLOCKED AT THE BROKER: the Kite app has NO allowed IPs "
+                "configured, and an empty list DENIES every order rather than allowing "
+                f"all. Add {own or 'this machine public IPv4'} on the Kite developer "
+                "console. Keep kite_registered_ip in step with it so the readiness gate "
+                "warns when this connection's address drifts."
+            )
 
     # ── entry ────────────────────────────────────────────────────────────────
     def place_order(
