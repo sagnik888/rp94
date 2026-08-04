@@ -54,6 +54,12 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "gtt_trigger_id",
     "protective_updated_at", "recovery_required_since", "signal_time",
     "entry_replace_count",
+    # partial_exit_flatten_count BOUNDS how many times the remainder of a partially
+    # filled exit may be re-submitted; unstored, a restart reset the bound to zero and
+    # the attempt budget started over. reversal_watch_required marks a contract whose
+    # protective stop may still be resting after a flatten — the operator-facing half of
+    # a hazard the logs shout about.
+    "partial_exit_flatten_count", "reversal_watch_required", "is_reversion_scalp",
 })
 
 
@@ -222,6 +228,9 @@ class DatabaseManager:
                     "recovery_required_since": "TEXT",
                     "signal_time": "TEXT",
                     "entry_replace_count": "INTEGER",
+                    "partial_exit_flatten_count": "INTEGER",
+                    "reversal_watch_required": "INTEGER",
+                    "is_reversion_scalp": "INTEGER",
                 },
             )
             

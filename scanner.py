@@ -21398,8 +21398,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 stop_price=stop,
                 cascade_scale=cascade_on,
                 heavy_trend_scale=heavy_on and not cascade_on,
+                # The compression cap is position_sizing's stated FINAL safety invariant:
+                # "a quiet locked session is never enlarged by a caller accidentally
+                # carrying cascade/heavy flags". This call omitted the state entirely, so
+                # converting a candidate to options re-derived lots without the cap and
+                # then overwrote the capped size at `candidate.lots =` below — 3 lots
+                # where the sizer had said 1, on a cascade flag this path reads raw.
+                # signal_processor stamps the state it sized under onto the candidate
+                # (sizing_compression_state); read it back rather than re-deriving it.
+                compression_state=str(
+                    getattr(candidate, "sizing_compression_state", "") or ""
+                ),
             )
-            lots = max(1, int(sized.lots or base_lots))
+            if sized.lots < 1:
+                # A refusal is a refusal. `max(1, sized.lots or base_lots)` turned the
+                # sizer's "one lot's risk exceeds the budget" back into a full-size
+                # position — the one answer it must never be allowed to become.
+                return False
+            lots = int(sized.lots)
             if sized.mode in {"cascade", "heavy_trend"}:
                 try:
                     candidate.reasons = list(candidate.reasons or []) + [sized.reason]

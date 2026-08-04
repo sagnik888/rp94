@@ -46,6 +46,46 @@ def test_to_dict_emits_every_persisted_column():
     assert not missing, f"to_dict() drops persisted columns, they will be NULLed: {sorted(missing)}"
 
 
+# Fields from_dict() reads that are deliberately NOT stored: post-trade attribution and
+# execution telemetry. Losing them on restart degrades reporting, not position management.
+# Anything that decides how a LIVE position is managed does not belong here.
+UNPERSISTED_BY_DESIGN = {
+    "entered_intracandle", "entry_slippage", "exit_slippage", "execution_ask_price",
+    "execution_bid_price", "execution_touch_age_seconds", "execution_touch_reason",
+    "execution_touch_source", "execution_touch_usable", "quad_union_entry",
+    "raw_union_entry", "signal_entry_price", "signal_fire_mode", "source_engine",
+    "source_engines",
+    "signal_timestamp",   # alias; the value persists under signal_time
+}
+
+
+def test_every_field_from_dict_reads_is_actually_stored():
+    """The reverse of the check above, which was the direction that stayed open.
+
+    Asserting only TRADE_PERSISTED_COLUMNS <= to_dict() catches a stored column nobody
+    emits. It does NOT catch the opposite: a field added to to_dict()/from_dict() but
+    never added to TRADE_PERSISTED_COLUMNS. save_trades filters every row through that
+    set, so such a field is dropped on write and from_dict quietly falls back to its
+    default on the next restart — no error, no NULL, just the default.
+
+    That is how partial_exit_flatten_count (which BOUNDS re-submission of a partially
+    filled exit) and reversal_watch_required both reverted to zero/False on restart while
+    the module comment claimed this file guarded the three-way sync.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(Trade.from_dict)
+    read = set(re.findall(r'data\.get\(\s*["\']([A-Za-z0-9_]+)["\']', src))
+    unstored = sorted(read - set(TRADE_PERSISTED_COLUMNS) - UNPERSISTED_BY_DESIGN)
+    assert not unstored, (
+        "from_dict() reads these but save_trades never stores them, so they silently "
+        f"revert to their defaults on restart: {unstored}. Add them to "
+        "TRADE_PERSISTED_COLUMNS (and the _ensure_columns type map), or to "
+        "UNPERSISTED_BY_DESIGN if losing them genuinely cannot affect a live position."
+    )
+
+
 def test_broker_contract_identity_survives_save_and_load():
     trade = _trade()
     with db.write_lock:

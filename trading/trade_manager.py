@@ -67,6 +67,10 @@ class Trade:
     signal_time: Optional[datetime] = None
     entry_submitted_at: Optional[datetime] = None
     entry_replace_count: int = 0
+    # How many times the remainder of a partially filled exit has been re-submitted after
+    # the original exit order died. Bounded so a contract the broker keeps rejecting
+    # cannot spin a fresh market order on every reconcile pass.
+    partial_exit_flatten_count: int = 0
     exit_order_id: str = ""
     protective_order_id: str = ""
     protective_trigger: float = 0.0
@@ -208,6 +212,14 @@ class Trade:
             "signal_timestamp": self.signal_time.isoformat() if self.signal_time else "",
             "entry_submitted_at": self.entry_submitted_at.isoformat() if self.entry_submitted_at else "",
             "entry_replace_count": self.entry_replace_count,
+            "partial_exit_flatten_count": self.partial_exit_flatten_count,
+            # Both of these were absent from the round trip, so a restart silently reset
+            # them. reversal_watch_required is the one that matters to an operator: it
+            # marks a contract whose stop MAY still be resting after a flatten, and the
+            # log that sets it says "watch this contract" — without serialising it there
+            # was no surface naming which contract that was.
+            "reversal_watch_required": self.reversal_watch_required,
+            "is_reversion_scalp": self.is_reversion_scalp,
             "pending_exit": self.pending_exit,
             "broker_order_id": self.broker_order_id,
             "exit_order_id": self.exit_order_id,
@@ -390,6 +402,9 @@ class Trade:
             signal_time=parse_ist_datetime(data.get("signal_time") or data.get("signal_timestamp")),
             entry_submitted_at=entry_submitted_at,
             entry_replace_count=int(data.get("entry_replace_count", 0) or 0),
+            partial_exit_flatten_count=int(data.get("partial_exit_flatten_count", 0) or 0),
+            reversal_watch_required=bool(data.get("reversal_watch_required", False)),
+            is_reversion_scalp=bool(data.get("is_reversion_scalp", False)),
             pending_exit=bool(data.get("pending_exit", False)),
             broker_quantity=int(data.get("broker_quantity", 0) or 0),
             trading_symbol=data.get("trading_symbol", ""),
@@ -1553,6 +1568,56 @@ class TradeManager:
             "avoid double-exiting the position",
         )
 
+    # The states a Kite order can finish in having NOT filled the rest of its quantity.
+    # COMPLETE is deliberately absent: it means the full quantity did fill, so a residual
+    # sitting alongside it is stale position data, and exiting on that would sell a
+    # quantity that is no longer there and open a naked short.
+    _DEAD_EXIT_STATES = {"CANCELLED", "REJECTED"}
+
+    def _abandoned_exit_verdict(self, trade: Trade) -> str:
+        """Can the exit order that partially filled still fill the remainder?
+
+        "DEAD" only when the broker states a terminal non-fill, "WORKING" while it is
+        still live, "UNKNOWN" when the question cannot be answered. UNKNOWN must never
+        read as DEAD — sending a second exit on top of one that is still resting is how
+        an intended exit becomes a reversed naked position.
+        """
+        order_id = str(getattr(trade, "exit_order_id", "") or "")
+        if not order_id:
+            # An exit was submitted (that is what set PARTIAL_EXIT) but we hold no id to
+            # interrogate, so its fate is unknowable here.
+            return "UNKNOWN"
+        lifecycle = getattr(self.broker, "get_order_lifecycle", None)
+        if not callable(lifecycle):
+            return "UNKNOWN"
+        try:
+            detail = lifecycle(order_id) or {}
+        except Exception as exc:
+            logger.debug(f"Exit lifecycle lookup failed for {trade.id}: {exc}")
+            return "UNKNOWN"
+        state = str(detail.get("state") or "").upper()
+        if not state or state == "UNKNOWN":
+            return "UNKNOWN"
+        return "DEAD" if state in self._DEAD_EXIT_STATES else "WORKING"
+
+    def _resume_abandoned_partial_exit(self, trade: Trade, residual: int) -> bool:
+        """Square off the remainder once the broker is finished with the exit order."""
+        attempts = int(getattr(trade, "partial_exit_flatten_count", 0) or 0)
+        if attempts >= 3:
+            self._mark_recovery(
+                trade,
+                f"Partially filled exit left {residual} quantity and {attempts} re-exit "
+                "attempts were all refused by the broker. This position is unprotected "
+                "— reconcile it manually.",
+            )
+            return False
+        trade.partial_exit_flatten_count = attempts + 1
+        # The dead order cannot fill anything further, so its id must not be carried into
+        # the new submission; emergency_flatten_trade stamps the replacement's own id.
+        trade.exit_order_id = ""
+        trade.pending_exit = False
+        return self.emergency_flatten_trade(trade, "PARTIAL_EXIT_ABANDONED")
+
     def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
         """Flatten a confirmed recovery position after safely cancelling its SL-M."""
         if not self.broker or not trade.symbol_token or not trade.trading_symbol:
@@ -1937,7 +2002,10 @@ class TradeManager:
                         trade,
                         "Broker protection unavailable",
                     )
-            elif trade.execution_status == "EXIT_PENDING" and abs(net_qty) < expected_qty:
+            elif (
+                trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
+                and abs(net_qty) < expected_qty
+            ):
                 trade.pending_exit = True
                 trade.execution_status = "PARTIAL_EXIT"
                 trade.execution_error = (
@@ -1945,6 +2013,32 @@ class TradeManager:
                     f"{expected_qty} quantity remains; awaiting broker completion"
                 )
                 changed = True
+                # PARTIAL_EXIT used to be re-examined by NOTHING until the 15:25 force
+                # exit: EXIT_PENDING was the only status this branch accepted, and the
+                # branch below excludes PARTIAL_EXIT explicitly. So the residual sat for
+                # the rest of the session with its protective stop already cancelled
+                # (cancelling it is what precedes sending an exit at all).
+                #
+                # "Awaiting broker completion" is the right posture only while the exit
+                # order can still fill the rest. Once the broker says that order is
+                # CANCELLED or REJECTED, nothing is coming: the remainder is a live
+                # position with no stop, no working exit, and nothing scheduled to touch
+                # it before the close. That is the moment to square it off, and it is a
+                # fact the broker can state rather than something to guess at.
+                verdict = self._abandoned_exit_verdict(trade)
+                if verdict == "DEAD":
+                    self._resume_abandoned_partial_exit(trade, abs(net_qty))
+                elif verdict == "UNKNOWN":
+                    if not hasattr(self, "_partial_exit_unknown_logged"):
+                        self._partial_exit_unknown_logged = set()
+                    if trade.id not in self._partial_exit_unknown_logged:
+                        self._partial_exit_unknown_logged.add(trade.id)
+                        logger.warning(
+                            f"Cannot determine whether the exit order for "
+                            f"{trade.trading_symbol} is still working; leaving "
+                            f"{abs(net_qty)} quantity in place rather than risking a "
+                            "double exit. The force-exit remains the backstop."
+                        )
             elif (
                 abs(net_qty) != expected_qty
                 and trade.execution_status not in {"EXIT_PENDING", "PARTIAL_EXIT"}
