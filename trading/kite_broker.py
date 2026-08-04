@@ -110,6 +110,12 @@ class KiteBroker(Broker):
         self._last_call_at = 0.0
         self._min_call_interval = 0.34      # Kite allows ~3 order req/s; stay under it
         self._entry_order_times: deque = deque()
+        # Cash this process has committed to orders Kite's own margin figure has not yet
+        # deducted. Guarded by its own lock: preflight runs on the entry workers, and two
+        # of them reading the same free cash is the exact over-commit this prevents.
+        self._margin_lock = threading.Lock()
+        self._margin_reservations: Dict[str, Dict[str, Any]] = {}
+        self._margin_reservation_ttl_seconds = 90.0
         self._entry_kill_latched_until = 0.0
         # Entries are placed from background threads (one per trade), so the window
         # bookkeeping below is genuinely concurrent. Without this lock two threads can
@@ -1272,13 +1278,85 @@ class KiteBroker(Broker):
                     "available": None, "required": required,
                     "limitation": "free cash unavailable (RMS limits are not published "
                                   "outside market hours); requirement known but unchecked"}
+
+        # Reserve against CONCURRENT entries. Without this, two entry workers reading the
+        # same free cash both pass and the account over-commits: /user/margins does not
+        # reflect an order that was placed moments ago, so the second check sees money the
+        # first has already spent. The reservation is this process's own memory of what it
+        # has committed but not yet seen deducted.
+        #
+        # reservation_id and release_entry_margin_reservation were already declared on the
+        # base Broker (broker.py:173-183) and returned "" here — the contract was designed
+        # and never implemented. entry_margin_buffer_pct (settings.py:423, with a 0-100
+        # validator) and requires_entry_margin_preflight (line 103 of this file) were both
+        # likewise sitting unread.
+        buffer_pct = self._entry_margin_buffer_pct()
+        committed = required * (1.0 + buffer_pct / 100.0)
+        with self._margin_lock:
+            self._expire_margin_reservations()
+            outstanding = sum(r["amount"] for r in self._margin_reservations.values())
+            spendable = available - outstanding
+            if spendable < committed:
+                return {
+                    "ok": False, "reservation_id": "", "basis": "KITE_ORDER_MARGIN",
+                    "available": available, "required": required,
+                    "reserved": outstanding,
+                    "limitation": (
+                        f"insufficient funds: {committed:,.2f} required "
+                        f"(incl {buffer_pct:.0f}% buffer), {available:,.2f} available"
+                        + (f", {outstanding:,.2f} already reserved by in-flight entries"
+                           if outstanding else "")
+                    ),
+                }
+            reservation_id = f"{symbol}:{time.time():.6f}"
+            self._margin_reservations[reservation_id] = {
+                "amount": committed, "at": time.time(), "symbol": symbol,
+            }
         return {
-            "ok": bool(available >= required),
-            "reservation_id": "",
+            "ok": True,
+            "reservation_id": reservation_id,
             "basis": "KITE_ORDER_MARGIN",
             "available": available,
             "required": required,
-            "limitation": "" if available >= required else (
-                f"insufficient funds: {required:,.2f} required, {available:,.2f} available"
-            ),
+            "reserved": outstanding,
+            "limitation": "",
         }
+
+    def _entry_margin_buffer_pct(self) -> float:
+        try:
+            from config.settings import get_settings
+
+            value = float(getattr(get_settings(), "entry_margin_buffer_pct", 10.0) or 0.0)
+        except Exception:
+            return 10.0
+        return min(100.0, max(0.0, value))
+
+    def _expire_margin_reservations(self) -> None:
+        """Drop reservations older than the TTL. Caller holds _margin_lock.
+
+        A reservation only covers the window between placing an order and Kite's own
+        margin figure reflecting it. Without expiry, an entry that died in a way no
+        release path caught would hold cash hostage for the rest of the session — which
+        would turn a safety feature into a self-inflicted trading halt.
+        """
+        cutoff = time.time() - self._margin_reservation_ttl_seconds
+        for key in [k for k, r in self._margin_reservations.items() if r["at"] < cutoff]:
+            logger.warning(
+                f"Margin reservation {key} expired after "
+                f"{self._margin_reservation_ttl_seconds:.0f}s without release."
+            )
+            self._margin_reservations.pop(key, None)
+
+    def release_entry_margin_reservation(self, reservation_id: str) -> None:
+        """Give the cash back once the entry is definitively not going to consume it.
+
+        Deliberately NOT called on an ambiguous acknowledgement: an order that may be
+        live must keep holding its margin, or the next entry spends money this one is
+        about to.
+        """
+        key = str(reservation_id or "")
+        if not key:
+            return
+        with self._margin_lock:
+            if self._margin_reservations.pop(key, None) is not None:
+                logger.debug(f"Released margin reservation {key}")

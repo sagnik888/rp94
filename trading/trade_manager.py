@@ -1489,6 +1489,21 @@ class TradeManager:
             )
         return verdict
 
+    def _release_margin_reservations(self, reservation_ids) -> None:
+        """Hand back margin an entry definitively did not consume.
+
+        Never called on an ambiguous acknowledgement: an order that may be live has to
+        keep holding its cash, or the next entry spends money this one is about to.
+        """
+        release = getattr(self.broker, "release_entry_margin_reservation", None)
+        if not callable(release):
+            return
+        for reservation_id in list(reservation_ids or []):
+            try:
+                release(reservation_id)
+            except Exception as exc:
+                logger.debug(f"Margin reservation {reservation_id} release failed: {exc}")
+
     def _trade_owning_protective_order(self, order_id: str, exclude_id: str = ""):
         """The open trade that holds this protective order id, if any."""
         if not order_id:
@@ -2738,6 +2753,10 @@ class TradeManager:
             order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
             
             def place_bg():
+                # Every retry runs the preflight again and takes its own reservation.
+                # Collected so a definitive rejection can hand all of them back at once.
+                reservations: List[str] = []
+
                 def place_order():
                     # Ask the broker whether this order can be funded BEFORE sending it.
                     # preflight_entry_margin was written for exactly this and had no
@@ -2755,6 +2774,16 @@ class TradeManager:
                             or "entry margin preflight failed",
                             terminal=True,
                         )
+                    # An approved preflight has RESERVED this order's margin so a
+                    # concurrent entry cannot spend the same cash. The reservation must
+                    # be given back the moment we know this order will not consume it —
+                    # but only on a definite refusal. An AMBIGUOUS acknowledgement means
+                    # the order may be live, so it keeps holding its margin; letting the
+                    # next entry spend that money is how an account over-commits on
+                    # exactly the orders it cannot see.
+                    reservation_id = str((preflight or {}).get("reservation_id") or "")
+                    if reservation_id:
+                        reservations.append(reservation_id)
                     try:
                         return self.broker.place_order(
                             symbol=trading_symbol,
@@ -2828,6 +2857,11 @@ class TradeManager:
                         on_execution_result(trade, False)
                     return
 
+                # A definitive refusal consumes no margin, so give every reservation
+                # this attempt took back immediately rather than waiting out the TTL and
+                # blocking the next signal on money nobody is spending. The ambiguous
+                # branch above deliberately does NOT reach here.
+                self._release_margin_reservations(reservations)
                 msg = (
                     f"❌ Broker entry failed for {trading_symbol} after "
                     f"{attempts} attempts: {error}"
