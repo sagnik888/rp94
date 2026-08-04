@@ -11167,19 +11167,39 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if entry_price <= 0 or qty <= 0 or peak_pnl < min_peak or inst_mult <= 0:
             return 0.0, "", 0.0
 
-        if peak_pnl >= 3000.0:
+        # The ladder below is written in absolute rupees, and its thresholds were tuned
+        # on single-lot trades. On a 3-lot position a Rs.3000 peak is Rs.1000 PER LOT --
+        # a modest win treated as a major one, locking 90% and scalping a trade that has
+        # barely developed. Reading the ladder per lot keeps the tuning intact as size
+        # scales.
+        #
+        # Default OFF, deliberately: per-lot is more principled but LOOSER, since a
+        # multi-lot winner lands on a lower tier and is allowed to give back more before
+        # the lock fires. That is a real risk increase on live money, so it is the
+        # operator's call rather than a silent change of exit behaviour.
+        ladder_pnl = peak_pnl
+        if self._setting_enabled(
+            getattr(settings, "profit_lock_per_lot_basis", False), False
+        ):
+            lots = self._profit_lock_lot_count(trade_like, qty)
+            if lots > 1:
+                ladder_pnl = peak_pnl / float(lots)
+        # ladder_pnl selects the TIER. peak_pnl stays the real figure, because the price
+        # floor below is derived from it -- dividing that by the lot count would understate
+        # every floor rather than just moving the trade to a different tier.
+        if ladder_pnl >= 3000.0:
             # Major wins tighten from 90% at Rs.3000 toward full peak protection
             # at Rs.5000+. Cap at 100%; a ratio above peak is not executable.
-            lock_ratio = min(1.0, 0.90 + 0.10 * (peak_pnl - 3000.0) / 2000.0)
-        elif peak_pnl >= 2000.0:
-            lock_ratio = 0.80 + 0.10 * (peak_pnl - 2000.0) / 1000.0
-        elif peak_pnl >= 1000.0:
-            lock_ratio = 0.70 + 0.10 * (peak_pnl - 1000.0) / 1000.0
-        elif peak_pnl >= 500.0:
-            lock_ratio = 0.50 + 0.15 * (peak_pnl - 500.0) / 500.0
+            lock_ratio = min(1.0, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
+        elif ladder_pnl >= 2000.0:
+            lock_ratio = 0.80 + 0.10 * (ladder_pnl - 2000.0) / 1000.0
+        elif ladder_pnl >= 1000.0:
+            lock_ratio = 0.70 + 0.10 * (ladder_pnl - 1000.0) / 1000.0
+        elif ladder_pnl >= 500.0:
+            lock_ratio = 0.50 + 0.15 * (ladder_pnl - 500.0) / 500.0
         else:
-            lock_ratio = 0.40 + 0.10 * max(0.0, peak_pnl) / 500.0
-        reason = "MAJOR_WIN_GUARD" if peak_pnl >= 3000.0 else "SMART_PROFIT_LOCK"
+            lock_ratio = 0.40 + 0.10 * max(0.0, ladder_pnl) / 500.0
+        reason = "MAJOR_WIN_GUARD" if ladder_pnl >= 3000.0 else "SMART_PROFIT_LOCK"
         if reason == "MAJOR_WIN_GUARD" and trade_like is not None:
             inst_type = str(getattr(trade_like, "inst_type", "") or "").upper()
             grade = str(getattr(trade_like, "grade", "") or "").upper()
@@ -14432,6 +14452,73 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return True, f"trend no longer supportive ({context.get('reason')})"
         return False, f"same-trend pullback deferred ({retention:.0%} of peak; {context.get('reason')})"
 
+    @staticmethod
+    def _profit_lock_lot_count(trade_like, qty: int) -> int:
+        """Lots behind a position, for reading the retention ladder per lot."""
+        lots = 0
+        try:
+            lots = int(getattr(trade_like, "lots", 0) or 0)
+        except (TypeError, ValueError):
+            lots = 0
+        if lots > 0:
+            return lots
+        try:
+            lot_size = int(getattr(trade_like, "lot_size", 0) or 0)
+            if lot_size > 0:
+                return max(1, int(qty) // lot_size)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return 1
+
+    def _armed_broker_stop_for(self, trade_like) -> float:
+        """The trigger this contract actually has RESTING at the exchange, or 0.0.
+
+        Deferral is a local decision, but ensure_broker_protection has already pushed
+        trade.current_stop to Kite as an SL-M and tightens it every time the stop trails.
+        So by the time a profit lock is deferred, the exchange may already hold a trigger
+        at the very level being deferred.
+        """
+        symbol = str(getattr(trade_like, "trading_symbol", "") or "").upper()
+        instrument = str(getattr(trade_like, "instrument", "") or "").split()
+        instrument = instrument[0].upper() if instrument else ""
+        timeframe = str(getattr(trade_like, "timeframe", "") or "")
+        try:
+            trades = list(getattr(self.trades, "open_trades", {}).values())
+        except Exception:
+            return 0.0
+        # Exact contract first: two trades can sit on one index at different strikes.
+        for trade in trades:
+            if symbol and str(getattr(trade, "trading_symbol", "") or "").upper() == symbol:
+                return float(getattr(trade, "protective_trigger", 0.0) or 0.0)
+        for trade in trades:
+            row_inst = str(getattr(trade, "instrument", "") or "").split()
+            row_inst = row_inst[0].upper() if row_inst else ""
+            if row_inst == instrument and str(getattr(trade, "timeframe", "") or "") == timeframe:
+                return float(getattr(trade, "protective_trigger", 0.0) or 0.0)
+        return 0.0
+
+    def _armed_broker_stop_crossed(self, trade_like, current_price: float) -> bool:
+        """Has the mark crossed a stop that is ALREADY armed at the exchange?
+
+        Such a stop is a hard boundary and must never be deferred by any local policy.
+        Deferring it does not keep the position open -- Kite fires the SL-M regardless --
+        it only means the broker closes the position while this process goes on managing
+        a trade that no longer exists, re-arming stops and holding a slot against it.
+        """
+        armed = self._armed_broker_stop_for(trade_like)
+        if armed <= 0:
+            return False
+        try:
+            mark = float(current_price or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if mark <= 0:
+            return False
+        direction = str(getattr(trade_like, "direction", "LONG") or "LONG").upper()
+        if self._is_premium_long_candidate(trade_like) or direction == "LONG":
+            return mark <= armed
+        return mark >= armed
+
     def _should_defer_trend_option_profit_lock(
         self,
         trade_like,
@@ -14456,6 +14543,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return False, "grade below B+"
         if peak_pnl <= 0 or current_pnl <= 0:
             return False, "not profitable"
+        # A stop already RESTING at the exchange outranks every local policy. This is the
+        # one check that has to come before the rest: the others decide whether holding is
+        # a good idea, and this decides whether holding is even possible.
+        #
+        # Fetched defensively because partially-constructed scanners are a real pattern
+        # here — recovery paths and tests call this with a stub `self`, and an
+        # AttributeError would turn a missing convenience into a broken exit decision.
+        armed_check = getattr(self, "_armed_broker_stop_crossed", None)
+        if callable(armed_check) and armed_check(trade_like, current_price):
+            return False, "exchange stop already armed at this level and crossed"
         retention = float(current_pnl) / float(peak_pnl)
         severe_retention = max(
             0.20,

@@ -1281,6 +1281,14 @@ class Settings(BaseSettings):
     # Default False: the measured edge against clean signals was NOT significant
     # (39% vs 50% win rate, median -151, N=56, p=0.21), so this is a deliberate opt-in.
     stabilization_override_drop_regime_flip: bool = False
+    # Read the profit-retention ladder PER LOT instead of in absolute rupees. Its tiers
+    # (500 / 1000 / 2000 / 3000) were tuned on single-lot trades, so on 3 lots a Rs.3000
+    # peak — Rs.1000 per lot, a modest win — lands on the Rs.3000 MAJOR_WIN_GUARD rung and
+    # locks 90%, scalping a position that has barely developed.
+    # Default OFF because per-lot is LOOSER, not safer: a multi-lot winner lands on a lower
+    # rung and is allowed to give back more before the lock fires. More principled, but a
+    # real risk increase on live money, so it stays the operator's decision.
+    profit_lock_per_lot_basis: bool = False
     # Tape hygiene: a 1min signal can ONLY enter via the volume-spike/scalp
     # filter, so 1min signals that never cleared it cannot trade. When True, the
     # raw-detection and rejection lines for such no-spike 1min signals are kept off
