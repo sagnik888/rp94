@@ -9407,10 +9407,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 ]
             )
             self._diag_inc_unique("source_fallback", "delayed_entry_blocked", identity)
+            # loguru formats with {}, not %-style args, so this logged a literal "%s" and
+            # never named the instrument — and it is the only line emitted when an entry
+            # is refused. Name the instrument AND the sources it saw, because "no source
+            # is fresh" without the ages is undiagnosable while the market is moving.
+            observed = ", ".join(
+                f"{src.get('source')}"
+                f"[{'entry' if src.get('entry_eligible') else 'context'}"
+                f"/{src.get('age_seconds')}s]"
+                for src in (source_snapshot.get("sources") or [])
+            ) or "none"
             logger.warning(
-                "Blocked live entry for %s because no entry-eligible broker source is fresh; "
-                "delayed data remains context-only.",
-                instrument,
+                f"Blocked live entry for {instrument} {getattr(candidate, 'timeframe', '')} "
+                f"{getattr(candidate, 'direction', '')}: no entry-eligible broker source "
+                f"is fresh; delayed data remains context-only. Sources seen: {observed}"
             )
             self._rtracker_record_candidate(
                 candidate,

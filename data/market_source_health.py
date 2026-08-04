@@ -97,24 +97,46 @@ def build_market_source_snapshot(
 ) -> Dict[str, Any]:
     now = time.time() if now_ts is None else float(now_ts)
     records = []
+    ws_keys = []
     token_info = index_spot_tokens.get(symbol)
     if token_info:
         token = token_info[0]
         short_token = token[3:] if token.startswith("999") else token
-        for key in (token, short_token):
-            cached = provider._ws_cache.get(key)
-            if isinstance(cached, dict):
-                source = str(cached.get("source") or "angel_ws")
-                age = _age_seconds(cached, now)
-                records.append(
-                    _source_record(
-                        source,
-                        cached,
-                        "REALTIME",
-                        age is not None and age <= 6.0,
-                        now,
-                    )
+        ws_keys.extend([token, short_token])
+
+    # index_spot_tokens holds the AngelOne 999-prefixed constants, but the Kite ticker
+    # caches under Kite's own instrument_token — as _load_kite_index_tokens puts it, "the
+    # AngelOne token constants (26000, 26009...) mean nothing to Kite". That was fixed for
+    # index candles and missed here, so this lookup never produced a kite_ws record. Since
+    # order authority requires a source named kite* (fyers_ws is passed entry_eligible=
+    # False and yahoo is DELAYED), the only realtime feed that can authorise an entry was
+    # invisible: entry_eligible could come from nothing but the slower REST path, and
+    # _filter_live_candidates_by_source dropped EVERY live entry whenever that path was
+    # older than 15s.
+    ws_keys.extend(
+        str(tok)
+        for tok, name in (getattr(provider, "_kite_index_names", None) or {}).items()
+        if name == symbol
+    )
+
+    seen_keys = set()
+    for key in ws_keys:
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        cached = provider._ws_cache.get(key)
+        if isinstance(cached, dict):
+            source = str(cached.get("source") or "angel_ws")
+            age = _age_seconds(cached, now)
+            records.append(
+                _source_record(
+                    source,
+                    cached,
+                    "REALTIME",
+                    age is not None and age <= 6.0,
+                    now,
                 )
+            )
 
     fyers_symbol = fyers_index_symbols.get(symbol)
     if fyers_symbol and isinstance(provider._ws_cache.get(fyers_symbol), dict):
