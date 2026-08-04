@@ -1489,6 +1489,88 @@ class TradeManager:
             )
         return verdict
 
+    def _entry_risk_admission(
+        self, *, inst_type: str, direction: str, price: float, trailing_stop: float,
+        initial_stop: float, lots: int, lot_size: int, instrument_multiplier: float,
+        is_recovery: bool,
+    ) -> Tuple[bool, str]:
+        """Refuse an entry that would push the book past its stop-risk budget.
+
+        Off by default. It earns its keep once several lots run across several indices
+        with cascade scaling enabled — at one or two positions the daily circuit breaker
+        already covers nearly the same ground, and the extra refusal is noise.
+
+        Recovery entries bypass it, matching can_open_trade: a recovery is re-establishing
+        protection on a position that already exists, and refusing it strands the very
+        exposure this is meant to bound.
+        """
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not _setting_enabled(
+            getattr(settings, "entry_risk_budget_enabled", False), False
+        ):
+            return True, ""
+        if is_recovery:
+            return True, ""
+        try:
+            from engine.entry_risk_policy import evaluate_entry_risk
+        except Exception as exc:
+            # A missing policy module must not silently stop trading.
+            logger.debug(f"Entry-risk policy unavailable: {exc}")
+            return True, ""
+
+        candidate = {
+            "inst_type": inst_type, "direction": direction, "price": price,
+            "current_stop": trailing_stop, "initial_stop": initial_stop,
+            "lots": lots, "lot_size": lot_size, "multiplier": instrument_multiplier,
+        }
+        # Same budgets the circuit breaker enforces, so there is one source of truth for
+        # "how much may be lost" rather than two ladders that can drift apart.
+        capital_fut = float(getattr(settings, "capital_fut", 0.0) or 0.0)
+        capital_opt = float(getattr(settings, "capital_opt", 0.0) or 0.0)
+        capital_total = float(getattr(settings, "capital_total", 0.0) or 0.0)
+        try:
+            decision = evaluate_entry_risk(
+                candidate,
+                list(self.open_trades.values()),
+                fut_limit_rs=capital_fut * float(getattr(settings, "risk_fut_pct", 0.0) or 0.0) / 100.0,
+                opt_limit_rs=capital_opt * float(getattr(settings, "risk_opt_pct", 0.0) or 0.0) / 100.0,
+                global_limit_rs=capital_total * float(getattr(settings, "max_daily_loss_pct", 0.0) or 0.0) / 100.0,
+                max_trade_loss_abs=float(getattr(settings, "max_trade_loss_abs", 0.0) or 0.0),
+                slippage_bps=float(getattr(settings, "slippage_fut_bps", 0.0) or 0.0),
+                realized_loss_by_segment=self._realized_loss_by_segment(),
+            )
+        except Exception as exc:
+            logger.error(f"Entry-risk evaluation failed, allowing entry: {exc}")
+            return True, ""
+        return bool(decision.allowed), str(decision.reason)
+
+    def _realized_loss_by_segment(self) -> Dict[str, float]:
+        """Today's realised LOSSES per segment, as positive rupees.
+
+        Folded into the budget so it shrinks as the session goes against you; without it
+        the last entry of a losing day is admitted against the same headroom as the first.
+        """
+        today = datetime.now(IST).date()
+        losses = {"FUT": 0.0, "OPT": 0.0}
+        for trade in list(getattr(self, "closed_trades", []) or []):
+            try:
+                exit_time = getattr(trade, "exit_time", None) or getattr(trade, "entry_time", None)
+                if exit_time is None:
+                    continue
+                stamp = exit_time if exit_time.tzinfo else IST.localize(exit_time)
+                if stamp.astimezone(IST).date() != today:
+                    continue
+                pnl = float(getattr(trade, "pnl", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if pnl >= 0:
+                continue
+            segment = "FUT" if str(getattr(trade, "inst_type", "") or "").upper() == "FUT" else "OPT"
+            losses[segment] += abs(pnl)
+        return losses
+
     def _stale_entry_still_worth_filling(self, trade: Trade) -> bool:
         """Would this entry still be taken at the current mark?
 
@@ -2734,6 +2816,21 @@ class TradeManager:
             can, reason = self.can_open_trade(is_recovery)
             if not can:
                 logger.warning(f"Cannot open trade: {reason}")
+                return None
+            # Would accepting this candidate make the BOOK unsafe at its configured
+            # stops? can_open_trade counts positions; the circuit breaker measures a book
+            # that already exists. Neither refuses the entry that creates the breach.
+            # Off by default — see _entry_risk_admission.
+            admitted, risk_reason = self._entry_risk_admission(
+                inst_type=inst_type, direction=direction, price=price,
+                trailing_stop=trailing_stop, initial_stop=initial_stop,
+                lots=lots, lot_size=lot_size,
+                instrument_multiplier=instrument_multiplier,
+                is_recovery=is_recovery,
+            )
+            if not admitted:
+                logger.warning(f"Entry refused by projected stop-risk budget: {risk_reason}")
+                self._log_ui(f"Entry refused: {risk_reason}", "warning")
                 return None
             known_ids = set(self.open_trades)
             known_ids.update(str(trade.id) for trade in self.closed_trades)

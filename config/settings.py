@@ -1289,6 +1289,14 @@ class Settings(BaseSettings):
     # rung and is allowed to give back more before the lock fires. More principled, but a
     # real risk increase on live money, so it stays the operator's decision.
     profit_lock_per_lot_basis: bool = False
+    # Refuse an entry that would push the book past its stop-risk budget. The daily
+    # circuit breaker measures a book that already exists and halts after the fact; this
+    # refuses the entry that would create the breach, using the SAME segment and global
+    # budgets so the two cannot drift apart.
+    # Off by default because at one or two concurrent positions it duplicates the breaker.
+    # It earns its keep once several lots run across several indices with cascade scaling
+    # on — which is exactly when the breaker's after-the-fact halt arrives too late.
+    entry_risk_budget_enabled: bool = False
     # Tape hygiene: a 1min signal can ONLY enter via the volume-spike/scalp
     # filter, so 1min signals that never cleared it cannot trade. When True, the
     # raw-detection and rejection lines for such no-spike 1min signals are kept off
