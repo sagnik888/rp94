@@ -285,15 +285,64 @@ def test_an_unreadable_master_is_unknown_not_expired():
     assert trade.id in manager.open_trades, "settled a trade on a master we could not read"
 
 
+def _settle_at(manager, trade, at, listed=False):
+    """Drive the settlement decision at a FIXED clock.
+
+    This assertion is about a session boundary, so it has to name the time rather than
+    inherit whatever the wall clock happens to be: the first version of this test read
+    datetime.now() through the implementation, passed all afternoon, and failed the
+    moment the suite was run at 21:23.
+    """
+    import engine.expiry_manager as em
+
+    class _EM:
+        df = _master(listed)
+
+    original = em.expiry_manager
+    em.expiry_manager = _EM()
+    try:
+        return manager._settle_expired_contract(trade.id, trade, now=at)
+    finally:
+        em.expiry_manager = original
+
+
 def test_a_same_session_trade_is_not_settled_intraday():
     """A contract missing from one positions read is usually just a slow book."""
     manager = _manager(_Broker())
-    trade = _trade(datetime.now(IST).replace(hour=10, minute=0))
+    entry = datetime.now(IST).replace(hour=10, minute=0)
+    trade = _trade(entry)
     manager.open_trades[trade.id] = trade
 
-    _run_reconcile(manager, listed=False)
+    settled = _settle_at(manager, trade, entry.replace(hour=11, minute=30))
 
+    assert settled is False
     assert trade.id in manager.open_trades
+
+
+def test_the_same_session_trade_is_settled_once_the_session_is_over():
+    """After the close it is no longer a slow book — the contract really is gone."""
+    manager = _manager(_Broker())
+    entry = datetime.now(IST).replace(hour=10, minute=0)
+    trade = _trade(entry)
+    manager.open_trades[trade.id] = trade
+
+    settled = _settle_at(manager, trade, entry.replace(hour=15, minute=40))
+
+    assert settled is True
+    assert trade.exit_reason == "EXPIRY_SETTLED"
+
+
+def test_the_boundary_does_not_move_with_the_wall_clock():
+    """Same inputs, two clocks, two answers — pinned so this cannot regress to now()."""
+    entry = datetime.now(IST).replace(hour=10, minute=0)
+    before, after = [], []
+    for at, sink in ((entry.replace(hour=15, minute=34), before),
+                     (entry.replace(hour=15, minute=36), after)):
+        manager = _manager(_Broker())
+        trade = _trade(entry)
+        manager.open_trades[trade.id] = trade
+        sink.append(_settle_at(manager, trade, at))
+    assert before == [False] and after == [True]
 
 
 def test_a_futures_row_is_never_settled_this_way():

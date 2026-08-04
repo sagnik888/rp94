@@ -1760,7 +1760,9 @@ class TradeManager:
             return None
         return True
 
-    def _settle_expired_contract(self, trade_id: str, trade: Trade) -> bool:
+    def _settle_expired_contract(
+        self, trade_id: str, trade: Trade, now: Optional[datetime] = None
+    ) -> bool:
         """Close a row whose option contract has expired and left the broker's book.
 
         An expired contract never returns to the positions book, so reconciliation can
@@ -1781,7 +1783,13 @@ class TradeManager:
         if entry is None:
             return False
         entry_ist = IST.localize(entry) if entry.tzinfo is None else entry.astimezone(IST)
-        now = datetime.now(IST)
+        # Injectable so the session-boundary rule below can be tested at a fixed point.
+        # Reading the wall clock unconditionally made this method behave differently
+        # depending on when the process ran, and its test passed before 15:35 and failed
+        # after — which is exactly how it broke, at 21:23.
+        now = now or datetime.now(IST)
+        if now.tzinfo is None:
+            now = IST.localize(now)
         # Never intraday on the entry's own session: a contract missing from one
         # positions read is far more likely to be a slow book than an expired contract.
         if entry_ist.date() >= now.date() and now.time() < self._parse_time("15:35"):

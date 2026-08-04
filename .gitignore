@@ -68,3 +68,9 @@ data_store/
 
 charting_diff.txt
 diff_names.txt
+
+# Claude Code agent worktrees. One of these was committed as a GITLINK whose pointer
+# file resolves into a DIFFERENT repository on this machine, so git could never read it
+# and the entry sat permanently modified in `git status`. The directory itself belongs to
+# that other repo's worktree and is deliberately left on disk; it is only untracked here.
+.claude/worktrees/
