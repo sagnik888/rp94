@@ -1489,6 +1489,67 @@ class TradeManager:
             )
         return verdict
 
+    def _stale_entry_still_worth_filling(self, trade: Trade) -> bool:
+        """Would this entry still be taken at the current mark?
+
+        A stale LIMIT is cancelled and replaced with a MARKET order, which GUARANTEES a
+        fill. That is the right move when the setup still stands and the limit merely
+        missed by a tick. It is the wrong move when price has already run past the level
+        the stop sits at, because the fill then enters a position that is a loser the
+        instant it exists — the entry was never valid at that price, and the 12s window
+        is long enough on a 1min option for exactly that to happen.
+
+        Fails OPEN: with no usable mark or stop this returns True and the existing
+        replace behaviour is unchanged. A missing price must not silently stop entries.
+        """
+        # An operator-supplied revalidator wins when one is wired; otherwise the
+        # self-contained stop check below is what decides.
+        revalidate = getattr(self, "entry_revalidator", None)
+        if callable(revalidate):
+            try:
+                if revalidate(trade) is False:
+                    return False
+            except Exception as exc:
+                logger.debug(f"Entry revalidation unavailable for {trade.id}: {exc}")
+
+        try:
+            mark = float(getattr(trade, "current_price", 0.0) or 0.0)
+            stop = float(
+                getattr(trade, "current_stop", 0.0)
+                or getattr(trade, "trailing_stop", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            return True
+        if mark <= 0 or stop <= 0:
+            return True
+        # Options here are always long premium, so a breach is always downward.
+        if str(getattr(trade, "inst_type", "") or "").upper() == "OPT":
+            return mark > stop
+        if str(getattr(trade, "direction", "LONG") or "LONG").upper() in {"LONG", "BUY"}:
+            return mark > stop
+        return mark < stop
+
+    def _abandon_invalidated_entry(self, trade: Trade) -> None:
+        """Close a cancelled entry that is no longer worth filling."""
+        trade.status = "CLOSED"
+        trade.pending_execution = False
+        trade.execution_status = "REJECTED"
+        trade.exit_reason = "SIGNAL_INVALIDATED"
+        trade.exit_time = datetime.now(IST)
+        trade.exit_price = trade.entry_price
+        trade.execution_error = (
+            "Stale entry cancelled and NOT replaced: the mark had already passed the "
+            "stop, so a market fill would have opened a losing position"
+        )
+        with self._lock:
+            if self.open_trades.pop(trade.id, None) is trade:
+                self.closed_trades.append(trade)
+        logger.warning(
+            f"Abandoned stale entry for {trade.trading_symbol}: price moved past the "
+            "stop while the limit rested, so it was not force-filled at market."
+        )
+
     def _release_margin_reservations(self, reservation_ids) -> None:
         """Hand back margin an entry definitively did not consume.
 
@@ -2109,6 +2170,13 @@ class TradeManager:
                                 cancelled = None
                         else:
                             cancelled = self.broker.cancel_order(trade.broker_order_id, "NORMAL")
+                        if cancelled is True and not self._stale_entry_still_worth_filling(trade):
+                            # The cancel is PROVEN, so nothing is resting and nothing
+                            # will fill. Replacing it with a MARKET order here would
+                            # guarantee entry into a setup that has already failed.
+                            self._abandon_invalidated_entry(trade)
+                            changed = True
+                            continue
                         if cancelled is True:
                             entry_side = (
                                 "BUY"
