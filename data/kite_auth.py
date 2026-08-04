@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -25,6 +26,59 @@ from typing import Any, Dict, Optional
 
 import pytz
 from loguru import logger
+
+# ── force Kite traffic onto IPv4 ────────────────────────────────────────────
+# Kite validates the TCP source address against the app's allowed-IP list and refuses
+# EVERY order from an address that is not on it, while leaving reads working — so the
+# failure looks like "the strategy stopped trading", not "the network is wrong".
+#
+# This machine has both families, and api.kite.trade resolves to IPv6 FIRST, so orders
+# left on the IPv6 address (2026-08-04: three signals dead, 12:36-12:38). A whitelisted
+# IPv4 does not cover that. Worse, an IPv6 egress is usually a PRIVACY/temporary address
+# that the OS rotates on its own schedule, so it cannot be usefully whitelisted at all.
+#
+# Pinning only the Kite hostnames keeps every other integration (Fyers, Yahoo) untouched.
+_KITE_IPV4_ONLY_HOSTS = {"api.kite.trade", "kite.zerodha.com", "kite.trade"}
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+_IPV4_PIN_INSTALLED = False
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0 and str(host or "").lower() in _KITE_IPV4_ONLY_HOSTS:
+        family = socket.AF_INET
+    return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+def pin_kite_to_ipv4(enabled: bool = True) -> bool:
+    """Make Kite calls leave on IPv4 so one whitelistable address is used. Idempotent."""
+    global _IPV4_PIN_INSTALLED
+    if not enabled or _IPV4_PIN_INSTALLED:
+        return _IPV4_PIN_INSTALLED
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    _IPV4_PIN_INSTALLED = True
+    logger.info(
+        "Kite API pinned to IPv4 so orders leave on the address you can whitelist "
+        "(an IPv6 egress is typically a rotating privacy address and cannot be)."
+    )
+    return True
+
+
+def current_egress_ip(family: str = "v4", timeout: float = 4.0) -> str:
+    """This machine's public address as a server sees it, or "" when unavailable.
+
+    Kite reports the address it saw only inside a refusal, which means the first time you
+    learn the whitelist is stale is when an order has already been rejected. This lets the
+    readiness gate say so before the session starts.
+    """
+    import urllib.request
+
+    url = "https://api4.ipify.org" if family == "v4" else "https://api6.ipify.org"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace").strip()
+    except Exception as exc:
+        logger.debug(f"Egress {family} lookup unavailable: {exc}")
+        return ""
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -91,6 +145,16 @@ class KiteAuth:
         self.api_key = str(api_key or "").strip()
         self._api_secret = str(api_secret or "").strip()
         self.token_file = Path(token_file or "kite_token.json")
+        # Installed before any KiteConnect client exists, so the very first call — the
+        # login itself — already leaves on the whitelistable address.
+        try:
+            from config.settings import get_settings
+
+            pin_kite_to_ipv4(
+                bool(getattr(get_settings(), "kite_force_ipv4", True))
+            )
+        except Exception as exc:
+            logger.debug(f"Could not pin Kite to IPv4: {exc}")
         self._kite = None
         self._auth_required = True
         self._auth_reason = "no Kite session yet"

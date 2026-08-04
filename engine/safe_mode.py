@@ -168,6 +168,27 @@ def validate_real_mode_readiness(
     except Exception:
         pass
 
+    # Whitelist drift. Kite refuses EVERY order from an unlisted source address while
+    # every read keeps working, so a read-only health check certifies nothing about
+    # placement — on 2026-08-04 three signals died before anyone learned the address had
+    # moved. Kite only names the address it saw inside a refusal, i.e. after an order is
+    # already lost, so check it here instead. Skipped entirely when kite_registered_ip is
+    # blank, which is the right setup for a dynamic connection with an empty console list.
+    try:
+        _registered = str(getattr(settings, "kite_registered_ip", "") or "").strip()
+        if _registered:
+            from data.kite_auth import current_egress_ip
+
+            _live_ip = current_egress_ip("v4")
+            if _live_ip and _live_ip != _registered:
+                warnings.append(
+                    f"this connection's public IPv4 is {_live_ip} but {_registered} is "
+                    "whitelisted for the Kite app - EVERY order will be refused until the "
+                    "developer console is updated (reads will keep working normally)"
+                )
+    except Exception:
+        pass
+
     token_warning = fyers_token_freshness_warning(now)
     if token_warning:
         if require_option_chains:

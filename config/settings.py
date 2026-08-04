@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     # is required once per trading day via /api/kite_login.
     kite_api_key: str = ""
     kite_api_secret: str = ""
+    # Kite checks the TCP source address against the app's allowed-IP list and refuses
+    # EVERY order from an address that is not on it, while READS keep working — so it
+    # presents as "the strategy stopped trading", not as a broken connection.
+    #
+    # This machine has both address families and api.kite.trade resolves to IPv6 first,
+    # so orders were leaving on the IPv6 address (2026-08-04, three signals dead). An
+    # IPv6 egress is normally a rotating privacy address, so it cannot be whitelisted in
+    # any durable way. Pinning Kite to IPv4 leaves exactly one address to manage.
+    kite_force_ipv4: bool = True
+    # The IPv4 address whitelisted on the Kite developer console. Set it and the readiness
+    # gate warns the moment this connection's real egress drifts off it — BEFORE a signal
+    # dies. Leave blank to skip the check (correct if the console's IP list is empty,
+    # which is the right setup for a dynamic home connection).
+    kite_registered_ip: str = ""
     kite_user_id: str = ""
     # Where the daily access token is cached. Kept out of .env because it rotates.
     kite_token_file: str = "kite_token.json"
