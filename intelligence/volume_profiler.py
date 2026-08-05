@@ -108,15 +108,35 @@ class VolumeProfiler:
             # The dead-feed case this guard exists for is still caught: nonzero_count >= 5
             # requires five measured bars in the active session, and a genuinely dead feed
             # has none. Looking one bar back only forgives the forming bar.
+            # Measure on the last bar that has actually FINISHED.
+            #
+            # The final bar is still forming unless a full interval has elapsed since it
+            # opened, and a partial bar compared against an average of complete bars
+            # understates the ratio by exactly the fraction of the bar that has not
+            # happened yet. Observed live: SENSEX 51 seconds into a 60-second bar read
+            # 3,112 against a 48,034 predecessor -- 0.09x on an ordinary tape, which the
+            # panel renders as "0.0x" after .toFixed(1). Every volume gate saw that same
+            # 0.09x and refused (2.5x power move, 1.6x thrust, 1.40x cascade, 1.05x scalp).
+            #
+            # An empty final bar is the same problem at its limit, so the zero check stays
+            # as a fallback for frames whose index carries no usable interval.
             recent_vol = current_vol
             measured_index = -1
-            if recent_vol <= 0 and len(volume) >= 2:
+            if len(volume) >= 2:
+                forming = False
                 try:
-                    recent_vol = float(volume.iloc[-2])
-                    measured_index = -2
-                except (IndexError, TypeError, ValueError):
-                    recent_vol = current_vol
-                    measured_index = -1
+                    interval = volume.index[-1] - volume.index[-2]
+                    now_ts = pd.Timestamp.now(tz=volume.index.tz)
+                    forming = (now_ts - volume.index[-1]) < interval
+                except (TypeError, ValueError, AttributeError):
+                    forming = False
+                if forming or current_vol <= 0:
+                    try:
+                        recent_vol = float(volume.iloc[-2])
+                        measured_index = -2
+                    except (IndexError, TypeError, ValueError):
+                        recent_vol = current_vol
+                        measured_index = -1
             volume_available = bool(nonzero_count >= 5 and recent_vol > 0)
             # Every RATIO below is measured against recent_vol for the same reason. Using
             # the forming bar made vol_ratio 0.0/avg = 0.0x, which is what the intel panel

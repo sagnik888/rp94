@@ -130,3 +130,73 @@ def test_a_dead_feed_reports_no_ratio_rather_than_a_fabricated_one():
     _avail, result = _available([0.0] * 12)
     assert result.get("available") is False
     assert float(result.get("volume_ratio", 0.0)) in (0.0, 1.0)
+
+
+# ── a PARTIALLY filled forming bar, which is the live case ───────────────────
+
+def _frame_with_forming_bar(volumes, partial, seconds_in=15, tz=None):
+    """Last bar opened `seconds_in` ago and holds only `partial` so far."""
+    n = len(volumes) + 1
+    end = pd.Timestamp.now(tz=tz).floor("min")
+    idx = pd.date_range(end - pd.Timedelta(minutes=n - 1), periods=n, freq="1min", tz=tz)
+    base = 24000 + np.arange(n) * 0.5
+    return pd.DataFrame(
+        {"open": base, "high": base + 4, "low": base - 4, "close": base + 2,
+         "volume": [float(v) for v in volumes] + [float(partial)],
+         "tick_count": [0.0] * n},
+        index=idx,
+    )
+
+
+def test_a_partially_filled_forming_bar_does_not_crush_the_ratio():
+    """The live defect. SENSEX: 51s into a 60s bar, 3,112 against a 48,034 predecessor.
+
+    That is 0.09x on an ordinary tape, which the panel renders as 0.0x after toFixed(1),
+    and which fails every volume gate. The zero-check added earlier never fired because
+    3,112 is not zero — the rule has to be COMPLETENESS, not emptiness.
+    """
+    steady = [700_000.0] * 20
+    result = VolumeProfiler().analyze(
+        _frame_with_forming_bar(steady, partial=175_000.0), "NIFTY"
+    )
+    assert result["available"] is True
+    ratio = float(result["volume_ratio"])
+    assert ratio > 0.8, (
+        f"ratio {ratio:.2f}x came from the quarter-filled forming bar, not the last "
+        "completed one"
+    )
+
+
+def test_a_completed_final_bar_is_still_the_one_measured():
+    """Nothing is skipped once the bar has actually finished."""
+    steady = [700_000.0] * 20
+    df = _frame_with_forming_bar(steady, partial=2_100_000.0)
+    df.index = df.index - pd.Timedelta(minutes=2)      # the last bar is long since closed
+    result = VolumeProfiler().analyze(df, "NIFTY")
+    assert float(result["volume_ratio"]) > 2.0, "ignored a genuine completed surge"
+
+
+def test_a_surge_on_the_previous_bar_is_reported_while_the_next_forms():
+    steady = [700_000.0] * 19 + [2_100_000.0]
+    result = VolumeProfiler().analyze(
+        _frame_with_forming_bar(steady, partial=50_000.0), "NIFTY"
+    )
+    assert float(result["volume_ratio"]) > 2.0
+
+
+def test_a_timezone_aware_index_is_handled():
+    """The live frames are IST-aware; a naive comparison would raise."""
+    steady = [700_000.0] * 20
+    result = VolumeProfiler().analyze(
+        _frame_with_forming_bar(steady, partial=175_000.0, tz="Asia/Kolkata"), "NIFTY"
+    )
+    assert result["available"] is True
+    assert float(result["volume_ratio"]) > 0.8
+
+
+def test_a_non_datetime_index_falls_back_to_the_zero_check():
+    """No usable interval means completeness cannot be judged; do not crash."""
+    df = _frame(LIVE + [0.0])
+    df = df.reset_index(drop=True)
+    result = VolumeProfiler().analyze(df, "NIFTY")
+    assert isinstance(result.get("volume_ratio"), (int, float))
