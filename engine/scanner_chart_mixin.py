@@ -458,6 +458,48 @@ class ScannerChartMixin:
         }
         return result
 
+    def _chart_cache_matches_candles(self, cached: Dict, instrument: str, timeframe: str) -> bool:
+        """Does the cached payload still end on the newest bar we hold?
+
+        _build_chart_from_cache rebuilds ONLY the active instrument+timeframe, so every
+        other chart's cache freezes the moment the operator switches away from it.
+        get_chart_snapshot's currency test asked whether a payload EXISTED and whether
+        the simulation_id matched — never whether the data was still true — and then
+        stamped the response `"timestamp": datetime.now()`. Switch to another index and
+        back and the chart renders bars from before the switch, presented as current.
+
+        The scan loop refreshes it on its next cycle, so this usually self-heals within
+        one cadence. It does not heal at all when the loop is stalled or the instrument
+        has dropped out of active_indices, which are exactly the moments an operator is
+        staring at the chart to work out what is wrong.
+        """
+        candles = getattr(self, "candles", None)
+        if candles is None:
+            return True
+        latest = None
+        reader = getattr(candles, "latest_candle_time", None)
+        if callable(reader):
+            latest = reader(instrument, timeframe)
+        else:
+            # Partial candle stores are a real pattern here (tests, replay harnesses).
+            df = candles.get_candles(instrument, timeframe)
+            if df is not None and len(df):
+                latest = df.index[-1]
+        if latest is None:
+            return True
+
+        bars = (cached.get("data") or {}).get("candles") or []
+        if not bars:
+            return False
+        try:
+            newest_shown = int(bars[-1].get("time") or 0)
+            ts = pd.Timestamp(latest)
+            ts = ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
+            return newest_shown >= int(ts.timestamp())
+        except (TypeError, ValueError, AttributeError):
+            # Cannot compare: rebuilding is the cheap, safe answer.
+            return False
+
     def get_chart_snapshot(self, instrument: str = "NIFTY", timeframe: str = "5min") -> Dict[str, Any]:
         """Switch and return the active chart payload for dashboard tab changes."""
         valid_instruments = set(self.config.get("indices", {}).keys())
@@ -485,6 +527,7 @@ class ScannerChartMixin:
             isinstance(cached, dict)
             and cached.get("data")
             and int(cached.get("simulation_id") or 0) == int(getattr(self, "simulation_id", 0) or 0)
+            and self._chart_cache_matches_candles(cached, instrument, timeframe)
         )
 
         if cache_is_current:

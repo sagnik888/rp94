@@ -426,6 +426,26 @@ class CandleBuilder:
                 df = None
             return df.copy() if df is not None else None
 
+    def latest_candle_time(self, instrument: str, timeframe: str):
+        """Timestamp of the newest bar, without copying the frame.
+
+        get_candles() copies everything it returns, which is right for callers that
+        read the data but wasteful for one that only needs to know whether anything
+        has changed since it last looked.
+        """
+        with self._lock:
+            if timeframe == "1min":
+                df = self._candles_1min.get(instrument)
+            elif timeframe == "5min":
+                df = self._candles_5min.get(instrument)
+            elif timeframe == "15min":
+                df = self._candles_15min.get(instrument)
+            else:
+                return None
+            if df is None or len(df) == 0:
+                return None
+            return df.index[-1]
+
     def get_candle_count(self, instrument: str, timeframe: str) -> int:
         """Get number of candles available"""
         df = self.get_candles(instrument, timeframe)
