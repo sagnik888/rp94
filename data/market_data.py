@@ -28,27 +28,17 @@ from data.market_source_health import build_market_source_snapshot, build_source
 from data.kite_market_data import KiteDataSource
 from engine.option_history_store import get_option_history_store
 from trading.api_rate_limiter import get_shared_api_limiter, get_shared_history_limiter
-from trading.secure_logging import install_smartapi_log_redaction, redact_sensitive_text
+from trading.secure_logging import redact_sensitive_text
 
-try:
-    import pyotp
-    from SmartApi import SmartConnect
-    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-    install_smartapi_log_redaction()
-    try:
-        import logzero
-        logzero.logger.setLevel(logging.CRITICAL)
-    except Exception as exc:
-        logger.debug(f"logzero logger level adjustment skipped: {exc}")
-    HAS_SMARTAPI = True
-except ImportError as e:
-    import traceback
-    with open("import_err.log", "a") as f:
-        f.write("FATAL IMPORT ERROR: " + str(e) + "\n")
-        f.write(traceback.format_exc())
-    SmartConnect = None
-    SmartWebSocketV2 = None
-    HAS_SMARTAPI = False
+# The AngelOne SDK import that used to sit here is gone. SmartConnect and
+# SmartWebSocketV2 were imported into module globals and never used to construct
+# anything: self.smart_api is set to None in __init__ and never reassigned, so every
+# legacy Angel path is already unreachable behind `self.smart_api is not None`.
+# HAS_SMARTAPI was written twice and read nowhere.
+#
+# Keeping it meant the RETIRED broker's SDK stayed a hard runtime dependency of the live
+# data layer, and a missing package wrote a FATAL IMPORT ERROR file at startup for a
+# broker this system no longer trades through.
 
 YAHOO_TICKERS = {
     "NIFTY": "^NSEI",

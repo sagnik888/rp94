@@ -384,7 +384,11 @@ def test_live_clock_skew_blocks_entries_and_requirements_are_reproducible(monkey
     requirements = Path("requirements.txt").read_text(encoding="utf-8")
     assert "\x00" not in requirements
     assert ">=" not in requirements
-    assert "smartapi-python==1.5.5" in requirements
+    # The retired broker's SDK was removed on 2026-08-05. It was pinned solely so a dead
+    # import in data/market_data.py would resolve; that import constructed nothing and is
+    # gone, so the pin would now install a package no code can reach.
+    assert "smartapi-python" not in requirements
+    assert "kiteconnect==5.2.1" in requirements
     assert Path(".python-version").read_text(encoding="utf-8").strip() == "3.13.9"
 
 
