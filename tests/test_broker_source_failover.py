@@ -42,6 +42,9 @@ def test_source_health_keeps_yahoo_idle_when_main_brokers_are_fresh(monkeypatch)
     provider.is_connected = True
     provider.smart_api = object()
     provider.fyers = object()
+    # _last_angel_ws_tick is a retired field nothing reads; "main brokers fresh" has to
+    # be stated on the socket that actually feeds Kite health.
+    provider._last_kite_ws_tick = now
     provider._last_angel_ws_tick = now
     provider._last_fyers_ws_tick = now
 
@@ -49,6 +52,7 @@ def test_source_health_keeps_yahoo_idle_when_main_brokers_are_fresh(monkeypatch)
 
     assert health["kite"] is True
     assert health["fyers"] is True
+    assert health["kite_stream_stalled"] is False
     assert health["broker_degraded"] is False
     assert health["all_brokers_unavailable"] is False
     assert health["yahoo_mode"] == "idle_standby"

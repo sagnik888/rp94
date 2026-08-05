@@ -732,6 +732,16 @@ class ScannerTelemetryMixin:
             add_issue("scan_latency_high", "Scan latency high", "warn", round(last_latency, 0))
         if bool(sources.get("broker_degraded")):
             add_issue("broker_degraded", "Broker degraded", "warn")
+        if bool(sources.get("kite_stream_stalled")):
+            # Distinct from broker_degraded on purpose: the Kite session can be perfectly
+            # healthy for ORDERS while the tick stream has gone quiet, and the operator
+            # needs to see which of the two is actually wrong.
+            add_issue(
+                "kite_stream_stalled",
+                "Kite ticks stalled" if sources.get("kite_data_fresh") else "Kite feed silent",
+                "warn" if sources.get("kite_data_fresh") else "critical",
+                sources.get("kite_tick_age_seconds"),
+            )
         if bool(sources.get("all_brokers_unavailable")):
             add_issue("brokers_down", "All brokers unavailable", "critical")
 

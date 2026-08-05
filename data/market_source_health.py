@@ -26,7 +26,30 @@ def build_source_health(
     kite_health = bool(provider.is_connected)
     fyers_available = provider.fyers is not None and not provider._fyers_auth_required
     fyers_health = bool(fyers_available and (fyers_fresh if is_live else True))
-    all_brokers_unavailable = bool(is_live and not kite_health and not fyers_health)
+
+    # "Can we place an order" and "are we still receiving prices" are two questions, and
+    # only the first one was ever asked. is_connected is set to `auth.kite is not None`
+    # at connect time and never revoked, so kite_health is effectively a constant True
+    # for the life of the process: broker_degraded could only ever fire on the Fyers
+    # half, and all_brokers_unavailable — the preflight BLOCKER that arms the Yahoo
+    # emergency path — required `not kite_health` and therefore could not fire at all.
+    # kite_age was computed and reported for exactly this and then read by nobody.
+    #
+    # So the data question is asked separately here. A stalled websocket is not
+    # necessarily a dead feed (the REST LTP path keeps serving), which is why a recent
+    # REST fill still counts as fresh, and why none of this touches kite_health itself.
+    kite_stream_stalled = bool(
+        is_live and (kite_age is None or kite_age >= freshness_threshold)
+    )
+    kite_rest_age = _newest_source_age(getattr(provider, "_ltp_cache", None), "kite", now)
+    kite_data_fresh = bool(
+        not is_live
+        or not kite_stream_stalled
+        or (kite_rest_age is not None and kite_rest_age < freshness_threshold)
+    )
+    all_brokers_unavailable = bool(
+        is_live and not (kite_health and kite_data_fresh) and not fyers_health
+    )
     yahoo_mode = (
         "emergency_used"
         if all_brokers_unavailable and provider._yahoo_request_count
@@ -36,9 +59,14 @@ def build_source_health(
     return {
         "kite": kite_health,
         "kite_tick_age_seconds": round(kite_age, 2) if kite_age is not None else None,
+        "kite_stream_stalled": kite_stream_stalled,
+        "kite_data_fresh": kite_data_fresh,
+        "kite_rest_age_seconds": round(kite_rest_age, 2) if kite_rest_age is not None else None,
         "fyers": fyers_health,
         "fyers_tick_age_seconds": round(fyers_age, 2) if fyers_age is not None else None,
-        "broker_degraded": bool(is_live and not (kite_health and fyers_health)),
+        "broker_degraded": bool(
+            is_live and not (kite_health and kite_data_fresh and fyers_health)
+        ),
         "all_brokers_unavailable": all_brokers_unavailable,
         "fyers_auth_required": provider._fyers_auth_required,
         "fyers_auth_reason": provider._fyers_auth_reason,
@@ -54,11 +82,27 @@ def build_source_health(
     }
 
 
+def _newest_source_age(cache: Any, source: str, now_ts: float) -> Optional[float]:
+    """Age of the freshest LTP this source filled, or None if it has filled none."""
+    if not isinstance(cache, Mapping):
+        return None
+    youngest: Optional[float] = None
+    for value in cache.values():
+        if not isinstance(value, dict) or str(value.get("source") or "") != source:
+            continue
+        age = _age_seconds(value, now_ts)
+        if age is not None and (youngest is None or age < youngest):
+            youngest = age
+    return youngest
+
+
 def _age_seconds(value: Any, now_ts: float) -> Optional[float]:
     try:
         timestamp = value.get("time") if isinstance(value, dict) else None
         if isinstance(timestamp, datetime):
-            return max(0.0, time.time() - timestamp.timestamp())
+            # now_ts, not time.time(): every other age here honours the injected clock,
+            # and this branch silently ignoring it made the datetime path untestable.
+            return max(0.0, now_ts - timestamp.timestamp())
         if timestamp:
             return max(0.0, now_ts - float(timestamp))
     except Exception:

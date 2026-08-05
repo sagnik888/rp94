@@ -29,6 +29,7 @@ def test_source_health_uses_injected_clock_at_freshness_boundary():
     provider = _provider()
     provider.is_connected = True
     provider.fyers = object()
+    provider._last_kite_ws_tick = 999.0
     provider._last_fyers_ws_tick = 955.0
 
     health = build_source_health(provider, now_ts=1000.0, freshness_threshold=45.0)
@@ -38,6 +39,27 @@ def test_source_health_uses_injected_clock_at_freshness_boundary():
     assert health["broker_degraded"] is True
     assert health["all_brokers_unavailable"] is False
     assert health["yahoo_mode"] == "idle_standby"
+
+
+def test_a_live_token_alone_no_longer_keeps_the_emergency_path_shut():
+    """The Kite half of this used to be `is_connected`, which is never revoked.
+
+    Same fixture as above minus the Kite tick: a valid token, nothing arriving on
+    either socket, no REST fill. That is genuinely no live price source, and it used
+    to report all_brokers_unavailable=False — leaving the preflight blocker and the
+    Yahoo emergency path unreachable for the life of the process.
+    """
+    provider = _provider()
+    provider.is_connected = True
+    provider.fyers = object()
+    provider._last_fyers_ws_tick = 955.0
+
+    health = build_source_health(provider, now_ts=1000.0, freshness_threshold=45.0)
+
+    assert health["kite"] is True            # orders would still go through
+    assert health["kite_stream_stalled"] is True
+    assert health["kite_data_fresh"] is False
+    assert health["all_brokers_unavailable"] is True
 
 
 def test_snapshot_keeps_only_kite_fresh_data_entry_eligible():
