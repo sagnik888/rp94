@@ -24393,7 +24393,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             from config.settings import get_settings
             settings = get_settings()
             if getattr(settings, "ut_intel_early_exit", False):
-                intel_result = self._get_trade_intel(trade)
+                # allow_blocking=False means "you are on the 100ms scanner event loop".
+                # It was threaded to the premium fetch and stopped there, so this call
+                # went on recomputing the full intelligence bundle -- measured at 48ms
+                # with a 40-strike chain -- inside a 100ms budget, every time the cache
+                # expired. Read the cache on the fast path and let the next unhurried
+                # pass do the work; an early exit that waits one cycle is not worse than
+                # a scanner loop that misses its cadence.
+                intel_result = (
+                    self._get_trade_intel(trade)
+                    if allow_blocking
+                    else self._cached_timeframe_intel(
+                        str(getattr(trade, "instrument", "") or "").upper(),
+                        str(getattr(trade, "timeframe", "5min") or "5min").lower(),
+                        allow_fallback=True,
+                    )
+                )
                 if intel_result:
                     # is_losing uses live unrealized for 2-vote OI/PCR (gap2).
                     reversal_reason = self._intel_reversal_reason(
