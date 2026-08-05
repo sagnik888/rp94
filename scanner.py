@@ -6613,6 +6613,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "expiry_aligned": expiry_aligned,
         }
 
+    def _intel_analysis_ttl_seconds(self) -> float:
+        """How long a computed intelligence bundle stays usable.
+
+        Deliberately NOT intelligence_cache_ttl_seconds. That one is a network budget —
+        the option chain is a broker round trip — and the analysis stacked on top is
+        candle math over an already-cached chain. Sharing one number meant the cheap
+        thing inherited the expensive thing's staleness, so the evidence behind an entry
+        could be 90 seconds old on a setup that trades 1-minute bars.
+
+        Falls back to the chain TTL when unset so an older .env keeps its old behaviour
+        rather than silently getting a 3x busier scanner.
+        """
+        settings = get_settings()
+        try:
+            value = float(getattr(settings, "intelligence_analysis_ttl_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        try:
+            return float(getattr(settings, "intelligence_cache_ttl_seconds", 90.0) or 90.0)
+        except (TypeError, ValueError):
+            return 90.0
+
     def _get_option_chain_cached(self, name: str, cfg: Dict, force: bool = False, allow_fetch: bool = True) -> Tuple[pd.DataFrame, Dict]:
         settings = get_settings()
         ttl = float(getattr(settings, "intelligence_cache_ttl_seconds", 30.0))
@@ -6861,7 +6885,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             tf = "5min"
         cache_key = self._timeframe_intel_key(name, tf)
         now_val = float(now if now is not None else time.time())
-        ttl = float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 90.0) or 90.0)
+        ttl = self._intel_analysis_ttl_seconds()
         cached = self._cached_timeframe_intel(name, tf, allow_fallback=False)
         cached_time = float(getattr(self, "_intel_cache_time", {}).get(cache_key, 0.0) or 0.0)
         if cached is not None and self._intel_result_cacheable(cached) and now_val - cached_time <= ttl:
@@ -9174,7 +9198,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self._last_vol_alert_time[name] = now
 
         # Use background-cached intel if fresh enough (avoids redundant heavy computation)
-        intel_ttl = getattr(get_settings(), 'intelligence_cache_ttl_seconds', 90.0)
+        intel_ttl = self._intel_analysis_ttl_seconds()
         cached_intel = self._cached_timeframe_intel(name, "5min", allow_fallback=False)
         cached_intel_time = getattr(self, '_intel_cache_time', {}).get(self._timeframe_intel_key(name, "5min"), 0) or getattr(self, '_intel_cache_time', {}).get(name, 0)
         regime_history_ready = self._regime_history_ready(candle_5min)
@@ -11266,13 +11290,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ):
                 r_mult = float(getattr(settings, "fifteen_min_choppy_scalp_profit_lock_r_multiple", 0.20) or 0.20)
             if risk > 0 and r_mult > 0:
-                min_peak = max(min_peak, min(risk * r_mult, 3000.0))
+                min_peak = max(min_peak, min(risk * r_mult, Scanner._profit_lock_arm_cap_rs(self, trade_like)))
         elif self._setting_enabled(getattr(settings, "let_winners_run", True), True):
             r_mult = normal_r_mult
             if risk > 0 and r_mult > 0:
                 # Delay only the small-tier lock; never past the major-win threshold
                 # (>= Rs.3000), so a big win is always protected by MAJOR_WIN_GUARD.
-                min_peak = max(min_peak, min(risk * r_mult, 3000.0))
+                min_peak = max(min_peak, min(risk * r_mult, Scanner._profit_lock_arm_cap_rs(self, trade_like)))
         # EOD-proximity (Fix 2): within the square-off window a trade cannot run to
         # 1R, so collapse the arm to a small peak so protection engages in time
         # instead of letting a winner round-trip until the forced EOD kill.
@@ -11284,6 +11308,43 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             eod_arm = max(eod_min, risk * eod_r) if risk > 0 else eod_min
             min_peak = min(min_peak, eod_arm)
         return min_peak
+
+    def _profit_lock_arm_cap_rs(self, trade_like=None) -> float:
+        """Ceiling on how late the profit lock may arm, in rupees.
+
+        Hardcoded Rs.3000, matching the ladder's major-win rung so a big win is always
+        protected. It is an absolute figure applied to a position of any size, so a
+        10-lot trade arms its lock at the same Rs.3000 peak as a 1-lot trade -- a tenth
+        of the move, in R terms, before protection starts tightening.
+
+        It scales per lot under the SAME switch that already makes the ladder read per
+        lot. One flag, one coherent basis: turning per-lot on and leaving this absolute
+        would put the arming threshold and the tier it feeds on different scales.
+        """
+        base = 3000.0
+        settings = get_settings()
+        if not Scanner._setting_enabled(
+            getattr(settings, "profit_lock_per_lot_basis", False), False
+        ):
+            return base
+        counter = getattr(self, "_profit_lock_lot_count", None)
+        lots = counter(trade_like, 0) if callable(counter) else Scanner._profit_lock_lot_count(trade_like, 0)
+        return base * float(max(1, lots))
+
+    def _profit_lock_ratio_ceiling(self) -> float:
+        """Most of a peak the ladder may lock, as a fraction.
+
+        Bounded to [0.50, 0.99]. 1.0 is deliberately unreachable: it places the floor on
+        the peak price itself, which the next tick breaches by definition, so the lock
+        stops trailing anything and becomes a fixed take-profit.
+        """
+        try:
+            value = float(
+                getattr(get_settings(), "profit_lock_max_ratio", 0.95) or 0.95
+            )
+        except (TypeError, ValueError):
+            value = 0.95
+        return max(0.50, min(0.99, value))
 
     def _profit_lock_floor(
         self,
@@ -11343,9 +11404,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # floor below is derived from it -- dividing that by the lot count would understate
         # every floor rather than just moving the trade to a different tier.
         if ladder_pnl >= 3000.0:
-            # Major wins tighten from 90% at Rs.3000 toward full peak protection
-            # at Rs.5000+. Cap at 100%; a ratio above peak is not executable.
-            lock_ratio = min(1.0, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
+            # Major wins tighten from 90% at Rs.3000 toward the ceiling at Rs.5000+.
+            #
+            # That ceiling used to be 1.0, and a ratio of exactly 1.0 puts the floor ON
+            # the peak price. Price has to come off the peak for any later tick to exist,
+            # so the floor is breached by the first one: the ladder stopped being a
+            # trailing lock and became a hard take-profit at Rs.5000. It also contradicts
+            # this function's own docstring, which promises the runner keeps trailing
+            # above Rs.3000. Trend options already dodged it via
+            # option_major_win_trend_lock_ratio_cap (0.95); everything else did not.
+            #
+            # It gets worse with size, which is where this is heading. At 10 NIFTY lots
+            # (750 qty) Rs.5000 of peak is under Rs.7 of premium movement -- every decent
+            # winner would be closed almost as soon as it started working.
+            ceiling = self._profit_lock_ratio_ceiling()
+            lock_ratio = min(ceiling, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
         elif ladder_pnl >= 2000.0:
             lock_ratio = 0.80 + 0.10 * (ladder_pnl - 2000.0) / 1000.0
         elif ladder_pnl >= 1000.0:
@@ -13697,6 +13770,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "fast_body_threshold": fast_body_threshold,
                 "fast_close_threshold": fast_close_threshold,
                 "median_range": median_range,
+                # median_range is measured on THIS frame, which is the index, so callers
+                # that want it as a fraction need the price it was measured against.
+                # Dividing it by an option premium instead is off by roughly 100x.
+                "reference_price": float(closes.iloc[-1]),
             }
         )
         if tf != "1min":
@@ -14831,7 +14908,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "SENSEX": 4.0,
             "MIDCPNIFTY": 5.0,
         }.get(str(getattr(trade_like, "instrument", "") or "").upper(), 4.5)
-        observed_bps = (median_range / current_price) * 10000.0 if median_range > 0 and current_price > 0 else baseline_bps
+        # median_range is measured on the INDEX candles, so the bps denominator has to be
+        # the index too. It used to be current_price, which for an option is the PREMIUM:
+        # ~20 index points over a Rs.217 premium reads as 919 bps against a 4 bps
+        # baseline, so volatility_ratio pinned to its 3.0 ceiling on EVERY option trade.
+        # Pinned there, extra_minutes was always the full 10 and retention_floor always
+        # the loosest 68% — the "volatility-adjusted" stagnation exit did no adjusting at
+        # all for the instrument type this system actually trades.
+        reference_price = float(context.get("reference_price", 0.0) or 0.0)
+        if reference_price <= 0:
+            reference_price = float(getattr(trade_like, "entry_spot", 0.0) or 0.0)
+        if reference_price <= 0:
+            reference_price = current_price
+        observed_bps = (
+            (median_range / reference_price) * 10000.0
+            if median_range > 0 and reference_price > 0
+            else baseline_bps
+        )
         volatility_ratio = max(0.5, min(3.0, observed_bps / baseline_bps))
         extra_minutes = max(0.0, min(max_extra, (volatility_ratio - 1.0) * 5.0))
         if str(regime or "").upper() in {"VOLATILE", "CHOPPY", "MEAN_REVERTING"}:

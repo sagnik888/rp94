@@ -1170,6 +1170,23 @@ class Settings(BaseSettings):
     trade_product_type: Literal["CARRYFORWARD"] = "CARRYFORWARD"
     live_filter_leniency_pct: float = 0.0 # Keep live gates strict; loosen only during deliberate diagnostics
     intelligence_cache_ttl_seconds: float = 90.0 # Option-chain cache TTL for live intelligence
+    # How long a COMPUTED intelligence bundle stays usable. This used to be the line
+    # above, which is a network budget: the option chain is a broker round trip, so
+    # re-fetching it every few seconds is wasteful and 90s is right for it. The analysis
+    # on top is candle math against an already-cached chain, and it was inheriting the
+    # network's budget for no reason — leaving the evidence behind an entry decision up
+    # to 90 seconds old, which on a 1min setup is a bar and a half.
+    # Measured: 48ms per instrument-timeframe with a 40-strike chain, 17ms without. Only
+    # the pair actually being read recomputes, not all twelve. At 30s that is well under
+    # 1% duty. Lower it if you want fresher evidence and can spare the CPU; a genuinely
+    # per-tick bundle is not on the table (all twelve pairs is ~580ms).
+    intelligence_analysis_ttl_seconds: float = 30.0
+    # Ceiling on the profit-retention ladder, as a fraction of peak P&L. The major-win
+    # rung used to run to 1.0 at a Rs.5000 peak, which places the protective floor ON the
+    # peak price — breached by the very next tick, so the "trailing lock" became a fixed
+    # take-profit at Rs.5000. Bounded to [0.50, 0.99] in code; 1.0 is not selectable.
+    # Matters more as size grows: at 10 NIFTY lots Rs.5000 is under Rs.7 of premium.
+    profit_lock_max_ratio: float = 0.95
     auto_option_chain_min_strikes: int = 3 # Minimum fresh active-expiry strikes required for OPT Auto
     vix_percentile_min_sessions: int = 20 # Minimum daily India VIX observations before volatility routing is trusted
     vix_live_cache_seconds: float = 60.0 # Avoid repeated India VIX REST calls across index scans

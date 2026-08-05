@@ -121,7 +121,15 @@ def test_smart_profit_lock_tier_boundaries():
     assert ratio(2000.0) == 0.80          # tier3 floor
     assert ratio(2334.0) == pytest.approx(0.8334, abs=1e-4)
     assert ratio(3000.0) == 0.90          # major-win floor
-    assert ratio(5000.0) == 1.00          # full peak lock cap
+    # The major-win rung used to run to 1.00 here. A ratio of exactly 1.00 puts the
+    # protective floor ON the peak price, and price must leave the peak for a later tick
+    # to exist — so the floor is breached by the first one and the trailing lock becomes
+    # a fixed take-profit at Rs.5000. test_option_trend_major_win_cap_keeps_nifty_pe_
+    # runner_breathing below already patched this for trend options via a 0.95 cap; the
+    # ceiling now applies to everything.
+    assert ratio(5000.0) == 0.95
+    assert ratio(50000.0) == 0.95         # and it stays a lock, however large the win
+    assert ratio(4000.0) == 0.95          # the ramp reaches the ceiling early and holds
 
 
 def test_option_trend_major_win_cap_keeps_nifty_pe_runner_breathing():
