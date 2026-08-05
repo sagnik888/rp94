@@ -204,6 +204,29 @@ class VolumeProfiler:
             ratio_basis = "TIME_OF_DAY" if tod_confident else "ROLLING_AVG"
             if is_proxy:
                 ratio_basis = f"TICK_{ratio_basis}"
+            # ── diagnostic for an implausibly low ratio ──
+            # A live feed reading near-zero is the symptom that has now been chased three
+            # times from stale CSV dumps, whose trailing rows are always partial and so
+            # cannot show what the running process actually saw. Emit the profiler's real
+            # INPUTS when the ratio is low enough to fail every gate, throttled per
+            # instrument so it cannot flood a session.
+            if volume_available and vol_ratio < 0.25:
+                marker = f"{instrument}|{int(now_bucket)}" if (now_bucket := len(volume) // 5) else instrument
+                if getattr(self, "_last_low_ratio_marker", None) != marker:
+                    self._last_low_ratio_marker = marker
+                    try:
+                        tail = [round(float(x)) for x in volume.iloc[-6:]]
+                        stamps = [str(t)[-8:] for t in volume.index[-3:]]
+                    except Exception:
+                        tail, stamps = [], []
+                    logger.warning(
+                        f"VOLUME RATIO LOW {instrument}: ratio={vol_ratio:.3f}x "
+                        f"measured_bar={measured_index} measured_vol={measured_vol:,.0f} "
+                        f"last_bar={current_vol:,.0f} avg={avg_vol:,.0f} "
+                        f"nonzero={nonzero_count} src={metric_source} "
+                        f"tail={tail} stamps={stamps}"
+                    )
+
             is_surge = bool(volume_available and effective_ratio > 1.5)
             surge_level = "EXTREME" if effective_ratio > 3.0 else ("HIGH" if effective_ratio > 2.0 else ("MODERATE" if effective_ratio > 1.5 else "NORMAL"))
             if not volume_available:
