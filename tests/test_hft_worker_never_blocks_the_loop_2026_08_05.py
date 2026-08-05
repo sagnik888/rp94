@@ -1,0 +1,157 @@
+"""The 100ms trade monitor must not make an HTTPS call on the scanner event loop.
+
+_background_hft_worker calls _update_active_trades() synchronously every 100ms ON the
+scanner's asyncio loop. _get_live_premium_cached falls through to two blocking calls when
+the websocket cache misses -- a Fyers option chain and a Kite REST LTP -- and the premium
+cache TTL is 2s, so per open OPT trade with a stale contract quote those fired every
+couple of seconds on the loop that also runs the 1s scan cycle AND services every
+dashboard _call_on_scanner_loop.
+
+Observed live on 2026-08-05: repeated `api_chart -> _call_on_scanner_loop -> TimeoutError`
+after the 5s ceiling, plus "Error in periodic trades updater: TimeoutError". This is the
+400ms -> 5000ms regression pattern returning by a different route.
+
+The fix is the one already used for the index-volume refresh: memory-only on the hot path,
+HTTPS dispatched off-thread, throttled per token, stamped only once dispatch is certain.
+"""
+import threading
+import time
+
+import pytest
+
+from scanner import Scanner
+
+
+class _Data:
+    def __init__(self, latency=0.0):
+        self.latency = latency
+        self.blocking_calls = []
+
+    def get_cached_contract_ltp(self, exchange, symbol, token, max_age_seconds=10.0):
+        return 0.0                      # force the fallback path
+
+    def subscribe_tokens(self, tokens, exchange_type=2):
+        return None
+
+    def get_ltp(self, exchange, symbol, token):
+        # Record the THREAD, not just the call. A refresh running on a worker thread is
+        # exactly what we want; the same call on the caller's thread is the stall.
+        self.blocking_calls.append((threading.current_thread().name, symbol))
+        time.sleep(self.latency)
+        return 210.0
+
+
+class _Trade:
+    def __init__(self):
+        self.symbol_token = "16858626"
+        self.trading_symbol = "NIFTY2680524500CE"
+        self.instrument = "NIFTY"
+        self.entry_price = 200.0
+        self.inst_type = "OPT"
+        self.id = "TH1"
+
+
+def _scanner(latency=0.0):
+    s = Scanner.__new__(Scanner)
+    s.data = _Data(latency)
+    s._premium_cache = {}
+    s._premium_refresh_guard = threading.Lock()
+    s._premium_refresh_inflight = set()
+    s._premium_refresh_at = {}
+    s.market_info = {}
+    s._option_premium_quote_plausible = lambda t, p: True
+    s._contract_quote_age_seconds = lambda t, n: 0.0
+    s._get_option_chain_premium = lambda t, max_age_seconds=10.0: 0.0
+    s._log_stale_option_premium_once = lambda *a, **k: None
+    s._log_bad_option_premium_once = lambda *a, **k: None
+    return s
+
+
+def test_the_hot_path_makes_no_blocking_call_on_its_own_thread():
+    """This is the whole point: no HTTPS on the thread running the event loop.
+
+    A refresh on a worker thread is the intended behaviour, so the assertion is about
+    WHICH thread made the call, not whether one happened at all.
+    """
+    scanner = _scanner()
+    caller = threading.current_thread().name
+    result = scanner._get_live_premium_cached(_Trade(), allow_blocking=False)
+    assert result is None, "returned a premium it could only have blocked to obtain"
+    time.sleep(0.4)
+    on_caller = [c for c in scanner.data.blocking_calls if c[0] == caller]
+    assert on_caller == [], (
+        f"made {len(on_caller)} blocking call(s) on the scanner loop thread"
+    )
+    assert scanner.data.blocking_calls, "no refresh happened at all"
+
+
+def test_the_hot_path_returns_promptly_even_with_a_slow_broker():
+    """A 2s Fyers round-trip must not become a 2s stall on the event loop."""
+    scanner = _scanner(latency=2.0)
+    started = time.monotonic()
+    scanner._get_live_premium_cached(_Trade(), allow_blocking=False)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2, f"hot path took {elapsed:.2f}s — that is a loop stall"
+
+
+def test_the_hot_path_dispatches_a_refresh_off_thread():
+    scanner = _scanner(latency=0.1)
+    trade = _Trade()
+    scanner._get_live_premium_cached(trade, allow_blocking=False)
+    time.sleep(0.5)
+    assert scanner.data.blocking_calls, "no refresh was ever dispatched"
+    assert scanner._premium_cache.get(trade.symbol_token), (
+        "the off-thread refresh did not populate the cache the hot path reads"
+    )
+
+
+def test_the_refreshed_premium_is_served_from_cache_next_pass():
+    scanner = _scanner(latency=0.1)
+    trade = _Trade()
+    scanner._get_live_premium_cached(trade, allow_blocking=False)
+    time.sleep(0.5)
+    before = len(scanner.data.blocking_calls)
+    assert scanner._get_live_premium_cached(trade, allow_blocking=False) == 210.0
+    assert len(scanner.data.blocking_calls) == before, "hit the broker again on a cache hit"
+
+
+def test_one_contract_is_not_refreshed_concurrently():
+    scanner = _scanner(latency=0.3)
+    trade = _Trade()
+    for _ in range(6):
+        scanner._get_live_premium_cached(trade, allow_blocking=False)
+    time.sleep(0.8)
+    assert len(scanner.data.blocking_calls) == 1, (
+        f"{len(scanner.data.blocking_calls)} concurrent refreshes for one contract"
+    )
+
+
+def test_a_failing_refresh_releases_its_slot():
+    """Otherwise one exception blocks that contract from ever refreshing again."""
+    scanner = _scanner()
+
+    def boom(exchange, symbol, token):
+        raise RuntimeError("fyers down")
+
+    scanner.data.get_ltp = boom
+    trade = _Trade()
+    scanner._get_live_premium_cached(trade, allow_blocking=False)
+    time.sleep(0.4)
+    assert trade.symbol_token not in scanner._premium_refresh_inflight
+
+
+def test_the_blocking_path_still_works_for_the_scan_cycle():
+    """The 1s scan keeps the authoritative fetch; only the 100ms path is restricted."""
+    scanner = _scanner()
+    assert scanner._get_live_premium_cached(_Trade(), allow_blocking=True) == 210.0
+    assert scanner.data.blocking_calls, "the authoritative path stopped fetching"
+
+
+def test_the_hft_worker_asks_for_the_non_blocking_variant():
+    """Pins the call site — the flag is worthless if the worker does not pass it."""
+    import inspect
+
+    src = inspect.getsource(Scanner._background_hft_worker)
+    assert "_update_active_trades(allow_blocking=False)" in src, (
+        "the 100ms worker is back to the blocking call"
+    )

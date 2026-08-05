@@ -463,6 +463,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._chain_quality_cache: Dict[str, Dict] = {}
         self._last_chain_fetch: Dict[str, float] = {}
         self._premium_cache: Dict[str, Dict] = {}
+        # Off-thread premium refresh, same shape as the index-volume refresh: the
+        # 100ms trade monitor must never make an HTTPS call on the scanner loop.
+        self._premium_refresh_guard = threading.Lock()
+        self._premium_refresh_inflight: set = set()
+        self._premium_refresh_at: Dict[str, float] = {}
         self._pre_candle_predictions: Dict[str, Dict[str, Any]] = {}
         self._pre_candle_prediction_last_log: Dict[str, str] = {}
         self._pre_candle_option_probe: Dict[str, Dict[str, float]] = {}
@@ -4912,7 +4917,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         logger.info("âš¡ HFT Trade Monitor Started (100ms loop)")
         while self.is_running:
             try:
-                self._update_active_trades()
+                # allow_blocking=False: this runs on the scanner EVENT LOOP every
+                # 100ms, and a blocking Fyers chain or Kite LTP here stalls the 1s
+                # scan cycle and every dashboard _call_on_scanner_loop with it
+                # (observed as api_chart TimeoutError after 5s). The 1s scan path
+                # below still does the authoritative fetch.
+                self._update_active_trades(allow_blocking=False)
                 await asyncio.sleep(0.1) # 100ms check loop
             except Exception as e:
                 logger.error(f"Error in HFT worker: {e}")
@@ -7332,7 +7342,54 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         side = "BUY" if direction == "LONG" else "SELL"
         return bool(is_trending_regime(regime) and regime_aligns(regime, side))
 
-    def _get_live_premium_cached(self, trade) -> Optional[float]:
+    def _request_premium_refresh(self, trade) -> None:
+        """Refresh one contract's premium OFF the scanner loop.
+
+        Mirrors the index-volume refresh, and for the same reason: the caller runs on the
+        event loop, so a blocking Fyers chain plus a Kite REST LTP there stalls the scan
+        cycle and every dashboard call marshalled onto that loop. Throttled per token, and
+        the throttle is stamped only once a dispatch is certain -- stamping before the
+        in-flight check is what starved three of four index volume refreshes.
+        """
+        key = str(getattr(trade, "symbol_token", "") or "")
+        if not key:
+            return
+        now = time.time()
+        try:
+            ttl = float(getattr(get_settings(), "option_premium_cache_ttl_seconds", 2.0) or 2.0)
+        except Exception:
+            ttl = 2.0
+        if now - float(self._premium_refresh_at.get(key, 0.0) or 0.0) < max(1.0, ttl):
+            return
+        with self._premium_refresh_guard:
+            if key in self._premium_refresh_inflight:
+                return
+            self._premium_refresh_inflight.add(key)
+            self._premium_refresh_at[key] = now
+        try:
+            threading.Thread(
+                target=self._premium_refresh_worker,
+                args=(trade, key),
+                name=f"premium-{getattr(trade, 'trading_symbol', key)}",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            with self._premium_refresh_guard:
+                self._premium_refresh_inflight.discard(key)
+            logger.debug(f"Premium refresh dispatch failed for {key}: {exc}")
+
+    def _premium_refresh_worker(self, trade, key: str) -> None:
+        try:
+            # The blocking path, run where blocking is harmless. It populates
+            # _premium_cache, so the next 100ms pass reads it for free.
+            self._get_live_premium_cached(trade, allow_blocking=True)
+        except Exception as exc:
+            logger.debug(f"Premium refresh failed for {key}: {exc}")
+        finally:
+            with self._premium_refresh_guard:
+                self._premium_refresh_inflight.discard(key)
+
+    def _get_live_premium_cached(self, trade, allow_blocking: bool = True) -> Optional[float]:
         if not getattr(trade, "symbol_token", "") or not getattr(trade, "trading_symbol", ""):
             return None
         settings = get_settings()
@@ -7386,6 +7443,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(trade, "quote_source", "contract_ws_cache")
                 setattr(trade, "quote_verified", True)
                 return price
+
+        # Everything above is memory-only. Everything below makes an HTTPS call, so on
+        # the 100ms trade-monitor path it is dispatched off-thread instead: the caller
+        # gets no premium THIS pass and a fresh one within a couple of seconds, rather
+        # than the whole event loop waiting on Fyers.
+        if not allow_blocking:
+            self._request_premium_refresh(trade)
+            return None
 
         # An exact active-expiry Fyers chain is the next live source. It must be
         # attempted before the synchronous Angel REST endpoint.
@@ -23938,7 +24003,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 when=self._last_exit_time.get(instrument),
             )
 
-    def _update_active_trades(self):
+    def _update_active_trades(self, allow_blocking: bool = True):
         self._reset_daily_counters()
         for tid, trade in list(self.trades.open_trades.items()):
             # Skip closed / already-latched manual exits (prevents PEAK/exit spam)
@@ -23958,7 +24023,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             real_fut_price = None
             is_fut_trade = getattr(trade, "inst_type", "FUT") == "FUT"
             if getattr(trade, "inst_type", "FUT") == "OPT":
-                real_premium = self._get_live_premium_cached(trade)
+                real_premium = self._get_live_premium_cached(trade, allow_blocking=allow_blocking)
             elif is_fut_trade:
                 real_fut_price = self._get_live_fut_ltp_cached(trade)
             
