@@ -96,7 +96,25 @@ class VolumeProfiler:
             # cannot qualify today's source.  The latest bar must also contain a
             # positive observation; otherwise 0.0x is a data gap, not a neutral
             # market measurement.
-            volume_available = bool(nonzero_count >= 5 and current_vol > 0)
+            #
+            # "Latest" means the last bar that has actually had a chance to trade.
+            # Index volume is a CUMULATIVE total and the candle stores the delta, so a
+            # bar that is still forming legitimately reads 0 for the first ticks of every
+            # minute. Testing only volume.iloc[-1] therefore reported the whole feed
+            # unavailable for part of EVERY minute — which is what showed zero on all four
+            # indices in the intel panel while the candles behind it held 700k+ of real
+            # volume, and what starved both the confidence score and the exit volume test.
+            #
+            # The dead-feed case this guard exists for is still caught: nonzero_count >= 5
+            # requires five measured bars in the active session, and a genuinely dead feed
+            # has none. Looking one bar back only forgives the forming bar.
+            recent_vol = current_vol
+            if recent_vol <= 0 and len(volume) >= 2:
+                try:
+                    recent_vol = float(volume.iloc[-2])
+                except (IndexError, TypeError, ValueError):
+                    recent_vol = current_vol
+            volume_available = bool(nonzero_count >= 5 and recent_vol > 0)
             volume_for_stats = volume.loc[active_mask]
 
             # ── Intraday Daily VWAP (Resets every day at 09:15) ──
