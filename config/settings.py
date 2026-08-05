@@ -1281,6 +1281,16 @@ class Settings(BaseSettings):
     # Default False: the measured edge against clean signals was NOT significant
     # (39% vs 50% win rate, median -151, N=56, p=0.21), so this is a deliberate opt-in.
     stabilization_override_drop_regime_flip: bool = False
+    # Refuse a LONG while a SHORT is live on the same index (and vice versa). The rest of
+    # the concurrency guard reasons about timeframe, lane, instrument type and count and
+    # never once about DIRECTION, so with ut_concurrency_guard off the only limit on
+    # holding both sides is max_trades_per_index. Options here are always BOUGHT, so a
+    # long CE beside a long PE is two premiums and two spreads with theta against both —
+    # a straddle assembled by accident from two signals that each looked fine alone.
+    # Default ON: a reversal that arrives AFTER the first trade exits is untouched, and a
+    # deliberately armed leg (pullback hedge, dual-lane reversal) is exempt. Turn it off
+    # only to deliberately run both sides of an index at once.
+    block_opposite_direction_stack: bool = True
     # Read the profit-retention ladder PER LOT instead of in absolute rupees. Its tiers
     # (500 / 1000 / 2000 / 3000) were tuned on single-lot trades, so on 3 lots a Rs.3000
     # peak — Rs.1000 per lot, a modest win — lands on the Rs.3000 MAJOR_WIN_GUARD rung and

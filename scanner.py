@@ -5430,12 +5430,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ui_data["error"] = reason
         return ui_data, []
 
-    def _live_utbot_signal_still_present(self, candidate: TradeCandidate, sig_timestamp) -> bool:
-        """True when the UT1 signal with the same timestamp still matches this candidate."""
-        cached_res = self._cached_results.get(f"{candidate.instrument}_{candidate.timeframe}") or {}
+    def _repaint_signal_status(self, candidate: TradeCandidate, sig_timestamp) -> str:
+        """Why the buffered arrow no longer matches — not merely THAT it does not.
+
+        The two ways to fail are not the same evidence and must not earn the same
+        treatment:
+
+          VANISHED — nothing prints at that timestamp any more. The indicator has
+                     WITHDRAWN its claim, so the momentum override is allowed to ask
+                     whether the market still supports the trade on its own merits.
+          FLIPPED  — a signal is still there, but it now prints the OPPOSITE side.
+                     That is evidence AGAINST the trade, not an absence of evidence,
+                     and no amount of confirming context makes a BUY correct while
+                     the source says SELL on the very same bar.
+
+        UNKNOWN covers "cannot tell": no cached scan yet, or no timestamp to match on.
+        Callers treat it like VANISHED, which is what this code has always done.
+        """
+        if sig_timestamp is None:
+            return "UNKNOWN"
+        # getattr, not attribute access: partial scanners are a real pattern here, and a
+        # missing cache is exactly the "cannot tell" case this function already names.
+        cache = getattr(self, "_cached_results", None) or {}
+        cached_res = cache.get(f"{getattr(candidate, 'instrument', '')}_{getattr(candidate, 'timeframe', '')}") or {}
         signals = list(cached_res.get("signals") or [])
-        if not signals or sig_timestamp is None:
-            return False
+        if not signals:
+            return "UNKNOWN"
 
         target_type = getattr(candidate, "source_signal_type", None) or ("BUY" if candidate.direction == "LONG" else "SELL")
         # Repaint stabilization is identity-only: original timestamp + type.
@@ -5453,13 +5473,73 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         if not match_sig:
             # The signal at this timestamp has disappeared (repainted)
-            return False
+            return "VANISHED"
 
         # Verify the type/direction still matches. Price is intentionally ignored.
-        if getattr(match_sig, "signal_type", None) != target_type:
-            return False
+        found_type = str(getattr(match_sig, "signal_type", "") or "").upper()
+        if found_type != str(target_type or "").upper():
+            return "FLIPPED" if found_type in {"BUY", "SELL"} else "VANISHED"
 
-        return True
+        return "PRESENT"
+
+    def _live_utbot_signal_still_present(self, candidate: TradeCandidate, sig_timestamp) -> bool:
+        """True when the UT1 signal with the same timestamp still matches this candidate."""
+        return self._repaint_signal_status(candidate, sig_timestamp) == "PRESENT"
+
+    def _evict_superseded_opposite_buffer(self, candidate: TradeCandidate, sig_timestamp) -> None:
+        """Drop an older buffered arrow when the same chart prints the other way.
+
+        The pending buffer is keyed by instrument+timeframe+DIRECTION, so a LONG and a
+        SHORT on the same chart occupy two independent slots and each runs its own
+        stabilization timer. Nothing evicts the loser. A stale LONG whose bar has since
+        turned bearish can therefore mature and enter alongside the fresh SHORT — and
+        because options are always BOUGHT here, that is a long CE and a long PE opened
+        minutes apart, paying two premiums and two spreads on one chart, with theta
+        working against both. Nobody decided to put that straddle on.
+
+        Only an OLDER arrow is evicted. If the incoming one is the stale side, the
+        repaint gate rejects it on its own terms and this stays out of the way.
+        """
+        instrument = getattr(candidate, "instrument", "")
+        timeframe = getattr(candidate, "timeframe", "")
+        direction = str(getattr(candidate, "direction", "") or "").upper()
+        opposite = "SHORT" if direction == "LONG" else "LONG" if direction == "SHORT" else ""
+        if not opposite:
+            return
+        stale_key = f"{instrument}_{timeframe}_{opposite}"
+        stale = (getattr(self, "_pending_live_signals", None) or {}).get(stale_key)
+        if not stale:
+            return
+
+        new_ts = self._naive_ist_time(sig_timestamp)
+        old_ts = self._naive_ist_time(stale.get("sig_timestamp"))
+        if new_ts is not None and old_ts is not None and old_ts > new_ts:
+            # The buffered arrow is the NEWER one; let it run its own timer.
+            return
+
+        self._pending_live_signals.pop(stale_key, None)
+        self._diag_inc("stabilization", "evicted_opposite")
+        stale_candidate = stale.get("candidate")
+        logger.warning(
+            f"[STABILIZATION] Evicting buffered {opposite} for {instrument} {timeframe}: "
+            f"the same chart now prints {direction}."
+        )
+        self.log_event(
+            f"Buffered {opposite} signal dropped for {instrument} {timeframe}: superseded by "
+            f"a {direction} arrow on the same chart.",
+            "warning",
+        )
+        if stale_candidate is not None:
+            try:
+                self._rtracker_record_candidate(
+                    stale_candidate,
+                    decision="REJECTED",
+                    reason=f"Superseded by an opposite {direction} arrow on the same chart",
+                    source="stabilization_opposite_evict",
+                )
+                self._forget_signal_display_rows(stale_candidate)
+            except Exception:
+                logger.debug("Opposite-buffer eviction bookkeeping failed", exc_info=True)
 
     def _live_signal_candle_has_closed(
         self,
@@ -10921,6 +11001,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return None
         signal_type = self._repaint_signal_type(candidate)
         signal_ts = sig_timestamp or getattr(candidate, "signal_timestamp", None)
+        if self._repaint_signal_status(candidate, signal_ts) == "FLIPPED":
+            # The bar now prints the OPPOSITE arrow. This override exists to rescue a
+            # signal whose evidence went QUIET, not one the source has contradicted:
+            # every branch below asks "does context still support this side", and the
+            # weakest of them (regime_flip, 49% of all re-admissions) asks only whether
+            # a slow-moving regime label happens to agree. A regime label lags the bar
+            # that just flipped, so without this check the override re-admits a BUY at
+            # the exact moment UT1 switched to SELL — and at the post-entry site it
+            # HOLDS a live position open against the printed reversal.
+            return None
         late_reclaim_ctx = self._late_session_reclaim_context(
             getattr(candidate, "instrument", ""),
             getattr(candidate, "timeframe", ""),
@@ -20449,6 +20539,61 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._apply_dual_lane_size_fraction(candidate, reason)
         return True, reason
 
+    def _opposite_direction_stack_block(self, candidate, existing: List[Any]) -> str:
+        """Reason to refuse a LONG while a SHORT is live on the same index, or vice versa.
+
+        Every other branch of the concurrency guard reasons about timeframe, lane,
+        instrument type and count — not one of them looks at DIRECTION. With
+        ut_concurrency_guard off (the live setting) the guard short-circuits to True
+        after the per-index cap, so the only thing standing between the book and a
+        NIFTY long CE sitting next to a NIFTY long PE is max_trades_per_index=10.
+
+        That pairing is not a hedge. Options here are always BOUGHT, so it is two
+        premiums, two spreads and theta bleeding both legs, assembled by accident out
+        of two independent signals that each looked fine alone. A real hedge is armed
+        deliberately against a specific runner and is exempted below.
+
+        Reversals are NOT blocked: an opposite signal that arrives after the first
+        trade exits sees an empty `existing` and passes untouched. This only refuses
+        holding both sides AT THE SAME TIME.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "block_opposite_direction_stack", True), True
+        ):
+            return ""
+        direction = str(getattr(candidate, "direction", "") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return ""
+        # A deliberately armed leg is the one case where holding both sides is the intent
+        # rather than an accident. rare_burst_entry belongs here too: it already demands
+        # A+ grade, ~95%+ confidence, high ADX, a volume burst AND all-index regime
+        # agreement, so it is the system saying the whole market just turned. Refusing
+        # that entry because two stale legs have not stopped out yet would forfeit the
+        # best trade of the move to protect the worst.
+        for flag in (
+            "pullback_hedge_leg", "hedge_leg", "dual_lane_entry",
+            "opposite_leg_entry", "rare_burst_entry",
+        ):
+            if bool(getattr(candidate, flag, False)):
+                return ""
+        for item in existing or []:
+            if bool(getattr(item, "is_ghost", False)):
+                continue
+            for flag in ("pullback_hedge_leg", "hedge_leg", "opposite_leg_entry"):
+                if bool(getattr(item, flag, False)):
+                    break
+            else:
+                item_direction = str(getattr(item, "direction", "") or "").upper()
+                if item_direction in {"LONG", "SHORT"} and item_direction != direction:
+                    return (
+                        f"opposite {direction} while {item_direction} is live on "
+                        f"{str(getattr(item, 'instrument', '') or '').split()[0]} "
+                        f"({getattr(item, 'timeframe', '?')}) — both sides at once is a "
+                        "straddle nobody armed"
+                    )
+        return ""
+
     def _prepare_candidate_for_concurrency(self, candidate: TradeCandidate) -> bool:
         """Per-index concurrency guard.
 
@@ -20530,6 +20675,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 f"{candidate.instrument}: {dual_reason}."
             )
             return True
+
+        opposite_block = self._opposite_direction_stack_block(candidate, existing)
+        if opposite_block:
+            return _block(opposite_block)
 
         # Cascade multi-TF stack: allow 1m+5m+15m (and dual TFs) on the same
         # index without forced FUT/OPT complement. Cap already applied above.
@@ -22529,6 +22678,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     }
                     pending_changed = True
                     self._diag_inc("stabilization", "buffered")
+                    self._evict_superseded_opposite_buffer(c, sig_timestamp)
                     stable_seconds, min_stable_scans, adaptive_stability = self._live_signal_stabilization_requirements(c)
                     scan_note = f" and {min_stable_scans} stable scans" if adaptive_stability and min_stable_scans > 1 else ""
                     logger.info(f"[STABILIZATION] Buffering {c.direction} signal for {c.instrument} {c.timeframe} for {stable_seconds:.0f}s{scan_note}...")
@@ -22589,7 +22739,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self._diag_inc("stabilization", "waiting_fresh_scan_after_restart")
                     continue
 
-                still_present = self._live_utbot_signal_still_present(c, sig_timestamp)
+                repaint_status = self._repaint_signal_status(c, sig_timestamp)
+                still_present = repaint_status == "PRESENT"
 
                 if not still_present:
                     override_ctx = self._stabilization_repaint_override_context(c, sig_timestamp)
@@ -22612,20 +22763,41 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             "trade",
                         )
                     else:
-                        self._diag_inc("stabilization", "discarded_repaint")
+                        flipped = repaint_status == "FLIPPED"
+                        self._diag_inc(
+                            "stabilization",
+                            "discarded_flipped" if flipped else "discarded_repaint",
+                        )
+                        what = (
+                            f"UT1 arrow FLIPPED to the opposite side after {elapsed:.1f}s"
+                            if flipped
+                            else f"UT1 arrow vanished after {elapsed:.1f}s"
+                        )
                         logger.warning(
-                            f"[STABILIZATION] Rejected {c.instrument} {c.timeframe} {c.direction}: "
-                            f"UT1 arrow vanished after {elapsed:.1f}s."
+                            f"[STABILIZATION] Rejected {c.instrument} {c.timeframe} {c.direction}: {what}."
                         )
                         self.log_event(
-                            f"Signal rejected: {c.instrument} {c.timeframe} {c.direction} "
-                            f"repainted during the {stable_seconds:.0f}s stabilization window.",
+                            (
+                                f"Signal rejected: {c.instrument} {c.timeframe} {c.direction} "
+                                f"flipped to the opposite side during the {stable_seconds:.0f}s "
+                                "stabilization window; the momentum override does not apply to a reversal."
+                            )
+                            if flipped
+                            else (
+                                f"Signal rejected: {c.instrument} {c.timeframe} {c.direction} "
+                                f"repainted during the {stable_seconds:.0f}s stabilization window."
+                            ),
                             "warning",
                         )
                         self._rtracker_record_candidate(
                             c,
                             decision="REJECTED",
-                            reason=f"Repainted during {stable_seconds:.0f}s stabilization window",
+                            reason=(
+                                f"Flipped to the opposite side during {stable_seconds:.0f}s "
+                                "stabilization window"
+                                if flipped
+                                else f"Repainted during {stable_seconds:.0f}s stabilization window"
+                            ),
                             source="stabilization_repaint_gate",
                         )
                         self._forget_signal_display_rows(c)
