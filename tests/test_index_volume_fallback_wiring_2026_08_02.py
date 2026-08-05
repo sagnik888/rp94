@@ -545,7 +545,10 @@ def test_frozen_fyers_total_does_not_block_the_futures_fallback_forever():
     p._index_cum_volume_source = {"NIFTY": "fyers_index"}
     p._index_cum_volume_at = {"NIFTY": 1_000_000.0}      # stamped long ago
     p._index_futures_volume_at = {}
-    p._index_volume_refresh_lock = threading.Lock()
+    # Per-index in-flight tracking replaced the single global lock, which starved
+    # three of four indices; see test_index_volume_refresh_is_per_index_2026_08_05.
+    p._index_volume_refresh_guard = threading.Lock()
+    p._index_volume_refresh_inflight = set()
     p.kite = None
 
     dispatched = []
@@ -568,7 +571,10 @@ def test_the_tick_path_never_blocks_on_broker_rest():
     p._index_cum_volume_source = {}
     p._index_cum_volume_at = {}
     p._index_futures_volume_at = {}
-    p._index_volume_refresh_lock = threading.Lock()
+    # Per-index in-flight tracking replaced the single global lock, which starved
+    # three of four indices; see test_index_volume_refresh_is_per_index_2026_08_05.
+    p._index_volume_refresh_guard = threading.Lock()
+    p._index_volume_refresh_inflight = set()
 
     def _slow(symbol):
         time.sleep(2.0)

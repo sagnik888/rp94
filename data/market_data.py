@@ -234,7 +234,10 @@ class MarketDataProvider:
         self._index_cum_volume_at: Dict[str, float] = {}
         self._index_futures_volume_at: Dict[str, float] = {}
         # One in-flight volume refresh at a time; the tick thread never waits on it.
-        self._index_volume_refresh_lock = threading.Lock()
+        # Per-index in-flight set, guarded by a short-lived mutex. A single global lock
+        # here starved three of four indices; see _request_index_volume_refresh.
+        self._index_volume_refresh_guard = threading.Lock()
+        self._index_volume_refresh_inflight: set = set()
         # Cached tick-callback arity; see _emit_index_tick.
         self._tick_callback_ref = None
         self._tick_callback_takes_source: Optional[bool] = None
@@ -1787,15 +1790,30 @@ class MarketDataProvider:
         return carried, source
 
     def _request_index_volume_refresh(self, index_name: str, now_ts: float) -> None:
-        """Throttled, off-thread refresh of the cumulative index volume."""
+        """Throttled, off-thread refresh of the cumulative index volume.
+
+        Serialised PER INDEX, not globally. The four indices tick within the same
+        instant, and a single shared lock meant the first to arrive won while the other
+        three failed a non-blocking acquire — having ALREADY stamped their throttle, so
+        they would not try again for another 15s, lose the same race, and repeat.
+        Measured with a realistic REST latency, that left 1 of 4 indices ever refreshing;
+        the rest carried a cumulative volume of zero all session, which is what set
+        volume_available=false everywhere and starved both the entry confidence score and
+        the exit volume test.
+
+        The stamp is therefore taken only once a dispatch is certain. Burning the window
+        on a refresh that never ran is what turned a lost race into a dead feed.
+        """
         last_try = float(self._index_futures_volume_at.get(index_name, 0.0) or 0.0)
         if now_ts - last_try < self.INDEX_FUTURES_VOLUME_REFRESH_SECONDS:
             return
-        # Stamp BEFORE dispatching, so a slow or failing refresh cannot be re-dispatched
-        # on every subsequent tick.
-        self._index_futures_volume_at[index_name] = now_ts
-        if not self._index_volume_refresh_lock.acquire(blocking=False):
-            return
+        with self._index_volume_refresh_guard:
+            if index_name in self._index_volume_refresh_inflight:
+                # Already refreshing this index; leave its throttle untouched so the next
+                # tick after it completes can legitimately ask again.
+                return
+            self._index_volume_refresh_inflight.add(index_name)
+            self._index_futures_volume_at[index_name] = now_ts
         try:
             threading.Thread(
                 target=self._refresh_index_volume_worker,
@@ -1804,7 +1822,8 @@ class MarketDataProvider:
                 daemon=True,
             ).start()
         except Exception as exc:
-            self._index_volume_refresh_lock.release()
+            with self._index_volume_refresh_guard:
+                self._index_volume_refresh_inflight.discard(index_name)
             logger.debug(f"Index volume refresh dispatch failed for {index_name}: {exc}")
 
     def _refresh_index_volume_worker(self, index_name: str) -> None:
@@ -1819,7 +1838,8 @@ class MarketDataProvider:
         except Exception as exc:
             logger.debug(f"Index activity fallback failed for {index_name}: {exc}")
         finally:
-            self._index_volume_refresh_lock.release()
+            with self._index_volume_refresh_guard:
+                self._index_volume_refresh_inflight.discard(index_name)
 
     def get_index_activity(self, symbol: str) -> Dict[str, Any]:
         """Index participation, with a broker cross-check and a broker fallback.
