@@ -304,6 +304,24 @@ def validate_real_mode_readiness(
             "market-open handoff window: REAL is armed; trade execution remains market/session gated"
         )
 
+    # A setting written into .env that nothing reads is worse than a missing feature: it
+    # reads as a control that is working. ut_correlated_core_limit=2 says "maximum
+    # simultaneous same-direction NIFTY/BANKNIFTY/SENSEX exposures" and the guard actually
+    # allows 6. Say so at startup rather than letting a dead knob look live.
+    try:
+        from config.inert_settings import configured_but_inert, env_keys_from_file
+
+        inert = configured_but_inert(env_keys_from_file())
+        if inert:
+            warnings.append(
+                f"{len(inert)} setting(s) in .env have no consumer and do nothing: "
+                + ", ".join(name for name, _why in inert[:6])
+                + (f", +{len(inert) - 6} more" if len(inert) > 6 else "")
+                + " (see config/inert_settings.py for what governs each instead)"
+            )
+    except Exception as exc:
+        warnings.append(f"inert-settings check unavailable: {exc}")
+
     return {
         "ok": not blockers,
         "blockers": blockers,
