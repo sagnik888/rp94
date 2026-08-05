@@ -5890,7 +5890,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # EOD Square-off monitoring (Always active if trades or manual signal rows exist)
         session_now = self._session_squareoff_clock()
         self._force_exit_session_candidates_at_eod(session_now)
-        if self.trades.open_trades:
+        # Orphans count as exposure here, not just local rows. An orphan makes
+        # can_open_trade refuse EVERY entry ("Broker-only orphan position requires
+        # reconciliation"), so on a day that starts with one — the first-start-of-day case
+        # the orphan sweep exists for — open_trades stays empty for the whole session and
+        # this gate never opens. check_session_end, and the orphan sweep at the end of it,
+        # would then never run: the position carries overnight in exactly the silence the
+        # sweep was written to end.
+        if self.trades.open_trades or getattr(self.trades, "orphan_positions", None):
             if self.mode != "HISTORICAL":
                 expired = self.trades.expire_stale_open_trades(now=session_now, reason="STALE_SESSION_END")
                 if expired:
@@ -13715,10 +13722,29 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
         ema21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1])
         slope = float(closes.iloc[-1] - closes.iloc[max(0, len(closes) - 4)])
+        # ema9/ema21 are computed from `closes`, which is the INDEX frame. current_price
+        # for an option trade is the PREMIUM — tens to low hundreds of rupees against an
+        # index in the tens of thousands. So `premium <= ema9` was unconditionally True
+        # for every PE and `premium >= ema9` unconditionally False for every CE: vote #1
+        # was a constant, not a measurement, on the only instrument this system trades.
+        #
+        # A free vote on every PE also makes trend_supportive (>= 1) permanently True,
+        # which makes `rejection_wick and not trend_supportive` and the `trend_votes == 0`
+        # arm of the big_reversal test dead code for PE trades — the strictest exits stop
+        # existing on exactly the side that most needs them. CE trades lose a vote they
+        # have earned and get cut on ordinary noise.
+        #
+        # Some callers already convert (they pass spot / entry_spot in as current_price);
+        # several do not. Rather than trust the caller, take the price on the same basis
+        # as the EMAs whenever the one handed in plainly is not.
+        trend_price = float(current_price or 0.0)
+        index_close = float(closes.iloc[-1])
+        if index_close > 0 and not (0.5 * index_close <= trend_price <= 1.5 * index_close):
+            trend_price = index_close
         if direction == "SHORT":
-            trend_votes = sum((float(current_price) <= ema9, ema9 <= ema21, slope <= 0))
+            trend_votes = sum((trend_price <= ema9, ema9 <= ema21, slope <= 0))
         else:
-            trend_votes = sum((float(current_price) >= ema9, ema9 >= ema21, slope >= 0))
+            trend_votes = sum((trend_price >= ema9, ema9 >= ema21, slope >= 0))
         trend_supportive = trend_votes >= 1
 
         # Classify small pullback vs big reversal for loss/profit guards.

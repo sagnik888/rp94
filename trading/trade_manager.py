@@ -2180,29 +2180,53 @@ class TradeManager:
             # how one ambiguous exit becomes two real ones.
             return False
         if trade.protective_order_id:
+            # Initialised BEFORE the try. `cancelled` used to be bound only by the call
+            # itself, so the refused-cancel path below fell through to `if not cancelled`
+            # with the name unbound and raised UnboundLocalError. check_session_end has no
+            # per-trade try, so that escaped the 15:25 force exit and took every remaining
+            # trade in the snapshot with it — and the orphan sweep after it. Reproduced.
+            cancelled = False
+            refused = False
             try:
-                cancelled = self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
+                cancelled = bool(
+                    self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
+                )
             except (BrokerOrderRejected, PermissionError) as exc:
                 # cancel_order takes the account lease and raises when it is held
-                # elsewhere. check_session_end has no per-trade try, so an escape here
-                # aborted the EOD flatten for every remaining trade in the snapshot.
-                # ensure_broker_protection was hardened against exactly this; this path
-                # was not.
+                # elsewhere. ensure_broker_protection was hardened against exactly this;
+                # this path was not.
                 # _withhold_flatten returns False once the operator's blocked-flatten
                 # deadline elapses ("stop withholding"). Discarding that logged
                 # "exiting anyway", set reversal_watch_required — and then did not exit.
+                refused = True
                 if self._withhold_flatten(
                     trade, f"{reason}; protective stop cancellation refused ({exc})"
                 ):
                     return False
-            if not cancelled:
+            if not cancelled and not refused:
+                # A refusal has already been through _withhold_flatten once; running it
+                # again here would double-count the block deadline for one failure.
                 if self._withhold_flatten(
                     trade,
                     f"{reason}; protective stop cancellation unconfirmed, market flatten "
                     "withheld to avoid over-exit",
                 ):
                     return False
-            trade.protective_order_id = ""
+            if cancelled:
+                trade.protective_order_id = ""
+            else:
+                # Past the deadline we flatten anyway, but the stop was never PROVEN gone.
+                # Clearing the id here is how an SL-M ends up owned by nobody: nothing
+                # scans closed trades for it, so when it later triggers it sells against a
+                # flat book — a naked written option in a product the broker will not
+                # square off. Keep the id and say so.
+                self._mark_recovery(
+                    trade,
+                    f"{reason}; flattened past the block deadline with protective stop "
+                    f"{trade.protective_order_id} UNCONFIRMED. It may still be resting — "
+                    "cancel it at the Zerodha terminal before it triggers against a flat "
+                    "book.",
+                )
         elif self._unowned_protective_stop_blocks_flatten(trade, reason):
             # Holding no stop id is NOT proof that no stop exists. A lost acknowledgement
             # leaves an SL-M resting that we never learned the id of; market-exiting on
@@ -2601,8 +2625,43 @@ class TradeManager:
             expected_qty = max(1, trade.quantity)
             if net_qty == 0:
                 if trade.protective_order_id:
-                    self.broker.cancel_order(trade.protective_order_id, "STOPLOSS")
-                    trade.protective_order_id = ""
+                    # This call used to be bare, and both halves of that were wrong.
+                    #
+                    # Unguarded: cancel_order takes the account lease and RAISES when a
+                    # second instance holds it, and there is no per-trade try in this
+                    # loop — so one throttled contract aborted the whole reconcile pass,
+                    # skipping every later trade AND the orphan-detection block below,
+                    # then did it again on every 5s tick for as long as the lease was held.
+                    #
+                    # Result discarded: cancel_order returns False on refusal, and the
+                    # next line cleared the id and closed the row anyway. The SL-M is then
+                    # owned by nobody — _trade_owning_protective_order and
+                    # _unowned_protective_stop_blocks_flatten only scan open_trades — so
+                    # when the premium later ticks through the trigger it SELLS against a
+                    # flat book: a naked written option in a product the broker will not
+                    # square off.
+                    stop_id = str(trade.protective_order_id)
+                    cleared = False
+                    try:
+                        cleared = bool(self.broker.cancel_order(stop_id, "STOPLOSS"))
+                    except (BrokerOrderRejected, PermissionError) as exc:
+                        logger.error(
+                            f"Protective stop {stop_id} cancel refused while closing "
+                            f"{trade.trading_symbol}: {exc}"
+                        )
+                    if cleared:
+                        trade.protective_order_id = ""
+                    else:
+                        self._alert_unowned_protective_stop(trade, stop_id)
+                # A GTT that survives this close fires later against a flat book with the
+                # same outcome. The flatten path releases it; this one never did.
+                if str(getattr(trade, "gtt_trigger_id", "") or ""):
+                    try:
+                        self._release_gtt_fallback(trade, "closing a flat position")
+                    except Exception as exc:
+                        logger.error(
+                            f"GTT release failed while closing {trade.trading_symbol}: {exc}"
+                        )
                 reason = (
                     trade.exit_reason
                     if trade.execution_status == "EXIT_PENDING" and trade.exit_reason
@@ -3921,6 +3980,22 @@ class TradeManager:
             if not flatten:
                 self._alert_orphan_left_open(symbol, quantity)
                 continue
+            # Latch BEFORE sending, once per symbol per session. check_session_end runs
+            # about once a second past the force-exit time, and orphan_positions is only
+            # refreshed by reconcile on its 5s loop — so an un-latched success path
+            # re-sends the same square-off four or five times before the book catches up.
+            # On a BOUGHT option that is a naked short in a product the broker will not
+            # square off, and once reconcile does update, the short is itself a
+            # broker-only position, so the next pass computes the opposite side and the
+            # loop oscillates, paying the spread each way.
+            # Latching before the call, not after, is deliberate: an order that raises may
+            # still have reached the exchange, and this file's rule everywhere else is
+            # that an unacknowledged exit is never re-sent blind.
+            if not hasattr(self, "_orphan_flatten_sent"):
+                self._orphan_flatten_sent = set()
+            if symbol in self._orphan_flatten_sent:
+                continue
+            self._orphan_flatten_sent.add(symbol)
             side = "SELL" if quantity > 0 else "BUY"
             try:
                 order_id = self.broker.close_order(
@@ -3945,6 +4020,27 @@ class TradeManager:
                 )
             else:
                 self._alert_orphan_left_open(symbol, quantity)
+
+    def _alert_unowned_protective_stop(self, trade, stop_id: str) -> None:
+        """A stop we could not prove cancelled, on a row about to leave open_trades.
+
+        Nothing scans closed trades for a protective order, so once the row is gone this
+        SL-M has no owner in the system. Only the operator can settle it, and they need
+        the id to do that. Throttled per order so the 5s reconcile loop cannot flood.
+        """
+        if not hasattr(self, "_unowned_stop_alerted"):
+            self._unowned_stop_alerted = set()
+        if stop_id in self._unowned_stop_alerted:
+            return
+        self._unowned_stop_alerted.add(stop_id)
+        message = (
+            f"UNOWNED STOP: {trade.trading_symbol} is flat at the broker and its row is "
+            f"closing, but protective order {stop_id} was NOT confirmed cancelled. If it "
+            "is still resting it will fire against a flat book and open a naked leg that "
+            "the broker will not square off. Cancel it at the Zerodha terminal."
+        )
+        logger.critical(message)
+        self._log_ui(message, "error")
 
     def _alert_orphan_left_open(self, symbol: str, quantity: int) -> None:
         """Say plainly that an unmanaged position is about to carry overnight."""
