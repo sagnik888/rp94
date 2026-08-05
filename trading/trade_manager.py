@@ -3888,6 +3888,81 @@ class TradeManager:
             else:
                 self.close_trade(tid, trade.current_price, "FORCE_EOD_KILL", exit_time=now)
 
+        self._handle_orphans_at_session_end(now)
+
+    def _handle_orphans_at_session_end(self, now: datetime) -> None:
+        """Broker positions this system did not open are NOT covered by the sweep above.
+
+        check_session_end iterates self.open_trades only, so a broker-only position — the
+        first-start-mid-session case, or a local row lost to a corrupted state file — is
+        detected by reconcile, blocks new entries, and is then carried OVERNIGHT. The
+        product is CARRYFORWARD/NRML precisely so the broker does not auto-square-off, so
+        nothing else is going to close it either.
+
+        Escalating is the default rather than flattening, because an orphan is not
+        necessarily ours: a position taken manually at the Zerodha terminal looks
+        identical from here, and squaring one off uninvited is worse than the exposure it
+        removes. force_exit_flattens_orphans lets an operator who never trades manually
+        opt into the sweep.
+        """
+        orphans = dict(getattr(self, "orphan_positions", {}) or {})
+        if not orphans:
+            return
+        from config.settings import get_settings
+
+        settings = get_settings()
+        flatten = _setting_enabled(
+            getattr(settings, "force_exit_flattens_orphans", False), False
+        )
+        for symbol, position in orphans.items():
+            quantity = self._position_quantity(position)
+            if not quantity:
+                continue
+            if not flatten:
+                self._alert_orphan_left_open(symbol, quantity)
+                continue
+            side = "SELL" if quantity > 0 else "BUY"
+            try:
+                order_id = self.broker.close_order(
+                    str(symbol), str(position.get("symboltoken") or position.get("instrument_token") or ""),
+                    abs(int(quantity)), side, self.product_type,
+                )
+            except (BrokerOrderRejected, PermissionError) as exc:
+                logger.critical(f"Orphan square-off refused for {symbol}: {exc}")
+                self._alert_orphan_left_open(symbol, quantity)
+                continue
+            except BrokerOrderAmbiguous as exc:
+                # May be live. Never re-send blind; the operator settles it.
+                logger.critical(
+                    f"Orphan square-off for {symbol} was not acknowledged ({exc}). It may "
+                    "be live — reconcile manually before sending another."
+                )
+                continue
+            if order_id:
+                logger.critical(
+                    f"Orphan {symbol} x{abs(int(quantity))} squared off at the session "
+                    f"force-exit: {order_id}"
+                )
+            else:
+                self._alert_orphan_left_open(symbol, quantity)
+
+    def _alert_orphan_left_open(self, symbol: str, quantity: int) -> None:
+        """Say plainly that an unmanaged position is about to carry overnight."""
+        if not hasattr(self, "_orphan_eod_alerted"):
+            self._orphan_eod_alerted = set()
+        if symbol in self._orphan_eod_alerted:
+            return
+        self._orphan_eod_alerted.add(symbol)
+        message = (
+            f"ORPHAN POSITION CARRYING OVERNIGHT: {symbol} x{abs(int(quantity))} is open "
+            "at the broker, was not opened by this system, and is NOT covered by the "
+            "force exit. CARRYFORWARD means the broker will not square it off either. "
+            "Close it manually, or set force_exit_flattens_orphans to have the session "
+            "end sweep it."
+        )
+        logger.critical(message)
+        self._log_ui(message, "error")
+
     def check_expiry_gamma_time_exit(self, current_time: Optional[datetime] = None):
         """Square off expiry-day current-expiry (gamma) OPTION trades at the configured
         gamma time-exit, so an expiring ATM never bleeds into the afternoon theta crush.

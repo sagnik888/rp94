@@ -1305,6 +1305,13 @@ class Settings(BaseSettings):
     # to profitable positions and to the reasons in Scanner._MARGINAL_EXIT_REASONS, and
     # bypassed entirely by every protective/loss/forced/expiry/broker/manual exit and by
     # an exchange stop that is already armed and crossed.
+    # Have the 15:25 force exit also square off BROKER-ONLY positions this system did not
+    # open. Off by default: an orphan may be a position taken manually at the Zerodha
+    # terminal, and squaring one off uninvited is worse than the exposure it removes.
+    # Left off, the session end escalates instead — the position still carries overnight,
+    # which CARRYFORWARD/NRML means the broker will not prevent either.
+    # Turn it on only if you never hold manual positions in this account.
+    force_exit_flattens_orphans: bool = False
     spread_aware_exit_enabled: bool = False
     spread_exit_deferral_min_spread_pct: float = 0.35   # below this the book is fine
     spread_exit_min_net_profit_rs: float = 250.0        # bid-side profit worth waiting for
