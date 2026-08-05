@@ -109,12 +109,22 @@ class VolumeProfiler:
             # requires five measured bars in the active session, and a genuinely dead feed
             # has none. Looking one bar back only forgives the forming bar.
             recent_vol = current_vol
+            measured_index = -1
             if recent_vol <= 0 and len(volume) >= 2:
                 try:
                     recent_vol = float(volume.iloc[-2])
+                    measured_index = -2
                 except (IndexError, TypeError, ValueError):
                     recent_vol = current_vol
+                    measured_index = -1
             volume_available = bool(nonzero_count >= 5 and recent_vol > 0)
+            # Every RATIO below is measured against recent_vol for the same reason. Using
+            # the forming bar made vol_ratio 0.0/avg = 0.0x, which is what the intel panel
+            # displayed on all four indices while the candles held real volume -- and 0.0x
+            # is not a neutral reading downstream: it fails every surge gate outright
+            # (2.5x power move, 1.6x thrust, 1.40x cascade, 1.05-1.10x scalps) and drags
+            # the volume component of the confidence score to its floor.
+            measured_vol = recent_vol if recent_vol > 0 else current_vol
             volume_for_stats = volume.loc[active_mask]
 
             # ── Intraday Daily VWAP (Resets every day at 09:15) ──
@@ -132,17 +142,21 @@ class VolumeProfiler:
             vwap_deviation = ((close.iloc[-1] - vwap_current) / vwap_current * 100) if vwap_current > 0 else 0
 
             # ── Volume Moving Average ──
-            current_idx = volume.index[-1]
+            # Anchored to the bar the ratio is MEASURED on. Taking the average at the
+            # last index while the numerator came from the one before it compares a bar
+            # against a window that includes the next bar's empty slot, which quietly
+            # inflates the ratio for part of every minute.
+            current_idx = volume.index[measured_index]
 
             vol_ma = volume_for_stats.rolling(20, min_periods=5).mean()
             avg_at_current = vol_ma.loc[current_idx] if current_idx in vol_ma.index else vol_ma.iloc[-1]
             if pd.isna(avg_at_current) or avg_at_current <= 0:
                 fallback_avg = volume_for_stats.tail(20).mean()
-                avg_vol = float(fallback_avg) if not pd.isna(fallback_avg) and fallback_avg > 0 else max(current_vol, 1.0)
+                avg_vol = float(fallback_avg) if not pd.isna(fallback_avg) and fallback_avg > 0 else max(measured_vol, 1.0)
             else:
                 avg_vol = float(avg_at_current)
 
-            vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+            vol_ratio = measured_vol / avg_vol if avg_vol > 0 else 1.0
 
             tod_avg = 0.0
             relative_volume_ratio = 1.0
@@ -160,7 +174,7 @@ class VolumeProfiler:
                     tod_source = same_slot_nonzero if len(same_slot_nonzero) >= 2 else same_slot_volume
                     tod_avg = float(tod_source.tail(10).mean())
                     if tod_avg > 0:
-                        relative_volume_ratio = current_vol / tod_avg
+                        relative_volume_ratio = measured_vol / tod_avg
                         volume_confidence = 65 if is_proxy else 75
 
             # ── Volume Surge Detection ──
@@ -259,7 +273,7 @@ class VolumeProfiler:
             return {
                 "vwap": round(vwap_current, 2),
                 "vwap_deviation_pct": round(float(vwap_deviation), 2),
-                "current_volume": int(current_vol),
+                "current_volume": int(measured_vol),
                 "avg_volume": int(avg_vol),
                 "volume_ratio": round(vol_ratio, 2),
                 "relative_volume_ratio": round(relative_volume_ratio, 2),

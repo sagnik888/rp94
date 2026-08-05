@@ -94,3 +94,39 @@ def test_the_volume_pillar_reaches_the_aggregator_on_a_forming_bar():
         "the volume pillar appears and disappears within a single minute, so the "
         "averaged intelligence score is not reproducible for the same market"
     )
+
+
+# ── the ratio, not just the availability flag ────────────────────────────────
+
+def test_the_ratio_is_not_zero_on_a_forming_bar():
+    """0.0x was what the intel panel actually displayed on all four indices.
+
+    Fixing `available` alone was not enough: vol_ratio is current_vol / avg_vol, and with
+    the forming bar that is 0.0/avg = 0.0. And 0.0x is not a neutral reading downstream —
+    it fails every surge gate outright and floors the volume component of confidence.
+    """
+    _avail, result = _available(LIVE + [0.0])
+    assert float(result.get("volume_ratio", 0.0)) > 0.0, (
+        "volume_ratio read 0.0x while the previous bars held real volume"
+    )
+    assert float(result.get("display_volume_ratio", 0.0)) > 0.0
+    assert int(result.get("current_volume", 0)) > 0
+
+
+def test_the_forming_bar_ratio_matches_the_settled_one():
+    """Same market, sampled a moment apart, must not give two different answers."""
+    _a1, forming = _available(LIVE + [0.0])
+    _a2, settled = _available(LIVE)
+    assert float(forming["volume_ratio"]) == pytest.approx(float(settled["volume_ratio"]))
+
+
+def test_a_real_surge_still_reads_as_a_surge():
+    """The fix must not flatten genuine surges."""
+    _avail, result = _available(LIVE + [3_000_000.0])
+    assert float(result["volume_ratio"]) > 2.0
+
+
+def test_a_dead_feed_reports_no_ratio_rather_than_a_fabricated_one():
+    _avail, result = _available([0.0] * 12)
+    assert result.get("available") is False
+    assert float(result.get("volume_ratio", 0.0)) in (0.0, 1.0)
