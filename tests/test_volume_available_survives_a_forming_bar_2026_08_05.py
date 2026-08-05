@@ -168,10 +168,22 @@ def test_a_partially_filled_forming_bar_does_not_crush_the_ratio():
 
 
 def test_a_completed_final_bar_is_still_the_one_measured():
-    """Nothing is skipped once the bar has actually finished."""
+    """Nothing is skipped once the bar has actually finished.
+
+    Anchored to a fixed in-session time rather than now()-minus-two-minutes. The
+    relative form rotted at midnight: shifted back from 00:03 the twenty-one bars
+    straddle two dates, leaving under five in the current one, so the feed read
+    unavailable and the ratio collapsed to 1.0. Nothing about this test needs the
+    bars to be recent — only closed.
+    """
     steady = [700_000.0] * 20
-    df = _frame_with_forming_bar(steady, partial=2_100_000.0)
-    df.index = df.index - pd.Timedelta(minutes=2)      # the last bar is long since closed
+    idx = pd.date_range("2026-08-05 11:00", periods=21, freq="1min")
+    base = 24000 + np.arange(21) * 0.5
+    df = pd.DataFrame(
+        {"open": base, "high": base + 4, "low": base - 4, "close": base + 2,
+         "volume": steady + [2_100_000.0], "tick_count": [0.0] * 21},
+        index=idx,
+    )
     result = VolumeProfiler().analyze(df, "NIFTY")
     assert float(result["volume_ratio"]) > 2.0, "ignored a genuine completed surge"
 

@@ -38,8 +38,22 @@ def build_source_health(
     # So the data question is asked separately here. A stalled websocket is not
     # necessarily a dead feed (the REST LTP path keeps serving), which is why a recent
     # REST fill still counts as fresh, and why none of this touches kite_health itself.
+    # "No tick has EVER arrived" is not the same claim as "ticks stopped arriving", and
+    # conflating them breaks this codebase's central invariant in the worst place: at a
+    # cold start inside market hours neither socket has ticked yet, so a first draft of
+    # this reported all_brokers_unavailable — a REAL-mode preflight BLOCKER — and the
+    # system refused to start at 09:15 until a tick happened to land first.
+    #
+    # A socket with no tick yet is UNKNOWN until we have actually waited. With no start
+    # time to measure that from, it stays unknown rather than becoming an accusation.
+    uptime = _uptime_seconds(provider, now)
     kite_stream_stalled = bool(
-        is_live and (kite_age is None or kite_age >= freshness_threshold)
+        is_live
+        and (
+            kite_age >= freshness_threshold
+            if kite_age is not None
+            else (uptime is not None and uptime >= freshness_threshold)
+        )
     )
     kite_rest_age = _newest_source_age(getattr(provider, "_ltp_cache", None), "kite", now)
     kite_data_fresh = bool(
@@ -80,6 +94,21 @@ def build_source_health(
             else None
         ),
     }
+
+
+def _uptime_seconds(provider: Any, now_ts: float) -> Optional[float]:
+    """Seconds since this provider came up, or None if it cannot say.
+
+    Used to tell "we have waited and nothing came" apart from "we only just started".
+    """
+    for attr in ("_stream_started_at", "_provider_started_at", "_connected_at"):
+        try:
+            started = float(getattr(provider, attr, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if started > 0:
+            return max(0.0, now_ts - started)
+    return None
 
 
 def _newest_source_age(cache: Any, source: str, now_ts: float) -> Optional[float]:

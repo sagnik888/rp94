@@ -83,8 +83,12 @@ def test_a_silent_stream_is_reported_stalled():
     )
 
 
-def test_a_stream_that_never_ticked_is_stalled():
-    assert _health(kite_tick_age=None)["kite_stream_stalled"] is True
+def test_a_stream_that_never_ticked_is_stalled_once_we_have_waited():
+    """Silence only counts as evidence after we have actually waited for it —
+    see test_a_cold_start_inside_market_hours_does_not_block_real_mode below."""
+    p = _Provider(kite_tick_age=None)
+    p._provider_started_at = NOW - 300.0
+    assert build_source_health(p, now_ts=NOW)["kite_stream_stalled"] is True
 
 
 def test_nothing_is_stalled_outside_market_hours():
@@ -188,3 +192,43 @@ def test_the_preflight_no_longer_blames_angelone():
     text = " | ".join(result.get("blockers") or [])
     assert "AngelOne" not in text
     assert "Kite broker not connected" in text
+
+
+# ── a cold start is not a dead feed ──────────────────────────────────────────
+
+def test_a_cold_start_inside_market_hours_does_not_block_real_mode():
+    """The regression this file's own fix introduced, caught before it shipped.
+
+    At 09:15 neither socket has ticked yet. Reading that as a stall made
+    all_brokers_unavailable True — a REAL-mode preflight BLOCKER — so the system
+    would refuse to start until a tick happened to land first. "No tick has EVER
+    arrived" is not the claim "ticks stopped arriving".
+    """
+    p = _Provider(kite_tick_age=None, fyers_tick_age=None)
+    p._provider_started_at = NOW - 2.0          # up for two seconds
+    h = build_source_health(p, now_ts=NOW)
+    assert h["kite_stream_stalled"] is False
+    assert h["all_brokers_unavailable"] is False, (
+        "a two-second-old process was told every broker was unavailable"
+    )
+
+
+def test_waiting_past_the_threshold_with_no_tick_is_a_stall():
+    """Once we HAVE waited, silence is evidence."""
+    p = _Provider(kite_tick_age=None, fyers_tick_age=None)
+    p._provider_started_at = NOW - 300.0
+    h = build_source_health(p, now_ts=NOW)
+    assert h["kite_stream_stalled"] is True
+    assert h["all_brokers_unavailable"] is True
+
+
+def test_a_provider_that_cannot_say_when_it_started_is_never_accused():
+    """No start time means no way to prove we waited; unknown, not stalled."""
+    p = _Provider(kite_tick_age=None, fyers_tick_age=None)
+    assert build_source_health(p, now_ts=NOW)["kite_stream_stalled"] is False
+
+
+def test_a_tick_that_arrived_and_went_quiet_is_still_a_stall_regardless_of_uptime():
+    p = _Provider(kite_tick_age=600.0)
+    p._provider_started_at = NOW - 1.0          # just restarted, but a tick DID arrive
+    assert build_source_health(p, now_ts=NOW)["kite_stream_stalled"] is True

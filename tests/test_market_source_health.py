@@ -53,6 +53,7 @@ def test_a_live_token_alone_no_longer_keeps_the_emergency_path_shut():
     provider.is_connected = True
     provider.fyers = object()
     provider._last_fyers_ws_tick = 955.0
+    provider._provider_started_at = 500.0     # up for 500s: we HAVE waited
 
     health = build_source_health(provider, now_ts=1000.0, freshness_threshold=45.0)
 

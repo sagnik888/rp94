@@ -253,6 +253,10 @@ class MarketDataProvider:
         self._index_tick_volume_diag: Dict[str, Dict[str, Any]] = {}
         self._active_angel_tokens = {1: set(["26000", "26009", "26017", "26074"]), 3: set(["19000"])}
         self._last_ltp_time: float = 0
+        # When this provider came up. Source health needs it to tell "we waited and no
+        # tick came" apart from "we only just started" — without it, a cold start inside
+        # market hours looks identical to a dead feed.
+        self._provider_started_at: float = time.time()
         self._last_ws_tick: float = 0.0  # Compatibility aggregate; provider health uses separate clocks.
         self._last_angel_ws_tick: float = 0.0
         self._last_fyers_ws_tick: float = 0.0
