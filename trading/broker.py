@@ -142,13 +142,26 @@ class Broker:
         Returns ``True`` only for a broker-confirmed safe terminal state,
         ``False`` when the order filled, and ``None`` when its final state is
         unknown.  A successful cancel API acknowledgement alone is not proof.
+
+        A cancel request that FAILS proves nothing either. It used to return ``False``
+        here, which under this contract is the specific claim "the order filled" — but a
+        refused cancel is far more often a network error, a rate limit, an expired
+        session or a blocked IP, and in every one of those cases the order's real state
+        is simply unread. Worse, the broker also refuses a cancel for an order that has
+        ALREADY gone terminal, so the one reading that was flatly backwards was
+        "cancelled successfully by someone else" being reported as "filled".
+
+        So a failed cancel falls through to the same status poll as a successful one.
+        The verdict comes from the order book, which is the authority; the cancel call's
+        return value only decides whether we expect the state to change.
         """
         if not order_id:
             return True
-        if not self.cancel_order(order_id, variety):
-            return False
+        cancel_accepted = bool(self.cancel_order(order_id, variety))
         getter = getattr(self, "get_order_status", None)
         if not callable(getter):
+            # No way to read the book. An accepted cancel is still only an
+            # acknowledgement, and a refused one is still unread: both are UNKNOWN.
             return None
         deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
         safe_terminal = {"cancelled", "canceled", "rejected", "expired", "lapsed"}
@@ -167,6 +180,11 @@ class Broker:
                 if status in filled_terminal:
                     return False
             if time.monotonic() >= deadline:
+                return None
+            if not cancel_accepted and not isinstance(row, dict):
+                # The cancel was refused AND the book will not answer. Nothing is going
+                # to change by waiting; burning the full timeout here only delays a
+                # caller that has to treat this as unknown regardless.
                 return None
             time.sleep(max(0.01, float(poll_seconds or 0.10)))
 
