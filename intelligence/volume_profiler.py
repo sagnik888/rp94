@@ -20,6 +20,13 @@ from intelligence.price_action import (
 )
 
 
+# A final bar holding less than this fraction of the recent median is a STUB — a bar cut
+# short by the session ending, the feed dropping, or the process stopping mid-bar — not a
+# quiet one. Measured stubs on 2026-08-05 ran at 0.003-0.01 of the median across all four
+# indices; an ordinary quiet bar runs at tens of percent. 0.05 sits well clear of both.
+STUB_BAR_FRACTION = 0.05
+
+
 class VolumeProfiler:
     """Intraday volume analysis engine"""
 
@@ -130,6 +137,34 @@ class VolumeProfiler:
                     forming = (now_ts - volume.index[-1]) < interval
                 except (TypeError, ValueError, AttributeError):
                     forming = False
+                # The clock test only catches a bar that is forming RIGHT NOW. A final bar
+                # can also be truncated and STALE: the session ended part-way through it,
+                # the feed dropped, or the process was stopped mid-bar. Hours later the
+                # clock says "long since closed" and the stub gets measured as if complete.
+                #
+                # Captured live on 2026-08-05 at 19:12, on all four indices at once —
+                #   NIFTY      tail=[..., 14980267, 13736088, 40189]  ratio 0.008x
+                #   BANKNIFTY  tail=[...,  6512759,  8209167, 15712]  ratio 0.005x
+                #   SENSEX     tail=[...,   210651,  1195852,  1792]  ratio 0.010x
+                #   MIDCPNIFTY tail=[...,  6854073,  8315127, 14961]  ratio 0.005x
+                # — the final bar holding a few tenths of a percent of its predecessors,
+                # which the panel renders as "0.0x" and every volume gate refuses. This is
+                # the zero-volume report that was chased for three sessions.
+                #
+                # So completeness is judged on the DATA as well as the clock: a final bar
+                # holding a tiny fraction of the recent median is a stub, whatever the time
+                # says. The threshold is deliberately low — a genuinely quiet bar runs at
+                # tens of percent of the median, not at one.
+                if not forming and current_vol > 0:
+                    try:
+                        prior = volume.iloc[-7:-1]
+                        prior = prior[prior > 0]
+                        if len(prior) >= 3:
+                            median_prior = float(prior.median())
+                            if median_prior > 0 and current_vol < STUB_BAR_FRACTION * median_prior:
+                                forming = True
+                    except (IndexError, TypeError, ValueError):
+                        pass
                 if forming or current_vol <= 0:
                     try:
                         recent_vol = float(volume.iloc[-2])

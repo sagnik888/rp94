@@ -1575,17 +1575,20 @@ class Settings(BaseSettings):
     fut_lots_hard_cap: int = 1
     fut_one_position_per_index: bool = True
     ut_option_history_mode: Literal["stored_or_synthetic", "fetch_or_synthetic", "fetch_or_skip"] = "fetch_or_synthetic"
-    market_intel_pullback_guard_enabled: bool = True
-    market_intel_pullback_hard_flip_score: float = 65.0
-    market_intel_pullback_severe_adverse_r: float = 1.25
-    market_intel_pullback_consensus_votes: int = 3
-    market_intel_pullback_loss_breathing_sl_fraction: float = 0.50
-    market_intel_index_ltp_breathing_pct: float = 0.10
-    market_intel_option_premium_breathing_pct: float = 15.0
-    market_intel_loss_recovery_entry_fraction: float = 0.20
-    market_intel_loss_danger_stop_fraction: float = 0.75
-    market_intel_small_profit_wait_rs: float = 500.0
-    market_intel_late_session_loss_room_fraction: float = 0.25
+    # REMOVED 2026-08-06: the eleven market_intel_pullback_* / market_intel_loss_* fields
+    # that used to sit here had no consumer anywhere in the codebase — a whole guard that
+    # was designed, configured (guard_enabled=True in .env) and never built. Keeping them
+    # meant eleven knobs an operator could set and watch do nothing.
+    #
+    # The job they describe is done by the loss-guard family below and in scanner.py:
+    # _profit_guard_reversal_context classifies the pullback (noise / small_pullback /
+    # reversal / big_reversal / structure_break / premium_melt) from candle structure,
+    # _loss_guard_severity scores it with loss_guard_rejection_wick_*, loss_guard_grind_*,
+    # loss_guard_opt_premium_melt_* and the OI/PCR vote settings, and _loss_guard_decision
+    # turns that severity into the R multiple at which the trade is cut. Those settings
+    # are read and tested; these were neither.
+    #
+    # model_config uses extra='ignore', so the keys may stay in .env harmlessly.
     pcr_near_strikes: int = 5 # Strikes on either side of ATM for near-money PCR
 
     # ─── Logging ─────────────────────────────────────────────

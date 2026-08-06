@@ -20857,11 +20857,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if candidate_base not in self.CORE_CORRELATED_INDICES:
             return True
 
-        # Same-direction CORE limit tracks the candidate-aware bucket cap.
-        # Normal capacity is 4 indices x 2 trades; the rare burst cap is stricter
-        # evidence-gated and only active when the concurrency guard is OFF.
+        # ut_correlated_core_limit is what this guard is FOR — "maximum simultaneous
+        # same-direction NIFTY/BANKNIFTY/SENSEX exposures", set to 2. It had no consumer:
+        # the limit came from _active_bucket_cap('CORE'), which answers 6 normally and 9
+        # on a rare burst. Three times the configured number on the concentration control
+        # that matters most as size grows, and silently, because the setting looked live.
+        #
+        # The bucket cap is a different quantity (total CORE positions, any direction) and
+        # still applies as a ceiling; this takes the tighter of the two.
         limit = max(1, self._active_bucket_cap("CORE", candidate))
         exposures = self._correlated_same_direction_exposures(direction, bucket="CORE")
+        configured = self._correlated_core_limit(candidate, exposures)
+        if configured > 0:
+            limit = min(limit, configured)
         if len(exposures) < limit:
             return True
 
@@ -20870,6 +20878,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             f"{len(exposures)} same-direction core exposures already active (limit {limit})."
         )
         return False
+
+    def _correlated_core_limit(self, candidate, exposures: List[Any]) -> int:
+        """Configured cap on same-direction CORE exposures, 0 when unset.
+
+        ut_correlated_allow_aplus_override describes the one documented escape: "permit a
+        third core exposure only when every setup is A+". Both settings sat unread, so
+        neither the limit nor its escape existed. The escape is deliberately strict —
+        EVERY exposure already on, plus the incoming one, has to be A+, so one weak leg in
+        the basket closes it.
+        """
+        settings = get_settings()
+        try:
+            limit = int(getattr(settings, "ut_correlated_core_limit", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        if limit <= 0:
+            return 0
+        if not Scanner._setting_enabled(
+            getattr(settings, "ut_correlated_allow_aplus_override", True), True
+        ):
+            return limit
+        grades = [str(getattr(item, "grade", "") or "").upper() for item in (exposures or [])]
+        grades.append(str(getattr(candidate, "grade", "") or "").upper())
+        if grades and all(g == "A+" for g in grades):
+            return limit + 1
+        return limit
 
     def _correlated_index_bucket(self, instrument: str) -> str:
         base = str(instrument or "").split()[0].upper()

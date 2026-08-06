@@ -212,3 +212,72 @@ def test_a_non_datetime_index_falls_back_to_the_zero_check():
     df = df.reset_index(drop=True)
     result = VolumeProfiler().analyze(df, "NIFTY")
     assert isinstance(result.get("volume_ratio"), (int, float))
+
+
+# ── a truncated FINAL bar, hours after it closed ─────────────────────────────
+#
+# The clock test above only catches a bar forming right now. A final bar can also be
+# truncated AND stale: the session ended part-way through it, the feed dropped, or the
+# process was stopped mid-bar. Hours later the clock says "long since closed" and the
+# stub is measured as if complete.
+#
+# Captured live on 2026-08-05 at 19:12 on all four indices at once — the real numbers
+# below, straight from the VOLUME RATIO LOW diagnostic. This is the zero-volume report
+# that was chased across three sessions.
+
+LIVE_STUBS = {
+    "NIFTY":      ([6911704, 6327287, 9129460, 14980267, 13736088], 40189),
+    "BANKNIFTY":  ([2940594, 4136442, 4687822, 6512759, 8209167], 15712),
+    "SENSEX":     ([140586, 121950, 276629, 210651, 1195852], 1792),
+    "MIDCPNIFTY": ([3233965, 3631338, 4794768, 6854073, 8315127], 14961),
+}
+
+
+def _closed_frame(volumes, start="2026-08-05 14:20"):
+    n = len(volumes)
+    idx = pd.date_range(start, periods=n, freq="5min")
+    base = 24000 + np.arange(n) * 0.5
+    return pd.DataFrame(
+        {"open": base, "high": base + 4, "low": base - 4, "close": base + 2,
+         "volume": [float(v) for v in volumes], "tick_count": [0.0] * n},
+        index=idx,
+    )
+
+
+@pytest.mark.parametrize("instrument", sorted(LIVE_STUBS))
+def test_a_truncated_final_bar_is_not_measured_as_a_complete_one(instrument):
+    """The exact live capture, per index."""
+    body, stub = LIVE_STUBS[instrument]
+    volumes = [float(v) for v in body] * 3 + [float(stub)]
+    result = VolumeProfiler().analyze(_closed_frame(volumes), instrument)
+    ratio = float(result["volume_ratio"])
+    assert ratio > 0.25, (
+        f"{instrument} read {ratio:.3f}x from a final bar holding "
+        f"{stub / body[-1]:.3%} of its predecessor — the panel renders that as 0.0x and "
+        "every volume gate refuses it"
+    )
+
+
+def test_the_stub_rule_does_not_flatten_a_genuinely_quiet_bar():
+    """A quiet bar runs at tens of percent of the median, not at one."""
+    volumes = [700_000.0] * 20 + [220_000.0]
+    result = VolumeProfiler().analyze(_closed_frame(volumes), "NIFTY")
+    assert 0.2 < float(result["volume_ratio"]) < 0.5, (
+        "a real 0.3x bar was rewritten as its predecessor"
+    )
+
+
+def test_a_completed_surge_is_still_measured():
+    volumes = [700_000.0] * 20 + [2_100_000.0]
+    assert float(VolumeProfiler().analyze(_closed_frame(volumes), "NIFTY")["volume_ratio"]) > 2.0
+
+
+def test_a_stub_after_too_few_prior_bars_is_left_alone():
+    """Three non-zero predecessors is the minimum evidence for calling one a stub."""
+    volumes = [0.0] * 18 + [700_000.0, 700_000.0, 1_000.0]
+    result = VolumeProfiler().analyze(_closed_frame(volumes), "NIFTY")
+    assert isinstance(float(result["volume_ratio"]), float)
+
+
+def test_an_all_zero_frame_is_still_an_unavailable_feed():
+    assert VolumeProfiler().analyze(_closed_frame([0.0] * 21), "NIFTY")["available"] is False

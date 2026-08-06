@@ -24,38 +24,14 @@ from __future__ import annotations
 # name -> why it is inert, and what actually governs the behaviour instead.
 INERT: dict[str, str] = {
     # ── risk / sizing ────────────────────────────────────────────────────────
-    "ut_correlated_core_limit": (
-        "Core concentration is capped by _active_bucket_cap('CORE') — 6 normally, 9 on a "
-        "rare burst — not by this. Setting it to 2 does not tighten anything."
-    ),
-    "ut_correlated_allow_aplus_override": (
-        "The A+ third-exposure override it describes is not implemented; overflow goes "
-        "through the rare-burst evidence gate instead."
-    ),
     "fut_force_fixed_lots": "No sizing path consults it; lots come from the risk sizer.",
     "heavy_trend_lot_multiplier_fut": "No sizing path consults it.",
     "api_max_trade_limit": "The trades API clamps with its own literal.",
 
-    # ── an entire guard that was never built ─────────────────────────────────
-    **{
-        name: (
-            "Part of the market-intel pullback guard, which does not exist in this "
-            "codebase. All eleven of its settings are inert together."
-        )
-        for name in (
-            "market_intel_pullback_guard_enabled",
-            "market_intel_pullback_hard_flip_score",
-            "market_intel_pullback_severe_adverse_r",
-            "market_intel_pullback_consensus_votes",
-            "market_intel_pullback_loss_breathing_sl_fraction",
-            "market_intel_index_ltp_breathing_pct",
-            "market_intel_option_premium_breathing_pct",
-            "market_intel_loss_recovery_entry_fraction",
-            "market_intel_loss_danger_stop_fraction",
-            "market_intel_small_profit_wait_rs",
-            "market_intel_late_session_loss_room_fraction",
-        )
-    },
+    # The eleven market_intel_pullback_* / market_intel_loss_* settings that used to be
+    # listed here were DELETED from settings.py on 2026-08-06 rather than documented: a
+    # guard that was configured and never built is better removed than catalogued. The
+    # loss-guard family does that job.
 
     # ── entry execution pricing ──────────────────────────────────────────────
     "option_limit_buffer_pct": "Entry limit pricing does not read it.",

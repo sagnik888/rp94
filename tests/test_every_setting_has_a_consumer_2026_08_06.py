@@ -104,20 +104,30 @@ def test_every_inert_entry_explains_itself():
     assert not thin, f"inert entries without a real explanation: {thin}"
 
 
-def test_the_core_concentration_limit_is_known_to_be_inert():
-    """The one that matters most for a multi-lot account."""
-    assert "ut_correlated_core_limit" in INERT
-    assert "_active_bucket_cap" in INERT["ut_correlated_core_limit"]
+def test_the_core_concentration_limit_is_no_longer_inert():
+    """It was the sharpest example on this list; it is now wired to the guard."""
+    assert "ut_correlated_core_limit" not in INERT
+    assert "ut_correlated_allow_aplus_override" not in INERT
+
+
+def test_the_pullback_guard_settings_are_gone_rather_than_catalogued():
+    """A guard that was configured and never built is better removed than documented."""
+    import config.settings as cs
+
+    fields = set(cs.Settings.model_fields)
+    dead = {f for f in fields if f.startswith("market_intel_pullback_")}
+    assert not dead, f"still declared: {sorted(dead)}"
+    assert not any(k.startswith("market_intel_pullback_") for k in INERT)
 
 
 def test_configured_but_inert_reports_what_the_operator_actually_set():
-    found = dict(configured_but_inert(["ut_correlated_core_limit", "kite_api_key", "UT_PRESET"]))
-    assert "ut_correlated_core_limit" in found
+    found = dict(configured_but_inert(["pcr_near_strikes", "kite_api_key", "UT_PRESET"]))
+    assert "pcr_near_strikes" in found
     assert "kite_api_key" not in found
 
 
 def test_configured_but_inert_is_case_insensitive():
-    assert dict(configured_but_inert(["UT_CORRELATED_CORE_LIMIT"]))
+    assert dict(configured_but_inert(["PCR_NEAR_STRIKES"]))
 
 
 def test_an_empty_env_reports_nothing():
