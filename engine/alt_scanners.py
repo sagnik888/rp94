@@ -724,9 +724,23 @@ class AltSignalEngine(UTBotEngine):
                 and float(ctx["range_atr"][i]) >= 0.55
             )
 
+            # breakout_ok and pullback_ok were computed on every bar and then discarded:
+            # `route` was only ever set from thrust_ok, so `if not route: continue` threw
+            # both away. Two entire entry routes ran the full evaluation and emitted
+            # nothing, on every index and every timeframe, forever — which is why
+            # "pullback signal trading" did not exist despite the logic being here.
+            #
+            # Strongest evidence first, and one route per bar: a thrust that also happens
+            # to satisfy the breakout test is a thrust, not two signals. _eligible keys
+            # its cooldown on (route, want), so each route now gets its own spacing rather
+            # than sharing the thrust route's.
             route = ""
             if thrust_ok:
                 route = "quality_thrust"
+            elif breakout_ok:
+                route = "quality_breakout"
+            elif pullback_ok:
+                route = "quality_pullback"
             if not route or not _eligible(route, want, i):
                 continue
             signal = self._signal_from_bar(
