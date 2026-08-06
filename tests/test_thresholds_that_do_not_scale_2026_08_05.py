@@ -305,3 +305,73 @@ def test_the_intel_cache_actually_expires_on_the_analysis_ttl(monkeypatch):
         "a 40-second-old bundle was still served: the cache is reading the chain's "
         "network budget, not the analysis budget"
     )
+
+
+# ── the noise FLOORS were on the wrong basis too ─────────────────────────────
+#
+# _profit_guard_reversal_context computes
+#     fast_body_threshold  = max(median_range * 1.20, price * 0.00025)
+#     fast_close_threshold = max(median_range * 1.50, price * 0.00035)
+# and compares them against INDEX candle bodies. The second term is an index-noise
+# floor: "an adverse candle under ~2.5-3.5 bps of the index is not a reversal."
+#
+# Fed an option premium it collapses to nothing. I looked at this when fixing the trend
+# votes and called it harmless, reasoning that max() picks the median_range term anyway.
+# That holds only when the tape is BUSY. In quiet tape the floor is meant to WIN, and a
+# premium-derived floor never can:
+#   NIFTY 24500, PE at 217.50, 3.0-point median range
+#     intended  max(3.60, 24500*0.00025 = 6.125) = 6.125
+#     premium   max(3.60,   217.50*0.00025 = 0.054) = 3.60
+# so the guard fires on exactly the wiggles the floor exists to ignore.
+
+def _quiet_tape(range_points=3.0, base=24500.0, n=20):
+    idx = pd.date_range("2026-08-07 12:30", periods=n, freq="1min")
+    close = np.full(n, base)
+    return pd.DataFrame(
+        {"open": close, "high": close + range_points / 2, "low": close - range_points / 2,
+         "close": close, "volume": np.full(n, 700000.0)},
+        index=idx,
+    )
+
+
+def _thresholds(price, frame=None):
+    s = Scanner.__new__(Scanner)
+    s.candles = SimpleNamespace(get_candles=lambda i, tf: (frame if frame is not None else _quiet_tape()).copy())
+    trade = SimpleNamespace(
+        instrument="NIFTY", timeframe="1min", inst_type="OPT", direction="SHORT",
+        entry_price=217.50, current_price=price, entry_spot=24500.0,
+    )
+    ctx = s._profit_guard_reversal_context(trade, price, datetime(2026, 8, 7, 12, 50), timeframe="1min")
+    return ctx.get("fast_body_threshold", 0.0), ctx.get("fast_close_threshold", 0.0)
+
+
+def test_the_noise_floor_survives_being_handed_a_premium():
+    """The live shape: an OPT trade whose caller passes the premium."""
+    body, close = _thresholds(217.50)
+    assert body == pytest.approx(6.125), (
+        f"body floor collapsed to {body:.3f}; the index floor is 6.125 and a 3.60 "
+        "threshold fires on ordinary lunchtime noise"
+    )
+    assert close == pytest.approx(8.575)
+
+
+def test_premium_and_spot_give_the_same_floor():
+    """Whichever basis the caller happens to pass, the answer is about the index."""
+    assert _thresholds(217.50) == _thresholds(24500.0)
+
+
+def test_a_busy_tape_is_still_driven_by_the_measured_range():
+    """The floor must not become a ceiling — a real range still wins."""
+    busy = _quiet_tape(range_points=40.0)
+    body, close = _thresholds(217.50, frame=busy)
+    assert body == pytest.approx(40.0 * 1.20)
+    assert close == pytest.approx(40.0 * 1.50)
+
+
+def test_the_median_range_fallback_is_on_the_index_basis_too():
+    """A degenerate frame falls back to price*0.0002; that price must be the index."""
+    flat = _quiet_tape(range_points=0.0)
+    body, _close = _thresholds(217.50, frame=flat)
+    # index fallback 24500*0.0002 = 4.90 -> body = max(4.90*1.20, 6.125) = 6.125
+    # premium fallback 217.50*0.0002 = 0.0435 -> body would be max(0.052, 0.054) = 0.054
+    assert body > 1.0, f"fallback range came from the premium: body floor {body:.4f}"

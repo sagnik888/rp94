@@ -13651,10 +13651,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         highs = tail["high"].astype(float)
         lows = tail["low"].astype(float)
         closes = tail["close"].astype(float)
+        # The level these candles are measured on. `closes` is the INDEX frame, so this is
+        # the only correct basis for any threshold expressed as a fraction of price —
+        # current_price may be an option premium, which is ~100x smaller.
+        index_close = float(closes.iloc[-1])
         ranges = (highs - lows).abs()
         median_range = float(ranges.iloc[:-1].median() if len(ranges) > 1 else ranges.iloc[-1])
         if not math.isfinite(median_range) or median_range <= 0:
-            median_range = max(float(current_price) * 0.0002, 1.0)
+            # Same basis rule: a fallback range derived from a premium is meaningless
+            # against index candles.
+            median_range = max(
+                (index_close if index_close > 0 else float(current_price or 0.0)) * 0.0002,
+                1.0,
+            )
 
         last_open = float(opens.iloc[-1])
         last_close = float(closes.iloc[-1])
@@ -13678,8 +13687,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             adverse_body = max(0.0, last_open - last_close)
             adverse_close_move = max(0.0, prev_close - last_close)
 
-        fast_body_threshold = max(median_range * 1.20, float(current_price) * 0.00025)
-        fast_close_threshold = max(median_range * 1.50, float(current_price) * 0.00035)
+        # These floors say "an adverse candle smaller than ~2.5-3.5 bps of the INDEX is
+        # not a reversal", and they are compared against index candle bodies. Fed an
+        # option premium instead they collapse to nothing and stop being floors at all.
+        #
+        # NIFTY 24500, bought PE at 217.50, lunchtime lull with a 3.0-point median range:
+        #   intended  max(3.0*1.20, 24500*0.00025) = 6.125 body / 8.575 close
+        #   with premium  max(3.60, 217.50*0.00025 = 0.054) = 3.60 body / 4.50 close
+        # so the guard fires on exactly the index wiggles the floor was written to ignore.
+        #
+        # I looked at this earlier and called it harmless on the reasoning that max()
+        # would pick the median_range term anyway. That is true only when the tape is
+        # busy. In quiet tape the floor is meant to WIN, and it cannot.
+        noise_basis = index_close if index_close > 0 else float(current_price or 0.0)
+        fast_body_threshold = max(median_range * 1.20, noise_basis * 0.00025)
+        fast_close_threshold = max(median_range * 1.50, noise_basis * 0.00035)
         fast_reversal = adverse_body >= fast_body_threshold or adverse_close_move >= fast_close_threshold
 
         # ── Gap1: rejection wick (pin / shooting-star) without PA module ──
@@ -13766,7 +13788,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # several do not. Rather than trust the caller, take the price on the same basis
         # as the EMAs whenever the one handed in plainly is not.
         trend_price = float(current_price or 0.0)
-        index_close = float(closes.iloc[-1])
         if index_close > 0 and not (0.5 * index_close <= trend_price <= 1.5 * index_close):
             trend_price = index_close
         if direction == "SHORT":
