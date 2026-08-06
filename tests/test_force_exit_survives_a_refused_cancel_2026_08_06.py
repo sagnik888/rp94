@@ -226,3 +226,60 @@ def test_two_orphans_each_get_their_own_attempt():
         "BANKNIFTY26AUG52000PE", SYMBOL,
     ]
     assert ("BANKNIFTY26AUG52000PE", 35, "BUY") in broker.exits
+
+
+# ── 6. one bad row must not take the whole book with it ──────────────────────
+
+class _Exploding:
+    """Fails on the first trade only."""
+
+    def __init__(self):
+        self.exits = []
+
+    def close_order(self, symbol, token, qty, side, product_type="CARRYFORWARD", **kw):
+        self.exits.append(symbol)
+        return "EXIT-1"
+
+
+def _book_manager(broker, boom_on="T1"):
+    m = _manager(broker)
+    closed = []
+    m.close_trade = lambda tid, px, reason, exit_time=None: (
+        (_ for _ in ()).throw(RuntimeError("boom")) if tid == boom_on else closed.append(tid)
+    )
+    m.closed_ids = closed
+    m.open_trades = {
+        "T1": _trade(id="T1", execution_status="OPEN"),
+        "T2": _trade(id="T2", execution_status="OPEN"),
+        "T3": _trade(id="T3", execution_status="OPEN"),
+    }
+    return m
+
+
+def test_one_failing_exit_does_not_abandon_the_rest_of_the_book():
+    broker = _Exploding()
+    m = _book_manager(broker)
+    _run_session_end(m, _On())
+    assert sorted(m.closed_ids) == ["T2", "T3"], (
+        "a raise on the first trade took every later position down with it"
+    )
+
+
+def test_a_failing_exit_is_escalated_by_name():
+    broker = _Exploding()
+    m = _book_manager(broker)
+    logged = []
+    m._log_ui = lambda msg, level="info": logged.append(msg)
+    _run_session_end(m, _On())
+    assert any("FORCE EXIT FAILED" in msg for msg in logged)
+    assert any("Square off manually" in msg for msg in logged)
+
+
+def test_the_orphan_sweep_still_runs_when_every_local_exit_failed():
+    """The sweep is the last line of defence; it must not depend on the loop succeeding."""
+    broker = _CountingBroker()
+    m = _book_manager(broker, boom_on=None)
+    m.close_trade = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    m.orphan_positions = {SYMBOL: {"tradingsymbol": SYMBOL, "netqty": "75", "symboltoken": "1"}}
+    _run_session_end(m, _On())
+    assert broker.exits == [(SYMBOL, 75, "SELL")], "the orphan sweep was skipped"

@@ -2549,7 +2549,20 @@ class TradeManager:
                                 )
                                 cancelled = None
                         else:
-                            cancelled = self.broker.cancel_order(trade.broker_order_id, "NORMAL")
+                            # Guarded like its sibling above. Only a double without
+                            # cancel_order_confirmed reaches this, but an escape here
+                            # unwinds out of the reconcile loop and abandons every
+                            # remaining trade in the snapshot — the same shape that took
+                            # out the force exit.
+                            try:
+                                cancelled = self.broker.cancel_order(
+                                    trade.broker_order_id, "NORMAL"
+                                )
+                            except (BrokerOrderRejected, PermissionError) as exc:
+                                logger.error(
+                                    f"Stale-entry cancel refused for {trade.trading_symbol}: {exc}"
+                                )
+                                cancelled = None
                         if cancelled is True and not self._stale_entry_still_worth_filling(trade):
                             # The cancel is PROVEN, so nothing is resting and nothing
                             # will fill. Replacing it with a MARKET order here would
@@ -3942,12 +3955,37 @@ class TradeManager:
             # emergency_flatten_trade is the right path — it scans for a stop it does not
             # own, withholds when it cannot prove the position is unprotected, and latches
             # after an ambiguous acknowledgement.
-            if status in {"RECOVERY_REQUIRED", "PARTIAL_EXIT"}:
-                self.emergency_flatten_trade(trade, "FORCE_EOD_KILL")
-            else:
-                self.close_trade(tid, trade.current_price, "FORCE_EOD_KILL", exit_time=now)
+            # Per-trade isolation. This loop had none, so ONE raise anywhere below took
+            # every remaining position in the snapshot down with it and skipped the orphan
+            # sweep after the loop — which is exactly how an UnboundLocalError in
+            # emergency_flatten_trade turned one refused stop cancel into an account that
+            # carried its whole book overnight in a product the broker will not square off.
+            # The specific raiser is fixed; this makes the next one cost one trade, loudly,
+            # instead of all of them, silently.
+            try:
+                if status in {"RECOVERY_REQUIRED", "PARTIAL_EXIT"}:
+                    self.emergency_flatten_trade(trade, "FORCE_EOD_KILL")
+                else:
+                    self.close_trade(tid, trade.current_price, "FORCE_EOD_KILL", exit_time=now)
+            except Exception as exc:
+                logger.critical(
+                    f"FORCE EXIT FAILED for {getattr(trade, 'trading_symbol', tid)}: "
+                    f"{type(exc).__name__}: {exc}. This position may carry overnight — "
+                    "square it off at the Zerodha terminal.",
+                    exc_info=True,
+                )
+                self._log_ui(
+                    f"FORCE EXIT FAILED for {getattr(trade, 'trading_symbol', tid)} "
+                    f"({type(exc).__name__}). Square off manually.",
+                    "error",
+                )
 
-        self._handle_orphans_at_session_end(now)
+        # Outside the loop and outside its try: an orphan must be swept even when every
+        # local exit above failed.
+        try:
+            self._handle_orphans_at_session_end(now)
+        except Exception as exc:
+            logger.critical(f"Orphan sweep failed at session end: {exc}", exc_info=True)
 
     def _handle_orphans_at_session_end(self, now: datetime) -> None:
         """Broker positions this system did not open are NOT covered by the sweep above.
