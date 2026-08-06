@@ -4920,8 +4920,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # allow_blocking=False: this runs on the scanner EVENT LOOP every
                 # 100ms, and a blocking Fyers chain or Kite LTP here stalls the 1s
                 # scan cycle and every dashboard _call_on_scanner_loop with it
-                # (observed as api_chart TimeoutError after 5s). The 1s scan path
-                # below still does the authoritative fetch.
+                # (observed as api_chart TimeoutError after 5s).
+                # The 1s scan path used to be described here as "the authoritative
+                # fetch". It is not, and must not be: it runs on this same loop.
+                # _premium_refresh_worker does that fetch on a daemon thread.
                 self._update_active_trades(allow_blocking=False)
                 await asyncio.sleep(0.1) # 100ms check loop
             except Exception as e:
@@ -6224,8 +6226,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 await self._coordinate_and_execute(candidates)
             self._refresh_session_signal_payloads(results)
 
-            # Update active trades (PnL and Trailing Stops)
-            self._update_active_trades()
+            # Update active trades (PnL and Trailing Stops).
+            #
+            # allow_blocking=False here too. The 100ms worker was moved off the blocking
+            # path earlier with a comment promising "the 1s scan path below still does the
+            # authoritative fetch" — but this call is ALSO on the scanner event loop, so
+            # it stalls exactly what that fix set out to protect, just once a second
+            # instead of ten times. Today's log carries 39 "Error in periodic trades
+            # updater" TimeoutErrors clustered through live hours (13:20-14:51); that
+            # updater budgets 5s on _call_on_scanner_loop, so the loop was blocked longer
+            # than five seconds, 39 times, while the market was open. A blocked loop is
+            # not scanning and not evaluating exits.
+            #
+            # Nothing is lost by dropping the blocking fetch: _premium_refresh_worker
+            # already calls _get_live_premium_cached(allow_blocking=True) on a daemon
+            # thread, single-flighted per token, and populates _premium_cache for both
+            # callers. The authoritative fetch still happens — off the loop, where it
+            # belongs. That promise in the older comment was true when it was written and
+            # stopped being true when the background refresher took the job over.
+            self._update_active_trades(allow_blocking=False)
 
             elapsed = time.time() - t0
             latency_ms = round(elapsed * 1000)

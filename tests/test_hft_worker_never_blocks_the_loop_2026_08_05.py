@@ -155,3 +155,55 @@ def test_the_hft_worker_asks_for_the_non_blocking_variant():
     assert "_update_active_trades(allow_blocking=False)" in src, (
         "the 100ms worker is back to the blocking call"
     )
+
+
+# ── the 1s scan cycle is on the same loop and had the same problem ────────────
+
+def test_the_scan_cycle_does_not_block_the_loop_either():
+    """The 100ms fix protected one caller and left the other on the same loop.
+
+    _scan_cycle is `async def` and called self._update_active_trades() with
+    allow_blocking defaulting to True, so the identical blocking Fyers/Kite chain still
+    ran on the scanner event loop once a second. Today's log carries 39 "Error in
+    periodic trades updater" TimeoutErrors clustered through live hours — that updater
+    budgets 5s on _call_on_scanner_loop, so the loop was blocked past five seconds, 39
+    times, while the market was open. A blocked loop is not scanning and not checking
+    exits.
+
+    Nothing is lost: _premium_refresh_worker does the authoritative fetch on a daemon
+    thread and fills the cache both callers read.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from scanner import Scanner
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._scan_cycle)))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_update_active_trades"
+    ]
+    assert calls, "_scan_cycle no longer updates active trades at all"
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "allow_blocking" in kw, (
+            "_scan_cycle calls _update_active_trades() with the default allow_blocking="
+            "True, so a blocking option-chain fetch runs on the scanner event loop"
+        )
+        assert isinstance(kw["allow_blocking"], ast.Constant)
+        assert kw["allow_blocking"].value is False
+
+
+def test_the_background_refresher_still_does_the_blocking_fetch():
+    """Dropping the blocking call is only safe because this one keeps it."""
+    import inspect
+
+    from scanner import Scanner
+
+    src = inspect.getsource(Scanner._premium_refresh_worker)
+    assert "allow_blocking=True" in src, (
+        "nothing does the authoritative premium fetch any more"
+    )
