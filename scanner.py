@@ -22847,6 +22847,29 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             for c in candidates:
                 if getattr(c, "action", "ENTRY") != "ENTRY":
                     continue
+                # A signal whose SOURCE BAR HAS CLOSED does not belong in an anti-repaint
+                # buffer. The buffer exists to let a forming bar's arrow settle; a final
+                # bar's arrow cannot repaint, so the wait buys nothing and costs 30s of
+                # drift before intelligence and the filters even see it.
+                #
+                # Worse, it was then run through the repaint gate below, which re-reads
+                # the CURRENT latest signal. Once the cache rolls to the next bar the old
+                # identity is gone, so a fully-confirmed closed-bar signal got discarded
+                # as "arrow vanished" — a rejection reason that cannot logically apply to
+                # a bar that is already final.
+                #
+                # entered_intracandle is computed for every candidate a few lines above
+                # and, until now, read by nothing in this block.
+                if not bool(getattr(c, "entered_intracandle", True)):
+                    matured_candidates.append(c)
+                    self._diag_inc("stabilization", "closed_candle_direct")
+                    self.log_signal_decision_once(
+                        f"{c.instrument}|{c.timeframe}|{getattr(c, 'signal_timestamp', '')}|closed-direct",
+                        f"{c.instrument} {c.timeframe} {c.direction}: source candle already "
+                        "closed, going straight to analysis without the stabilization wait.",
+                        "trade",
+                    )
+                    continue
                 # Timeframe-Specific entry gate check
                 c_time = session_now.time()
                 limit_time = (
