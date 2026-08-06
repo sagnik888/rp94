@@ -60,10 +60,18 @@ class DataManager:
         except Exception as e:
             logger.error(f"❌ [DataManager] Error syncing history: {e}")
 
-    # Index spot/futures files are re-populated every session; only dated CONTRACT files
-    # (an expiry and a strike in the name) go permanently dead. Deleting an index file
-    # would just cost a re-download, but there is no reason to churn them.
-    _CONTRACT_NAME = __import__("re").compile(r"\d{2}[A-Z]{3}\d{2}", __import__("re").I)
+    # Index spot files are re-populated every session; only CONTRACT files (a specific
+    # expiry and strike) go permanently dead. Deleting an index file would just cost a
+    # re-download, but there is no reason to churn them.
+    #
+    # The discriminator is a DIGIT in the symbol, not a date format. A first version
+    # matched \d{2}[A-Z]{3}\d{2} — the MONTHLY style, NIFTY26AUG26… — and missed every
+    # WEEKLY contract, which has no three-letter month: SENSEX2660474100PE. Checked
+    # against the real directory, that left 200 of 483 dead files behind, all of them
+    # weeklies. Index names (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY) carry no digits at
+    # all, so "has a digit" separates the two cleanly and does not care what expiry
+    # convention the exchange uses next.
+    _CONTRACT_NAME = __import__("re").compile(r"\d")
 
     def _delete_dead_candle_file(self, file) -> None:
         """Remove a candle CSV that can never receive another bar.
@@ -73,7 +81,10 @@ class DataManager:
         the next sync, so it is left alone.
         """
         try:
-            if not self._CONTRACT_NAME.search(file.stem):
+            # The symbol, not the timeframe suffix: "NIFTY_5min" must not look like a
+            # contract because "5min" contains a digit.
+            symbol = str(file.stem).rsplit("_", 1)[0]
+            if not self._CONTRACT_NAME.search(symbol):
                 return
             file.unlink()
             logger.info(f"🧹 [DataManager] Removed expired contract file {file.name}")

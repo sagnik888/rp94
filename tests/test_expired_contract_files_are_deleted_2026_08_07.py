@@ -114,14 +114,38 @@ def test_deleting_is_tolerant_of_a_locked_file(tmp_path):
 
 
 @pytest.mark.parametrize("name,should_delete", [
+    # monthly-style expiries
     ("BANKNIFTY26MAY2653000CE_1min", True),
     ("NIFTY26AUG2624500PE_5min", True),
     ("SENSEX26AUG2680000CE_15min", True),
+    # WEEKLY-style expiries have no three-letter month. A first version of this fix
+    # matched only the monthly pattern and silently kept every weekly: checked against
+    # the real directory, 200 of 483 dead files survived, all of them weeklies.
+    ("SENSEX2660474100PE_1min", True),
+    ("NIFTY2680724500CE_5min", True),
+    ("MIDCPNIFTY2681213000PE_15min", True),
+    # index spot files, which refill on the next sync
     ("NIFTY_5min", False),
     ("BANKNIFTY_1min", False),
     ("MIDCPNIFTY_15min", False),
+    ("SENSEX_1min", False),
 ])
 def test_only_dated_contract_names_are_eligible(tmp_path, name, should_delete):
     f = _write(tmp_path, f"{name}.csv", [])
     _manager(tmp_path)._prune_candles()
     assert f.exists() is (not should_delete)
+
+
+def test_the_timeframe_suffix_is_not_mistaken_for_a_strike(tmp_path):
+    """"5min" and "15min" contain digits; only the SYMBOL may make it a contract."""
+    for name in ("NIFTY_5min", "BANKNIFTY_15min", "SENSEX_1min"):
+        f = _write(tmp_path, f"{name}.csv", [])
+        _manager(tmp_path)._prune_candles()
+        assert f.exists(), f"{name} was deleted because its timeframe has a digit in it"
+
+
+def test_a_weekly_contract_stub_is_removed(tmp_path):
+    """The 200 files the first version of this fix missed."""
+    f = _write(tmp_path, "SENSEX2660474100PE_1min.csv", [])
+    _manager(tmp_path)._prune_candles()
+    assert not f.exists()
