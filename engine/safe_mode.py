@@ -304,6 +304,36 @@ def validate_real_mode_readiness(
             "market-open handoff window: REAL is armed; trade execution remains market/session gated"
         )
 
+    # Position size is taken from config/instruments.json, a hand-maintained file, while
+    # the exchange's own lot size is refreshed daily in the Kite contract master and read
+    # by nobody. Exchanges revise index lot sizes periodically; when they do, every order
+    # is sized on the wrong multiple and the broker refuses it as an invalid quantity —
+    # an ordinary-looking rejection with no hint of the cause. Compare them and say so.
+    if data_provider is not None:
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            raw = _json.loads(_Path("config/instruments.json").read_text(encoding="utf-8"))
+            configured = {
+                name: int((cfg or {}).get("lot_size") or 0)
+                for name, cfg in (raw.get("indices") or raw).items()
+                if isinstance(cfg, dict)
+            }
+            source = getattr(data_provider, "kite", None)
+            checker = getattr(source, "lot_size_mismatches", None)
+            if callable(checker) and configured:
+                for name, mine, actual in checker(configured):
+                    blockers.append(
+                        f"{name} lot size is {mine} in config/instruments.json but the "
+                        f"exchange uses {actual}. Every order would be sized on the wrong "
+                        "multiple and refused as an invalid quantity."
+                    )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            warnings.append(f"lot-size cross-check unavailable: {exc}")
+
     # A setting written into .env that nothing reads is worse than a missing feature: it
     # reads as a control that is working. ut_correlated_core_limit=2 says "maximum
     # simultaneous same-direction NIFTY/BANKNIFTY/SENSEX exposures" and the guard actually

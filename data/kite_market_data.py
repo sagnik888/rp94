@@ -147,6 +147,53 @@ class KiteDataSource:
             row["lot_size"] = 0
         return row
 
+    def option_lot_size(self, underlying: str) -> Optional[int]:
+        """Lot size the EXCHANGE currently uses for this index's options, or None.
+
+        Position size is taken from config/instruments.json, a hand-maintained file, while
+        this — the authoritative figure, refreshed daily with the contract master — is
+        parsed into every row and then read by nobody. Exchanges revise index lot sizes
+        periodically, and when they do the JSON goes stale silently: every order is then
+        sized on the wrong multiple and the broker refuses it as an invalid quantity,
+        which surfaces as an ordinary rejection with no hint of the cause.
+
+        Reported rather than applied. Silently resizing positions because a file
+        disagrees with a dump would be a worse failure than the one it fixes.
+        """
+        wanted = str(underlying or "").upper()
+        if not wanted:
+            return None
+        sizes: Dict[int, int] = {}
+        with self._lock:
+            exchanges = list(self._instruments.items())
+        for _exchange, rows in exchanges:
+            for row in rows:
+                if str(row.get("name") or "").upper() != wanted:
+                    continue
+                if str(row.get("instrument_type") or "").upper() not in {"CE", "PE"}:
+                    continue
+                size = int(row.get("lot_size") or 0)
+                if size > 0:
+                    sizes[size] = sizes.get(size, 0) + 1
+        if not sizes:
+            return None
+        # Expiries mid-revision can carry two sizes at once; the most common one is the
+        # size the bulk of the tradable chain uses.
+        return max(sizes.items(), key=lambda item: item[1])[0]
+
+    def lot_size_mismatches(self, configured: Dict[str, int]) -> List[Tuple[str, int, int]]:
+        """(index, configured, exchange) for each index whose JSON lot size is wrong."""
+        out: List[Tuple[str, int, int]] = []
+        for name, size in (configured or {}).items():
+            try:
+                mine = int(size or 0)
+            except (TypeError, ValueError):
+                continue
+            actual = self.option_lot_size(name)
+            if mine > 0 and actual and actual != mine:
+                out.append((str(name), mine, int(actual)))
+        return sorted(out)
+
     def instrument_token(self, tradingsymbol: str, exchange: str) -> Optional[int]:
         with self._lock:
             row = self._by_symbol.get((str(tradingsymbol or "").upper(), str(exchange or "").upper()))
