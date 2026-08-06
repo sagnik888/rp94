@@ -2369,8 +2369,8 @@ class MarketDataProvider:
                 logger.debug(f"Fyers quote fetch failed for {symbol}: {exc}")
 
         ltp = self.get_latest_price_by_token(token, symbol, exchange)
-        quote["ltp"] = float(ltp or 0.0)
         cached_source = self._ltp_cache.get(symbol, {})
+        quote["ltp"] = float(ltp or 0.0)
         quote["source"] = str(cached_source.get("source") or "fallback")
         if "time" in cached_source:
             quote["quote_age_seconds"] = (datetime.now() - cached_source["time"]).total_seconds()
@@ -2379,6 +2379,33 @@ class MarketDataProvider:
         prev_close = self.get_previous_close(symbol)
         quote["previous_close"] = prev_close
         quote["prev_close"] = prev_close
+
+        # A zero here used to be written straight into the panel. It is not a price: an
+        # index does not trade at 0, so it can only mean "nothing answered just now" —
+        # before the open, between reconnects, or while both REST paths are timing out.
+        # The last known price was sitting in _ltp_cache the whole time and this function
+        # read that dict for its `source` and `time` and ignored its `ltp`.
+        #
+        # Fall back to the last cached trade, then to the previous close, and mark the
+        # quote STALE so nothing downstream mistakes it for a live tick. Only when
+        # genuinely nothing has ever been seen does it stay 0, and the source says so.
+        if quote["ltp"] <= 0:
+            recovered = 0.0
+            try:
+                recovered = float(cached_source.get("ltp", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                recovered = 0.0
+            if recovered > 0:
+                quote["ltp"] = recovered
+                quote["source"] = f"{quote['source']}_stale"
+            elif prev_close > 0:
+                quote["ltp"] = prev_close
+                quote["source"] = "previous_close"
+                quote["quote_age_seconds"] = 0.0
+            else:
+                quote["source"] = "unavailable"
+            quote["is_stale"] = quote["ltp"] > 0
+
         if quote["ltp"] > 0 and prev_close > 0:
             quote["change"] = quote["ltp"] - prev_close
             quote["change_pct"] = quote["change"] / prev_close * 100.0

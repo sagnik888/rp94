@@ -246,6 +246,12 @@ def test_index_quote_recomputes_ws_change_from_fyers_previous_close(monkeypatch)
     # past 6s and failed the test intermittently. Nothing here is about elapsed time.
     now = time.time()
     monkeypatch.setattr(market_data_module.time, "time", lambda: now)
+    # ...and pin the SESSION too. get_index_quote checks the pre-open settlement window
+    # before it ever reaches the websocket selection this test is about, and inside that
+    # window it returns the Fyers REST quote and never gets there. So the test failed
+    # every day between 09:00 and 09:08 IST and passed the other 23h52m, which is worse
+    # than failing outright: an eight-minute window each morning in which it lies.
+    monkeypatch.setattr(provider, "get_market_session_label", lambda dt=None: "LIVE")
     provider._ws_cache["99926009"] = {
         "ltp": 58429.25,
         "time": now - 0.25,
