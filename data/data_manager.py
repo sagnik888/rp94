@@ -60,6 +60,26 @@ class DataManager:
         except Exception as e:
             logger.error(f"❌ [DataManager] Error syncing history: {e}")
 
+    # Index spot/futures files are re-populated every session; only dated CONTRACT files
+    # (an expiry and a strike in the name) go permanently dead. Deleting an index file
+    # would just cost a re-download, but there is no reason to churn them.
+    _CONTRACT_NAME = __import__("re").compile(r"\d{2}[A-Z]{3}\d{2}", __import__("re").I)
+
+    def _delete_dead_candle_file(self, file) -> None:
+        """Remove a candle CSV that can never receive another bar.
+
+        Only for expired CONTRACT files. An index file with no rows is empty for some
+        other reason — a fresh install, a failed first fetch — and will fill up again on
+        the next sync, so it is left alone.
+        """
+        try:
+            if not self._CONTRACT_NAME.search(file.stem):
+                return
+            file.unlink()
+            logger.info(f"🧹 [DataManager] Removed expired contract file {file.name}")
+        except OSError as exc:
+            logger.debug(f"Could not remove {getattr(file, 'name', file)}: {exc}")
+
     def _prune_candles(self):
         """Delete rows older than retention limits from CSV files."""
         if not self.candles_dir.exists():
@@ -81,13 +101,25 @@ class DataManager:
                 
                 df = pd.read_csv(file, index_col=0, parse_dates=True)
                 if df.empty:
+                    # A file with no rows left is a contract that has expired and will
+                    # never receive another bar. This used to `continue`, so every
+                    # expired weekly option left a header-only stub behind FOREVER: 808
+                    # CSVs on disk today, including BANKNIFTY 26MAY26 strikes long past
+                    # expiry, each one re-opened by pd.read_csv on every daily run. The
+                    # prune was pruning rows out of files it then kept for good.
+                    self._delete_dead_candle_file(file)
                     continue
-                
+
                 # Filter out old rows
                 orig_len = len(df)
                 df = df[df.index >= cutoff_date]
                 new_len = len(df)
-                
+
+                if new_len == 0:
+                    # Every row aged out: same as above, one run earlier.
+                    self._delete_dead_candle_file(file)
+                    continue
+
                 if new_len < orig_len:
                     df.to_csv(file)
                     logger.info(f"🧹 [DataManager] Pruned {orig_len - new_len} old rows from {file.name} (Retaining {retention} days)")

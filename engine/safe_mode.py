@@ -334,6 +334,28 @@ def validate_real_mode_readiness(
         except Exception as exc:
             warnings.append(f"lot-size cross-check unavailable: {exc}")
 
+    # Options are the only instrument this system trades and they carry the widest
+    # spreads, yet the charge model can be configured to assume they cost nothing to
+    # cross. estimate_trade_charges reads
+    #     float(getattr(settings, "slippage_opt_pct", 0.30) or 0.0) / 100.0
+    # so an explicit 0.0 in .env wins over the 0.30 default and every simulated,
+    # backtested and displayed option P&L comes out optimistic by the entire slippage
+    # cost. The measured EWMA replaces this once real fills accumulate, but
+    # slippage_stats.json currently holds FUT keys only, so nothing is replacing it.
+    #
+    # Not silently overridden — a deliberate zero is the operator's call — but they
+    # should know that is what is configured.
+    try:
+        _opt_slip = float(getattr(settings, "slippage_opt_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        _opt_slip = 0.0
+    if _opt_slip <= 0:
+        warnings.append(
+            "slippage_opt_pct is 0 — option P&L is modelled with NO slippage on the "
+            "instrument this system actually trades, so every simulated and displayed "
+            "figure is optimistic by the real cost of crossing the spread"
+        )
+
     # Hedging is DORMANT: _pullback_hedge_arm/_pullback_hedge_release are written and
     # tested, but no code path places the second leg. The setting is a live toggle in the
     # dashboard, so an operator can switch it on and reasonably believe hedging is now
