@@ -79,6 +79,21 @@ class Trade:
     partial_derisk_done: bool = False
     partial_reduce_order_id: str = ""
     partial_reduce_requested_quantity: int = 0
+    # Deliberate scale-IN state, the mirror of the three above.
+    #   scale_in_count   — how many add-ons this trade has taken, against the per-trade cap.
+    #   scale_in_lots    — lots added since entry, so the original size stays recoverable.
+    #   frozen_initial_risk_rs — the rupee risk committed at ENTRY, held across every
+    #     add-on. Without it, averaging the entry price up moves the stop distance and
+    #     therefore silently redefines 1R: a trade up 1.5R reads as 0.9R the moment lots
+    #     are added, and every R-based exit rule changes behaviour because of a decision
+    #     the operator made rather than anything the market did.
+    #   scale_in_order_id / scale_in_requested_quantity — an in-flight add, persisted so a
+    #     restart reconciles it from broker positions instead of sending a second one.
+    scale_in_count: int = 0
+    scale_in_lots: int = 0
+    frozen_initial_risk_rs: float = 0.0
+    scale_in_order_id: str = ""
+    scale_in_requested_quantity: int = 0
     exit_order_id: str = ""
     protective_order_id: str = ""
     protective_trigger: float = 0.0
@@ -224,6 +239,11 @@ class Trade:
             "partial_derisk_done": self.partial_derisk_done,
             "partial_reduce_order_id": self.partial_reduce_order_id,
             "partial_reduce_requested_quantity": self.partial_reduce_requested_quantity,
+            "scale_in_count": self.scale_in_count,
+            "scale_in_lots": self.scale_in_lots,
+            "frozen_initial_risk_rs": self.frozen_initial_risk_rs,
+            "scale_in_order_id": self.scale_in_order_id,
+            "scale_in_requested_quantity": self.scale_in_requested_quantity,
             # Both of these were absent from the round trip, so a restart silently reset
             # them. reversal_watch_required is the one that matters to an operator: it
             # marks a contract whose stop MAY still be resting after a flatten, and the
@@ -418,6 +438,13 @@ class Trade:
             partial_reduce_order_id=data.get("partial_reduce_order_id", "") or "",
             partial_reduce_requested_quantity=int(
                 data.get("partial_reduce_requested_quantity", 0) or 0
+            ),
+            scale_in_count=int(data.get("scale_in_count", 0) or 0),
+            scale_in_lots=int(data.get("scale_in_lots", 0) or 0),
+            frozen_initial_risk_rs=float(data.get("frozen_initial_risk_rs", 0.0) or 0.0),
+            scale_in_order_id=data.get("scale_in_order_id", "") or "",
+            scale_in_requested_quantity=int(
+                data.get("scale_in_requested_quantity", 0) or 0
             ),
             reversal_watch_required=bool(data.get("reversal_watch_required", False)),
             is_reversion_scalp=bool(data.get("is_reversion_scalp", False)),
@@ -1762,6 +1789,289 @@ class TradeManager:
             self._mark_recovery(
                 trade, "Remainder of a partial de-risk could not be re-protected"
             )
+
+    # ── scale-in ─────────────────────────────────────────────────────────────
+    def scale_in_trade(
+        self, trade_id: str, add_lots: Optional[int] = None, price: float = 0.0,
+        reason: str = "CASCADE_ADD",
+    ) -> Tuple[bool, str]:
+        """Add lots to a position that is already working.
+
+        The mirror of partial_close_trade, and deliberately ordered the other way round.
+        The reduce must cancel the full-size stop FIRST, because exiting on top of a live
+        SL-M double-exits. An add has the opposite failure direction: the existing stop
+        already covers what is held, so the order is ADD -> confirm from broker positions
+        -> re-arm the stop for the new total. If the add never fills, nothing changed and
+        the position stayed protected the whole time; if it fills and the re-arm fails,
+        the trade is marked for recovery rather than left running under-protected.
+
+        Returns (accepted, reason) so a caller can log WHY an add was refused instead of
+        guessing from a bare False.
+        """
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not _setting_enabled(getattr(settings, "scale_in_enabled", False), False):
+            return False, "scale-in disabled"
+
+        with self._lock:
+            trade = self.open_trades.get(trade_id)
+            if not trade or trade.status != "OPEN":
+                return False, "trade is not cleanly open"
+            if trade.pending_exit or str(trade.execution_status or "").upper() in {
+                "EXIT_PENDING", "PARTIAL_EXIT", "RECOVERY_REQUIRED",
+            }:
+                return False, f"exit or recovery in flight ({trade.execution_status})"
+            if bool(getattr(trade, "partial_derisk_done", False)):
+                # De-risking and scaling in are opposite decisions about the same trade.
+                return False, "already de-risked; not adding back"
+            if (
+                str(getattr(trade, "scale_in_order_id", "") or "")
+                or int(getattr(trade, "scale_in_requested_quantity", 0) or 0) > 0
+            ):
+                return False, "an add is already in flight"
+            if bool(getattr(trade, "_scale_in_inflight", False)):
+                return False, "an add is already in flight"
+
+            if add_lots is None:
+                # scale_in_lots_per_add is the size of one add. A caller that knows
+                # better may override it; most just say "add".
+                add_lots = int(getattr(settings, "scale_in_lots_per_add", 1) or 1)
+            add_lots = max(0, int(add_lots or 0))
+            if add_lots < 1:
+                return False, "no lots to add"
+            max_adds = max(0, int(getattr(settings, "scale_in_max_adds_per_trade", 2) or 0))
+            if int(getattr(trade, "scale_in_count", 0) or 0) >= max_adds:
+                return False, f"add cap {max_adds} reached"
+            max_total = max(1, int(getattr(settings, "scale_in_max_total_lots", 6) or 6))
+            if int(trade.lots or 0) + add_lots > max_total:
+                return False, f"would exceed {max_total} total lots"
+
+            price = float(price or trade.current_price or trade.entry_price or 0.0)
+            if price <= 0:
+                return False, "no usable price"
+
+            ok, why = self._scale_in_is_earned(trade, settings)
+            if not ok:
+                return False, why
+
+            # An add-on is new money at risk even though it is not a new position, so it
+            # faces the rupee budget. It does NOT face the per-index/bucket count caps —
+            # those bound how many ideas are live, and this is the same idea.
+            admitted, risk_why = self._entry_risk_admission(
+                inst_type=trade.inst_type,
+                direction=trade.direction,
+                price=price,
+                trailing_stop=float(trade.current_stop or trade.trailing_stop or 0.0),
+                initial_stop=float(getattr(trade, "initial_stop", 0.0) or trade.trailing_stop or 0.0),
+                lots=add_lots,
+                lot_size=int(trade.lot_size or 1),
+                instrument_multiplier=float(getattr(trade, "instrument_multiplier", 1.0) or 1.0),
+                is_recovery=False,
+            )
+            if not admitted:
+                return False, f"entry risk budget: {risk_why}"
+
+            is_real = bool(
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and self.broker
+                and getattr(trade, "symbol_token", "")
+                and not getattr(trade, "is_ghost", False)
+            )
+            if not is_real:
+                self._book_scale_in(trade, add_lots, price, reason)
+                self.save_state()
+                return True, "booked"
+            setattr(trade, "_scale_in_inflight", True)
+
+        self._request_broker_scale_in(trade, add_lots, price, reason)
+        return True, "submitted"
+
+    def _scale_in_is_earned(self, trade: Trade, settings) -> Tuple[bool, str]:
+        """Only add to a trade that is already working, and still with the trend.
+
+        Adding to a loser is averaging down, which turns one bad idea into a bigger one.
+        Profit is measured in R against the ORIGINAL risk, not the current unrealised
+        rupees, so the bar does not get easier as the position grows.
+        """
+        risk = self._frozen_initial_risk_rs(trade)
+        min_r = max(0.0, float(getattr(settings, "scale_in_min_profit_r", 0.75) or 0.0))
+        if min_r > 0:
+            if risk <= 0:
+                return False, "original risk unknown, cannot measure R"
+            entry = float(trade.entry_price or 0.0)
+            mark = float(trade.current_price or 0.0)
+            if entry <= 0 or mark <= 0:
+                return False, "no mark to measure profit against"
+            signed = (mark - entry) if str(trade.direction).upper() == "LONG" else (entry - mark)
+            qty = int(getattr(trade, "broker_quantity", 0) or trade.quantity or 0)
+            mult = 1.0 if str(trade.inst_type or "").upper() == "OPT" else float(
+                getattr(trade, "instrument_multiplier", 1.0) or 1.0
+            )
+            open_r = (signed * max(1, qty) * mult) / risk
+            if open_r < min_r:
+                return False, f"open profit {open_r:.2f}R below {min_r:.2f}R"
+
+        if _setting_enabled(getattr(settings, "scale_in_requires_trend", True), True):
+            regime = str(getattr(trade, "market_regime", "") or "").upper()
+            if regime:
+                bullish = "UP" in regime or "BULL" in regime
+                bearish = "DOWN" in regime or "BEAR" in regime
+                wants_up = str(trade.direction).upper() == "LONG"
+                if (wants_up and bearish) or (not wants_up and bullish):
+                    return False, f"regime {regime} opposes the trade"
+                if not (bullish or bearish):
+                    return False, f"regime {regime} is not trending"
+        return True, ""
+
+    def _frozen_initial_risk_rs(self, trade: Trade) -> float:
+        """Rupee risk committed at ENTRY, held constant across every add-on.
+
+        Computed once, on the first add, from the pre-scale entry and stop. After that the
+        weighted-average entry has moved and the same arithmetic would give a different —
+        and meaningless — answer.
+        """
+        stored = float(getattr(trade, "frozen_initial_risk_rs", 0.0) or 0.0)
+        if stored > 0:
+            return stored
+        entry = float(trade.entry_price or 0.0)
+        stop = float(getattr(trade, "initial_stop", 0.0) or trade.trailing_stop or 0.0)
+        if entry <= 0 or stop <= 0:
+            return 0.0
+        qty = int(getattr(trade, "broker_quantity", 0) or trade.quantity or 0)
+        mult = 1.0 if str(trade.inst_type or "").upper() == "OPT" else float(
+            getattr(trade, "instrument_multiplier", 1.0) or 1.0
+        )
+        return abs(entry - stop) * max(1, qty) * max(0.0, mult)
+
+    def _book_scale_in(self, trade: Trade, add_lots: int, fill_price: float, reason: str) -> None:
+        """Fold a confirmed add into the parent. Caller holds the lock."""
+        # Freeze R BEFORE the entry price moves — afterwards the original is unrecoverable.
+        if float(getattr(trade, "frozen_initial_risk_rs", 0.0) or 0.0) <= 0:
+            trade.frozen_initial_risk_rs = self._frozen_initial_risk_rs(trade)
+
+        old_lots = max(0, int(trade.lots or 0))
+        old_qty = old_lots * int(trade.lot_size or 1)
+        add_qty = int(add_lots) * int(trade.lot_size or 1)
+        total_qty = old_qty + add_qty
+        if total_qty > 0:
+            trade.entry_price = (
+                float(trade.entry_price or 0.0) * old_qty + float(fill_price) * add_qty
+            ) / total_qty
+        trade.lots = old_lots + int(add_lots)
+        trade.scale_in_lots = int(getattr(trade, "scale_in_lots", 0) or 0) + int(add_lots)
+        trade.scale_in_count = int(getattr(trade, "scale_in_count", 0) or 0) + 1
+        trade.broker_quantity = total_qty
+        logger.success(
+            f"Scale-in booked for {trade.trading_symbol}: +{add_lots} lot(s) @ "
+            f"{fill_price:.2f} ({reason}); {trade.lots} lots now, average entry "
+            f"{trade.entry_price:.2f}, 1R still Rs.{trade.frozen_initial_risk_rs:.0f}"
+        )
+
+    def _request_broker_scale_in(
+        self, trade: Trade, add_lots: int, price: float, reason: str,
+    ) -> None:
+        quantity = int(add_lots) * int(trade.lot_size or 1)
+
+        def add_bg():
+            try:
+                self._run_scale_in(trade, add_lots, quantity, price, reason)
+            except Exception as exc:
+                logger.error(f"Scale-in crashed for {trade.trading_symbol}: {exc}")
+                self._mark_recovery(trade, f"Scale-in failed unexpectedly: {exc}")
+            finally:
+                setattr(trade, "_scale_in_inflight", False)
+                trade.scale_in_order_id = ""
+                trade.scale_in_requested_quantity = 0
+                self.save_state()
+
+        from engine.async_queue import execution_queue
+
+        if execution_queue.submit(f"ScaleIn_{trade.trading_symbol}", add_bg) is False:
+            setattr(trade, "_scale_in_inflight", False)
+            logger.warning(
+                f"Scale-in for {trade.trading_symbol} was refused by the execution queue; "
+                "the position is untouched and fully protected."
+            )
+
+    def _run_scale_in(
+        self, trade: Trade, add_lots: int, quantity: int, price: float, reason: str,
+    ) -> None:
+        entry_side = "BUY" if trade.inst_type == "OPT" else (
+            "BUY" if str(trade.direction).upper() in {"LONG", "BUY"} else "SELL"
+        )
+        # The existing stop is NOT cancelled first. It covers the quantity currently held,
+        # so leaving it armed means a failed add changes nothing and a filled add is
+        # merely under-protected on the new lots until the re-arm below — never naked, and
+        # never over-exited.
+        try:
+            order_id = self.broker.place_order(
+                trade.trading_symbol, trade.symbol_token, quantity, entry_side,
+                self.product_type, price=0.0,
+                **self._tag_kwargs(self.broker.place_order, trade, "ADD"),
+            )
+        except (BrokerOrderRejected, PermissionError) as exc:
+            logger.error(f"Scale-in refused for {trade.trading_symbol}: {exc}")
+            return
+        except BrokerOrderAmbiguous as exc:
+            # The add MAY be live. Book nothing and re-arm nothing: a stop sized for the
+            # old quantity on a position that may now be larger is the safe direction, and
+            # reconciliation will read the real quantity.
+            self._mark_recovery(
+                trade,
+                f"Scale-in acknowledgement ambiguous ({exc}); broker quantity must be "
+                "reconciled before this position is managed further.",
+            )
+            return
+        if not order_id:
+            logger.warning(f"Scale-in for {trade.trading_symbol} returned no order id.")
+            return
+
+        trade.scale_in_order_id = str(order_id)
+        trade.scale_in_requested_quantity = quantity
+        self.save_state()
+
+        expected_total = int(trade.broker_quantity or trade.quantity or 0) + quantity
+        confirmed = self._confirmed_scaled_quantity(trade, expected_total)
+        if confirmed is None:
+            self._mark_recovery(
+                trade,
+                "Scale-in could not be confirmed from broker positions; the protective "
+                "stop is NOT re-sized until the real quantity is known.",
+            )
+            return
+
+        with self._lock:
+            self._book_scale_in(trade, add_lots, price, reason)
+            trade.broker_quantity = confirmed or trade.broker_quantity
+        self.save_state()
+
+        if not self.ensure_broker_protection(trade, trade.broker_quantity):
+            self._mark_recovery(
+                trade, "Scale-in filled but the enlarged position could not be re-protected"
+            )
+
+    def _confirmed_scaled_quantity(
+        self, trade: Trade, expected_total: int, timeout: float = 4.0
+    ) -> Optional[int]:
+        """Wait for POSITIONS — not an order ack — to prove the add landed.
+
+        The exact mirror of _confirmed_reduced_quantity, including its rule that None
+        means UNKNOWN and never "it did not fill". Booking an add off an acknowledgement
+        would move the average entry price for lots that may never have arrived, and every
+        R and P&L figure downstream is computed from that price.
+        """
+        deadline = time.monotonic() + max(0.5, float(timeout or 0.5))
+        while time.monotonic() < deadline:
+            position, readable = self._live_position_for_trade(trade)
+            if readable and position is not None:
+                signed = self._position_quantity(position)
+                if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
+                    return None          # direction flipped: not our add
+                if abs(signed) >= int(expected_total):
+                    return abs(signed)
+            time.sleep(0.2)
+        return None
 
     def _entry_risk_admission(
         self, *, inst_type: str, direction: str, price: float, trailing_stop: float,

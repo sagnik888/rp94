@@ -1187,6 +1187,34 @@ class Settings(BaseSettings):
     # take-profit at Rs.5000. Bounded to [0.50, 0.99] in code; 1.0 is not selectable.
     # Matters more as size grows: at 10 NIFTY lots Rs.5000 is under Rs.7 of premium.
     profit_lock_max_ratio: float = 0.95
+    # ── scale-in (adding lots to a position that is already working) ─────────────────
+    # Until now nothing anywhere increased an open trade's quantity: "cascade lot-adding"
+    # opens SEPARATE trades across timeframes, which is a different thing.
+    #
+    # Default OFF. Turning it on changes how much money is at risk per idea, so it is an
+    # explicit decision. The four design choices behind it, each made deliberately:
+    #   * ONE shared stop, re-armed for the full quantity. Every exit path in this system
+    #     assumes one position with one stop; giving a trade two stops would mean teaching
+    #     all of them about legs.
+    #   * The profit ladder reads the COMBINED position — so run this with
+    #     profit_lock_per_lot_basis on, or adding size fakes a bigger win and the ladder
+    #     scalps a trade that has barely developed.
+    #   * WEIGHTED-AVERAGE entry price, with the original rupee risk FROZEN. Averaging up
+    #     moves the stop distance, which would silently redefine 1R and change every
+    #     R-based exit rule because of a sizing decision rather than a market move.
+    #   * An add-on does NOT consume a fresh position slot (it is not a new trade) but it
+    #     IS new money at risk, so it must pass the rupee-risk check and is refused when
+    #     it does not fit.
+    scale_in_enabled: bool = False
+    scale_in_max_adds_per_trade: int = 2
+    scale_in_lots_per_add: int = 1
+    # An add-on is only allowed on a trade that is ALREADY working: this much of the
+    # original risk in open profit, measured in R. Adding to a loser is averaging down.
+    scale_in_min_profit_r: float = 0.75
+    # ...and only while the regime still points the trade's way.
+    scale_in_requires_trend: bool = True
+    # Hard ceiling on total lots after adding, whatever the adds-per-trade cap allows.
+    scale_in_max_total_lots: int = 6
     auto_option_chain_min_strikes: int = 3 # Minimum fresh active-expiry strikes required for OPT Auto
     vix_percentile_min_sessions: int = 20 # Minimum daily India VIX observations before volatility routing is trusted
     vix_live_cache_seconds: float = 60.0 # Avoid repeated India VIX REST calls across index scans

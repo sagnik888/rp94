@@ -8159,6 +8159,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         qty: Optional[int] = None,
         inst_mult: float = 1.0,
     ) -> float:
+        # A scaled-in trade carries the rupee risk it committed at ENTRY. Recomputing it
+        # from the weighted-average entry would move the stop distance and therefore
+        # redefine 1R: a trade up 1.5R reads as 0.9R the instant lots are added, and every
+        # R-based exit rule changes behaviour because of a sizing decision rather than
+        # anything the market did. Only set once a trade has actually scaled in.
+        frozen = float(getattr(trade_like, "frozen_initial_risk_rs", 0.0) or 0.0)
+        if frozen > 0 and qty is None:
+            return frozen
+
         entry = self._trade_like_entry_price(trade_like)
         initial = self._ensure_trade_like_initial_stop(trade_like)
         if entry <= 0 or initial <= 0:

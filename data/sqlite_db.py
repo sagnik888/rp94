@@ -64,6 +64,11 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # re-submitted against lots that are already gone.
     "partial_derisk_done", "partial_reduce_order_id",
     "partial_reduce_requested_quantity",
+    "scale_in_count",
+    "scale_in_lots",
+    "frozen_initial_risk_rs",
+    "scale_in_order_id",
+    "scale_in_requested_quantity",
 })
 
 
@@ -238,6 +243,11 @@ class DatabaseManager:
                     "partial_derisk_done": "INTEGER",
                     "partial_reduce_order_id": "TEXT",
                     "partial_reduce_requested_quantity": "INTEGER",
+                    "scale_in_count": "INTEGER",
+                    "scale_in_lots": "INTEGER",
+                    "frozen_initial_risk_rs": "REAL",
+                    "scale_in_order_id": "TEXT",
+                    "scale_in_requested_quantity": "INTEGER",
                 },
             )
             
