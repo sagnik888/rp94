@@ -137,7 +137,106 @@ def per_trade_risk_budget(
     return min(max(0.0, budget), max(0.0, hard_cap))
 
 
+def _market_lot_multiplier(settings: Any, inst_type: str, intel_score: float) -> float:
+    """How much the measured market supports sizing up, as a multiplier.
+
+    Lot COUNT already responds to market conditions through the cascade and heavy-trend
+    flags, but lot SIZE was a user-configured constant with only those coarse on/off
+    multipliers. This reads the same intelligence score that already drives RR, target,
+    exit and (optionally) the stop, so conviction moves size the way it moves everything
+    else.
+
+    Options only. FUT is hard-capped at fut_lots_hard_cap by operator rule and must not be
+    enlarged by anything.
+
+    Default OFF: sizing up is how a good idea becomes an expensive one.
+    """
+    if str(inst_type or "").upper() != "OPT":
+        return 1.0
+    if not _setting_enabled(getattr(settings, "market_driven_lot_size", False), False):
+        return 1.0
+    try:
+        score = float(intel_score or 0.0)
+    except (TypeError, ValueError):
+        return 1.0
+    if score <= 0:
+        return 1.0                      # no reading is not a reason to size up
+    try:
+        span = float(getattr(settings, "market_lot_size_max_boost_pct", 50.0) or 0.0)
+    except (TypeError, ValueError):
+        span = 50.0
+    span = max(0.0, min(100.0, span)) / 100.0
+    if span <= 0:
+        return 1.0
+    # Only ABOVE neutral adds size. Below neutral the trade should not be taken larger,
+    # and shrinking it is the entry filters' job, not the sizer's.
+    lean = max(0.0, min(1.0, (score - 50.0) / 50.0))
+    return 1.0 + lean * span
+
+
 def resolve_trade_lots(
+    *,
+    settings: Any,
+    inst_type: str,
+    requested_lots: int,
+    lot_size: int,
+    entry_price: float = 0.0,
+    stop_price: float = 0.0,
+    quality_multiplier: float = 1.0,
+    cap_lots: int | None = None,
+    cascade_scale: bool = False,
+    heavy_trend_scale: bool = False,
+    high_conviction: bool = False,
+    compression_state: str = "",
+    intel_score: float = 0.0,
+) -> PositionSizeResult:
+    """Resolve lots, then let measured market conviction scale the result.
+
+    A thin wrapper so the multiplier composes with EVERY existing path and cap rather
+    than being threaded through each of them. The compression cap is deliberately exempt:
+    "a quiet locked session is never enlarged" is a safety invariant, and a market score
+    is not permission to override it.
+    """
+    result = _resolve_trade_lots_core(
+        settings=settings,
+        inst_type=inst_type,
+        requested_lots=requested_lots,
+        lot_size=lot_size,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        quality_multiplier=quality_multiplier,
+        cap_lots=cap_lots,
+        cascade_scale=cascade_scale,
+        heavy_trend_scale=heavy_trend_scale,
+        high_conviction=high_conviction,
+        compression_state=compression_state,
+    )
+    if result.lots < 1 or result.mode == "compression_cap":
+        return result
+    mult = _market_lot_multiplier(settings, inst_type, intel_score)
+    if mult <= 1.0:
+        return result
+    grown = int(result.lots * mult)
+    if cap_lots is not None:
+        grown = min(grown, max(1, int(cap_lots)))
+    try:
+        ceiling = int(getattr(settings, "market_lot_size_max_lots", 0) or 0)
+    except (TypeError, ValueError):
+        ceiling = 0
+    if ceiling > 0:
+        grown = min(grown, ceiling)
+    if grown <= result.lots:
+        return result
+    return PositionSizeResult(
+        grown,
+        f"{result.reason}; market conviction {mult:.2f}x -> {grown} lots",
+        result.risk_per_lot,
+        result.risk_budget,
+        result.mode,
+    )
+
+
+def _resolve_trade_lots_core(
     *,
     settings: Any,
     inst_type: str,

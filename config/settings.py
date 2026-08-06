@@ -1208,6 +1208,15 @@ class Settings(BaseSettings):
     # and the per-timeframe rules is nudged, never redefined.
     dynamic_stop_from_intelligence: bool = False
     dynamic_stop_intel_max_shift_pct: float = 20.0
+    # Let measured market conviction move lot SIZE, not just lot COUNT. Cascade and
+    # heavy-trend already scale the number of trades, but size itself was a
+    # user-configured constant with only those coarse on/off multipliers.
+    # Options only — FUT is hard-capped at fut_lots_hard_cap by operator rule. Only
+    # ABOVE-neutral conviction adds size; shrinking is the entry filters' job.
+    # Default OFF: sizing up is how a good idea becomes an expensive one.
+    market_driven_lot_size: bool = False
+    market_lot_size_max_boost_pct: float = 50.0
+    market_lot_size_max_lots: int = 4
     # ── scale-in (adding lots to a position that is already working) ─────────────────
     # Until now nothing anywhere increased an open trade's quantity: "cascade lot-adding"
     # opens SEPARATE trades across timeframes, which is a different thing.

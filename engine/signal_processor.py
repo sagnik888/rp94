@@ -2994,6 +2994,7 @@ class SignalProcessor:
                                 entry_price=hist_entry_px,
                                 stop_price=hist_stop_px,
                                 compression_state=hist_compression_state,
+                                intel_score=float(hist_intel_score or 0.0),
                             )
                             hist_lots = int(size_result.lots or 0)
                             if hist_lots < 1:
@@ -3039,6 +3040,7 @@ class SignalProcessor:
                                         entry_price=float(entry_premium or 0.0),
                                         stop_price=fut_stop,
                                         compression_state=hist_compression_state,
+                                        intel_score=0.0,  # FUT: never enlarged by conviction
                                     )
                                     hist_lots = int(size_result.lots or 0)
                                     if hist_lots < 1:
@@ -3645,6 +3647,10 @@ class SignalProcessor:
                                 lot_size=lot_size,
                                 entry_price=rec_entry,
                                 stop_price=rec_stop,
+                                # Recovery re-establishes an EXISTING position; there is
+                                # no fresh intelligence reading behind it and conviction
+                                # must not resize what is already on.
+                                intel_score=0.0,
                             )
                             rec_lots = int(size_result.lots or 0)
                             if rec_lots < 1:
@@ -6017,6 +6023,7 @@ class SignalProcessor:
                     heavy_trend_scale=heavy_trend_scale,
                     high_conviction=False,
                     compression_state=_effective_compression_state,
+                    intel_score=float(intel_score or 0.0),
                 )
                 if size_result.lots < 1:
                     logger.info(
