@@ -4251,6 +4251,19 @@ class TradeManager:
         if now_t < kill_threshold:
             return
 
+        # ...and only on a day the exchange actually traded. This gated on the CLOCK
+        # alone, so a position that survived Friday's square-off — a broker reject, an RMS
+        # refusal, an IP block — kept the scanner running into the weekend, and at 15:23
+        # on Saturday `now_t >= kill_threshold` was true again. It then sent exit orders
+        # into a shut exchange, once a second, for two days.
+        #
+        # The position is real and does need closing, so this does NOT go quiet: it
+        # escalates with the symbol and tells the operator to square off manually. What it
+        # will not do is fire orders that can only be rejected.
+        if not self._session_is_a_trading_day(now):
+            self._alert_carrying_through_a_closed_day(now)
+            return
+
         with self._lock:
             snapshot = list(self.open_trades.items())
             
@@ -4296,6 +4309,56 @@ class TradeManager:
             self._handle_orphans_at_session_end(now)
         except Exception as exc:
             logger.critical(f"Orphan sweep failed at session end: {exc}", exc_info=True)
+
+    def _session_is_a_trading_day(self, now: datetime) -> bool:
+        """Did the exchange trade today? Weekends and holidays are not square-off days.
+
+        Fails OPEN — an unreadable calendar returns True — because refusing to square off
+        on a real trading day is far worse than sending an order that gets rejected on a
+        holiday. The special-session case (a Saturday the exchange DOES open) is handled
+        by is_market_holiday's own calendar, which knows about them.
+        """
+        provider = getattr(self, "data", None) or getattr(
+            getattr(self, "scanner", None), "data", None
+        )
+        try:
+            if now.weekday() >= 5:
+                checker = getattr(provider, "is_market_special_session", None)
+                if callable(checker) and checker(now):
+                    return True
+                # No provider to ask: a weekend is a weekend.
+                if provider is None or not callable(checker):
+                    return False
+                return False
+            holiday = getattr(provider, "is_market_holiday", None)
+            if callable(holiday):
+                return not bool(holiday(now))
+        except Exception as exc:
+            logger.debug(f"Trading-day check unavailable, assuming open: {exc}")
+        return True
+
+    def _alert_carrying_through_a_closed_day(self, now: datetime) -> None:
+        """Say once per closed day that positions are sitting through it."""
+        holding = [t for t in self.open_trades.values() if str(getattr(t, "status", "")) == "OPEN"]
+        orphans = dict(getattr(self, "orphan_positions", {}) or {})
+        if not holding and not orphans:
+            return
+        stamp = now.date().isoformat()
+        if not hasattr(self, "_closed_day_alerted"):
+            self._closed_day_alerted = set()
+        if stamp in self._closed_day_alerted:
+            return
+        self._closed_day_alerted.add(stamp)
+        names = [str(getattr(t, "trading_symbol", t.id)) for t in holding] + list(orphans)
+        message = (
+            f"MARKET CLOSED {stamp}: {len(names)} position(s) still open and the force exit "
+            f"cannot run — {', '.join(names[:4])}"
+            + (f" +{len(names) - 4} more" if len(names) > 4 else "")
+            + ". Orders would only be rejected today. Square off at the Zerodha terminal, "
+            "or they carry to the next session."
+        )
+        logger.critical(message)
+        self._log_ui(message, "error")
 
     def _handle_orphans_at_session_end(self, now: datetime) -> None:
         """Broker positions this system did not open are NOT covered by the sweep above.
