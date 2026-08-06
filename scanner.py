@@ -20762,6 +20762,62 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     )
         return ""
 
+    def _offer_cascade_add(self, candidate) -> Tuple[bool, str]:
+        """Turn a blocked same-chart duplicate into one more lot on the running trade.
+
+        The operator's rule: when the quad/dual scanners fire more than one signal in the
+        SAME index and SAME timeframe, do not open a second trade at another strike — add
+        a lot to the one already working. Until now the duplicate was simply discarded by
+        the concurrency guard, and on a non-overlapping quad source it could instead open
+        that second trade, which is the outcome the rule exists to prevent.
+
+        Matching is deliberately strict: same base index, same timeframe, same direction.
+        A different timeframe is a different idea and keeps its own trade; the opposite
+        direction is a reversal, not a reinforcement.
+
+        Everything about WHETHER to add belongs to scale_in_trade — profit, trend, add
+        cap, lot ceiling, rupee budget, in-flight guard. This only decides when to ask,
+        and returns its refusal so the operator can see why in the decision log.
+        """
+        try:
+            adder = getattr(getattr(self, "trades", None), "scale_in_trade", None)
+            if not callable(adder):
+                return False, ""
+            base = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+            timeframe = str(getattr(candidate, "timeframe", "") or "")
+            direction = str(getattr(candidate, "direction", "") or "").upper()
+            if not base or not timeframe or direction not in {"LONG", "SHORT"}:
+                return False, ""
+
+            for trade_id, trade in list(getattr(self.trades, "open_trades", {}).items()):
+                if str(getattr(trade, "instrument", "") or "").split()[0].upper() != base:
+                    continue
+                if str(getattr(trade, "timeframe", "") or "") != timeframe:
+                    continue
+                if str(getattr(trade, "direction", "") or "").upper() != direction:
+                    continue
+                price = float(
+                    getattr(trade, "current_price", 0.0)
+                    or getattr(trade, "entry_price", 0.0)
+                    or 0.0
+                )
+                ok, why = adder(trade_id, None, price, "CASCADE_ADD")
+                if ok:
+                    logger.success(
+                        f"Cascade add: {base} {timeframe} {direction} duplicate signal "
+                        f"added a lot to {getattr(trade, 'trading_symbol', trade_id)} "
+                        f"instead of opening a second trade."
+                    )
+                    self.log_event(
+                        f"Cascade add: extra lot on {base} {timeframe} {direction} "
+                        "from a duplicate same-chart signal.",
+                        "trade",
+                    )
+                return bool(ok), str(why or "")
+        except Exception as exc:
+            logger.debug(f"Cascade add skipped for {getattr(candidate, 'instrument', '?')}: {exc}")
+        return False, ""
+
     def _prepare_candidate_for_concurrency(self, candidate: TradeCandidate) -> bool:
         """Per-index concurrency guard.
 
@@ -23384,8 +23440,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
                 # Per-Instrument Safety (Cross-TF Complementary Rule)
                 if not self._prepare_candidate_for_concurrency(sig):
+                    # A duplicate on a chart that is already working is not noise to throw
+                    # away — it is the cascade confirming itself. Before dropping it, offer
+                    # it to the running trade as one more lot. scale_in_trade owns every
+                    # rule about whether that is allowed (already in profit, still with
+                    # trend, add cap, lot ceiling, rupee risk budget) and refuses with a
+                    # reason when it is not; this only decides WHEN to ask.
+                    added, add_note = self._offer_cascade_add(sig)
+                    if added:
+                        continue
                     ts = getattr(sig, "signal_timestamp", None)
                     ts_key = ts.isoformat(timespec="seconds") if ts else ""
+                    if add_note:
+                        self.log_signal_decision_once(
+                            f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{ts_key}|cascade-add",
+                            f"{sig.instrument} {sig.timeframe} {sig.direction}: cascade add "
+                            f"declined ({add_note})",
+                            "trade",
+                        )
                     self.log_signal_decision_once(
                         f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{ts_key}|concurrency",
                         f"Signal rejected: {sig.instrument} {sig.direction} {sig.timeframe} - concurrency guard blocked it",
