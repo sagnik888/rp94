@@ -656,6 +656,17 @@ class Settings(BaseSettings):
     # standalone directional bet — it closes with its parent and never outlives it.
     # DEFAULT OFF: this opens a second live broker leg (sizing/exposure/accounting),
     # so it stays off until the archived-session backtest justifies enabling it.
+    #
+    # DORMANT AS OF 2026-08-07, and the distinction matters because this is a toggle in
+    # the dashboard UI. _pullback_hedge_arm and _pullback_hedge_release are written and
+    # tested, but NOTHING IN THE SYSTEM OPENS A HEDGE LEG — there is no call site that
+    # places the second order. Turning this on therefore changes nothing at all.
+    #
+    # The decision helpers are kept rather than deleted: they encode real thinking about
+    # when a hedge is justified (only a proven runner, armed before the lock's give-back)
+    # and that work is worth having when the leg is eventually built. What is NOT
+    # acceptable is a switch an operator can flip believing it does something, so the
+    # REAL-mode preflight warns when this is on. See engine/safe_mode.py.
     pullback_hedge_enabled: bool = False
     # Arm when the premium has retraced this FRACTION of the distance from peak to the
     # runner stop. Relative (not a fixed premium %) because the runner lock sits only

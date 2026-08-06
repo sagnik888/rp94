@@ -334,6 +334,17 @@ def validate_real_mode_readiness(
         except Exception as exc:
             warnings.append(f"lot-size cross-check unavailable: {exc}")
 
+    # Hedging is DORMANT: _pullback_hedge_arm/_pullback_hedge_release are written and
+    # tested, but no code path places the second leg. The setting is a live toggle in the
+    # dashboard, so an operator can switch it on and reasonably believe hedging is now
+    # running. Say otherwise, loudly, at the one moment they are reading this output.
+    _hedge_on = getattr(settings, "pullback_hedge_enabled", False)
+    if _hedge_on is True or str(_hedge_on).strip().lower() in {"1", "true", "yes", "on"}:
+        warnings.append(
+            "pullback_hedge_enabled is ON but hedging is DORMANT — the arm/release "
+            "decisions exist and nothing opens a hedge leg, so no hedge will be placed"
+        )
+
     # A setting written into .env that nothing reads is worse than a missing feature: it
     # reads as a control that is working. ut_correlated_core_limit=2 says "maximum
     # simultaneous same-direction NIFTY/BANKNIFTY/SENSEX exposures" and the guard actually

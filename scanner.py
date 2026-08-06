@@ -16744,7 +16744,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if source_ts is not None:
             setattr(candidate, "source_signal_timestamp", source_ts)
         setattr(candidate, "entry_spot", spot)
-        setattr(candidate, "market_regime", getattr(seed, "market_regime", getattr(self, "latest_regimes", {}).get(instrument, "")))
+        # Own-timeframe regime, not the 5-minute one. latest_regimes is keyed by
+        # INSTRUMENT and its own declaration calls it "5min instrument regime", so a 1min
+        # or 15min candidate was being graded on a label computed from 5-minute candles.
+        # _timeframe_regimes has held the per-timeframe answer all along and
+        # _get_trade_regime already does the right cascade — own timeframe, then the 5min
+        # label, then UNKNOWN — it was simply never used at the ENTRY seam, only for
+        # managing trades already open.
+        setattr(
+            candidate,
+            "market_regime",
+            getattr(seed, "market_regime", None) or self._get_trade_regime(candidate, default=""),
+        )
         setattr(candidate, "intelligence_score", float(getattr(seed, "intelligence_score", 0.0) or 0.0))
         setattr(candidate, "source_engine", str(getattr(seed, "source_engine", "") or "missed_reentry"))
         setattr(candidate, "source_engines", list(getattr(seed, "source_engines", []) or []))
