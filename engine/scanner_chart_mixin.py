@@ -11,6 +11,7 @@ Rollback: `git revert` of the extraction commit restores the monolith.
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -28,6 +29,19 @@ class ScannerChartMixin:
     def _build_chart_from_cache(self, instrument: str, force: bool = False) -> Dict:
         if not getattr(self, "chart_stream_enabled", True):
             return {}
+
+        # Serialised because two callers can now reach this at once: the scan cycle on the
+        # scanner event loop, and a dashboard chart request on the chart executor. Both
+        # write self.chart_cache_<inst>_<tf> and self._chart_metadata_cache, and a build
+        # interleaved with another build can publish a payload whose fingerprint belongs
+        # to the other one — the cache would then look current while holding the wrong
+        # bars. Builds are ~10-20ms, so contention is not a concern; correctness is.
+        if not hasattr(self, "_chart_build_lock"):
+            self._chart_build_lock = threading.RLock()
+        with self._chart_build_lock:
+            return self._build_chart_from_cache_locked(instrument, force)
+
+    def _build_chart_from_cache_locked(self, instrument: str, force: bool = False) -> Dict:
 
         chart = {}
         active_tf = getattr(self, "active_chart_tf", "5min")

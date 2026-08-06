@@ -13,6 +13,7 @@ import os
 import secrets
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
@@ -126,6 +127,42 @@ async def _await_on_scanner_loop(coro, timeout_seconds: float = 8.0):
                 raise
             return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout_seconds)
     return await coro
+
+
+# Chart builds are the one heavy, self-contained piece of work this server does, and they
+# used to run ON the scanner's own event loop via _call_on_scanner_loop — the same loop
+# whose `while self.is_running:` body awaits _scan_cycle(). A rebuild there delays signal
+# generation and every other dashboard call marshalled onto that loop.
+#
+# A DEDICATED pool, not asyncio's default one: every asyncio.to_thread in this file
+# (scanner join, trades.save_state, volume_source_health) shares the default executor, so
+# a chart build there would queue behind a state save and vice versa. Two workers is
+# enough — builds are ~10-20ms and _build_chart_from_cache serialises itself anyway.
+_chart_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chart")
+
+
+async def _build_chart_off_loop(instrument: str, timeframe: str):
+    """Select the chart on the scanner loop, then BUILD it on the chart pool.
+
+    The selection half (active_chart_instrument / active_chart_tf) has to stay on the
+    scanner loop: the scan cycle reads those two attributes to decide which chart to keep
+    warm, so setting them from another thread could have it refresh the wrong one. It is
+    two attribute writes. The build that follows is the expensive part and is safe off the
+    loop because _build_chart_from_cache takes its own lock.
+    """
+    if not scanner_ref:
+        return {}
+    await _call_on_scanner_loop(
+        lambda: (
+            setattr(scanner_ref, "active_chart_instrument", instrument),
+            setattr(scanner_ref, "active_chart_tf", timeframe),
+        )
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _chart_executor,
+        lambda: scanner_ref.get_chart_snapshot(instrument=instrument, timeframe=timeframe),
+    )
 
 
 async def _call_on_scanner_loop(
@@ -1973,12 +2010,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
         if scanner_ref:
             instrument = str(msg.get("instrument") or "NIFTY").upper()
             tf = str(msg.get("tf") or "5min")
-            snapshot = await _call_on_scanner_loop(
-                lambda: scanner_ref.get_chart_snapshot(
-                    instrument=instrument,
-                    timeframe=tf,
-                )
-            )
+            snapshot = await _build_chart_off_loop(instrument, tf)
             await _send_command_response(ws, msg, "chart_snapshot", make_serializable(snapshot))
 
     elif cmd == "set_chart_stream":
@@ -2819,12 +2851,7 @@ async def api_chart(instrument: str = "NIFTY", tf: str = "5min", bars: int | Non
     max_bars = max(1, int(getattr(settings, "api_max_chart_bars", 1000) or 1000))
     default_bars = max(1, int(getattr(settings, "api_default_chart_bars", 300) or 300))
     requested_bars = max(1, min(max_bars, int(bars or default_bars)))
-    snapshot = await _call_on_scanner_loop(
-        lambda: scanner_ref.get_chart_snapshot(
-            instrument=instrument,
-            timeframe=tf,
-        )
-    )
+    snapshot = await _build_chart_off_loop(instrument, tf)
     chart = snapshot.get("chart") if isinstance(snapshot, dict) else None
     if isinstance(chart, dict):
         for tf_key, payload in list(chart.items()):

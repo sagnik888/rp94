@@ -945,6 +945,14 @@ def main():
                 lab_executor.shutdown(wait=False, cancel_futures=True)
             except Exception as exc:
                 logger.debug(f"Engine-lab executor shutdown skipped: {exc}")
+        # The dashboard's dedicated chart pool. Every other executor in this system is
+        # shut down here; a new one that is not would keep the process alive on exit.
+        chart_executor = getattr(dashboard_module, "_chart_executor", None)
+        if chart_executor is not None:
+            try:
+                chart_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug(f"Chart executor shutdown skipped: {exc}")
         runtime.clear()
 
     dashboard_module.shutdown_hook = _graceful_system_shutdown
