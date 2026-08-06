@@ -1198,6 +1198,16 @@ class Settings(BaseSettings):
     # take-profit at Rs.5000. Bounded to [0.50, 0.99] in code; 1.0 is not selectable.
     # Matters more as size grows: at 10 NIFTY lots Rs.5000 is under Rs.7 of premium.
     profit_lock_max_ratio: float = 0.95
+    # Let the option STOP flex with the intelligence score, the way RR, target and exit
+    # already do. Of those four only the stop ignored intelligence entirely, moving with
+    # regime and ATR alone. Above the neutral 50 the stop widens slightly (corroborated
+    # conviction earns room to be right); below it, it tightens.
+    #
+    # Default OFF: this changes the risk taken on EVERY option entry, which is a strategy
+    # decision, not a defect being repaired. The shift is capped so a stop chosen by ATR
+    # and the per-timeframe rules is nudged, never redefined.
+    dynamic_stop_from_intelligence: bool = False
+    dynamic_stop_intel_max_shift_pct: float = 20.0
     # ── scale-in (adding lots to a position that is already working) ─────────────────
     # Until now nothing anywhere increased an open trade's quantity: "cascade lot-adding"
     # opens SEPARATE trades across timeframes, which is a different thing.

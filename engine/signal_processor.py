@@ -312,7 +312,45 @@ def carry_grading_telemetry(candidate, signal) -> None:
             pass
 
 
+def _intelligence_stop_pct(base_pct: float, intel_score: float, settings) -> float:
+    """Nudge the option stop percentage by how strong the corroborating evidence is.
+
+    intel_score runs 0-100 with 50 as neutral. Above neutral the stop may widen slightly
+    (conviction earns room), below it the stop tightens. The adjustment is capped by
+    dynamic_stop_intel_max_shift_pct so a stop chosen by ATR and the per-timeframe rules
+    is only ever nudged, never redefined, and the result is clamped to a sane band.
+
+    Off unless dynamic_stop_from_intelligence is set: this moves the risk on every option
+    entry, which is a strategy decision rather than a defect.
+    """
+    try:
+        base = float(base_pct or 0.0)
+    except (TypeError, ValueError):
+        return float(base_pct or 0.0)
+    if base <= 0:
+        return base
+    enabled = getattr(settings, "dynamic_stop_from_intelligence", False)
+    if not (enabled is True or str(enabled).strip().lower() in {"1", "true", "yes", "on"}):
+        return base
+    try:
+        score = float(intel_score or 0.0)
+    except (TypeError, ValueError):
+        return base
+    if score <= 0:
+        return base                      # no reading is not a reason to move the stop
+    try:
+        max_shift = float(getattr(settings, "dynamic_stop_intel_max_shift_pct", 20.0) or 0.0)
+    except (TypeError, ValueError):
+        max_shift = 20.0
+    max_shift = max(0.0, min(50.0, max_shift)) / 100.0
+    if max_shift <= 0:
+        return base
+    lean = max(-1.0, min(1.0, (score - 50.0) / 50.0))
+    return max(0.5, min(base * 2.0, base * (1.0 + lean * max_shift)))
+
+
 @dataclass
+
 class TradeCandidate:
     instrument: str
     direction: str
@@ -1381,6 +1419,7 @@ class SignalProcessor:
         timeframe: str = "",
         atr_premium_stop: float = 0.0,
         settings=None,
+        intel_score: float = 0.0,
     ) -> float:
         try:
             opt_sl_pct = float(getattr(scanner, "options_sl_pct", getattr(get_settings(), "options_sl_pct", 15.0)) or 15.0)
@@ -1388,6 +1427,15 @@ class SignalProcessor:
             opt_sl_pct = 15.0
         if is_choppy_regime(regime):
             opt_sl_pct = max(opt_sl_pct, 15.0)
+        # RR, target and exit all flex with the intelligence score; the STOP was the one
+        # of the four that ignored it entirely, moving only with regime and ATR. Strong
+        # corroborating evidence earns a little more room to be right; weak evidence
+        # gets less. Bounded hard so this can only ever nudge a stop the ATR and
+        # per-timeframe rules already chose, never redefine it.
+        #
+        # Default OFF: this changes the risk on every option entry, which is the
+        # operator's decision and not a defect being repaired.
+        opt_sl_pct = _intelligence_stop_pct(opt_sl_pct, intel_score, settings)
         price = float(live_trade_price or 0.0)
         pct_stop = max(0.5, price * (opt_sl_pct / 100.0))
 
@@ -5795,6 +5843,7 @@ class SignalProcessor:
                                     timeframe=best_tf,
                                     atr_premium_stop=float(index_stop_distance) * abs(float(instrument_multiplier or 0.0)),
                                     settings=settings,
+                                    intel_score=float(intel_score or 0.0),
                                 )
                             candidate_stop = live_trade_price - max_sl_dist
                             candidate_target = live_trade_price + (max_sl_dist * final_rr)
