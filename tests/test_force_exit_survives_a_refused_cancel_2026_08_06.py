@@ -189,7 +189,14 @@ def _run_session_end(manager, settings, passes=1):
     cs.get_settings = lambda: settings
     try:
         for _ in range(passes):
-            manager.check_session_end(datetime.now(IST).replace(hour=15, minute=29))
+            # A fixed WEDNESDAY. datetime.now() made this pass Mon-Fri and fail every
+            # SATURDAY, when _session_is_a_trading_day correctly reports a non-trading
+            # day and check_session_end takes the "cannot square off" branch instead.
+            manager.check_session_end(
+                datetime.now(IST).replace(
+                    year=2026, month=8, day=5, hour=15, minute=29, second=0, microsecond=0
+                )
+            )
     finally:
         cs.get_settings = original
 

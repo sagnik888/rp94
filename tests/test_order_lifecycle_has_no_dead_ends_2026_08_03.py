@@ -146,7 +146,14 @@ def test_a_partial_exit_is_squared_off_at_the_close():
     trade.broker_quantity = 25          # residual after a partial fill
     manager.open_trades[trade.id] = trade
 
-    manager.check_session_end(datetime.now(IST).replace(hour=15, minute=29))
+    # A fixed WEDNESDAY. datetime.now() made this pass Mon-Fri and fail every SATURDAY,
+    # when _session_is_a_trading_day correctly reports a non-trading day and
+    # check_session_end takes the "cannot square off" branch instead.
+    manager.check_session_end(
+        datetime.now(IST).replace(
+            year=2026, month=8, day=5, hour=15, minute=29, second=0, microsecond=0
+        )
+    )
 
     assert broker.exits, "the residual of a partially filled exit was never squared off"
     assert broker.exits[0][1] == 25

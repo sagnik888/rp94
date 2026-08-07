@@ -21,6 +21,24 @@ from trading.trade_manager import IST, TradeManager
 SYMBOL = "NIFTY2680524500CE"
 
 
+def _trading_day(hour: int, minute: int = 0) -> datetime:
+    """A fixed WEDNESDAY at the given time.
+
+    These used datetime.now(IST), so they passed Mon-Fri and failed every SATURDAY:
+    _session_is_a_trading_day correctly reports a weekend as a non-trading day, so
+    check_session_end takes the "market closed, the force exit cannot run" branch and
+    every assertion about the orphan path sees the wrong message. Caught on
+    2026-08-08, a Saturday, when 14 tests across three files went red with no code
+    change. Fifth instance of clock-dependent rot in this suite.
+
+    The tz object is reused rather than reconstructed so this stays correct whether IST
+    is a pytz zone or a fixed offset.
+    """
+    return datetime.now(IST).replace(
+        year=2026, month=8, day=5, hour=hour, minute=minute, second=0, microsecond=0
+    )
+
+
 class _Broker:
     def __init__(self, result="EXIT-ORPHAN"):
         self.result = result
@@ -62,7 +80,7 @@ def _run_session_end(manager, settings=None):
     original = cs.get_settings
     cs.get_settings = lambda: (settings or _S())
     try:
-        manager.check_session_end(datetime.now(IST).replace(hour=15, minute=29))
+        manager.check_session_end(_trading_day(hour=15, minute=29))
     finally:
         cs.get_settings = original
 
@@ -171,7 +189,7 @@ def test_before_the_force_exit_time_nothing_happens():
     original = cs.get_settings
     cs.get_settings = lambda: _S()
     try:
-        manager.check_session_end(datetime.now(IST).replace(hour=11, minute=0))
+        manager.check_session_end(_trading_day(hour=11, minute=0))
     finally:
         cs.get_settings = original
     assert logged == [], "escalated an orphan hours before the session end"
