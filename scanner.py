@@ -23064,6 +23064,47 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # entered_intracandle is computed for every candidate a few lines above
                 # and, until now, read by nothing in this block.
                 if not bool(getattr(c, "entered_intracandle", True)):
+                    # Exempt from the anti-repaint WAIT — not from the session's entry
+                    # policy. BOTH cutoff checks live further down this function: the
+                    # pre-buffer one below, and the matured one inside the pending loop.
+                    # `continue` skipped both, so a closed 15min bar could open a fresh
+                    # index-option position after ut_no_entry_after with minutes left to
+                    # the 15:25 force exit. The wave-level check above is an any() across
+                    # all candidates, so it does not gate this one.
+                    limit_time = (
+                        self._configured_session_time("ut_no_entry_after", "15:00")
+                        if c.timeframe == "15min"
+                        else self._configured_session_time("ut_5min_no_entry_after", "15:15")
+                    )
+                    if not self._entry_cutoff_allows_candidate(c, session_now):
+                        logger.info(
+                            f"🚫 [LIVE GATE] Discarding closed-candle {c.instrument} "
+                            f"{c.timeframe} {c.direction} due to entry policy ({limit_time})"
+                        )
+                        self._rtracker_record_candidate(
+                            c,
+                            decision="REJECTED",
+                            reason=f"Entry cutoff policy {limit_time}",
+                            source="entry_cutoff_gate",
+                        )
+                        continue
+                    # A closed-bar arrow printing the OTHER way must still evict a stale
+                    # opposite buffer. The repaint gate cannot do it: the cached signals
+                    # list holds the whole session's flip history, so after a CROSS-BAR
+                    # reversal the older arrow is still in that list and the stale side
+                    # reads PRESENT. It then matures into a second bought leg — a long CE
+                    # and a long PE on one chart, two premiums, theta against both.
+                    sig_ts = getattr(c, "signal_timestamp", None)
+                    if sig_ts is None:
+                        cached_res = self._cached_results.get(f"{c.instrument}_{c.timeframe}")
+                        if cached_res and cached_res.get("signals"):
+                            target_type = "BUY" if c.direction == "LONG" else "SELL"
+                            matching_sigs = [
+                                s for s in cached_res["signals"] if s.signal_type == target_type
+                            ]
+                            if matching_sigs:
+                                sig_ts = matching_sigs[-1].timestamp
+                    self._evict_superseded_opposite_buffer(c, sig_ts)
                     matured_candidates.append(c)
                     self._diag_inc("stabilization", "closed_candle_direct")
                     self.log_signal_decision_once(

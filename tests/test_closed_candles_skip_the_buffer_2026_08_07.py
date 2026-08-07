@@ -29,6 +29,18 @@ def _buffer_source():
     return src[src.index(marker):]
 
 
+def _closed_candle_branch():
+    """The `if not entered_intracandle:` branch of the buffer block, as an AST node."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        dumped = ast.dump(node.test)
+        if "entered_intracandle" in dumped and "UnaryOp" in dumped:
+            return node
+    raise AssertionError("the closed-candle fast-path branch was not found")
+
+
 def test_the_buffer_consults_entered_intracandle():
     """It was computed for every candidate and read by nothing in this block."""
     block = _buffer_source()
@@ -39,14 +51,28 @@ def test_the_buffer_consults_entered_intracandle():
 
 
 def test_a_closed_candle_candidate_is_matured_not_buffered():
-    """Parse the branch: it must append to matured_candidates, not _pending_live_signals."""
-    block = _buffer_source()
-    start = block.index("entered_intracandle")
-    window = block[start:start + 900]
-    assert "matured_candidates.append" in window, (
+    """It must append to matured_candidates, not _pending_live_signals.
+
+    Parsed, not windowed. The first version took a fixed 900-character slice from the
+    first occurrence of the flag name; adding the entry-cutoff and opposite-eviction
+    gates to this branch on 2026-08-07 pushed the append past the window and the test
+    failed against a strictly BETTER implementation. A char budget is not a scope.
+    """
+    branch = _closed_candle_branch()
+    appended = {
+        n.func.value.id
+        for n in ast.walk(branch)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "append"
+        and isinstance(n.func.value, ast.Name)
+    }
+    assert "matured_candidates" in appended, (
         "a closed-candle signal is not routed straight to the matured list"
     )
-    assert "continue" in window, "the closed-candle branch falls through into buffering"
+    assert any(isinstance(n, ast.Continue) for n in ast.walk(branch)), (
+        "the closed-candle branch falls through into buffering"
+    )
 
 
 def test_the_branch_is_the_negative_case():
