@@ -104,8 +104,9 @@ def test_smart_profit_lock_tiered_retention():
     )
 
     assert reason == "SMART_PROFIT_LOCK"
-    assert ratio == 0.72
-    assert lock_stop == pytest.approx(186.4)  # 100 + (1200*0.72)/10
+    # Clamped into the operator's 20-25% breathing band; the raw tier here was 0.72.
+    assert ratio == 0.75
+    assert lock_stop == pytest.approx(190.0)  # 100 + (1200*0.75)/10
 
 
 def test_smart_profit_lock_tier_boundaries():
@@ -114,22 +115,25 @@ def test_smart_profit_lock_tier_boundaries():
     def ratio(peak):
         return scanner._profit_lock_floor(100.0, "LONG", 10, peak)[2]
 
+    # The raw tiers (0.50 / 0.70 / 0.80 / 0.90 / ...) are now CLAMPED into the operator's
+    # 20-25% breathing band, so the ladder still orders the trades but cannot leave a big
+    # winner on a 5% leash nor hand a small one back nearly half its gain.
     assert ratio(400.0) == 0.0            # below Rs.500 min -> no lock
-    assert ratio(500.0) == 0.50           # tier1 floor
-    assert ratio(1000.0) == 0.70          # tier2 floor
+    assert ratio(500.0) == 0.75           # raw 0.50 -> band floor
+    assert ratio(1000.0) == 0.75          # raw 0.70 -> band floor
     assert ratio(1500.0) == 0.75
-    assert ratio(2000.0) == 0.80          # tier3 floor
-    assert ratio(2334.0) == pytest.approx(0.8334, abs=1e-4)
-    assert ratio(3000.0) == 0.90          # major-win floor
+    assert ratio(2000.0) == 0.80          # raw 0.80 sits inside the band
+    assert ratio(2334.0) == 0.80          # raw 0.8334 -> band ceiling
+    assert ratio(3000.0) == 0.80          # raw 0.90 -> band ceiling
     # The major-win rung used to run to 1.00 here. A ratio of exactly 1.00 puts the
     # protective floor ON the peak price, and price must leave the peak for a later tick
     # to exist — so the floor is breached by the first one and the trailing lock becomes
     # a fixed take-profit at Rs.5000. test_option_trend_major_win_cap_keeps_nifty_pe_
     # runner_breathing below already patched this for trend options via a 0.95 cap; the
     # ceiling now applies to everything.
-    assert ratio(5000.0) == 0.95
-    assert ratio(50000.0) == 0.95         # and it stays a lock, however large the win
-    assert ratio(4000.0) == 0.95          # the ramp reaches the ceiling early and holds
+    assert ratio(5000.0) == 0.80
+    assert ratio(50000.0) == 0.80         # and it stays a lock, however large the win
+    assert ratio(4000.0) == 0.80          # the ramp reaches the band ceiling and holds
 
 
 def test_option_trend_major_win_cap_keeps_nifty_pe_runner_breathing():
@@ -158,8 +162,9 @@ def test_option_trend_major_win_cap_keeps_nifty_pe_runner_breathing():
         settings.option_major_win_trend_lock_ratio_cap = old_cap
 
     assert reason == "MAJOR_WIN_GUARD"
-    assert ratio == 0.95
-    assert lock_stop == pytest.approx(238.0625)
+    assert ratio == 0.80
+    # Clamped to the 0.80 band ceiling instead of the old 0.95 trend-option cap.
+    assert lock_stop == pytest.approx(226.85)
     assert 241.27 > lock_stop
 
 

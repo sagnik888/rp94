@@ -77,14 +77,27 @@ def test_the_ladder_never_locks_the_entire_peak():
 
 
 def test_the_ceiling_still_protects_a_major_win():
-    assert _ratio(5000.0) >= 0.90
+    """The operator's band is 20-25% breathing, so a major win locks 80%, not 90%."""
+    assert _ratio(5000.0) == pytest.approx(0.80)
 
 
-def test_the_lower_rungs_are_untouched():
-    assert _ratio(500.0) == 0.50
-    assert _ratio(1000.0) == 0.70
-    assert _ratio(2000.0) == 0.80
-    assert _ratio(3000.0) == 0.90
+def test_every_armed_tier_sits_inside_the_breathing_band():
+    """The tiers still ORDER the trades; the band bounds how far they can go.
+
+    Before the clamp the ladder ran 41% breathing at a Rs.800 peak down to 5% at
+    Rs.4,000+ — a big winner on a 5% leash and a small one handed back nearly half its
+    gain. Both ends are now inside 20-25%.
+    """
+    for peak in (600.0, 800.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0, 50000.0):
+        breathing = 1.0 - _ratio(peak)
+        assert 0.199 <= breathing <= 0.2501, (
+            f"peak Rs.{peak:.0f} leaves {breathing:.1%} breathing, outside 20-25%"
+        )
+
+
+def test_more_gain_still_locks_tighter():
+    """Ordering is preserved inside the band."""
+    assert _ratio(5000.0) >= _ratio(800.0)
 
 
 def test_the_floor_price_leaves_room_to_breathe():

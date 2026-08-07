@@ -406,8 +406,10 @@ def test_major_win_guard_fut_long_reversal_exit(monkeypatch):
     tid, exit_val, reason = closed_trades[0]
     assert tid == "trade-mwg"
     assert reason == "MAJOR_WIN_GUARD"
-    # lock_stop = entry + (peak_pnl * 0.95) / (qty * inst_mult) = 100 + 3800/500 = 107.6
-    assert exit_val == 107.6
+    # lock_stop = entry + (peak_pnl * ratio) / (qty * inst_mult). The ratio is now the
+    # 0.80 band ceiling rather than 0.95, per the operator's 20-25% breathing rule:
+    # 100 + (4000 * 0.80) / 500 = 106.4
+    assert exit_val == 106.4
 
 def test_major_win_guard_fut_long_pullback_deferred(monkeypatch):
     scanner = setup_mock_scanner(monkeypatch)
@@ -515,8 +517,9 @@ def test_major_win_guard_opt_call_reversal(monkeypatch):
     tid, exit_val, reason = closed_trades[0]
     assert tid == "trade-opt-mwg"
     assert reason == "MAJOR_WIN_GUARD"
-    # lock_stop = entry + (peak_pnl * 0.9125) / qty = 150 + 2965.625 / 50 = 209.3125
-    assert exit_val == 209.3125
+    # lock_stop = entry + (peak_pnl * ratio) / qty. The raw 0.9125 rung is clamped to the
+    # 0.80 band ceiling: 150 + (3250 * 0.80) / 50 = 202.0
+    assert exit_val == 202.0
 
 
 def test_major_win_guard_opt_pe_same_trend_pullback_deferred(monkeypatch):
@@ -558,7 +561,12 @@ def test_major_win_guard_opt_pe_same_trend_pullback_deferred(monkeypatch):
     updated_stops = []
     entry_spot = 24215.20
     entry_price = 167.05
-    current_premium = 237.50
+    # The lock this test needs to breach moved when the ladder was clamped into the
+    # operator's 20-25% breathing band: on a Rs.4,858.75 peak over 65 qty it is
+    # 167.05 + (4858.75 * 0.80) / 65 = 226.85, where the old 0.95 cap put it at 238.06.
+    # 237.50 now CLEARS the lock, so the guard never ran and there was nothing to defer.
+    # Sit just under the new lock so the deferral path is exercised as intended.
+    current_premium = 226.00
     current_spot = entry_spot + ((current_premium - entry_price) / -0.5)
     trade = MockTrade(
         id="trade-opt-pe-mwg-defer",

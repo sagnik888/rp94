@@ -11400,6 +11400,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         lots = counter(trade_like, 0) if callable(counter) else Scanner._profit_lock_lot_count(trade_like, 0)
         return base * float(max(1, lots))
 
+    def _profit_lock_ratio_floor(self) -> float:
+        """Least of a peak the ladder may lock — the LOOSEST breathing space allowed.
+
+        Bounded to [0.40, the ceiling] so a misconfigured floor can never sit above the
+        ceiling and inverts the band.
+        """
+        try:
+            value = float(getattr(get_settings(), "profit_lock_min_ratio", 0.75) or 0.75)
+        except (TypeError, ValueError):
+            value = 0.75
+        return max(0.40, min(Scanner._profit_lock_ratio_ceiling(self), value))
+
     def _profit_lock_ratio_ceiling(self) -> float:
         """Most of a peak the ladder may lock, as a fraction.
 
@@ -11409,7 +11421,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """
         try:
             value = float(
-                getattr(get_settings(), "profit_lock_max_ratio", 0.95) or 0.95
+                getattr(get_settings(), "profit_lock_max_ratio", 0.80) or 0.80
             )
         except (TypeError, ValueError):
             value = 0.95
@@ -11472,6 +11484,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # ladder_pnl selects the TIER. peak_pnl stays the real figure, because the price
         # floor below is derived from it -- dividing that by the lot count would understate
         # every floor rather than just moving the trade to a different tier.
+        # Unbound: partial scanners are a real pattern here and this now runs on EVERY
+        # tier, not just the major-win branch, so a stub that never reached the old
+        # call site reaches this one.
+        ceiling_band = Scanner._profit_lock_ratio_ceiling(self)
         if ladder_pnl >= 3000.0:
             # Major wins tighten from 90% at Rs.3000 toward the ceiling at Rs.5000+.
             #
@@ -11486,8 +11502,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # It gets worse with size, which is where this is heading. At 10 NIFTY lots
             # (750 qty) Rs.5000 of peak is under Rs.7 of premium movement -- every decent
             # winner would be closed almost as soon as it started working.
-            ceiling = self._profit_lock_ratio_ceiling()
-            lock_ratio = min(ceiling, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
+            lock_ratio = min(ceiling_band, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
         elif ladder_pnl >= 2000.0:
             lock_ratio = 0.80 + 0.10 * (ladder_pnl - 2000.0) / 1000.0
         elif ladder_pnl >= 1000.0:
@@ -11515,6 +11530,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     ),
                 )
                 lock_ratio = min(lock_ratio, cap)
+        # Clamp into the operator's breathing band. The tiers above still order the
+        # trades — more gain, tighter lock — but the ladder may no longer leave a big
+        # winner on a 5% leash nor hand a small one back nearly half its gain.
+        lock_ratio = max(Scanner._profit_lock_ratio_floor(self), min(ceiling_band, lock_ratio))
         lock_ratio = round(lock_ratio, 4)
         locked_points = (peak_pnl * lock_ratio) / (qty * inst_mult)
         if str(direction).upper() == "SHORT":

@@ -1197,7 +1197,16 @@ class Settings(BaseSettings):
     # peak price — breached by the very next tick, so the "trailing lock" became a fixed
     # take-profit at Rs.5000. Bounded to [0.50, 0.99] in code; 1.0 is not selectable.
     # Matters more as size grows: at 10 NIFTY lots Rs.5000 is under Rs.7 of premium.
-    profit_lock_max_ratio: float = 0.95
+    # Breathing space the ladder leaves on a peak, as a band. The operator's rule:
+    # 20-25% on the current tiers. The tier progression still decides WHERE in the band a
+    # trade sits — more gain, tighter lock — but it can no longer squeeze past 20% or
+    # loosen past 25%.
+    #
+    # Before this the ladder ran 41% breathing at a Rs.800 peak down to 5% at Rs.4,000+,
+    # so a big winner was held on a 5% leash and a small one was given nearly half its
+    # gain back. Both ends are now inside the band.
+    profit_lock_max_ratio: float = 0.80      # 20% breathing — the tightest allowed
+    profit_lock_min_ratio: float = 0.75      # 25% breathing — the loosest allowed
     # Let the option STOP flex with the intelligence score, the way RR, target and exit
     # already do. Of those four only the stop ignored intelligence entirely, moving with
     # regime and ATR alone. Above the neutral 50 the stop widens slightly (corroborated
