@@ -22958,7 +22958,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     if callable(marker):
                         marker(candidate, sig_timestamp, now, source="async_repaint_abort")
                     # Force Exit
-                    price = self.candles.get_latest_price(candidate.instrument) or getattr(trade, "current_price", trade.entry_price)
+                    # Unbound: partial scanner stubs are a real pattern here, and this
+                    # tracker's whole body sits under one `except Exception` — a missing
+                    # attribute would be swallowed and the abort would silently not fire.
+                    price = Scanner._repaint_abort_exit_price(self, trade, candidate)
+                    if price <= 0:
+                        logger.error(
+                            f"REPAINT ABORT for {trade.id}: no usable mark for "
+                            f"{getattr(trade, 'symbol', '')}; leaving the position to the "
+                            "exit engines rather than booking a zero."
+                        )
+                        break
                     self._close_and_record(
                         trade.id,
                         float(price),
@@ -24529,6 +24539,49 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             f"spread={spread_pct:.2f}% bid={bid:.2f} ask={ask:.2f} "
             f"bidPnL=Rs.{executable_pnl:.0f} cost/edge={cost_ratio:.0%}"
         )
+
+    def _repaint_abort_exit_price(self, trade, candidate) -> float:
+        """The mark to close at when a repaint aborts a just-entered position.
+
+        `candidate.instrument` is the INDEX name, so `candles.get_latest_price(...)`
+        returns the index SPOT. For a bought option that is the wrong instrument
+        entirely, and nothing downstream checks the basis: `_close_and_record` takes
+        whatever float it is handed.
+
+        A NIFTY 25000CE bought at 120 with spot at 24850, 75 qty, would be recorded as
+        exiting at 24850 — a fabricated (24850-120)*75 = Rs 18.5 lakh "profit" written
+        into the trade book, and in manual mode shown to the operator on the confirm
+        toast as the exit price to approve.
+
+        Options mark on their own premium; the index path keeps its existing behaviour.
+        Returns 0.0 when nothing usable is available, so the caller can decline to close
+        rather than book a zero exit.
+        """
+        inst_type = str(getattr(trade, "inst_type", "") or "").upper()
+        if inst_type == "OPT":
+            for value in (
+                getattr(trade, "current_price", None),
+                getattr(trade, "entry_price", None),
+            ):
+                try:
+                    price = float(value or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    return price
+            return 0.0
+
+        price = None
+        try:
+            price = self.candles.get_latest_price(getattr(candidate, "instrument", ""))
+        except Exception:
+            price = None
+        if not price:
+            price = getattr(trade, "current_price", None) or getattr(trade, "entry_price", 0.0)
+        try:
+            return max(0.0, float(price or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _close_and_record(self, tid: str, exit_price: float, reason: str, exit_time: Optional[datetime] = None):
         """Wraps trade closure to track over-trading metrics"""
