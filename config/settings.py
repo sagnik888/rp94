@@ -1225,6 +1225,15 @@ class Settings(BaseSettings):
     # Default OFF: it changes fills, and a missed fill and a paid spread are both real.
     macd_aware_entry_pricing: bool = False
     macd_entry_urgency_max_penalty: float = 0.15
+    # Treat intelligence that is DECAYING as a loss-guard signal, not just intelligence
+    # that is low. Every pillar the guard reads is a point-in-time value; the snapshot
+    # store has held the whole session's history and only a chart overlay ever read it.
+    # A trade whose evidence has been sliding for a quarter hour is deteriorating even
+    # while price sits still. Default OFF: it makes exits stricter.
+    loss_guard_intel_decay_enabled: bool = False
+    loss_guard_intel_decay_window_seconds: float = 900.0
+    loss_guard_intel_decay_min_slope: float = -1.0   # points per minute
+    loss_guard_intel_decay_severity: int = 1
     # ── scale-in (adding lots to a position that is already working) ─────────────────
     # Until now nothing anywhere increased an open trade's quantity: "cascade lot-adding"
     # opens SEPARATE trades across timeframes, which is a different thing.

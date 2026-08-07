@@ -75,6 +75,47 @@ class MarketIntelSnapshotStore:
             bars.append(row)
         return row
 
+    def score_trend(
+        self,
+        instrument: str,
+        lookback_seconds: float = 900.0,
+        min_points: int = 4,
+    ) -> Optional[float]:
+        """Change in the intelligence score per minute over the recent window.
+
+        Negative means the case for the trade is DECAYING even if price has not moved
+        yet. Every snapshot pillar is a point-in-time reading; the store has held the
+        whole session's worth of them and nothing ever asked which way they were going.
+
+        None when the answer is unknown — too few points, no timestamps, a flat window
+        of zeros — so a caller can tell "not deteriorating" from "cannot say".
+        """
+        rows = list(self._raw.get(instrument, []))
+        if len(rows) < max(2, int(min_points)):
+            return None
+        try:
+            newest_ts = float(rows[-1].get("snapshot_ts") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if newest_ts <= 0:
+            return None
+        cutoff = newest_ts - max(60.0, float(lookback_seconds or 0.0))
+        points = []
+        for row in rows:
+            try:
+                ts = float(row.get("snapshot_ts") or 0.0)
+                score = float(row.get("intel_score") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ts >= cutoff and score > 0:
+                points.append((ts, score))
+        if len(points) < max(2, int(min_points)):
+            return None
+        span_seconds = points[-1][0] - points[0][0]
+        if span_seconds <= 0:
+            return None
+        return (points[-1][1] - points[0][1]) / (span_seconds / 60.0)
+
     def history(
         self,
         instrument: str,
@@ -181,6 +222,10 @@ class MarketIntelSnapshotStore:
         return {
             "instrument": instrument,
             "snapshot_ts": int(timestamp),
+            # The aggregate score, kept so the DIRECTION of the evidence is recoverable
+            # later. Every pillar below is a point-in-time reading; none of them says
+            # whether the case for the trade is strengthening or decaying.
+            "intel_score": _safe_float(intel_result.get("score")),
             "primary_pcr": _safe_float(pcr.get("primary_pcr") or pcr.get("pcr_oi")),
             "pcr_oi": _safe_float(pcr.get("pcr_oi")),
             "pcr_near_oi": _safe_float(pcr.get("pcr_near_oi")),

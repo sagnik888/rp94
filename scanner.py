@@ -14005,6 +14005,40 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             pass
         return None
 
+    def _decaying_intel_points(self, instrument: str, reasons: list, settings) -> int:
+        """Severity points for intelligence that has been sliding, not merely low.
+
+        Zero whenever the trend cannot be established — too few snapshots, no history
+        yet, the feature switched off. "Cannot say" must never read as "deteriorating",
+        or every trade in the first minutes of a session would be penalised for the
+        store being empty.
+        """
+        if not Scanner._setting_enabled(
+            getattr(settings, "loss_guard_intel_decay_enabled", False), False
+        ):
+            return 0
+        store = getattr(self, "intel_snapshots", None)
+        trend_fn = getattr(store, "score_trend", None)
+        if not callable(trend_fn):
+            return 0
+        try:
+            window = float(getattr(settings, "loss_guard_intel_decay_window_seconds", 900.0) or 900.0)
+            slope = trend_fn(str(instrument or "").upper(), window)
+        except Exception as exc:
+            logger.debug(f"Intel decay trend unavailable for {instrument}: {exc}")
+            return 0
+        if slope is None:
+            return 0
+        try:
+            floor = float(getattr(settings, "loss_guard_intel_decay_min_slope", -1.0) or -1.0)
+        except (TypeError, ValueError):
+            floor = -1.0
+        if slope > floor:
+            return 0
+        points = max(1, int(getattr(settings, "loss_guard_intel_decay_severity", 1) or 1))
+        reasons.append(f"intelligence decaying {slope:.2f}/min over the last window")
+        return points
+
     def _loss_guard_severity(
         self,
         trade_like,
@@ -14091,6 +14125,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             intel_result = {}
 
         instrument = str(getattr(trade_like, "instrument", "") or "").split()[0]
+        # DECAYING evidence, not just weak evidence. Every pillar below is a
+        # point-in-time reading; none of them says whether the case for this trade has
+        # been strengthening or falling apart over the last quarter hour. The snapshot
+        # store has held that history all session and only a chart overlay ever read it.
+        #
+        # A trade whose intelligence has been sliding steadily is deteriorating even
+        # while price sits still, and that is exactly the trade worth cutting before the
+        # stop does it. Default OFF: it makes exits stricter.
+        price_points += self._decaying_intel_points(instrument, reasons, settings)
+
         intel_age = self._intel_age_seconds(intel_result, instrument, latest_time)
         max_age = max(
             15.0,
