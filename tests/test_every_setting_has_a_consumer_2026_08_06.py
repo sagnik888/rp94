@@ -150,30 +150,62 @@ def test_the_live_env_is_reported(capsys):
 
 # ── the operator has to actually see it ──────────────────────────────────────
 
-def test_the_preflight_warns_about_configured_but_inert_settings():
+# These two drove the real .env, so they passed only while the operator's config was
+# actually dirty and FAILED the moment it was cleaned (2026-08-07: 32 inert keys were
+# commented out, and both tests inverted). A test that breaks when the bug is fixed is
+# testing the config, not the code. They now drive a synthetic key list, and the state
+# of the real .env is asserted separately below.
+
+def _with_env_keys(monkeypatch, keys):
+    """Point the preflight's env reader at a synthetic key list.
+
+    safe_mode imports env_keys_from_file INSIDE the function, so patching the attribute
+    on config.inert_settings is what the call actually resolves.
+    """
+    import config.inert_settings as inert_mod
+
+    monkeypatch.setattr(inert_mod, "env_keys_from_file", lambda *a, **k: list(keys))
+
+
+def test_the_preflight_warns_about_configured_but_inert_settings(monkeypatch):
     """Drive validate_real_mode_readiness, not just the helper."""
+    import config.inert_settings as inert_mod
     from config.settings import get_settings
     from engine.safe_mode import validate_real_mode_readiness
 
-    result = validate_real_mode_readiness(get_settings())
-    text = " | ".join(result.get("warnings") or [])
+    _with_env_keys(monkeypatch, sorted(inert_mod.INERT)[:8])
+    text = " | ".join(validate_real_mode_readiness(get_settings()).get("warnings") or [])
     assert "have no consumer and do nothing" in text, (
-        "the live .env sets dozens of settings that do nothing and startup said nothing"
+        "an .env full of settings that do nothing and startup said nothing"
     )
     assert "config/inert_settings.py" in text, "the warning does not say where to look"
 
 
-def test_the_warning_names_the_worst_offender_first():
+def test_the_warning_names_the_worst_offender_first(monkeypatch):
     """Alphabetical order happens to put the risk knobs late; make sure the count is
     stated so a truncated list is never mistaken for the whole list."""
+    import config.inert_settings as inert_mod
     from config.settings import get_settings
     from engine.safe_mode import validate_real_mode_readiness
 
+    sample = sorted(inert_mod.INERT)[:10]
+    _with_env_keys(monkeypatch, sample)
     line = next(
         w for w in validate_real_mode_readiness(get_settings())["warnings"]
         if "have no consumer" in w
     )
+    assert str(len(sample)) in line
+    assert "more" in line, "truncated the list without saying it was truncated"
+
+
+def test_no_inert_setting_is_live_in_the_real_env():
+    """The regression that matters now: a dead knob must not creep back into .env.
+
+    Commented-out lines do not count -- env_keys_from_file skips them -- so the record
+    of what was once configured, and why it does nothing, stays in the file.
+    """
     rows = configured_but_inert(env_keys_from_file(os.path.join(REPO, ".env")))
-    assert str(len(rows)) in line
-    if len(rows) > 6:
-        assert "more" in line, "truncated the list without saying it was truncated"
+    assert not rows, (
+        "these .env settings have no consumer and will read as working controls: "
+        + ", ".join(name for name, _ in rows)
+    )
