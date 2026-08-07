@@ -23644,7 +23644,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     # rule about whether that is allowed (already in profit, still with
                     # trend, add cap, lot ceiling, rupee risk budget) and refuses with a
                     # reason when it is not; this only decides WHEN to ask.
-                    added, add_note = self._offer_cascade_add(sig)
+                    #
+                    # MANUAL MODE MUST NOT REACH THE BROKER. This call site sits 51 lines
+                    # ABOVE the `if not self.auto_mode` gate that stops every ordinary
+                    # entry, and nothing below it re-checks: trade_manager.py contains no
+                    # reference to auto_mode at all, and scale_in_trade branches only on
+                    # mode == "REAL" before placing a live BUY on the running contract.
+                    # An operator with auto mode off, expecting to approve each entry from
+                    # the toast, would have had a lot added to a live position with no
+                    # approval. Inert today only because scale_in_enabled is False -- which
+                    # is exactly the switch this feature exists to be turned on by.
+                    if not self.auto_mode and not is_warmup:
+                        self.log_signal_decision_once(
+                            f"{sig.instrument}|{sig.timeframe}|{sig.direction}|manual-cascade",
+                            f"{sig.instrument} {sig.timeframe} {sig.direction}: cascade add "
+                            "available but manual mode is on — approve it yourself.",
+                            "trade",
+                        )
+                        added, add_note = False, "manual mode: cascade add not auto-executed"
+                    else:
+                        added, add_note = self._offer_cascade_add(sig)
                     if added:
                         continue
                     ts = getattr(sig, "signal_timestamp", None)
