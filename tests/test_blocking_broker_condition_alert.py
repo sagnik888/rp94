@@ -41,7 +41,14 @@ def test_unregistered_ip_names_the_ip_and_where_to_fix_it():
     alert = m.alerts[0]
     assert "TRADING BLOCKED" in alert
     assert "49.37.34.211" in alert, "the operator cannot act without the actual IP"
-    assert "smartapi.angelone.in" in alert
+    # Was "smartapi.angelone.in" until 2026-08-07. AngelOne is retired, so that sent the
+    # operator to a console they no longer use at the exact moment every order is being
+    # refused. The address family and empty-list points are carried over from the
+    # Kite-side alert in kite_broker, because both have bitten this account.
+    assert "developers.kite.trade" in alert
+    assert "smartapi.angelone.in" not in alert
+    assert "IPv6" in alert, "a whitelisted IPv4 does not cover an IPv6 egress"
+    assert "EMPTY" in alert, "an empty allowed-IP list denies every order"
 
 
 def test_repeat_failures_do_not_spam_the_operator():

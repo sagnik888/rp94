@@ -11,9 +11,18 @@ from engine.market_regime import MarketRegime, normalize_regime, regime_aligns
 
 
 class RegimeDetector:
+    # Shared across instances ON PURPOSE. Scanner._detect_regime_warmed builds a
+    # deliberate throwaway detector on every call (it needs empty smoothing history to
+    # stay replay-deterministic), so a per-instance dedup set is empty every time and
+    # the "log once" below logged on every scan instead: 1,050 lines in one session,
+    # a single BANKNIFTY_60min promotion repeating 314 times. Whether a given promotion
+    # has already been reported for a given bar is a question about the session, not
+    # about one short-lived detector object.
+    _ER_PROMOTION_LOG_KEYS: set = set()
+    _ER_PROMOTION_LOG_CAP = 2048
+
     def __init__(self):
         self._regime_history: Dict[str, list] = {}
-        self._er_promotion_log_keys = set()
 
     def reset_history(self, instrument=None) -> int:
         """Clear stateful smoothing/hysteresis history.
@@ -25,7 +34,7 @@ class RegimeDetector:
         if instrument is None:
             count = len(self._regime_history)
             self._regime_history.clear()
-            self._er_promotion_log_keys.clear()
+            RegimeDetector._ER_PROMOTION_LOG_KEYS.clear()
             return count
         prefix = f"{str(instrument).upper()}_"
         keys = [
@@ -34,8 +43,8 @@ class RegimeDetector:
         ]
         for key in keys:
             self._regime_history.pop(key, None)
-        self._er_promotion_log_keys = {
-            key for key in self._er_promotion_log_keys
+        RegimeDetector._ER_PROMOTION_LOG_KEYS = {
+            key for key in RegimeDetector._ER_PROMOTION_LOG_KEYS
             if not str(key[0]).upper().startswith(prefix)
         }
         return len(keys)
@@ -693,11 +702,15 @@ class RegimeDetector:
         try:
             bar_id = str(df.index[-1]) if df is not None and len(df.index) else ""
             log_key = (str(key), bar_id, str(regime.value))
-            if log_key in self._er_promotion_log_keys:
+            seen = RegimeDetector._ER_PROMOTION_LOG_KEYS
+            if log_key in seen:
                 return
-            self._er_promotion_log_keys.add(log_key)
-            if len(self._er_promotion_log_keys) > 2048:
-                self._er_promotion_log_keys = set(list(self._er_promotion_log_keys)[-1024:])
+            # Drop the whole window rather than slicing it: a set has no order, so
+            # keeping "the last 1024" kept an arbitrary 1024 and evicted live keys at
+            # random. Clearing costs at most one repeated line per key.
+            if len(seen) >= RegimeDetector._ER_PROMOTION_LOG_CAP:
+                seen.clear()
+            seen.add(log_key)
             logger.info(
                 "Regime ER promotion: "
                 f"{key} -> {regime.value} (ER={er_value:.2f}, ADX={adx_val:.1f}); {reason}"

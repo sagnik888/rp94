@@ -3785,16 +3785,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             self.on_notification(f"REAL mode refused: {reason}", "error")
                         return False
                     self.trades.broker = self.trades.real_broker
-                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (AngelOne)")
+                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (Zerodha Kite)")
                 else:
-                    logger.error("â Œ CRITICAL: Attempted REAL mode without Broker connection!")
-                    self._last_configure_block_reason = "AngelOne broker not connected"
+                    logger.error("❌ CRITICAL: Attempted REAL mode without Broker connection!")
+                    self._last_configure_block_reason = "Kite broker not connected"
                     self.mode = "HISTORICAL" # Safety fallback
                     self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
                     # Sync trade manager mode back to fallback
                     self.trades.mode = self.mode
                     if self.on_notification:
-                        self.on_notification("Failed to switch to REAL mode! AngelOne not connected.", "error")
+                        self.on_notification("Failed to switch to REAL mode! Kite not connected.", "error")
             else:
                 # Historical Mode: Signals analysed from Real Historical Data
                 self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)

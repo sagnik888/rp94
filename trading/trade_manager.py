@@ -902,25 +902,26 @@ class TradeManager:
     _BLOCKING_BROKER_CONDITIONS = (
         (
             "registered ip",
-            "AngelOne is refusing orders from this machine's public IP ({detail}). "
-            "Add that IP to your SmartAPI app at smartapi.angelone.in "
-            "(My Profile -> your app -> Redirect/Whitelisted IP) and restart. "
-            "Until then NO order can reach the exchange.",
+            "The broker is refusing orders from this machine's public IP ({detail}). "
+            "Add that address on the Kite developer console (developers.kite.trade -> "
+            "your app) and restart. Check the address family: a whitelisted IPv4 does "
+            "NOT cover an IPv6 egress. An EMPTY allowed-IP list denies every order "
+            "rather than allowing all. Until then NO order can reach the exchange.",
         ),
         (
             "invalid token",
-            "The AngelOne session token is invalid. Re-login and restart; no order "
-            "can reach the exchange until the session is renewed.",
+            "The Kite session token is invalid. Re-login through the dashboard and "
+            "restart; no order can reach the exchange until the session is renewed.",
         ),
         (
             "invalid session",
-            "The AngelOne session has expired. Re-login and restart; no order can "
-            "reach the exchange until the session is renewed.",
+            "The Kite session has expired. Re-login through the dashboard and restart; "
+            "no order can reach the exchange until the session is renewed.",
         ),
         (
             "session expired",
-            "The AngelOne session has expired. Re-login and restart; no order can "
-            "reach the exchange until the session is renewed.",
+            "The Kite session has expired. Re-login through the dashboard and restart; "
+            "no order can reach the exchange until the session is renewed.",
         ),
     )
 
@@ -2481,7 +2482,7 @@ class TradeManager:
             self._mark_recovery(
                 trade,
                 f"{reason}; emergency flatten unavailable (no broker contract on the "
-                "trade). Reconcile this position manually at your AngelOne terminal — "
+                "trade). Reconcile this position manually at your Kite terminal — "
                 "the system cannot act on it and will stop retrying.",
             )
             return False
