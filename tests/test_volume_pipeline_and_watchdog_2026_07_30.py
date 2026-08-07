@@ -75,7 +75,7 @@ def test_history_pacing_is_configurable_and_conservative(monkeypatch):
 
 # ── watchdog ────────────────────────────────────────────────────────────────
 
-def _watchdog(scanner, alerts, kite_auth_required=False):
+def _watchdog(scanner, alerts, kite_auth_required=False, startup_grace="0"):
     """Drive the watchdog deterministically.
 
     The liveness checks are gated on `now.weekday() < 5`, so these tests silently
@@ -89,6 +89,9 @@ def _watchdog(scanner, alerts, kite_auth_required=False):
     os.environ["RUNTIME_WATCHDOG_INTERVAL_SECONDS"] = "1"
     os.environ["RUNTIME_WATCHDOG_START"] = "00:00"
     os.environ["RUNTIME_WATCHDOG_UNTIL"] = "23:59"
+    # Default 0 so the existing liveness cases still assert immediately. The grace
+    # itself is exercised explicitly by the startup tests below.
+    os.environ["RUNTIME_WATCHDOG_STARTUP_GRACE_SECONDS"] = str(startup_grace)
     import main
 
     real_datetime = main.datetime
@@ -132,6 +135,71 @@ def test_watchdog_alerts_when_scanner_is_dead():
     alerts = []
     _watchdog(_scanner(is_running=False), alerts)
     assert any("NOT running" in a for a in alerts)
+
+
+def test_a_restart_inside_market_hours_does_not_cry_wolf():
+    """The scanner sets is_running only once it has finished coming up.
+
+    Observed live on 2026-08-07: the watchdog fired "scanner is NOT running during
+    market hours" at 10:02:32.033 — the same MILLISECOND the scanner logged that it
+    had started. A CRITICAL and a desktop alert on every routine restart is how an
+    operator learns to ignore CRITICALs.
+    """
+    alerts = []
+    _watchdog(_scanner(is_running=False), alerts, startup_grace="60")
+    assert not any("NOT running" in a for a in alerts), (
+        "still alerting during the startup window"
+    )
+
+
+# The loop sleeps a floor of 15s between iterations, so a test can never observe a
+# SECOND poll in a sane window. The decision itself is tested directly instead.
+
+def test_the_grace_defers_the_check_it_does_not_cancel_it():
+    """A scanner that never comes up must still be reported once grace expires."""
+    import main
+
+    assert main._scanner_liveness_alert_due(False, False, 121.0, 120.0) is True
+
+
+def test_still_silent_while_the_grace_is_open():
+    import main
+
+    assert main._scanner_liveness_alert_due(False, False, 5.0, 120.0) is False
+
+
+def test_a_scanner_that_dies_after_coming_up_alerts_immediately():
+    """Grace applies only before the scanner has EVER been seen running.
+
+    Without the seen-running latch, a long grace would also mute a mid-session
+    death — the incident the watchdog was written for.
+    """
+    import main
+
+    assert main._scanner_liveness_alert_due(False, True, 1.0, 9999.0) is True
+
+
+def test_a_running_scanner_is_never_alerted_on():
+    import main
+
+    assert main._scanner_liveness_alert_due(True, False, 0.0, 0.0) is False
+    assert main._scanner_liveness_alert_due(True, True, 99999.0, 0.0) is False
+
+
+def test_the_watchdog_loop_actually_consults_the_decision():
+    """A helper wired to nothing is the dominant defect pattern in this codebase."""
+    import ast
+    import inspect
+    import textwrap
+
+    import main
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main.start_runtime_watchdog)))
+    called = {
+        n.func.id for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "_scanner_liveness_alert_due" in called
 
 
 def test_watchdog_alerts_when_fyers_login_required():

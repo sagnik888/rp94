@@ -322,6 +322,25 @@ def start_live_session_tracker_scheduler():
     ).start()
 
 
+def _scanner_liveness_alert_due(
+    running: bool, seen_running: bool, elapsed: float, grace: float
+) -> bool:
+    """Whether a not-running scanner should be escalated.
+
+    Split out of the watchdog loop so it can be tested directly: the loop sleeps a
+    floor of 15s between iterations, so a test can never observe a SECOND poll inside
+    a reasonable window, and the interesting cases here are all about the second poll
+    onwards.
+
+    Silent only while the scanner has never once been seen up and the startup grace is
+    still open. A scanner that dies after coming up is reported immediately, which is
+    the incident the watchdog exists for.
+    """
+    if running:
+        return False
+    return bool(seen_running or elapsed >= grace)
+
+
 def start_runtime_watchdog(scanner: Scanner, settings) -> None:
     """Alert on the silent failure modes that unattended operation cannot tolerate.
 
@@ -360,9 +379,25 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
         except Exception as exc:
             logger.debug(f"Watchdog desktop alert unavailable: {exc}")
 
+    # The scanner thread does not set is_running until it has finished coming up, and
+    # this loop runs its first check immediately. Restarting inside market hours
+    # therefore fired "scanner is NOT running" every single time — observed on
+    # 2026-08-07 at 10:02:32.033, the same MILLISECOND the scanner logged that it had
+    # started. A CRITICAL plus a desktop alert on every routine restart is how an
+    # operator learns to ignore CRITICALs, which is the opposite of what a watchdog
+    # covering three real silent-failure incidents is for.
+    #
+    # A scanner that is genuinely dead on arrival is still caught: the grace only
+    # defers the check, it never cancels it.
+    startup_grace = float(
+        os.getenv("RUNTIME_WATCHDOG_STARTUP_GRACE_SECONDS", "120") or 120.0
+    )
+
     def _loop():
         state: dict = {}
         auto_mode_seen_on = False
+        watchdog_started = time.monotonic()
+        scanner_seen_running = False
         while True:
             try:
                 now = datetime.now(IST)
@@ -374,8 +409,17 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 if in_session:
                     last_scan = getattr(scanner, "last_scan_time", None)
                     running = bool(getattr(scanner, "is_running", False))
-                    if not running:
-                        _alert("dead", "scanner is NOT running during market hours", state)
+                    if running:
+                        scanner_seen_running = True
+                    if _scanner_liveness_alert_due(
+                        running,
+                        scanner_seen_running,
+                        time.monotonic() - watchdog_started,
+                        startup_grace,
+                    ):
+                        _alert(
+                            "dead", "scanner is NOT running during market hours", state
+                        )
                     elif last_scan is not None:
                         try:
                             last = last_scan if last_scan.tzinfo else IST.localize(last_scan)
