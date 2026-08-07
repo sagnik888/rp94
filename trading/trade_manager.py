@@ -4095,7 +4095,32 @@ class TradeManager:
             )
 
             if trade.protective_order_id:
-                if not broker.cancel_order(trade.protective_order_id, "STOPLOSS"):
+                # PROVE the cancel; do not just acknowledge it. cancel_order returns True
+                # whenever the HTTP call did not raise. The SL-M trigger sits at
+                # protective_trigger — the same level the local trailing stop fires at —
+                # so the cancel races the trigger at exactly the moment an exit is
+                # decided. Kite can accept the cancel request while the triggered order
+                # still fills; the full-size MARKET exit below then sells on top of an
+                # SL-M that already sold, and the second fill is a naked written option
+                # in CARRYFORWARD/NRML.
+                #
+                # _run_partial_reduce already uses this `is not True` test verbatim, with
+                # the rule spelled out: "the fill routinely wins the race against the
+                # cancel". This path was the one that never adopted it.
+                confirm = getattr(broker, "cancel_order_confirmed", None)
+                if callable(confirm):
+                    try:
+                        cancelled = confirm(trade.protective_order_id, "STOPLOSS")
+                    except (BrokerOrderRejected, PermissionError) as exc:
+                        logger.error(f"Protective stop cancel refused: {exc}")
+                        cancelled = None
+                else:
+                    # A broker without the proven variant keeps the old behaviour rather
+                    # than deadlocking; partial broker stubs are a real pattern here.
+                    cancelled = True if broker.cancel_order(
+                        trade.protective_order_id, "STOPLOSS"
+                    ) else None
+                if cancelled is not True:
                     self._mark_recovery(
                         trade,
                         "Protective stop cancellation unconfirmed; market exit withheld to avoid over-exit",
