@@ -8369,9 +8369,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # RR-based target off that tight risk (not the spot-derived target move),
             # so the protective stop matches the spike's stabilization sizing.
             risk = Scanner._option_premium_stop_distance_for_candidate(self, entry, candidate)
+            # Keep the candidate's ATR-aware per-timeframe stop. SignalProcessor bounds
+            # the premium stop to 4-10% (5min) / 6-15% (15min) with OPTION_STOP_TF_ATR_AWARE
+            # on, and _option_premium_stop_distance_for_candidate has no ATR or timeframe
+            # term at all — it returns the flat 15% cap. Recomputing here therefore threw
+            # the graded stop away and sent every live option order out on the widest
+            # allowed risk, up to 3.75x what the policy chose. The FUT branch below does
+            # not do this: it preserves candidate risk_distance verbatim.
+            #
+            # min(), not replace: the execution-time function also applies the volume-spike
+            # and expiry-gamma tightenings, and those must still bind. This can only make
+            # the stop TIGHTER than the cap, never wider.
+            cand_price = float(candidate.price or 0.0)
+            cand_stop = float(candidate.stop or 0.0)
+            if cand_price > 0 and 0.0 < cand_stop < cand_price:
+                risk = min(risk, entry * ((cand_price - cand_stop) / cand_price))
             stop = max(0.05, entry - risk)
-            target_move = abs(float(candidate.target or 0.0) - float(candidate.price or 0.0))
-            target_move *= abs(float(getattr(candidate, "multiplier", 1.0) or 1.0))
+            # candidate.target and candidate.price are BOTH premium for an OPT candidate
+            # (signal_processor sets live_trade_price = live_premium, then
+            # candidate_target = live_trade_price + max_sl_dist * final_rr), so their
+            # difference is already a premium distance. Multiplying it by the signed delta
+            # applied the option's delta a SECOND time and shrank every normal option
+            # target to roughly delta x the graded reward — a 2.0 RR realised as 1.0 at an
+            # ATM delta of 0.5. The FUT branch and both sibling option paths do not do it.
+            #
+            # Guard on the candidate TARGET, not on the distance. With target 0.0 the
+            # distance is abs(0 - price) = the whole premium, so "no target" produced a
+            # fabricated target at twice the entry (and, while the delta was being applied
+            # twice, at 1.5x). Either way it is a level that can never be reached, which
+            # silently disables TARGET_HIT for that trade instead of leaving it unset.
+            cand_target = float(candidate.target or 0.0)
+            target_move = abs(cand_target - cand_price) if cand_target > 0 else 0.0
             target = entry + target_move if target_move > 0 else 0.0
             if (
                 bool(getattr(candidate, "volume_spike_entry", False))
