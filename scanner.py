@@ -3379,6 +3379,43 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         }
         return aliases.get(raw, "auto")
 
+    def _surface_readiness_warnings(self, readiness) -> None:
+        """Log what the readiness check found but does not consider a blocker.
+
+        validate_real_mode_readiness returns "blockers" AND "warnings". Every call site
+        read only the blockers, so the warnings were computed and thrown away on every
+        arming — the same "primitive wired to no consumer" this audit keeps finding, and
+        this time it swallowed the things the operator most needs to hear. On
+        2026-08-07 the discarded list was:
+
+          * broker free cash is 11,255.40, below the 50,000 floor for one index lot —
+            RMS will refuse entries until the account is funded
+          * slippage_opt_pct is 0 — option P&L is modelled with NO slippage
+          * 32 setting(s) in .env have no consumer and do nothing
+
+        readiness["ok"] was True throughout. The system armed REAL knowing it could not
+        fund a single lot, and said nothing.
+
+        Warnings never block; they are deliberately not promoted to blockers. This only
+        makes them audible.
+        """
+        try:
+            warnings = (readiness or {}).get("warnings") or []
+        except AttributeError:
+            return
+        for warning in warnings:
+            logger.warning(f"REAL readiness warning: {warning}")
+        # One notification, not one per warning: the dashboard toast is a summary and
+        # the detail is in the log.
+        if warnings and self.on_notification:
+            try:
+                self.on_notification(
+                    f"REAL armed with {len(warnings)} readiness warning(s) — see the log",
+                    "warning",
+                )
+            except Exception as exc:
+                logger.debug(f"Readiness warning notification failed: {exc}")
+
     def configure(self, capital_total=None, capital_fut=None, capital_opt=None, risk_fut_pct=None, risk_opt_pct=None,
                   lots=None, lots_fut=None, mode=None, reset=False, futures_sl_pct=None, options_sl_pct=None,
                   fut_cost=None, opt_cost=None, backtest_days=None, auto_mode=None, inst_pref=None, strike_selection=None, active_indices=None,
@@ -3405,6 +3442,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self.on_notification("REAL mode blocked. Confirm YES to switch to REAL.", "error")
                 return False
             readiness = validate_real_mode_readiness(settings, getattr(self, "data", None))
+            self._surface_readiness_warnings(readiness)
             if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
                 blockers = readiness.get("blockers") or ["readiness failed"]
                 reason = "; ".join(str(item) for item in blockers)
@@ -3462,6 +3500,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # connectivity / warmup / feed freshness here before enabling auto-execution.
             if current_mode == "REAL" or requested_mode == "REAL":
                 readiness = validate_real_mode_readiness(settings, getattr(self, "data", None))
+                self._surface_readiness_warnings(readiness)
                 if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
                     blockers = readiness.get("blockers") or ["readiness failed"]
                     reason = "; ".join(str(item) for item in blockers)

@@ -757,6 +757,11 @@ def create_system():
                 readiness = validate_real_mode_readiness(settings, data_provider)
                 if readiness.get("blockers") != ["all broker sources unavailable"]:
                     break
+        # Warnings are not blockers, but they were being discarded entirely — including
+        # "broker free cash is below the floor for one index lot". See
+        # Scanner._surface_readiness_warnings for the full account.
+        for warning in readiness.get("warnings") or []:
+            logger.warning(f"REAL readiness warning: {warning}")
         if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
             logger.error(
                 "REAL startup refused by safe mode: "
