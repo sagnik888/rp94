@@ -2552,7 +2552,43 @@ class TradeManager:
                 f"{reason}; GTT cancellation unconfirmed, market flatten withheld to avoid over-exit",
             ):
                 return False
-        qty = int(trade.broker_quantity or trade.quantity)
+        # NEVER size a flatten from the INTENDED quantity. broker_quantity is 0 on every
+        # row whose entry the broker did not confirm: an ambiguous acknowledgement, an
+        # entry not found in the order book within the timeout, a stale entry that could
+        # not be safely cancelled, and every prior-session row on restart. check_session_end
+        # routes all of those straight here.
+        #
+        # Options are always BOUGHT, so the flatten side is SELL. Selling a fill that never
+        # happened does not close anything — it OPENS a naked written option in
+        # CARRYFORWARD/NRML, the product chosen precisely so the broker will not square it
+        # off, at 15:25 with no session left to correct it. The sibling
+        # _maybe_auto_flatten_unprotected already refuses on exactly this test.
+        qty = self._confirmed_broker_quantity(trade)
+        if qty <= 0:
+            # Ask the book once before concluding anything. A real position we simply
+            # failed to record is still worth flattening; a flat book is nothing to do;
+            # an unreadable book is NOT flat and must not be guessed at.
+            row, readable = self._live_position_for_trade(trade)
+            if not readable:
+                self._mark_recovery(
+                    trade,
+                    f"{reason}; the broker never confirmed a fill and the positions book "
+                    "is unreadable, so the size to flatten is unknown. NOT sending an "
+                    "order — a market exit here could open a naked short. Reconcile this "
+                    "position manually at your Kite terminal.",
+                )
+                return False
+            try:
+                qty = abs(int(float((row or {}).get("netqty") or 0)))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                logger.info(
+                    f"Flatten skipped for {trade.trading_symbol}: the broker never "
+                    "confirmed a fill and the book shows flat, so there is nothing to "
+                    "square off."
+                )
+                return False
         side = self._protective_exit_side(trade)
         try:
             order_id = self.broker.close_order(
