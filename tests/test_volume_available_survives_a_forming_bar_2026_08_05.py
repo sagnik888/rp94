@@ -76,9 +76,32 @@ def test_two_bars_of_volume_is_not_enough_to_qualify_a_feed():
     assert _available([0.0] * 10 + [500.0, 600.0, 0.0])[0] is False
 
 
-def test_a_feed_that_stopped_several_bars_ago_is_unavailable():
-    """Forgiving ONE forming bar must not forgive a feed that quit."""
-    assert _available(LIVE + [0.0, 0.0, 0.0])[0] is False
+def test_a_short_stale_edge_is_backfill_lag_not_a_dead_feed():
+    """Relaxed on 2026-08-07 against live evidence. This test used to assert False.
+
+    It assumed a run of empty trailing bars means the feed quit. For indices it does
+    not. Index candles carry NO traded volume on the live tick feed; it arrives only
+    with the periodic Fyers history backfill, which lags the tape by a few bars. So a
+    2-3 bar empty edge is NORMAL operation — it fired 85 times in the first ten minutes
+    of the 2026-08-07 session across all four indices, while real volume sat one bar
+    further back.
+
+    Holding the old expectation meant the volume pillar was either abstaining or
+    scoring a phantom 0.0x essentially all the time. Measuring the last COMPLETE bar
+    is the honest reading.
+
+    The dead-feed case this test was written to protect is still covered, three ways:
+    nonzero_count >= 5 (below), a run longer than the backfill tolerance (below), and
+    a measured bar under a twentieth of its own average (the ratio guard).
+    """
+    assert _available(LIVE + [0.0, 0.0, 0.0])[0] is True
+
+
+def test_a_run_longer_than_the_backfill_tolerance_is_still_unavailable():
+    """Where the line actually sits now: past the walk-back bound, absence is absence."""
+    from intelligence.volume_profiler import MAX_STUB_WALKBACK
+
+    assert _available(LIVE + [0.0] * (MAX_STUB_WALKBACK + 2))[0] is False
 
 
 def test_the_volume_pillar_reaches_the_aggregator_on_a_forming_bar():

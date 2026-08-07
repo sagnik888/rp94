@@ -26,6 +26,13 @@ from intelligence.price_action import (
 # indices; an ordinary quiet bar runs at tens of percent. 0.05 sits well clear of both.
 STUB_BAR_FRACTION = 0.05
 
+# How many trailing stub bars to step back over before giving up. Index candles carry no
+# traded volume on the live tick feed; it arrives only with the periodic Fyers history
+# backfill, which lags the tape by a few bars, so the dead zone at the right edge is
+# several bars deep rather than one. A few bars of lag is backfill and worth stepping
+# over; a longer run is a dead feed and must be reported as absent, not measured.
+MAX_STUB_WALKBACK = 4
+
 
 class VolumeProfiler:
     """Intraday volume analysis engine"""
@@ -155,23 +162,53 @@ class VolumeProfiler:
                 # holding a tiny fraction of the recent median is a stub, whatever the time
                 # says. The threshold is deliberately low — a genuinely quiet bar runs at
                 # tens of percent of the median, not at one.
-                if not forming and current_vol > 0:
+                # The dead zone is not one bar deep. Index candles carry NO traded volume
+                # on the live tick feed — it arrives only with the periodic Fyers history
+                # backfill ("Prioritizing Fyers history for ... to get volume"), which lags
+                # the tape. Captured live on 2026-08-07 at 10:15, 1min frame, all four
+                # indices at once:
+                #   NIFTY tail=[515102, 478060, 210220, 6760, 5655, 0]  avg=495,263
+                # — bars -1, -2 AND -3 are all stubs. Stepping back a single bar lands
+                # still inside the zone and measures 5,655 as if complete: 0.011x, which
+                # the panel renders "0.0x". That reading is NOT inert downstream: it
+                # reports available=True, so the volume pillar scores a phantom "no
+                # participation" into every candidate instead of abstaining.
+                #
+                # So step back until a bar is genuinely complete, and judge each candidate
+                # by the same rule rather than trusting the one behind a stub.
+                def _stub_at(pos: int) -> bool:
+                    """True when the bar at `pos` cannot be a complete observation."""
                     try:
-                        prior = volume.iloc[-7:-1]
+                        bar_vol = float(volume.iloc[pos])
+                    except (IndexError, TypeError, ValueError):
+                        return False
+                    if bar_vol <= 0:
+                        return True
+                    try:
+                        prior = volume.iloc[pos - 6:pos]
                         prior = prior[prior > 0]
-                        if len(prior) >= 3:
-                            median_prior = float(prior.median())
-                            if median_prior > 0 and current_vol < STUB_BAR_FRACTION * median_prior:
-                                forming = True
+                        if len(prior) < 3:
+                            return False
+                        median_prior = float(prior.median())
                     except (IndexError, TypeError, ValueError):
-                        pass
-                if forming or current_vol <= 0:
-                    try:
-                        recent_vol = float(volume.iloc[-2])
-                        measured_index = -2
-                    except (IndexError, TypeError, ValueError):
-                        recent_vol = current_vol
-                        measured_index = -1
+                        return False
+                    return median_prior > 0 and bar_vol < STUB_BAR_FRACTION * median_prior
+
+                measured_index = None
+                for step in range(MAX_STUB_WALKBACK + 1):
+                    pos = -1 - step
+                    if len(volume) + pos < 0:
+                        break
+                    if (step == 0 and forming) or _stub_at(pos):
+                        continue
+                    measured_index = pos
+                    recent_vol = float(volume.iloc[pos])
+                    break
+                if measured_index is None:
+                    # Nothing complete within reach. Report absence so the pillar abstains;
+                    # a phantom 0.0x that claims to be a measurement is strictly worse.
+                    measured_index = -1
+                    recent_vol = 0.0
             volume_available = bool(nonzero_count >= 5 and recent_vol > 0)
             # Every RATIO below is measured against recent_vol for the same reason. Using
             # the forming bar made vol_ratio 0.0/avg = 0.0x, which is what the intel panel
@@ -261,6 +298,20 @@ class VolumeProfiler:
                         f"nonzero={nonzero_count} src={metric_source} "
                         f"tail={tail} stamps={stamps}"
                     )
+
+            # The walk-back above judges each bar against its immediate NEIGHBOURS, which
+            # is what identifies a stub at the right edge of an otherwise healthy series.
+            # It cannot identify a feed that has been dead for a while: by then the
+            # neighbours are dead too, the local median collapses, and a dribble of 30
+            # against a 300,000 average looks locally consistent and passes as real.
+            #
+            # So make the final call against the AVERAGE the ratio is actually reported
+            # on. A bar under a twentieth of its own 20-bar mean is not a quiet bar — this
+            # module's own threshold says quiet runs at tens of percent — it is an absence
+            # wearing a number. Say so, and let the aggregator's volume pillar abstain
+            # instead of scoring a phantom into every candidate.
+            if volume_available and vol_ratio < STUB_BAR_FRACTION:
+                volume_available = False
 
             is_surge = bool(volume_available and effective_ratio > 1.5)
             surge_level = "EXTREME" if effective_ratio > 3.0 else ("HIGH" if effective_ratio > 2.0 else ("MODERATE" if effective_ratio > 1.5 else "NORMAL"))
