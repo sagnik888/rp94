@@ -6771,6 +6771,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._timeframe_regimes = {}
         self._timeframe_regimes[key] = regime
 
+        # MACD acceleration needs the PREVIOUS reading, and the payload carries only the
+        # current one. Keep the last value per instrument+timeframe, exactly as the regime
+        # label above is kept, so entry pricing can tell an expanding histogram from a
+        # stalling one. Two floats per key; nothing is persisted.
+        try:
+            macd_now = float(regime_payload.get("macd_histogram") or 0.0)
+        except (TypeError, ValueError):
+            macd_now = 0.0
+        if not hasattr(self, "_timeframe_macd"):
+            self._timeframe_macd = {}
+        previous = self._timeframe_macd.get(key, (0.0, 0.0))[0]
+        self._timeframe_macd[key] = (macd_now, float(previous))
+
         # Most entry/dashboard code historically reads instrument-only 5min context.
         if mirror_legacy or tf == "5min":
             name = str(instrument or "").upper()
@@ -6780,6 +6793,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if not hasattr(self, "latest_regimes"):
                 self.latest_regimes = {}
             self.latest_regimes[name] = regime
+
+    def _entry_momentum_urgency(self, candidate) -> float:
+        """How fast the premium is leaving the bid, for this candidate's own timeframe.
+
+        Zero whenever the answer is unknown — no MACD reading, no previous reading, an
+        unrecognised timeframe. Absence of evidence must not read as urgency, or every
+        entry would take the market on the first bar after a restart.
+        """
+        try:
+            from engine.order_pricing import momentum_urgency
+
+            instrument = str(getattr(candidate, "instrument", "") or "").upper()
+            timeframe = str(getattr(candidate, "timeframe", "") or "").lower()
+            if not instrument or not timeframe:
+                return 0.0
+            key = self._timeframe_intel_key(instrument, timeframe)
+            now, previous = (getattr(self, "_timeframe_macd", {}) or {}).get(key, (0.0, 0.0))
+            return momentum_urgency(now, previous, getattr(candidate, "direction", ""))
+        except Exception as exc:
+            logger.debug(f"Entry momentum urgency unavailable: {exc}")
+            return 0.0
 
     def _cached_timeframe_intel(
         self,
@@ -23563,6 +23597,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             symbol_token=candidate_sig.symbol_token,
                                             inst_type=candidate_sig.inst_type,
                                             market_regime=str(getattr(candidate_sig, "market_regime", "") or ""),
+                                            entry_momentum_urgency=self._entry_momentum_urgency(candidate_sig),
                                             exec_type="M",
                                             entry_spot=actual_spot,
                                             spot_stop=candidate_sig.stop,
@@ -23675,6 +23710,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         symbol_token=sig.symbol_token,
                         inst_type=sig.inst_type,
                         market_regime=str(getattr(sig, "market_regime", "") or ""),
+                        entry_momentum_urgency=self._entry_momentum_urgency(sig),
                         exec_type="A",
                         entry_spot=actual_spot,
                         spot_stop=spot_stop,

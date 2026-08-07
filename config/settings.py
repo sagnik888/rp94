@@ -1217,6 +1217,14 @@ class Settings(BaseSettings):
     market_driven_lot_size: bool = False
     market_lot_size_max_boost_pct: float = 50.0
     market_lot_size_max_lots: int = 4
+    # Let MACD acceleration decide how patient an ENTRY bid can be. The broker chooses
+    # MARKET vs LIMIT on confidence alone — how good the setup is — and never on how fast
+    # the premium is leaving the bid, so a strong signal into an accelerating move rested
+    # a limit behind the market. Urgency RAISES the confidence bar a limit must clear; it
+    # never lowers it, so this can only make the system less willing to wait, never more.
+    # Default OFF: it changes fills, and a missed fill and a paid spread are both real.
+    macd_aware_entry_pricing: bool = False
+    macd_entry_urgency_max_penalty: float = 0.15
     # ── scale-in (adding lots to a position that is already working) ─────────────────
     # Until now nothing anywhere increased an open trade's quantity: "cascade lot-adding"
     # opens SEPARATE trades across timeframes, which is a different thing.

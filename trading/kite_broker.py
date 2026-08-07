@@ -480,6 +480,7 @@ class KiteBroker(Broker):
         touch_quote: Optional[Dict[str, Any]] = None,
         trade_id: str = "",
         confidence: float = 0.0,
+        momentum_urgency: float = 0.0,
     ) -> Optional[str]:
         try:
             self._require_account_execution_lease("entry order")
@@ -494,6 +495,7 @@ class KiteBroker(Broker):
         try:
             return self._submit_entry(
                 api, symbol, token, qty, side, product_type, price, trade_id, confidence,
+                momentum_urgency,
             )
         except (BrokerOrderRejected, BrokerOrderAmbiguous):
             raise
@@ -507,13 +509,22 @@ class KiteBroker(Broker):
     def _submit_entry(
         self, api, symbol: str, token: str, qty: int, side: str, product_type: str,
         price: float, trade_id: str, confidence: float,
+        momentum_urgency: float = 0.0,
     ) -> Optional[str]:
         exchange = self._exchange_for_symbol(symbol)
         # Take the market unless the signal is strong enough to justify waiting for a
         # price. On 2026-07-31 every entry went out as a blind LTP mark-up limit
         # against an empty book — a limit is only meaningful when the conviction is
         # high enough that missing the fill beats paying the spread.
+        # ...and unless the move is running away. The rule above weighs how GOOD the
+        # setup is and never how fast the premium is leaving the bid, so a strong signal
+        # into an accelerating move rested a limit behind the market. MACD acceleration
+        # raises the bar a limit has to clear; it never lowers it.
+        from config.settings import get_settings as _cfg
+        from engine.order_pricing import limit_confidence_penalty
+
         threshold = self._entry_limit_confidence_threshold()
+        threshold += limit_confidence_penalty(momentum_urgency, _cfg())
         use_limit = float(price or 0.0) > 0 and float(confidence or 0.0) >= threshold
         order_type = "LIMIT" if use_limit else "MARKET"
         params: Dict[str, Any] = {

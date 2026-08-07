@@ -3446,6 +3446,7 @@ class TradeManager:
         data_provenance: str = "",
         price_action_verdict: str = "",
         intelligence_score: float = 0.0,
+        entry_momentum_urgency: float = 0.0,
         strategy_revision: str = "",
         strategy_direction_mode: str = "",
         market_wide_reversal_entry: bool = False,
@@ -3551,6 +3552,9 @@ class TradeManager:
             execution_touch_usable=bool((execution_touch_quote or {}).get("usable", False)),
             execution_touch_reason=str((execution_touch_quote or {}).get("reason") or ""),
         )
+        # Not a Trade field: it matters only at the instant the entry order is placed,
+        # so it never needs to persist or survive a restart.
+        setattr(trade, "entry_momentum_urgency", float(entry_momentum_urgency or 0.0))
 
         trade.pending_execution = not is_recovery
         trade.execution_status = "OPEN" if (is_recovery or is_ghost) else "ENTRY_PENDING"
@@ -3620,10 +3624,19 @@ class TradeManager:
                             # Decides MARKET vs LIMIT: only a high-conviction signal
                             # is worth risking a missed fill to get a better price.
                             confidence=float(getattr(trade, "confidence", 0.0) or 0.0),
+                            # How fast the premium is leaving the bid, from MACD
+                            # acceleration. Not persisted: it is only meaningful at the
+                            # instant the order is placed, so it never needs to survive a
+                            # restart. Absent on a recovery or a replayed row, which
+                            # correctly reads as "no urgency".
+                            momentum_urgency=float(
+                                getattr(trade, "entry_momentum_urgency", 0.0) or 0.0
+                            ),
                         )
                     except TypeError as exc:
                         if not any(
-                            arg in str(exc) for arg in ("touch_quote", "trade_id", "confidence")
+                            arg in str(exc)
+                            for arg in ("touch_quote", "trade_id", "confidence", "momentum_urgency")
                         ):
                             raise
                         return self.broker.place_order(
