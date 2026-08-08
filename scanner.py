@@ -12006,7 +12006,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             live_regime = (getattr(self, "latest_regimes", {}) or {}).get(base)
         except Exception:
             live_regime = None
-        live_regime = str(live_regime or regime or getattr(trade_like, "market_regime", "") or "UNKNOWN")
+        # The TRADE'S OWN timeframe wins. `regime` is what every caller passes, and they
+        # derive it from _get_trade_regime(trade); `latest_regimes` is keyed by INSTRUMENT
+        # with no timeframe and is written on the 5-minute pass, so reading it first meant
+        # a 15-minute trade was always judged on the 5-minute label.
+        #
+        # That cost money in both directions. A 5-minute flip against a profitable
+        # 15-minute position fired LIVE_REVERSAL_EXIT and cut a winner its own timeframe
+        # still supported; conversely a 5-minute label that merely looked aligned relaxed
+        # the end-of-day give-back on evidence belonging to a different chart. The
+        # borrowed-label rule stated elsewhere in this file is explicit that a sampled
+        # cross-timeframe regime "must NOT be used to grant a privilege".
+        live_regime = str(regime or live_regime or getattr(trade_like, "market_regime", "") or "UNKNOWN")
         view = str(view or "").upper()
         if view == "LONG":
             aligned_side = "BUY"
@@ -12684,7 +12695,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 live_regime = (getattr(self, "latest_regimes", {}) or {}).get(base)
             except Exception:
                 live_regime = None
-            live_regime = live_regime or regime
+            # Same precedence fix as _live_direction_context: the trade's OWN timeframe
+            # wins. latest_regimes is instrument-keyed and written on the 5-minute pass,
+            # so reading it first let a 5-minute flip fire LIVE_REVERSAL_EXIT against a
+            # profitable 15-minute position its own chart still supported.
+            live_regime = regime or live_regime
             rev_arm = self._profit_giveback_arm(initial_risk_rs, now=latest_time)
             fade_ratio = float(getattr(settings, "live_reversal_exit_fade_ratio", 0.85) or 0.85)
             if peak_pnl >= rev_arm and current_pnl_rs < peak_pnl * fade_ratio:
