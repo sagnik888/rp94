@@ -4726,6 +4726,38 @@ class SignalProcessor:
                         or bool(candidate_sources & trade_sources)
                     )
                     if same_tf and source_overlaps:
+                        # THIS is the cascade confirming itself: the same engine firing
+                        # again on the same chart, which is the commonest shape of the
+                        # operator's add-a-lot rule. It was discarded here, upstream of
+                        # the only place the add is offered -- _offer_cascade_add is
+                        # reached from _coordinate_and_execute, and a candidate that
+                        # never leaves process_best_signal never gets there. So the rule
+                        # produced nothing at all in its most likely case.
+                        #
+                        # Gated on auto_mode for the same reason as the scanner-side call
+                        # site: scale_in_trade reaches broker.place_order, and manual mode
+                        # means the operator approves every entry.
+                        add_note = ""
+                        adder = getattr(scanner, "_offer_cascade_add", None)
+                        if callable(adder) and bool(getattr(scanner, "auto_mode", False)):
+                            try:
+                                added, add_note = adder(best_sig)
+                                if added:
+                                    _emit_signal_decision(
+                                        {
+                                            "sig": best_sig,
+                                            "tf": best_tf,
+                                            "grade": best_grade,
+                                            "confidence": best_conf,
+                                            "reasons": best_reasons,
+                                        },
+                                        f"Cascade add: one more lot on {tid} instead of a "
+                                        f"second {best_tf} trade",
+                                        "CASCADE_ADD",
+                                    )
+                                    return []
+                            except Exception as exc:
+                                logger.debug(f"Cascade add offer failed for {instrument}: {exc}")
                         _emit_signal_decision(
                             {
                                 "sig": best_sig,
@@ -4734,7 +4766,8 @@ class SignalProcessor:
                                 "confidence": best_conf,
                                 "reasons": best_reasons,
                             },
-                            f"Already has active quad-prime {best_tf} {trade_direction} source {tid}",
+                            f"Already has active quad-prime {best_tf} {trade_direction} source {tid}"
+                            + (f"; cascade add declined ({add_note})" if add_note else ""),
                             "REJECTED - Existing Active Trade",
                         )
                         return []

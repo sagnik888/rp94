@@ -427,6 +427,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         current_price=float(getattr(entry_cand, 'current_price', getattr(entry_cand, 'price', 0.0))),
                         entry_spot=float(getattr(entry_cand, 'entry_spot', getattr(entry_cand, 'price', 0.0))),
                         status="CLOSED" if exit_price > 0 else "OPEN",
+                        # RECONSTRUCTIONS, not confirmed broker positions. These are built
+                        # from the day's SIGNAL ledger so the trades panel shows something
+                        # immediately — note broker_order_id below is the trading symbol,
+                        # not an order id, because no order exists.
+                        #
+                        # Unmarked they entered the live book as real exposure:
+                        # can_open_trade counts active_positions excluding ghosts, so
+                        # three reconstructed lifecycles ate half of MAX_CONCURRENT_
+                        # POSITIONS=6 before a single real trade was placed. The block is
+                        # guarded on mode == "HISTORICAL", and .env pins TRADING_MODE to
+                        # HISTORICAL, so it runs on EVERY launch — including the one that
+                        # then arms REAL at 09:00.
+                        is_ghost=True,
+                        data_provenance="HISTORICAL",
                         broker_order_id=getattr(entry_cand, 'trading_symbol', ''),
                         trading_symbol=getattr(entry_cand, 'trading_symbol', ''),
                         symbol_token=getattr(entry_cand, 'symbol_token', ''),
