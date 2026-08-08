@@ -95,7 +95,8 @@ def test_bought_pe_uses_long_premium_direction_for_profit_lock():
 def test_smart_profit_lock_tiered_retention():
     scanner = Scanner.__new__(Scanner)
 
-    # peak 1200 is in the Rs.1000-2000 tier: 0.70 + 0.10*(200/1000) = 0.72.
+    # peak 1200 is in the Rs.1,000-2,000 tier of the operator's breathing schedule
+    # (35% -> 30%): 0.65 + 0.05*(200/1000) = 0.66, i.e. 34% breathing.
     lock_stop, reason, ratio = scanner._profit_lock_floor(
         entry_price=100.0,
         direction="LONG",
@@ -105,8 +106,8 @@ def test_smart_profit_lock_tiered_retention():
 
     assert reason == "SMART_PROFIT_LOCK"
     # Clamped into the operator's 20-25% breathing band; the raw tier here was 0.72.
-    assert ratio == 0.75
-    assert lock_stop == pytest.approx(190.0)  # 100 + (1200*0.75)/10
+    assert ratio == 0.66
+    assert lock_stop == pytest.approx(179.2)  # 100 + (1200*0.66)/10
 
 
 def test_smart_profit_lock_tier_boundaries():
@@ -115,25 +116,28 @@ def test_smart_profit_lock_tier_boundaries():
     def ratio(peak):
         return scanner._profit_lock_floor(100.0, "LONG", 10, peak)[2]
 
-    # The raw tiers (0.50 / 0.70 / 0.80 / 0.90 / ...) are now CLAMPED into the operator's
-    # 20-25% breathing band, so the ladder still orders the trades but cannot leave a big
-    # winner on a 5% leash nor hand a small one back nearly half its gain.
-    assert ratio(400.0) == 0.0            # below Rs.500 min -> no lock
-    assert ratio(500.0) == 0.75           # raw 0.50 -> band floor
-    assert ratio(1000.0) == 0.75          # raw 0.70 -> band floor
-    assert ratio(1500.0) == 0.75
-    assert ratio(2000.0) == 0.80          # raw 0.80 sits inside the band
-    assert ratio(2334.0) == 0.80          # raw 0.8334 -> band ceiling
-    assert ratio(3000.0) == 0.80          # raw 0.90 -> band ceiling
+    # The operator's breathing schedule (2026-08-08). It replaced a flat 20-25% band that
+    # was far too tight at the small end: on an index option a Rs.600 peak is a handful of
+    # premium points, and a 20-25% leash closed trades on ordinary bid/ask breathing.
+    #   < Rs.1,000  50%      Rs.1,000-2,000  35%->30%
+    #   Rs.2,000-3,000  25%->20%            Rs.3,000+  15%->10%
+    assert ratio(400.0) == 0.0            # below Rs.500 min -> not armed, no lock
+    assert ratio(500.0) == 0.50           # 50% breathing
+    assert ratio(999.0) == 0.50
+    assert ratio(1000.0) == 0.65          # 35% breathing
+    assert ratio(1500.0) == 0.675
+    assert ratio(2000.0) == 0.75          # 25% breathing
+    assert ratio(2500.0) == 0.775
+    assert ratio(3000.0) == 0.85          # 15% breathing
     # The major-win rung used to run to 1.00 here. A ratio of exactly 1.00 puts the
     # protective floor ON the peak price, and price must leave the peak for a later tick
     # to exist — so the floor is breached by the first one and the trailing lock becomes
     # a fixed take-profit at Rs.5000. test_option_trend_major_win_cap_keeps_nifty_pe_
     # runner_breathing below already patched this for trend options via a 0.95 cap; the
     # ceiling now applies to everything.
-    assert ratio(5000.0) == 0.80
-    assert ratio(50000.0) == 0.80         # and it stays a lock, however large the win
-    assert ratio(4000.0) == 0.80          # the ramp reaches the band ceiling and holds
+    assert ratio(4000.0) == 0.875         # 12.5% breathing, mid-ramp
+    assert ratio(5000.0) == 0.90          # 10% breathing, the tight end
+    assert ratio(50000.0) == 0.90         # and it stays a lock, however large the win
 
 
 def test_option_trend_major_win_cap_keeps_nifty_pe_runner_breathing():
@@ -162,9 +166,9 @@ def test_option_trend_major_win_cap_keeps_nifty_pe_runner_breathing():
         settings.option_major_win_trend_lock_ratio_cap = old_cap
 
     assert reason == "MAJOR_WIN_GUARD"
-    assert ratio == 0.80
+    assert ratio == 0.8965  # trend cap 0.95 no longer binds below the 0.90 ceiling
     # Clamped to the 0.80 band ceiling instead of the old 0.95 trend-option cap.
-    assert lock_stop == pytest.approx(226.85)
+    assert lock_stop == pytest.approx(234.063, abs=0.01)
     assert 241.27 > lock_stop
 
 
@@ -1347,8 +1351,9 @@ def test_choppy_scalp_smart_profit_lock_is_not_diluted_by_breathing_room():
     )
 
     assert reason == "SMART_PROFIT_LOCK"
-    assert ratio == pytest.approx(0.7554)
-    assert lock_stop == pytest.approx(746.18, abs=0.02)
+    # Rs.1,554 peak sits in the 35%->30% tier: 32.2% breathing.
+    assert ratio == pytest.approx(0.6777)
+    assert lock_stop == pytest.approx(742.15, abs=0.02)
     assert breathing > 0
     assert clamped is False
     assert adjusted_stop == pytest.approx(lock_stop)

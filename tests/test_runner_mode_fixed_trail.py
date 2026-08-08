@@ -408,8 +408,9 @@ def test_major_win_guard_fut_long_reversal_exit(monkeypatch):
     assert reason == "MAJOR_WIN_GUARD"
     # lock_stop = entry + (peak_pnl * ratio) / (qty * inst_mult). The ratio is now the
     # 0.80 band ceiling rather than 0.95, per the operator's 20-25% breathing rule:
-    # 100 + (4000 * 0.80) / 500 = 106.4
-    assert exit_val == 106.4
+    # Rs.4,000 peak sits in the 15%->10% tier: lock 0.875.
+    # 100 + (4000 * 0.875) / 500 = 107.0
+    assert exit_val == 107.0
 
 def test_major_win_guard_fut_long_pullback_deferred(monkeypatch):
     scanner = setup_mock_scanner(monkeypatch)
@@ -519,7 +520,7 @@ def test_major_win_guard_opt_call_reversal(monkeypatch):
     assert reason == "MAJOR_WIN_GUARD"
     # lock_stop = entry + (peak_pnl * ratio) / qty. The raw 0.9125 rung is clamped to the
     # 0.80 band ceiling: 150 + (3250 * 0.80) / 50 = 202.0
-    assert exit_val == 202.0
+    assert exit_val == pytest.approx(205.653)
 
 
 def test_major_win_guard_opt_pe_same_trend_pullback_deferred(monkeypatch):
@@ -566,7 +567,11 @@ def test_major_win_guard_opt_pe_same_trend_pullback_deferred(monkeypatch):
     # 167.05 + (4858.75 * 0.80) / 65 = 226.85, where the old 0.95 cap put it at 238.06.
     # 237.50 now CLEARS the lock, so the guard never ran and there was nothing to defer.
     # Sit just under the new lock so the deferral path is exercised as intended.
-    current_premium = 226.00
+    # Sits 4.06 BELOW the Rs.234.06 major-win lock, i.e. inside the mocked 8.0 premium
+    # breathing distance, so this is the 'ordinary pullback' the deferral exists for.
+    # Was 226.00 against the old flat-band lock of 226.85; the operator's 2026-08-08
+    # schedule locks 89.65% at this peak, so the breach had to move with it.
+    current_premium = 230.00
     current_spot = entry_spot + ((current_premium - entry_price) / -0.5)
     trade = MockTrade(
         id="trade-opt-pe-mwg-defer",

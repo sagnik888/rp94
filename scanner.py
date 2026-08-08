@@ -11569,15 +11569,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # It gets worse with size, which is where this is heading. At 10 NIFTY lots
             # (750 qty) Rs.5000 of peak is under Rs.7 of premium movement -- every decent
             # winner would be closed almost as soon as it started working.
-            lock_ratio = min(ceiling_band, 0.90 + 0.10 * (ladder_pnl - 3000.0) / 2000.0)
+            # 15% breathing at Rs.3,000 tightening to 10% by Rs.5,000+.
+            lock_ratio = min(ceiling_band, 0.85 + 0.05 * (ladder_pnl - 3000.0) / 2000.0)
         elif ladder_pnl >= 2000.0:
-            lock_ratio = 0.80 + 0.10 * (ladder_pnl - 2000.0) / 1000.0
+            # 25% -> 20%
+            lock_ratio = 0.75 + 0.05 * (ladder_pnl - 2000.0) / 1000.0
         elif ladder_pnl >= 1000.0:
-            lock_ratio = 0.70 + 0.10 * (ladder_pnl - 1000.0) / 1000.0
-        elif ladder_pnl >= 500.0:
-            lock_ratio = 0.50 + 0.15 * (ladder_pnl - 500.0) / 500.0
+            # 35% -> 30%
+            lock_ratio = 0.65 + 0.05 * (ladder_pnl - 1000.0) / 1000.0
         else:
-            lock_ratio = 0.40 + 0.10 * max(0.0, ladder_pnl) / 500.0
+            # Below Rs.1,000 a winner is barely out of the noise. On an index option a
+            # Rs.600 peak is a handful of premium points, and a 20-25% leash there was
+            # closing trades on ordinary bid/ask breathing before the move developed.
+            # 50% is the operator's schedule (2026-08-08) and supersedes the flat band.
+            lock_ratio = 0.50
         reason = "MAJOR_WIN_GUARD" if ladder_pnl >= 3000.0 else "SMART_PROFIT_LOCK"
         if reason == "MAJOR_WIN_GUARD" and trade_like is not None:
             inst_type = str(getattr(trade_like, "inst_type", "") or "").upper()

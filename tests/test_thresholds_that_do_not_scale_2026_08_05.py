@@ -77,22 +77,55 @@ def test_the_ladder_never_locks_the_entire_peak():
 
 
 def test_the_ceiling_still_protects_a_major_win():
-    """The operator's band is 20-25% breathing, so a major win locks 80%, not 90%."""
-    assert _ratio(5000.0) == pytest.approx(0.80)
+    """A major win locks 90% — 10% breathing, the tight end of the schedule."""
+    assert _ratio(5000.0) == pytest.approx(0.90)
 
 
-def test_every_armed_tier_sits_inside_the_breathing_band():
-    """The tiers still ORDER the trades; the band bounds how far they can go.
+# The operator's breathing schedule, set 2026-08-08. It REPLACED a flat 20-25% band,
+# which was far too tight at the small end: on an index option a Rs.600 peak is a handful
+# of premium points, and a 20-25% leash there closed trades on ordinary bid/ask breathing
+# before the move had developed. Loose while a winner is young, tight once it is real.
+BREATHING_SCHEDULE = [
+    # (peak per lot, min breathing, max breathing)
+    (600.0, 0.50, 0.50),
+    (999.0, 0.50, 0.50),
+    (1000.0, 0.30, 0.35),
+    (1500.0, 0.30, 0.35),
+    (1999.0, 0.30, 0.35),
+    (2000.0, 0.20, 0.25),
+    (2500.0, 0.20, 0.25),
+    (2999.0, 0.20, 0.25),
+    (3000.0, 0.10, 0.15),
+    (4000.0, 0.10, 0.15),
+    (5000.0, 0.10, 0.15),
+    (50000.0, 0.10, 0.15),
+]
 
-    Before the clamp the ladder ran 41% breathing at a Rs.800 peak down to 5% at
-    Rs.4,000+ — a big winner on a 5% leash and a small one handed back nearly half its
-    gain. Both ends are now inside 20-25%.
+
+@pytest.mark.parametrize("peak,lo,hi", BREATHING_SCHEDULE)
+def test_every_armed_tier_matches_the_operator_schedule(peak, lo, hi):
+    breathing = 1.0 - _ratio(peak)
+    assert lo - 1e-6 <= breathing <= hi + 1e-6, (
+        f"peak Rs.{peak:.0f} leaves {breathing:.1%} breathing, outside {lo:.0%}-{hi:.0%}"
+    )
+
+
+def test_below_the_arming_threshold_there_is_no_lock_at_all():
+    """Rs.300 is not a 100%-breathing tier — the ladder has simply not armed yet.
+
+    _profit_lock_min_peak gates the whole ladder, so the schedule only describes peaks
+    that have cleared it. A first draft listed Rs.300 as a 50% tier and failed here.
     """
-    for peak in (600.0, 800.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0, 50000.0):
-        breathing = 1.0 - _ratio(peak)
-        assert 0.199 <= breathing <= 0.2501, (
-            f"peak Rs.{peak:.0f} leaves {breathing:.1%} breathing, outside 20-25%"
-        )
+    assert _ratio(300.0) == 0.0
+
+
+def test_a_young_winner_breathes_far_more_than_a_mature_one():
+    """The whole point of the schedule: 5x more room at Rs.600 than at Rs.5,000."""
+    young = 1.0 - _ratio(600.0)
+    mature = 1.0 - _ratio(5000.0)
+    assert young == pytest.approx(0.50)
+    assert mature == pytest.approx(0.10)
+    assert young >= 4.0 * mature
 
 
 def test_more_gain_still_locks_tighter():

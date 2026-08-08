@@ -1205,8 +1205,16 @@ class Settings(BaseSettings):
     # Before this the ladder ran 41% breathing at a Rs.800 peak down to 5% at Rs.4,000+,
     # so a big winner was held on a 5% leash and a small one was given nearly half its
     # gain back. Both ends are now inside the band.
-    profit_lock_max_ratio: float = 0.80      # 20% breathing — the tightest allowed
-    profit_lock_min_ratio: float = 0.75      # 25% breathing — the loosest allowed
+    # Outer bounds of the operator's breathing schedule (2026-08-08). These are a CLAMP,
+    # not the schedule itself — the tiers in _profit_lock_floor set the shape:
+    #   < Rs.1,000/lot   50% breathing   (a young winner needs room)
+    #   Rs.1,000-2,000   35% -> 30%
+    #   Rs.2,000-3,000   25% -> 20%
+    #   Rs.3,000+        15% -> 10%      (protect a big gain)
+    # The previous 0.75/0.80 pair flattened every tier to 20-25%, which is far too tight
+    # on an index option at a Rs.600 peak.
+    profit_lock_max_ratio: float = 0.90      # 10% breathing — the tightest allowed
+    profit_lock_min_ratio: float = 0.50      # 50% breathing — the loosest allowed
     # Let the option STOP flex with the intelligence score, the way RR, target and exit
     # already do. Of those four only the stop ignored intelligence entirely, moving with
     # regime and ATR alone. Above the neutral 50 the stop widens slightly (corroborated
@@ -1882,7 +1890,22 @@ class Settings(BaseSettings):
             
         # Serialize fields using pydantic's model_dump
         data = self.model_dump()
+        # Never write back a setting nothing reads. This method dumps EVERY field, so
+        # each save resurrected all 32 inert keys as live .env lines — undoing the
+        # commenting that documents them as dead and making the preflight shout about
+        # them again on the next start. Observed on 2026-08-08: a running scanner
+        # persisted settings and every one came back.
+        #
+        # Their commented lines survive untouched, so the record of what was once
+        # configured, and why it does nothing, stays in the file.
+        try:
+            from config.inert_settings import INERT as _INERT
+        except Exception:
+            _INERT = {}
+
         for key, val in data.items():
+            if key in _INERT:
+                continue
             # Handle list/dict serialization (e.g. active_indices)
             if isinstance(val, (list, dict)):
                 str_val = json.dumps(val)
