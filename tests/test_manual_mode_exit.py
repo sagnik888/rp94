@@ -1770,7 +1770,7 @@ def test_repaint_window_giveback_guard_protects_unconfirmed_winner():
 
     unconfirmed = SimpleNamespace(
         instrument="MIDCPNIFTY 14525CE",
-        entered_intracandle=True,  # repaint check pending (no _repaint_guard_checked)
+        entered_intracandle=True,  # repaint check pending (no repaint_guard_checked)
     )
     should, reason, _ = sc._peak_giveback_or_reversal_exit(
         unconfirmed, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,
@@ -1785,7 +1785,7 @@ def test_repaint_window_giveback_guard_protects_unconfirmed_winner():
     confirmed = SimpleNamespace(
         instrument="MIDCPNIFTY 14525CE",
         entered_intracandle=True,
-        _repaint_guard_checked=True,
+        repaint_guard_checked=True,
     )
     hold, _, _ = sc._peak_giveback_or_reversal_exit(
         confirmed, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,

@@ -36,7 +36,7 @@ async def test_broker_repaint_tracker_checks_signal_at_candle_close(monkeypatch)
 
     await Scanner._track_repaint_until_candle_close(dummy, trade, candidate)
 
-    assert trade._repaint_guard_checked is True
+    assert trade.repaint_guard_checked is True
     assert closed == []
 
 

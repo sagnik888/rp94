@@ -139,6 +139,12 @@ class Trade:
     is_reversion_scalp: bool = False
     signal_fire_mode: str = "INTRACANDLE"
     entered_intracandle: bool = True
+    # Has the post-entry repaint check completed for this trade? PERSISTED, because it
+    # was previously only a dynamic setattr: a restart lost it, and an intracandle trade
+    # then rehydrated as "structurally unconfirmed" for the rest of the day — which
+    # disables let-winners-run and arms the blunt sub-1R give-back guard on a position
+    # whose source candle closed hours earlier.
+    repaint_guard_checked: bool = False
     market_regime: str = ""   # Regime at entry (for post-hoc attribution)
     data_provenance: str = "" # LIVE / HISTORICAL / RECOVERY / EOD — data source of the entry
     price_action_verdict: str = "" # FAVORABLE/NEUTRAL/ADVERSE from the price-action patch (advisory)
@@ -311,6 +317,7 @@ class Trade:
             "max_drawdown": self.max_drawdown,
             "signal_fire_mode": self.signal_fire_mode,
             "entered_intracandle": self.entered_intracandle,
+            "repaint_guard_checked": self.repaint_guard_checked,
             "market_regime": self.market_regime,
             "data_provenance": self.data_provenance,
             "price_action_verdict": self.price_action_verdict,
@@ -465,6 +472,7 @@ class Trade:
             is_ghost=bool(data.get("is_ghost", False)),
             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
             entered_intracandle=bool(data.get("entered_intracandle", True)),
+            repaint_guard_checked=bool(data.get("repaint_guard_checked", False)),
             market_regime=str(data.get("market_regime") or ""),
             data_provenance=str(data.get("data_provenance") or ""),
             price_action_verdict=str(data.get("price_action_verdict") or ""),
@@ -3205,6 +3213,26 @@ class TradeManager:
                 if not tid: continue
                 t = Trade.from_dict(data)
                 t.status = "OPEN"
+                # A source candle that has already closed cannot repaint, so the guard is
+                # satisfied by definition. Rows written before repaint_guard_checked was
+                # persisted carry False, and the async repaint tracker is started from
+                # exactly one place — the entry acknowledgement — with no rehydration
+                # path, so without this a restarted trade would sit "structurally
+                # unconfirmed" for the rest of the session: let-winners-run off and the
+                # blunt sub-1R give-back guard armed on a position whose candle closed
+                # hours ago.
+                if not t.repaint_guard_checked and t.entered_intracandle:
+                    try:
+                        minutes = {"1min": 1, "5min": 5, "15min": 15}.get(
+                            str(getattr(t, "timeframe", "") or "").lower(), 5
+                        )
+                        entry_time = t.entry_time
+                        if entry_time.tzinfo is None:
+                            entry_time = IST.localize(entry_time)
+                        if datetime.now(IST) >= entry_time + timedelta(minutes=minutes):
+                            t.repaint_guard_checked = True
+                    except (AttributeError, TypeError, ValueError):
+                        pass
                 symbol = str(getattr(t, "trading_symbol", "") or "").strip()
                 token = str(getattr(t, "symbol_token", "") or "").strip()
                 broker_order_id = str(getattr(t, "broker_order_id", "") or "").strip()

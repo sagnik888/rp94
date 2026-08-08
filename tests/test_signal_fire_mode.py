@@ -89,7 +89,7 @@ async def test_confirmed_trade_skips_repaint_tracker():
 
     await Scanner._track_repaint_until_candle_close(SimpleNamespace(), trade, candidate)
 
-    assert trade._repaint_guard_checked is True
+    assert trade.repaint_guard_checked is True
 
 
 def test_trade_persists_entry_signal_mode():

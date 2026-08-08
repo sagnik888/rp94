@@ -1006,7 +1006,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ):
                 asyncio.create_task(self._track_repaint_until_candle_close(trade, candidate))
             else:
-                setattr(trade, "_repaint_guard_checked", True)
+                setattr(trade, "repaint_guard_checked", True)
             
             self._notify(
                 f"{candidate.direction} {candidate.instrument} @ {candidate.price:.2f} "
@@ -12612,7 +12612,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     getattr(settings, "repaint_window_giveback_guard_enabled", True), True
                 )
                 and bool(getattr(trade_like, "entered_intracandle", False))
-                and not bool(getattr(trade_like, "_repaint_guard_checked", False))
+                and not bool(getattr(trade_like, "repaint_guard_checked", False))
             )
             # Non-trend session phase: chop round-trips are the norm, so every
             # trade gets give-back protection at the lower non-trend arm.
@@ -19679,9 +19679,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # For 15min trades, we also check periodically (every 2 mins)
             # while the candle is still forming to abort earlier.
             sig_ts = getattr(previous, "signal_timestamp", None)
-            repaint_checked = bool(getattr(previous, "_repaint_guard_checked", False))
+            repaint_checked = bool(getattr(previous, "repaint_guard_checked", False))
             if not bool(getattr(previous, "entered_intracandle", True)):
-                setattr(previous, "_repaint_guard_checked", True)
+                setattr(previous, "repaint_guard_checked", True)
                 repaint_checked = True
                 changed = True
             if sig_ts and not repaint_checked:
@@ -19810,7 +19810,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # intrabar and the trade is a NORMAL tracked/trailed position — never
                 # repaint-aborted afterwards.
                 if is_candle_closed:
-                    setattr(previous, "_repaint_guard_checked", True)
+                    setattr(previous, "repaint_guard_checked", True)
                     setattr(previous, "_next_repaint_check", None)  # FIX H1
                     changed = True  # persist the flag so we don't re-check
                     if not self._repaint_close_check_in_window(sig_ts, previous.timeframe, latest_time):
@@ -22959,7 +22959,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     async def _track_repaint_until_candle_close(self, trade, candidate):
         """Continuously monitors if a signal repaints before its source candle closes."""
         if not bool(getattr(trade, "entered_intracandle", True)):
-            setattr(trade, "_repaint_guard_checked", True)
+            setattr(trade, "repaint_guard_checked", True)
             return
         try:
             if not getattr(trade, "id", None) or trade.status != "OPEN":
@@ -23014,7 +23014,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     )
                     break
                 if now >= candle_close_time:
-                    setattr(trade, "_repaint_guard_checked", True)
+                    setattr(trade, "repaint_guard_checked", True)
                     logger.info(f"✅ Repaint Tracker complete for {trade.id} - final candle-close check passed.")
                     break
         except Exception as e:
