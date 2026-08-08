@@ -34,6 +34,39 @@ STUB_BAR_FRACTION = 0.05
 MAX_STUB_WALKBACK = 4
 
 
+def volume_window_is_homogeneous(frame) -> bool:
+    """False when the window mixes volume UNITS, so no ratio across it is meaningful.
+
+    Index volume switches mid-session between Fyers cash-market shares and the broker's
+    near-month FUTURES contracts when Fyers drops. Both are legitimate; they are simply
+    not the same quantity, and they differ by roughly 1000x (a measured 0.006 for NIFTY,
+    0.001 for SENSEX). Comparing a bar in one against a 20-bar mean of the other
+    manufactures a surge out of a feed failover.
+
+    Deliberately mirrors Scanner._volume_window_is_homogeneous rather than importing it:
+    intelligence must not depend on scanner. Its NaN rule is copied exactly and was
+    learned the hard way — historical backfill rows carry no basis, float('nan') is
+    TRUTHY, and treating it as a distinct unit marked every post-backfill window mixed
+    and silently killed the surge signal the guard existed to protect. Unknown is not a
+    unit. A test asserts the two implementations still agree.
+    """
+    columns = getattr(frame, "columns", [])
+    if "volume_basis" not in columns:
+        return True
+    try:
+        seen = set()
+        for value in frame["volume_basis"].tolist():
+            text = str(value).strip()
+            if not text or text.lower() in {"nan", "none"}:
+                continue
+            if text == "MIXED":
+                return False
+            seen.add(text)
+    except Exception:
+        return True
+    return len(seen) <= 1
+
+
 class VolumeProfiler:
     """Intraday volume analysis engine"""
 
@@ -313,6 +346,18 @@ class VolumeProfiler:
             if volume_available and vol_ratio < STUB_BAR_FRACTION:
                 volume_available = False
 
+            # A ratio across MIXED UNITS is not a measurement. On a Fyers recovery the
+            # numerator flips from futures CONTRACTS back to cash SHARES while the 20-bar
+            # mean is still contracts, so vol_ratio reads in the hundreds: is_surge fires,
+            # surge_level goes EXTREME, and +/-0.20 of intelligence score is injected in
+            # whatever direction the last bar happened to close. Two homogeneity guards
+            # already existed for exactly this and neither was wired to the pillar that
+            # feeds the score.
+            if volume_available and not volume_window_is_homogeneous(df):
+                volume_available = False
+                is_proxy = False
+                metric_source = "MIXED_UNITS"
+
             is_surge = bool(volume_available and effective_ratio > 1.5)
             surge_level = "EXTREME" if effective_ratio > 3.0 else ("HIGH" if effective_ratio > 2.0 else ("MODERATE" if effective_ratio > 1.5 else "NORMAL"))
             if not volume_available:
@@ -423,7 +468,17 @@ class VolumeProfiler:
                     else (
                         ""
                         if volume_available
-                        else "Current-session OHLCV/tick activity is missing, zero, or insufficient"
+                        # `source` collapses to UNAVAILABLE for every cause and other
+                        # code keys off that marker, so the specific cause is carried
+                        # here instead. A mixed-unit window is a very different problem
+                        # from a dead feed and the operator should be able to tell them
+                        # apart.
+                        else (
+                            "Volume window mixes units (cash shares and futures "
+                            "contracts); no ratio across it is meaningful"
+                            if metric_source == "MIXED_UNITS"
+                            else "Current-session OHLCV/tick activity is missing, zero, or insufficient"
+                        )
                     )
                 ),
                 "source": metric_source if volume_available else "UNAVAILABLE",
