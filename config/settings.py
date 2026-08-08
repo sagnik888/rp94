@@ -426,7 +426,14 @@ class Settings(BaseSettings):
     # ~37k-56k, so an account below this cannot fund a single lot and every entry will
     # be refused by RMS with a generic rejection. Advisory only: it warns, never blocks,
     # because margin moves intraday and the operator may fund mid-session.
-    entry_funds_warning_floor: float = 50000.0
+    # 0 = derive it. A flat floor cannot describe an option account: this system BUYS
+    # options, so one lot costs premium x lot_size, and the four indices span 6x on lot
+    # size alone (SENSEX 20, MIDCPNIFTY 120). The real range is about Rs.2,000 to
+    # Rs.48,000. Set this above zero only to override the calculation.
+    entry_funds_warning_floor: float = 0.0
+    # The ATM premium the funding estimate assumes. Named in the warning so the operator
+    # can judge it against the day's actual chain.
+    entry_funds_assumed_atm_premium: float = 120.0
     recovery_auto_flatten_seconds: float = 5.0
     # When the order book cannot be read we cannot prove a position is unprotected, so a
     # flatten is withheld — a double exit (stop still resting + our market exit) opens a

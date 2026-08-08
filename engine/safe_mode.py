@@ -79,6 +79,62 @@ INTEL_SCORE_GATES = (
 )
 
 
+def cheapest_one_lot_cost(settings) -> tuple[float, str]:
+    """Rupees needed for ONE lot of the cheapest active index option, and how it was got.
+
+    This used to be a flat Rs.50,000 constant described as "the floor for one index lot".
+    That is a FUTURES margin figure. This system BUYS options, where one lot costs
+    premium x lot_size, and the four indices differ by 6x on lot size alone:
+
+        SENSEX      lot  20  ->  Rs. 2,400 at a Rs.120 ATM premium
+        BANKNIFTY   lot  30  ->  Rs. 3,600
+        NIFTY       lot  65  ->  Rs. 7,800
+        MIDCPNIFTY  lot 120  ->  Rs.14,400   (Rs.48,000 at a Rs.400 premium)
+
+    So the real range is roughly Rs.2,000 to Rs.48,000 depending on index and premium,
+    and a flat Rs.50,000 declared an account unfundable when it could in fact buy several
+    of those. Reported wrongly to this operator on 2026-08-08.
+
+    The question that matters is "can I afford ANY entry", so this returns the MINIMUM
+    across the ACTIVE indices. Lot sizes come from instruments.json; the ATM premium is an
+    assumption, named in the message so the operator can judge it.
+
+    entry_funds_warning_floor overrides the whole calculation when set above zero.
+    """
+    try:
+        override = float(getattr(settings, "entry_funds_warning_floor", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        override = 0.0
+    if override > 0:
+        return override, f"operator floor {override:,.0f}"
+
+    try:
+        premium = float(getattr(settings, "entry_funds_assumed_atm_premium", 120.0) or 120.0)
+    except (TypeError, ValueError):
+        premium = 120.0
+    try:
+        indices = getattr(settings, "get_instruments")()["indices"]
+    except Exception:
+        return 0.0, ""
+
+    active = [str(x).upper() for x in (getattr(settings, "active_indices", None) or indices)]
+    best_cost, best_name, best_lot = 0.0, "", 0
+    for name in active:
+        row = indices.get(name) or {}
+        try:
+            lot = int(row.get("lot_size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lot <= 0:
+            continue
+        cost = lot * premium
+        if best_cost == 0.0 or cost < best_cost:
+            best_cost, best_name, best_lot = cost, name, lot
+    if best_cost <= 0:
+        return 0.0, ""
+    return best_cost, f"{best_name} {best_lot} x Rs.{premium:,.0f} assumed ATM premium"
+
+
 def unreachable_intel_gates(settings) -> list[tuple[str, float]]:
     """Configured intelligence-score gates that the score can never reach."""
     found: list[tuple[str, float]] = []
@@ -208,11 +264,12 @@ def validate_real_mode_readiness(
 
         _probe = _KB(kite=_auth_for_funds(settings).kite)
         _cash = _probe.available_funds()
-        _floor = float(getattr(settings, "entry_funds_warning_floor", 50000.0) or 0.0)
+        _floor, _detail = cheapest_one_lot_cost(settings)
         if _cash is not None and _floor > 0 and _cash < _floor:
             warnings.append(
-                f"broker free cash is {_cash:,.2f}, below the {_floor:,.0f} floor for one "
-                "index lot - RMS will refuse entries until the account is funded"
+                f"broker free cash is {_cash:,.2f}, below the {_floor:,.0f} needed for "
+                f"the CHEAPEST one-lot option entry ({_detail}) - every entry will be "
+                "refused until the account is funded"
             )
     except Exception:
         pass
