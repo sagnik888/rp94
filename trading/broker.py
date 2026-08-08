@@ -176,7 +176,33 @@ class Broker:
                     or ""
                 ).strip().lower().replace("_", " ")
                 if status in safe_terminal:
-                    return True
+                    # Terminal is not the same as UNFILLED. Kite reports an order that
+                    # partially executed and was then cancelled as CANCELLED with a
+                    # non-zero filled quantity, and the contract for True here is
+                    # "nothing is resting, nothing will fill" — which a partial fill
+                    # plainly contradicts.
+                    #
+                    # The stale-entry replace acts only on True and then places a
+                    # replacement for the FULL quantity: a limit that filled 1 of 3 lots
+                    # and was cancelled would come back True and be topped up with 3
+                    # more, giving a 4-lot position where the sizer approved 3. The stop
+                    # is then armed on the enlarged netqty, so a single stop-out costs
+                    # about a third more than the approved per-trade risk.
+                    #
+                    # A partial fill IS a fill, so it answers False under this contract.
+                    # Callers already treat anything other than True as "do not act".
+                    filled = 0.0
+                    for field in (
+                        "filledshares", "filled_quantity", "filledQuantity", "filled",
+                    ):
+                        try:
+                            value = abs(float(row.get(field) or 0.0))
+                        except (TypeError, ValueError):
+                            continue
+                        if value > 0:
+                            filled = value
+                            break
+                    return filled <= 0
                 if status in filled_terminal:
                     return False
             if time.monotonic() >= deadline:
