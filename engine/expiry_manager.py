@@ -609,11 +609,46 @@ class ExpiryManager:
         expiry_df["strike_val"] = expiry_df["strike"].astype(float) / 100.0
         expiry_df["diff"] = (expiry_df["strike_val"] - float(strike)).abs()
         best_match = expiry_df.loc[expiry_df["diff"].idxmin()]
+        if not self._snap_is_sane(name, strike, best_match["strike_val"]):
+            return None
         res = best_match.to_dict()
         res["date_aware_expiry"] = expiry_str
         self._token_cache[cache_key] = res
         logger.info(f"Using closest dated strike: {name} {expiry_str} {best_match['strike_val']} {option_type}")
         return res
+
+    # Strike spacing per index, used ONLY to bound the nearest-strike fallback below.
+    _STRIKE_INTERVAL = {"NIFTY": 50.0, "BANKNIFTY": 100.0, "SENSEX": 100.0, "MIDCPNIFTY": 25.0}
+    # How far the fallback may reach. A missing intermediate strike is one or two steps
+    # away; anything further means the REQUESTED value was wrong, not the chain.
+    _MAX_STRIKE_SNAP_STEPS = 3
+
+    def _snap_is_sane(self, name: str, requested: float, matched: float) -> bool:
+        """Guard the nearest-strike fallback against a wrong-basis request.
+
+        Both resolvers picked idxmin() on |listed - requested| with no bound, so ANY
+        number resolved to a real, tradeable contract. A caller passing an option
+        PREMIUM (~200) instead of a spot level (~24,700) got the LOWEST listed NIFTY
+        strike -- deep ITM, premium in the thousands -- wrapped in a valid symbol and
+        token, and the order pipeline proceeded normally.
+
+        The fallback exists to absorb a missing intermediate strike. It must never
+        absorb a wrong input.
+        """
+        try:
+            step = self._STRIKE_INTERVAL.get(str(name or "").upper(), 50.0)
+            gap = abs(float(matched) - float(requested))
+        except (TypeError, ValueError):
+            return False
+        if gap <= step * self._MAX_STRIKE_SNAP_STEPS:
+            return True
+        logger.error(
+            f"Strike snap REFUSED for {name}: requested {requested} but nearest listed is "
+            f"{matched}, {gap:.0f} away ({step:.0f} spacing). That is not a missing "
+            f"strike, it is a wrong request -- returning no token rather than buying "
+            f"the wrong contract."
+        )
+        return False
 
     def get_token(self, name: str, strike: float, option_type: str, expiry_type: str = "weekly") -> Optional[Dict]:
         """Find the specific token for an option strike.
@@ -668,6 +703,8 @@ class ExpiryManager:
                 opt_type_filtered['strike_val'] = opt_type_filtered['strike'].astype(float) / 100.0
                 opt_type_filtered['diff'] = (opt_type_filtered['strike_val'] - float(strike)).abs()
                 best_match = opt_type_filtered.loc[opt_type_filtered['diff'].idxmin()]
+                if not self._snap_is_sane(name, strike, best_match['strike_val']):
+                    return None
                 res = best_match.to_dict()
                 self._token_cache[cache_key] = res
                 logger.info(f"Using closest available strike: {best_match['strike_val']}")

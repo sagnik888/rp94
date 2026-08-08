@@ -8259,6 +8259,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 pass
         return float(initial or 0.0)
 
+    def _profit_ladder_pnl(self, trade_like, peak_pnl: float, qty=None) -> float:
+        """The peak figure the Rs.3,000 profit tiers should be READ on.
+
+        The ladder's rungs were tuned on single-lot trades, so on a 3-lot position a
+        Rs.3,000 peak is Rs.1,000 PER LOT -- a modest win treated as a major one.
+        profit_lock_per_lot_basis rescales it, but only _profit_lock_floor and
+        _profit_lock_arm_cap_rs honoured the flag. Four other consumers compared the RAW
+        whole-position peak against the same Rs.3,000 rung, so a 3-lot trade peaking at
+        Rs.4,500 was SMART_PROFIT_LOCK in one place and MAJOR_WIN_GUARD in another.
+
+        Default OFF, so this returns peak_pnl unchanged unless the operator opts in.
+        """
+        try:
+            peak = float(peak_pnl or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        try:
+            if not self._setting_enabled(
+                getattr(get_settings(), "profit_lock_per_lot_basis", False), False
+            ):
+                return peak
+            lots = self._profit_lock_lot_count(trade_like, qty)
+            return peak / float(lots) if lots > 1 else peak
+        except Exception:
+            return peak
+
     def _trade_like_initial_risk_rs(
         self,
         trade_like,
@@ -8270,9 +8296,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # redefine 1R: a trade up 1.5R reads as 0.9R the instant lots are added, and every
         # R-based exit rule changes behaviour because of a sizing decision rather than
         # anything the market did. Only set once a trade has actually scaled in.
+        # `qty is None` alone made the freeze unreachable: BOTH hot callers pass qty
+        # explicitly (the live exit ladders and the session ladder), so 1R silently
+        # re-based on every scaled-in trade -- exactly what the comment above says must
+        # not happen. Honour it whenever the caller is asking about the WHOLE position;
+        # a genuine partial-quantity question still recomputes.
         frozen = float(getattr(trade_like, "frozen_initial_risk_rs", 0.0) or 0.0)
-        if frozen > 0 and qty is None:
-            return frozen
+        if frozen > 0:
+            try:
+                whole = int(self._trade_like_quantity(trade_like) or 0)
+            except Exception:
+                whole = 0
+            if qty is None or (whole > 0 and int(qty or 0) == whole):
+                return frozen
 
         entry = self._trade_like_entry_price(trade_like)
         initial = self._ensure_trade_like_initial_stop(trade_like)
@@ -19618,7 +19654,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 create_exit(previous, float(current_price), "LOW_GAIN_PROTECT", f"Low-gain protection peak {peak_gain_pct:.1f}%, current {current_gain_pct:.1f}%")
                 continue
 
-            if previous_peak >= 3000.0 and current_pnl_rs < previous_peak * 0.75:
+            ladder_peak = Scanner._profit_ladder_pnl(self, previous, previous_peak, qty)
+            if ladder_peak >= 3000.0 and current_pnl_rs < previous_peak * 0.75:
                 should_exit, guard_context = (
                     self._should_exit_major_win_guard(
                         previous,
@@ -19657,7 +19694,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             smart_ratio = 0.70 if scalp_mode else 0.65
             abs_floor_rs = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
-            if smart_min_peak <= previous_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or current_pnl_rs < abs_floor_rs):
+            if smart_min_peak <= previous_peak and ladder_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or current_pnl_rs < abs_floor_rs):
                 exit_floor = float(lock_stop or 0.0)
                 if exit_floor > 0 and self._candidate_net_pnl(previous, exit_floor) > 0:
                     create_exit(previous, exit_floor, "SMART_PROFIT_LOCK", f"Smart profit lock peak Rs.{previous_peak:.0f}, current Rs.{current_pnl_rs:.0f}")
@@ -20054,13 +20091,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if target_type == candidate.inst_type:
             return True
 
-        spot = getattr(candidate, "entry_spot", 0.0) or candidate.price
+        # entry_spot ONLY. candidate.price is the CONTRACT price -- a futures LTP on a
+        # FUT candidate (spot plus the basis, so a strike two steps off) or an option
+        # PREMIUM on an OPT one (~120, which rounds to a NIFTY "strike" of 100 and then
+        # gets snapped to the lowest listed contract). A strike must be derived from a
+        # genuine index level or not at all.
+        spot = float(getattr(candidate, "entry_spot", 0.0) or 0.0)
         candles = getattr(self, "candles", None)
         if candles is not None and hasattr(candles, "get_latest_price"):
             try:
                 spot = candles.get_latest_price(candidate.instrument) or spot
             except Exception as e:
                 logger.debug(f"Concurrency Guard: latest price unavailable for {candidate.instrument}: {e}")
+        # Guarded ONCE, here, so nothing downstream needs an `or candidate.price` escape.
+        # That escape was the bug: candidate.price is the CONTRACT price, so converting an
+        # OPT candidate to FUT took its premium (~120) as a futures price, and converting
+        # a FUT candidate to OPT rounded the futures LTP into a strike two steps off the
+        # true ATM. Without a genuine index level there is nothing safe to convert.
+        if not spot or float(spot) <= 0:
+            logger.warning(
+                f"Concurrency Guard: no index spot for {candidate.instrument}; refusing "
+                "to convert instrument type from a contract price."
+            )
+            return False
+        spot = float(spot)
         rr = max(1.1, float(candidate.rr or 1.5))
 
         if target_type == "FUT":
@@ -20080,7 +20134,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception as e:
                 logger.debug(f"FUT conversion LTP fallback for {symbol}: {e}")
             if fut_price <= 0:
-                fut_price = float(spot or candidate.price)
+                fut_price = spot
 
             risk = max(1.0, fut_price * (float(getattr(self, "futures_sl_pct", 0.2) or 0.2) / 100.0))
             candidate.inst_type = "FUT"
@@ -20107,7 +20161,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 return False
             config = getattr(self, "config", {}) or {}
             strike_interval = config.get("indices", {}).get(candidate.instrument, {}).get("strike_interval", 50)
-            strike = round(float(spot or candidate.price) / strike_interval) * strike_interval
+            strike = round(spot / strike_interval) * strike_interval
             option_type = "CE" if candidate.direction == "LONG" else "PE"
             opt_info = data.get_option_token(candidate.instrument, strike, option_type)
             if not opt_info:
@@ -20121,7 +20175,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception as e:
                 logger.debug(f"OPT conversion LTP fallback for {opt_info.get('symbol')}: {e}")
             if premium <= 0:
-                premium = max(1.0, float(spot or candidate.price) * 0.012)
+                premium = max(1.0, spot * 0.012)
 
             risk = Scanner._option_premium_stop_distance_for_candidate(self, premium, candidate)
             candidate.inst_type = "OPT"
@@ -22147,8 +22201,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 spot = live_spot
         except Exception:
             pass
-        if spot <= 0:
-            spot = float(getattr(candidate, "price", 0.0) or 0.0)
+        # No `or candidate.price` fallback: that is the contract price, not an index
+        # level, and rounding it into a strike buys the wrong contract.
         if spot <= 0:
             return False
 
@@ -25635,7 +25689,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 self._close_and_record(tid, exit_val, threat_reason, exit_time=latest_time)
                 continue
 
-            if smart_min_peak_live <= trade.peak_pnl < 3000.0:
+            ladder_peak_live = Scanner._profit_ladder_pnl(self, trade, trade.peak_pnl, qty)
+            if smart_min_peak_live <= trade.peak_pnl and ladder_peak_live < 3000.0:
                 # If profit drops below 45% of peak OR falls below Rs.450 minimum floor
                 if current_pnl_rs < (trade.peak_pnl * 0.45) or current_pnl_rs < 450.0:
                     if current_pnl_rs < 0.0:
@@ -25695,7 +25750,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     continue
 
             # Rule 3: Major Win Protection (Peak >= Rs.3000)
-            if trade.peak_pnl >= 3000.0:
+            if Scanner._profit_ladder_pnl(self, trade, trade.peak_pnl, qty) >= 3000.0:
                 if current_pnl_rs < (trade.peak_pnl * 0.75):
                     should_exit, guard_context = (
                         self._should_exit_major_win_guard(
