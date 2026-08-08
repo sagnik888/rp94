@@ -24912,6 +24912,34 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         allow_fallback=True,
                     )
                 )
+                if intel_result is not None and not allow_blocking:
+                    # The cache read above has no age bound, and this result can CLOSE a
+                    # live position via OI_PCR_REVERSAL. When the scan loop stalls — the
+                    # exact condition the fast path exists for — the bundle stops
+                    # refreshing while this 100ms loop keeps acting on it, so the exit
+                    # fires on evidence that may have reverted minutes ago.
+                    #
+                    # loss_guard_intel_max_age_seconds (90s) is this codebase's existing
+                    # answer to "too old to drive a decision" and sits well above the 30s
+                    # recompute TTL, so a healthy loop is never affected. Dropping the
+                    # read simply defers the exit to the next unhurried pass, which is
+                    # what the comment above already intends.
+                    try:
+                        max_age = float(
+                            getattr(get_settings(), "loss_guard_intel_max_age_seconds", 90.0)
+                            or 90.0
+                        )
+                    except (TypeError, ValueError):
+                        max_age = 90.0
+                    age = Scanner._intel_age_seconds(
+                        self,
+                        intel_result,
+                        str(getattr(trade, "instrument", "") or "").upper(),
+                        latest_time,
+                    )
+                    if age is not None and age > max_age:
+                        self._diag_inc("intel", "fast_path_stale_skipped")
+                        intel_result = None
                 if intel_result:
                     # is_losing uses live unrealized for 2-vote OI/PCR (gap2).
                     reversal_reason = self._intel_reversal_reason(
