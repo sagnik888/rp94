@@ -119,12 +119,13 @@ def test_smart_profit_lock_tier_boundaries():
     # The operator's breathing schedule (2026-08-08). It replaced a flat 20-25% band that
     # was far too tight at the small end: on an index option a Rs.600 peak is a handful of
     # premium points, and a 20-25% leash closed trades on ordinary bid/ask breathing.
-    #   < Rs.1,000  50%      Rs.1,000-2,000  35%->30%
+    #   <= Rs.1,000  50%      Rs.1,000-2,000  35%->30%
     #   Rs.2,000-3,000  25%->20%            Rs.3,000+  15%->10%
     assert ratio(400.0) == 0.0            # below Rs.500 min -> not armed, no lock
     assert ratio(500.0) == 0.50           # 50% breathing
     assert ratio(999.0) == 0.50
-    assert ratio(1000.0) == 0.65          # 35% breathing
+    assert ratio(1000.0) == 0.50          # 'up to Rs.1,000' is inclusive -> 50%
+    assert ratio(1001.0) == pytest.approx(0.65, abs=1e-3)  # 35% starts just above
     assert ratio(1500.0) == 0.675
     assert ratio(2000.0) == 0.75          # 25% breathing
     assert ratio(2500.0) == 0.775

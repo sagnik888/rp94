@@ -11574,8 +11574,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         elif ladder_pnl >= 2000.0:
             # 25% -> 20%
             lock_ratio = 0.75 + 0.05 * (ladder_pnl - 2000.0) / 1000.0
-        elif ladder_pnl >= 1000.0:
-            # 35% -> 30%
+        elif ladder_pnl > 1000.0:
+            # 35% -> 30%. Strictly ABOVE Rs.1,000: the operator's schedule reads "up to
+            # Rs.1,000 gets 50%", so the boundary itself belongs to the loose tier below.
             lock_ratio = 0.65 + 0.05 * (ladder_pnl - 1000.0) / 1000.0
         else:
             # Below Rs.1,000 a winner is barely out of the noise. On an index option a
