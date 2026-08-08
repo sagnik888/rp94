@@ -54,6 +54,44 @@ def _format_time(value: dtime) -> str:
 from data.kite_auth import most_recent_token_cutoff  # noqa: E402
 
 
+# IntelligenceAggregator publishes `averaged_score = sum(votes) / components`, clamped to
+# [-1, 1] and scaled by 100; every consumer normalises it straight back. So the number the
+# gates below test is that MEAN.
+#
+# Summing ALL twenty literal score deltas in the aggregator gives 3.00, and that is already
+# a wild over-count because most sit in mutually exclusive if/elif arms. With the minimum
+# plausible five components that is 0.60; with the eight component sites that exist it is
+# 0.375. Measured intent sits around 0.25-0.30.
+#
+# Any threshold at or above the ceiling is therefore a gate that can never fire while
+# reading, in .env, as though it were tuned. Re-scaling the score or re-basing the
+# thresholds is a calibration decision for the operator; this only makes the dead ones
+# audible. test_intel_score_ceiling_2026_08_08.py re-derives the ceiling from the
+# aggregator's own source so this constant cannot drift silently.
+INTEL_SCORE_CEILING = 0.60
+
+INTEL_SCORE_GATES = (
+    "rare_burst_min_intel_score",
+    "live_15min_trending_momentum_intel_threshold",
+    "live_15min_momentum_intel_threshold",
+    "live_5min_special_intel_threshold",
+    "volume_spike_entry_strong_1min_intel_threshold",
+)
+
+
+def unreachable_intel_gates(settings) -> list[tuple[str, float]]:
+    """Configured intelligence-score gates that the score can never reach."""
+    found: list[tuple[str, float]] = []
+    for name in INTEL_SCORE_GATES:
+        try:
+            value = float(getattr(settings, name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value >= INTEL_SCORE_CEILING:
+            found.append((name, value))
+    return found
+
+
 def validate_real_mode_readiness(
     settings: Any,
     data_provider: Any = None,
@@ -371,6 +409,15 @@ def validate_real_mode_readiness(
     # reads as a control that is working. ut_correlated_core_limit=2 says "maximum
     # simultaneous same-direction NIFTY/BANKNIFTY/SENSEX exposures" and the guard actually
     # allows 6. Say so at startup rather than letting a dead knob look live.
+    # A threshold set above what the score can physically reach is a gate that never
+    # fires, and it reads in .env as if it were tuned and active.
+    for name, configured in unreachable_intel_gates(settings):
+        warnings.append(
+            f"{name}={configured} can never be met: the aggregate intelligence score is a "
+            f"MEAN of votes whose magnitudes are all <= 0.35, so its absolute ceiling is "
+            f"{INTEL_SCORE_CEILING} and its typical value is ~0.25-0.30. This gate is inert."
+        )
+
     try:
         from config.inert_settings import configured_but_inert, env_keys_from_file
 
