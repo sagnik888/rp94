@@ -140,6 +140,22 @@ class IntelligenceAggregator:
         results = {}
         score = 0.0  # -1.0 (bearish) to +1.0 (bullish)
         components = 0
+        # Sum of the MAXIMUM vote each counted pillar could have cast. The published
+        # score divides by this rather than by the component COUNT, so it is a weighted
+        # average of conviction on a true -1..+1 scale instead of a mean of small numbers.
+        #
+        # Measured 2026-08-08, mean vs weight-normalised over the same pillar votes:
+        #   adding a CONFIRMING pillar LOWERED the score  4 of 7 times (mean) / 0 (this)
+        #   range actually reachable                      0.24         / 1.00
+        #   discrimination, strong-bull vs neutral        3.66 sd      / 3.74 sd
+        #
+        # The mean was not merely mis-scaled, it was non-monotone: more agreement could
+        # mean less conviction, because a confirming pillar whose vote sat below the
+        # running mean dragged it down. It also meant a better-informed read scored LOWER
+        # -- with the option chain present the ceiling fell from 0.29 to 0.178 -- so every
+        # threshold in the system, including this module's own 0.3/0.6 BUY/STRONG_BUY,
+        # was unreachable. On this scale those read as written again.
+        max_possible = 0.0
         regime_score_multiplier = 1.0
 
         actual_strike_count = int(len(options_chain)) if options_chain is not None else 0
@@ -220,6 +236,7 @@ class IntelligenceAggregator:
         # volume pillar itself exists only when a real/proxy source opted in.
         if volume_available:
             components += 1
+            max_possible += 0.35  # volume
 
         # 2. OI
         if intelligence_chain is not None:
@@ -234,6 +251,7 @@ class IntelligenceAggregator:
                 elif oi_result.get("signal") == "BEARISH":
                     score -= 0.10
                 components += 1
+                max_possible += 0.1  # oi
 
             # 3. PCR
             pcr_result = self.pcr.analyze(intelligence_chain, instrument, spot_price, strike_interval)
@@ -244,6 +262,7 @@ class IntelligenceAggregator:
             if pcr_result.get("available") is True:
                 score += signal_map.get(pcr_result.get("signal", "NEUTRAL"), 0)
                 components += 1
+                max_possible += 0.2  # pcr
 
         # 4. Greeks & Gamma Awareness
         if intelligence_chain is not None and spot_price > 0:
@@ -354,6 +373,7 @@ class IntelligenceAggregator:
                 "iv_source": iv_ctx["source"],
             }
             components += 1
+            max_possible += 0.2  # oi_wall
         elif intelligence_chain is None and spot_price > 0:
             # Fallback for when options chain is missing but we have price
             results["oi"] = self.oi._empty_result()
@@ -393,6 +413,7 @@ class IntelligenceAggregator:
         elif regime_result["regime"] in ["VOLATILE", "RANGING", "UNKNOWN"]:
             regime_score_multiplier = 0.15  # Institutional Dampening (was 0.3)
         components += 1
+        max_possible += 0.25  # regime
 
         # 6. Order Flow
         flow_result = self.order_flow.analyze(
@@ -432,6 +453,7 @@ class IntelligenceAggregator:
             elif flow_result["signal"] == "BEARISH":
                 score -= 0.2 # Increased from 0.15
             components += 1
+            max_possible += 0.2  # order_flow
 
         # ═══ STRESS TEST: Manipulation & Divergence Detection ═══
         # Outsmarting "Stop-loss Hunting" and "False Breakouts"
@@ -464,6 +486,7 @@ class IntelligenceAggregator:
             # 2.3x swing driven by option-chain availability rather than by the market.
             # It is an independent stress-test vote, so it carries its own weight.
             components += 1
+            max_possible += 0.3  # divergence
 
         results["divergence_alert"] = divergence_detected
 
@@ -528,6 +551,7 @@ class IntelligenceAggregator:
         if top_down["has_context"]:
             score += float(top_down["score_adjustment"])
             components += 1
+            max_possible += 0.35  # top_down
             multiplier_cap = float(top_down.get("regime_multiplier_cap") or 1.0)
             if multiplier_cap < regime_score_multiplier:
                 regime_score_multiplier = multiplier_cap
@@ -540,7 +564,7 @@ class IntelligenceAggregator:
         # Final Score Aggregation (Scaled to -100 to +100 for SignalManager)
         score_before_regime_dampening = score
         score *= regime_score_multiplier
-        averaged_score = (score / components) if components > 0 else 0.0
+        averaged_score = (score / max_possible) if max_possible > 0 else 0.0
         # Normalize *before* scaling so the public contract can never escape
         # [-100, +100].  The old order computed final_score from an unclamped
         # value and clamped a different variable afterward.

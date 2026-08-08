@@ -29,14 +29,11 @@ from engine.signal_quality_policy import (
 # (trending regime + ADX>=28 + 15m-aligned) previously rejected, so the system
 # stops missing big directional moves. Diff audited: all 240 are False->True,
 # all 5min, all trending regimes, all ADX>=28, all 15m-agree.
-# Regenerated 2026-08-08 when the five intelligence gates were rebased onto the score's
-# real scale (0.60-0.75 -> 0.107-0.134; see test_intel_gates_are_reachable_2026_08_08).
-# The change was measured across all 61,440 combinations before regenerating:
-#   760 rows changed (1.24%), ALL of them a gate that now PASSES where it previously
-#   blocked, 0 rows newly blocked, and every changed row had intel_score=0.6 — the only
-#   value on the test's intel axis above the new thresholds. intel_score=0.0 rows are
-#   byte-identical. Monotone loosening, confined to the intelligence dimension.
-GOLDEN_SHA256 = "971fc711c467edfac0d5ef997f563f6c071fa49776567b4b0a60491e2fe79883"
+# Unchanged. The five intelligence gates were briefly rebased to 0.107-0.134 on
+# 2026-08-08 (Option A) and then restored to these values when the aggregator moved to a
+# weight-normalised score (Option B), on which the original 0.60-0.75 read as written.
+# The hash returning to its pre-Option-A value is the proof the gates are byte-identical.
+GOLDEN_SHA256 = "a1948c1b9530535be6554e64e0b9057c5549386a797a35e5dfa89fbb2b4eb351"
 
 _CONFS = [0.30, 0.42, 0.50, 0.54, 0.58, 0.62, 0.68, 0.72, 0.80, 0.88]
 _REGIMES = ["TRENDING_UP", "TRENDING_DOWN", "BREAKOUT_UP", "RANGING",

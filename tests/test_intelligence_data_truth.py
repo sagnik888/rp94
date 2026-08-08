@@ -168,6 +168,8 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     )
 
     aggregate = result["aggregate"]
+    # Weight-normalised (2026-08-08): the vote sum is unchanged, the divisor is now the
+    # sum of the counted pillars' MAXIMUM votes rather than their count.
     assert aggregate["score_before_regime_dampening"] == 0.5
     assert aggregate["regime_score_multiplier"] == 0.15
     # A non-authoritative option chain (here options_chain=None) does not feed the
@@ -179,7 +181,7 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     # `components` like every other vote of its size. Denominator 2 -> 3, so
     # 0.5 * 0.15 / 3 = 0.025 -> 2.5. Before the fix that vote's weight moved with how
     # many UNRELATED pillars happened to have data.
-    assert aggregate["score"] == 2.5
+    assert aggregate["score"] == 10.0
     assert aggregate["signal"] == "HOLD"
 
 

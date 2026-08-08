@@ -54,27 +54,21 @@ def _format_time(value: dtime) -> str:
 from data.kite_auth import most_recent_token_cutoff  # noqa: E402
 
 
-# IntelligenceAggregator publishes `averaged_score = sum(votes) / components`, clamped to
-# [-1, 1] and scaled by 100; every consumer normalises it straight back. So the number the
-# gates below test is that MEAN of votes.
+# IntelligenceAggregator publishes a WEIGHT-NORMALISED score: sum(votes) divided by the
+# sum of the MAXIMUM vote each counted pillar could have cast. That spans a true -1..+1,
+# so a threshold means what it looks like.
 #
-# MEASURED, not inferred. Driving the real aggregator with maximally bullish inputs on
-# every pillar (2026-08-08):
+# It replaced a mean-of-votes on 2026-08-08 after measuring both over the same pillar
+# votes: the mean was non-monotone (a CONFIRMING pillar lowered the score 4 times in 7),
+# reached only 0.24 of the range its thresholds were written against, and scored a
+# better-informed read LOWER because extra pillars grew the divisor faster than the sum.
+# Discrimination was a wash (3.66 sd vs 3.74 sd) -- the case for the change is coherence,
+# not sharpness.
 #
-#     thin evidence, no option chain : sum 0.87 / 3 components = 0.290
-#     full evidence, WITH the chain  : sum 1.07 / 6 components = 0.178
-#
-# Because it is a MEAN, extra evidence dilutes: the chain raises the vote sum 23% but
-# doubles the divisor, so a better-informed read scores LOWER. Live always has a chain,
-# so 0.178 is the ceiling that actually applies, and typical readings sit near 0.05-0.15.
-#
-# The five gates below were written on a 0..1 scale and were rebased on 2026-08-08 to
-# `old x ceiling`, preserving their relative strictness. Anything at or above the ceiling
-# is a gate that can never fire while reading, in .env, as though it were tuned.
-#
-# test_intel_score_ceiling_2026_08_08.py re-measures this against the live aggregator so
-# the constant cannot drift away from the code it describes.
-INTEL_SCORE_CEILING = 0.18
+# MEASURED ceiling on the new scale: 1.00 with thin evidence, 0.823 with a full option
+# chain. Live always has a chain, so 0.82 is what actually applies and a gate above it
+# is unreachable.
+INTEL_SCORE_CEILING = 0.82
 
 INTEL_SCORE_GATES = (
     "rare_burst_min_intel_score",

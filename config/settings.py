@@ -271,7 +271,7 @@ class Settings(BaseSettings):
     rare_burst_min_confidence: float = 0.95
     rare_burst_min_volume_ratio: float = 3.5
     rare_burst_min_adx: float = 35.0
-    rare_burst_min_intel_score: float = 0.125  # Rebased 2026-08-08 onto the score's real scale; see engine/safe_mode.py INTEL_SCORE_CEILING
+    rare_burst_min_intel_score: float = 0.70
     rare_burst_min_breadth_votes: int = 3
     rare_burst_require_hourly_anchor: bool = True
     rare_burst_require_session_bias: bool = True
@@ -1361,7 +1361,7 @@ class Settings(BaseSettings):
     volume_spike_entry_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_adx_threshold: float = 25.0
-    volume_spike_entry_strong_1min_intel_threshold: float = 0.125  # Rebased 2026-08-08 onto the score's real scale; see engine/safe_mode.py INTEL_SCORE_CEILING
+    volume_spike_entry_strong_1min_intel_threshold: float = 0.70
     volume_spike_entry_min_range_atr_ratio: float = 1.5
     volume_spike_entry_min_close_location: float = 0.65
     volume_spike_entry_futures_sl_pct: float = 0.05
@@ -1487,7 +1487,7 @@ class Settings(BaseSettings):
     # ─── Live quality-gate confidence floors (promoted from getattr-defaults to real fields) ───
     live_15min_min_confidence: float = 0.62
     live_15min_trending_momentum_adx_threshold: float = 24.0
-    live_15min_trending_momentum_intel_threshold: float = 0.107  # Rebased 2026-08-08 onto the score's real scale; see engine/safe_mode.py INTEL_SCORE_CEILING
+    live_15min_trending_momentum_intel_threshold: float = 0.60
     live_15min_trending_momentum_min_confidence: float = 0.58
     live_15min_momentum_override_enabled: bool = True
     live_15min_momentum_min_confidence: float = 0.20
@@ -1495,7 +1495,7 @@ class Settings(BaseSettings):
     live_15min_momentum_range_atr_ratio: float = 1.25
     live_15min_momentum_close_location: float = 0.65
     live_15min_momentum_adx_threshold: float = 24.0
-    live_15min_momentum_intel_threshold: float = 0.116  # Rebased 2026-08-08 onto the score's real scale; see engine/safe_mode.py INTEL_SCORE_CEILING
+    live_15min_momentum_intel_threshold: float = 0.65
     fifteen_min_choppy_scalp_guard_enabled: bool = True
     fifteen_min_choppy_scalp_min_intel_score: float = 0.20
     fifteen_min_choppy_scalp_min_volume_ratio: float = 1.05
@@ -1509,7 +1509,7 @@ class Settings(BaseSettings):
     live_5min_pre_close_min_confidence: float = 0.70
     live_5min_special_adx_threshold: float = 30.0
     live_5min_special_bplus_min_confidence: float = 0.60
-    live_5min_special_intel_threshold: float = 0.134  # Rebased 2026-08-08 onto the score's real scale; see engine/safe_mode.py INTEL_SCORE_CEILING
+    live_5min_special_intel_threshold: float = 0.75
     live_5min_special_max_iv_percentile: float = 70.0
     live_5min_special_min_chain_score: float = 50.0
     reversal_entry_relief_enabled: bool = True
