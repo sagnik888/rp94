@@ -24753,11 +24753,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     return price
             return 0.0
 
+        # A FUTURES position marks on the FUTURES price, not on index spot. The two are
+        # the same order of magnitude but differ by the basis, which is tens of points on
+        # NIFTY and moves intraday — so booking a futures exit at spot misprices the
+        # recorded P&L by basis x quantity on every repaint abort.
+        #
+        # This is the other half of the bug fixed for options today, where marking a
+        # bought CE at the index spot booked a fabricated Rs.18.5 lakh. Less violent
+        # here, but wrong in the same way: the exit loop already resolves FUT through
+        # the live futures LTP and only falls back to a basis-adjusted spot.
         price = None
         try:
-            price = self.candles.get_latest_price(getattr(candidate, "instrument", ""))
+            live_fut = self._get_live_fut_ltp_cached(trade)
+            if live_fut and float(live_fut) > 0:
+                price = float(live_fut)
         except Exception:
             price = None
+        if not price:
+            try:
+                spot = self.candles.get_latest_price(getattr(candidate, "instrument", ""))
+            except Exception:
+                spot = None
+            if spot and float(spot) > 0:
+                # Hold the entry basis rather than treating spot as the contract price.
+                price = Scanner._fut_price_from_spot_level(trade, float(spot))
         if not price:
             price = getattr(trade, "current_price", None) or getattr(trade, "entry_price", 0.0)
         try:
