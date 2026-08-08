@@ -435,7 +435,13 @@ def test_pipeline_order_contains_ladder_after_loss_guard():
     # Session path: loss guard then ladder (by source order)
     sess = src.find("def _check_session_candidates_breaches_locked")
     assert sess > 0
-    chunk = src[sess : sess + 25000]
+    # Bounded by the NEXT top-level def, not a character budget. A fixed 25,000-char
+    # window silently dropped _peak_threat_exit_decision out of scope the moment the
+    # function grew (2026-08-08), turning a real ordering check into a -1.
+    import re
+
+    nxt = re.search("\n    def ", src[sess + 10:])
+    chunk = src[sess : sess + 10 + (nxt.start() if nxt else len(src))]
     i_loss = chunk.find("_loss_guard_decision(")
     i_band = chunk.find("_rupee_loss_band_guard_decision(")
     i_threat = chunk.find("_peak_threat_exit_decision(")

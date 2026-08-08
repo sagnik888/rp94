@@ -1912,7 +1912,21 @@ class TradeManager:
             mark = float(trade.current_price or 0.0)
             if entry <= 0 or mark <= 0:
                 return False, "no mark to measure profit against"
-            signed = (mark - entry) if str(trade.direction).upper() == "LONG" else (entry - mark)
+            # OPTIONS ARE ALWAYS BOUGHT. A bearish view is a bought PE, stored with
+            # direction="SHORT", and it profits when its PREMIUM RISES exactly as a CE
+            # does. Reading `direction` alone inverted the sign for every PE: premium
+            # 120 -> 100 is a Rs.1,300 loss on 65 qty, about -1.1R, but computed as
+            # (120-100) = +20 it reported +1.11R and cleared the 0.75R bar.
+            #
+            # So this function did the one thing its own docstring forbids -- it added
+            # size to a loser. The `mult` line just below already pins 1.0 for OPT, so
+            # the option case was known here; only the sign was missed.
+            signed = (
+                (mark - entry)
+                if (str(trade.inst_type or "").upper() == "OPT"
+                    or str(trade.direction).upper() == "LONG")
+                else (entry - mark)
+            )
             qty = int(getattr(trade, "broker_quantity", 0) or trade.quantity or 0)
             mult = 1.0 if str(trade.inst_type or "").upper() == "OPT" else float(
                 getattr(trade, "instrument_multiplier", 1.0) or 1.0

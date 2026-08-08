@@ -10,6 +10,8 @@ Confluence score is computed for display/context only — not an entry gate.
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+from loguru import logger
+
 
 @dataclass
 class ApexConfig:
@@ -122,13 +124,24 @@ class ApexConfig:
     @property
     def strike_interval(self) -> float:
         """Option strike spacing for the detected instrument."""
+        # SENSEX was missing and fell through to NIFTY's 50. apex_hybrid maps
+        # SENSEX -> "Sensex", a label absent from this dict, so a spot ending on an odd
+        # 50 produced a strike that does not exist on BFO.
         _map = {
             "Bank Nifty": 100.0,
             "Nifty 50":   50.0,
             "FinNifty":   50.0,
             "Midcap":     25.0,
+            "Sensex":     100.0,
         }
-        return _map.get(self.detected_instrument, 50.0)
+        interval = _map.get(self.detected_instrument)
+        if interval is None:
+            # Do not silently assume NIFTY's spacing for an unknown index.
+            logger.warning(
+                f"No strike interval for '{self.detected_instrument}'; defaulting to 50.0"
+            )
+            return 50.0
+        return interval
 
     @property
     def min_bars_required(self) -> int:

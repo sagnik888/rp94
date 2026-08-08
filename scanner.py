@@ -19346,7 +19346,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
 
                 if getattr(previous, "runner_mode", False):
-                    current_gain_pts = max(0.0, abs(float(current_price) - float(previous.price)))
+                    # SIGNED, not abs(). price_direction is always "LONG" for an option
+                    # (options are bought, so profit is a premium RISE), and abs() turned
+                    # an adverse move into a "gain": premium 165.05 -> 158 gave
+                    # |158-165.05| = 7.05 of "gain", locked a stop ABOVE entry, and the
+                    # exit was then booked at that stop and recorded as a profit lock on
+                    # a trade that was down. A retracement must lock nothing.
+                    current_gain_pts = max(
+                        0.0,
+                        (float(current_price) - float(previous.price))
+                        if price_direction == "LONG"
+                        else (float(previous.price) - float(current_price)),
+                    )
                     locked_gain_pts = current_gain_pts * runner_lock_pct
                     new_runner_stop = (
                         float(previous.price) + locked_gain_pts
@@ -25019,9 +25030,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     )
                     lot_mult = float(getattr(trade, "lot_size", 1) or 1)
                     if entry_px > 0 and mark_px > 0:
-                        signed = (mark_px - entry_px) if str(
-                            getattr(trade, "direction", "")
-                        ).upper() == "LONG" else (entry_px - mark_px)
+                        # Options are always BOUGHT, so a premium RISE is profit for a
+                        # PE as much as a CE. Reading direction alone reported a winning
+                        # PE as a loser, and live_unreal feeds the distress-reversion arm
+                        # and the is_losing flag on the OI/PCR reversal vote.
+                        signed = (mark_px - entry_px) if (
+                            str(getattr(trade, "inst_type", "")).upper() == "OPT"
+                            or str(getattr(trade, "direction", "")).upper() == "LONG"
+                        ) else (entry_px - mark_px)
                         # OPT qty often already includes lot; keep simple Rs estimate.
                         live_unreal = signed * abs(qty) * (lot_mult if abs(qty) < 50 else 1.0)
                 except Exception:
@@ -25345,7 +25361,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Calculate absolute PnL in Rupees for institutional exit rules
             current_pnl_rs = 0.0
             entry_val = trade.entry_price
-            qty = getattr(trade, "quantity", getattr(trade, "qty", 0))
+            # The CONFIRMED fill, not the intended size. `quantity` is lots * lot_size;
+            # on a partial fill the broker confirms less and pnl_quantity carries that.
+            # Its own docstring cites the case: 65 intended / 30 filled reported -860
+            # against a true -440. This qty feeds current_pnl_rs, candle_extreme_pnl,
+            # peak_pnl and initial_risk_live, so an overstatement arms the rupee loss
+            # band (Rs.1,000/lot) and even the Rs.3,000 catastrophe force-exit on money
+            # that was never at risk. Falls back to the intended size pre-fill.
+            qty = getattr(trade, "pnl_quantity", None) or getattr(
+                trade, "quantity", getattr(trade, "qty", 0)
+            )
             inst_mult = getattr(trade, 'instrument_multiplier', 1.0)
             if trade.inst_type == "OPT":
                 current_pnl_rs = (trade.current_price - entry_val) * qty

@@ -191,12 +191,41 @@ def test_the_trend_requirement_can_be_turned_off(settings):
     assert _manager(t).scale_in_trade("T1", 1, 240.0)[0] is True
 
 
-def test_a_short_is_measured_the_right_way_round(settings):
+def test_a_futures_short_is_measured_the_right_way_round(settings):
+    """A genuine SHORT only exists in futures.
+
+    This was inst_type="OPT" with direction="SHORT" and premium 200 -> 240, described as
+    "40 points underwater". For a BOUGHT PE that is a Rs.40/unit PROFIT: the test
+    encoded the sign inversion fixed on 2026-08-08.
+    """
     t = _trade(lots=2, direction="SHORT", entry_price=200.0, current_price=240.0,
                regime="STRONG_DOWNTREND")
+    t.inst_type = "FUT"
     t.trailing_stop = t.current_stop = t.initial_stop = 230.0
     ok, why = _manager(t).scale_in_trade("T1", 1, 240.0)
     assert ok is False, "a SHORT 40 points underwater was treated as profitable"
+
+
+def test_a_losing_bought_pe_is_refused_an_add(settings):
+    """The fix. A PE is stored SHORT but profits when its PREMIUM RISES.
+
+    Premium 200 -> 160 is a loss, and adding to it is the averaging-down this
+    function's own docstring forbids.
+    """
+    t = _trade(lots=2, direction="SHORT", entry_price=200.0, current_price=160.0,
+               regime="STRONG_DOWNTREND")
+    t.trailing_stop = t.current_stop = t.initial_stop = 170.0
+    ok, why = _manager(t).scale_in_trade("T1", 1, 160.0)
+    assert ok is False, f"added size to a losing bought PE ({why})"
+
+
+def test_a_winning_bought_pe_still_qualifies(settings):
+    """Premium 200 -> 240 on a PE is a real profit and must still be addable."""
+    t = _trade(lots=2, direction="SHORT", entry_price=200.0, current_price=240.0,
+               regime="STRONG_DOWNTREND")
+    t.trailing_stop = t.current_stop = t.initial_stop = 170.0
+    ok, why = _manager(t).scale_in_trade("T1", 1, 240.0)
+    assert ok is True, f"refused an add on a winning bought PE ({why})"
 
 
 # ── caps ─────────────────────────────────────────────────────────────────────
