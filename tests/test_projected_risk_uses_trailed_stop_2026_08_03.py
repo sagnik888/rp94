@@ -32,11 +32,11 @@ def _rm():
     return rm
 
 
-def _trade(current_stop, trailing_stop, direction="LONG", entry=ENTRY):
+def _trade(current_stop, trailing_stop, direction="LONG", entry=ENTRY, inst_type="OPT"):
     # quantity is derived as lots * lot_size inside the method, not read directly.
     return SimpleNamespace(
         entry_price=entry, lots=1, lot_size=QTY, instrument_multiplier=1.0,
-        direction=direction, inst_type="OPT",
+        direction=direction, inst_type=inst_type,
         current_stop=current_stop, trailing_stop=trailing_stop,
     )
 
@@ -63,10 +63,37 @@ def test_an_untrailed_trade_still_projects_its_entry_risk():
 
 
 def test_a_short_stop_trailed_into_profit_projects_no_risk():
+    """A genuine SHORT only exists in futures, so this case is FUT.
+
+    It was inst_type="OPT" with direction="SHORT", which asserted the bug fixed on
+    2026-08-08: for an option, direction="SHORT" means a bought PE, still LONG PREMIUM,
+    and a stop below entry is a real loss rather than a locked profit. Half the option
+    book projected zero risk because of exactly this reading.
+    """
     risk = _rm()._projected_stop_risk(
-        _trade(current_stop=95.0, trailing_stop=105.0, direction="SHORT")
+        _trade(current_stop=95.0, trailing_stop=105.0, direction="SHORT", inst_type="FUT")
     )
     assert risk == 0.0
+
+
+def test_a_bought_pe_projects_real_risk_despite_direction_short():
+    """The fix. A PE is stored SHORT but its stop sits BELOW entry."""
+    risk = _rm()._projected_stop_risk(
+        _trade(current_stop=95.0, trailing_stop=95.0, direction="SHORT", inst_type="OPT")
+    )
+    assert risk == pytest.approx(5.0 * QTY), (
+        "a bought PE projected no stop risk — the entire PE side of the book was "
+        "invisible to the forward-looking half of the circuit breaker"
+    )
+
+
+def test_an_option_delta_is_not_a_contract_multiplier():
+    """instrument_multiplier on an OPT row is the signed BS delta, not a lot multiplier."""
+    t = _trade(current_stop=95.0, trailing_stop=95.0, direction="SHORT", inst_type="OPT")
+    t.instrument_multiplier = -0.4687
+    assert _rm()._projected_stop_risk(t) == pytest.approx(5.0 * QTY), (
+        "|delta| scaled the rupee risk, understating it by about half"
+    )
 
 
 def test_a_missing_current_stop_falls_back_to_the_entry_stop():

@@ -103,10 +103,26 @@ class RiskManager:
             lots = int(getattr(trade, "lots", 0) or 0)
             lot_size = int(getattr(trade, "lot_size", 0) or 0)
             quantity = lots * lot_size
-            raw_multiplier = getattr(trade, "instrument_multiplier", 1.0)
-            multiplier = abs(
-                float(1.0 if raw_multiplier is None else raw_multiplier)
-            )
+            inst_type = str(getattr(trade, "inst_type", "FUT") or "FUT").upper()
+            # An OPTION's instrument_multiplier is the signed Black-Scholes DELTA, a
+            # spot<->premium conversion factor -- NOT a contract-size multiplier. The
+            # rupee value of a bought option is premium x quantity, full stop, which is
+            # why every other rupee path pins it to 1.0 for OPT: entry_risk_policy:90,
+            # trade_manager:552 (gross = (current - entry) * sized, no multiplier),
+            # scanner's profit-lock and exit paths, and trade_accounting, which applies a
+            # multiplier only in its FUT branch.
+            #
+            # Using |delta| here scaled projected risk by about 0.5. Measured against a
+            # real row: BANKNIFTY CE entry 840.60, stop 806.98, 1 lot of 30, delta 0.5729
+            # -> true stop risk Rs.1,008.60, computed Rs.577.80. A 43% understatement, so
+            # the daily OPT loss budget admitted roughly twice the exposure configured.
+            if inst_type == "OPT":
+                multiplier = 1.0
+            else:
+                raw_multiplier = getattr(trade, "instrument_multiplier", 1.0)
+                multiplier = abs(
+                    float(1.0 if raw_multiplier is None else raw_multiplier)
+                )
             if (
                 entry <= 0
                 or quantity <= 0
@@ -115,7 +131,6 @@ class RiskManager:
             ):
                 return None
 
-            inst_type = str(getattr(trade, "inst_type", "FUT") or "FUT").upper()
             sl_pct = self.futures_sl_pct if inst_type == "FUT" else self.options_sl_pct
             configured_risk = entry * quantity * multiplier * max(0.0, float(sl_pct or 0.0)) / 100.0
 
@@ -138,9 +153,30 @@ class RiskManager:
             if not math.isfinite(stop):
                 return None
 
+            # OPTIONS ARE ALWAYS BOUGHT, so the adverse move is always a FALL in premium
+            # regardless of what `direction` says. A bearish view is a bought PE, and this
+            # system stores it as direction="SHORT" while its stop sits BELOW entry: the
+            # live book holds exactly two OPT shapes, 54 LONG/CE and 26 SHORT/PE, and
+            # every PE row has stop < entry.
+            #
+            # Reading `direction` alone therefore computed max(0, stop - entry) = 0 for
+            # EVERY bought PE. Measured on real rows: SENSEX PE projected 0.00 vs a true
+            # Rs.1,134 of stop risk; BANKNIFTY PE 0.00 vs Rs.3,113; MIDCPNIFTY PE 0.00 vs
+            # Rs.3,600. Half the option book was invisible to the forward-looking half of
+            # the circuit breaker, which exists precisely so it does "not wait for
+            # mark-to-market P&L to turn red".
+            #
+            # Every other risk surface branches on inst_type FIRST -- entry_risk_policy:88,
+            # trade_manager:552, scanner's _trade_like_price_direction. This was the only
+            # one that did not.
             direction = str(getattr(trade, "direction", "LONG") or "LONG").upper()
             if stop > 0:
-                stop_distance = max(0.0, entry - stop) if direction == "LONG" else max(0.0, stop - entry)
+                if inst_type == "OPT":
+                    stop_distance = max(0.0, entry - stop)
+                else:
+                    stop_distance = (
+                        max(0.0, entry - stop) if direction == "LONG" else max(0.0, stop - entry)
+                    )
                 stop_risk = min(configured_risk, stop_distance * quantity * multiplier)
             else:
                 stop_risk = configured_risk
@@ -250,7 +286,15 @@ class RiskManager:
                     open_pnl = float(getattr(t, 'unrealized_pnl', 0) or 0.0)
                     exit_price = float(getattr(t, "current_price", 0.0) or getattr(t, "entry_price", 0.0) or 0.0)
                     quantity = max(1, int(getattr(t, "lots", 1) or 1) * int(getattr(t, "lot_size", 1) or 1))
-                    multiplier = abs(float(getattr(t, "instrument_multiplier", 1.0) or 1.0))
+                    # Same delta-is-not-a-contract-multiplier rule as
+                    # _projected_stop_risk above: an OPT row's instrument_multiplier is
+                    # the signed Black-Scholes delta, so |delta| was shrinking the
+                    # option slippage buffer by roughly half.
+                    multiplier = (
+                        1.0
+                        if str(getattr(t, "inst_type", "FUT") or "FUT").upper() == "OPT"
+                        else abs(float(getattr(t, "instrument_multiplier", 1.0) or 1.0))
+                    )
                     slippage_buffer = (
                         exit_price
                         * quantity
