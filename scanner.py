@@ -23916,7 +23916,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         spot_stop=spot_stop,
                         spot_target=spot_target,
                         is_reversion_scalp=bool(getattr(sig, "is_reversion_scalp", False)),
-                        is_recovery=getattr(self, "is_warmup", False),
+                        # A fresh entry is NEVER a recovery. This passed is_warmup, which
+                        # only means the scanner is still loading data — unrelated. When
+                        # true, can_open_trade skips BOTH the orphan block and the
+                        # max-concurrent-positions cap, and the trade is written
+                        # execution_status="OPEN" with pending_execution=False, i.e.
+                        # already established rather than awaiting a fill. Auto Mode is
+                        # not persisted, so an operator re-enabling it seconds after a
+                        # restart lands squarely inside _background_initial_setup.
+                        # The other two open_trade call sites both pass False.
+                        is_recovery=False,
                         entry_time=datetime.now(IST),
                         signal_time=getattr(sig, "signal_timestamp", None),
                         signal_fire_mode=getattr(sig, "signal_fire_mode", signal_fire_mode),

@@ -4635,9 +4635,26 @@ class TradeManager:
                     entry_time = entry_time.astimezone(IST)
                 if entry_time.date() >= now.date():
                     continue
+                # Count the TRANSITION, not the state. `marked` drives the save_state()
+                # plus reconcile_broker_positions() block below, and reconcile makes a
+                # synchronous Kite get_positions() call. This function runs from
+                # _scan_cycle on the 1s event loop, so re-marking an already-marked row
+                # fired a blocking broker REST call and a full trades-table snapshot
+                # EVERY SECOND for as long as a prior-session position stayed open —
+                # around the clock, on the same loop that hosts the 100ms exit monitor.
+                #
+                # A prior-session open position is exactly the state this system reaches
+                # when the 15:25 force exit fails (NRML does not auto-square-off), i.e.
+                # the one where exits matter most. A dedicated PositionSync thread
+                # already reconciles on its own adaptive cadence.
+                already_marked = (
+                    str(getattr(trade, "execution_status", "") or "").upper()
+                    == "RECOVERY_REQUIRED"
+                )
                 trade.execution_status = "RECOVERY_REQUIRED"
                 trade.execution_error = "Previous-session trade requires broker reconciliation"
-                marked += 1
+                if not already_marked:
+                    marked += 1
         if marked:
             self.save_state()
             try:
