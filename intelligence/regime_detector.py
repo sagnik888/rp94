@@ -23,6 +23,9 @@ class RegimeDetector:
 
     def __init__(self):
         self._regime_history: Dict[str, list] = {}
+        # Last bar identity recorded per key, so a re-evaluation of the SAME bar revises
+        # its vote instead of adding another one.
+        self._regime_history_bar: Dict[str, str] = {}
 
     def reset_history(self, instrument=None) -> int:
         """Clear stateful smoothing/hysteresis history.
@@ -34,6 +37,7 @@ class RegimeDetector:
         if instrument is None:
             count = len(self._regime_history)
             self._regime_history.clear()
+            self._regime_history_bar.clear()
             RegimeDetector._ER_PROMOTION_LOG_KEYS.clear()
             return count
         prefix = f"{str(instrument).upper()}_"
@@ -43,6 +47,7 @@ class RegimeDetector:
         ]
         for key in keys:
             self._regime_history.pop(key, None)
+            self._regime_history_bar.pop(key, None)
         RegimeDetector._ER_PROMOTION_LOG_KEYS = {
             key for key in RegimeDetector._ER_PROMOTION_LOG_KEYS
             if not str(key[0]).upper().startswith(prefix)
@@ -252,12 +257,32 @@ class RegimeDetector:
                 regime = MarketRegime.RANGING
                 confidence = min(confidence, 60)
             guarded_regime = regime.value
-            # Track history (raw per-bar opinion)
+            # Track history: one entry PER BAR, as the comment below and _smooth_regime
+            # both assume. It used to append on every detect() CALL. Live, detect runs on
+            # the intelligence TTL (30s), not per bar — 10 calls per 5-minute bar, 30 per
+            # 15-minute bar — so a 5-entry "5 bar" window actually spanned 150 seconds,
+            # half of one 5-minute bar. The majority vote and the strong-ADX hysteresis
+            # were therefore smoothing a bar against ITSELF: complete no-ops.
+            #
+            # That matters because the label they were meant to stabilise is the one every
+            # money decision reads — reversal exits, the trending-vs-tight trailing
+            # branch, the futures veto and grading. A single-bar flip reached those gates
+            # unfiltered. Same bar identity as _log_er_promotion_once uses.
             if key not in self._regime_history:
                 self._regime_history[key] = []
-            self._regime_history[key].append(regime.value)
-            if len(self._regime_history[key]) > 50:
-                self._regime_history[key] = self._regime_history[key][-50:]
+            history = self._regime_history[key]
+            try:
+                bar_id = str(df.index[-1]) if df is not None and len(df.index) else ""
+            except (AttributeError, IndexError, TypeError):
+                bar_id = ""
+            if history and bar_id and self._regime_history_bar.get(key) == bar_id:
+                # Same bar re-evaluated: revise this bar's opinion, do not add a vote.
+                history[-1] = regime.value
+            else:
+                history.append(regime.value)
+                self._regime_history_bar[key] = bar_id
+            if len(history) > 50:
+                del history[:-50]
             # Smoothing: expose a majority vote over the last N bars, not the raw bar —
             # damps the bar-to-bar flips that fed the gates an unstable regime.
             out_regime = regime.value
