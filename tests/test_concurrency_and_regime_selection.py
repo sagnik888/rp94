@@ -222,12 +222,33 @@ def guard_setting():
         setattr(s, name, value)
 
 
-def test_concurrency_guard_off_allows_any_candidate(guard_setting):
+def test_the_same_chart_is_blocked_even_with_the_guard_off(guard_setting):
+    """Changed 2026-08-08. This used to assert the duplicate was ALLOWED through.
+
+    Requirement 3 is explicit: when a second signal fires on an index+timeframe that
+    already has a working trade, the system must add one lot to that trade rather than
+    "adding new trade with same or different option or future strike price". Blocking
+    here is what routes the duplicate to _offer_cascade_add.
+
+    The same-chart test used to sit BELOW `if not guard_on: return True`, and .env sets
+    UT_CONCURRENCY_GUARD='False', so it was dead at runtime and a duplicate opened a
+    second position at another strike — the exact outcome the requirement forbids.
+
+    ut_concurrency_guard still governs the cross-timeframe complement rules; it is not a
+    switch that permits duplicate positions on one chart.
+    """
     guard_setting.ut_concurrency_guard = False
     sc = _scanner()
-    # even with a same-index same-TF trade already open, guard OFF lets it through
     sc.trades.open_trades = {"a": _open_trade_obj("NIFTY", "5min")}
-    assert sc._prepare_candidate_for_concurrency(_cand("NIFTY", "5min")) is True
+    assert sc._prepare_candidate_for_concurrency(_cand("NIFTY", "5min")) is False
+
+
+def test_the_guard_off_still_permits_a_different_timeframe(guard_setting):
+    """What ut_concurrency_guard=False is actually for: the cross-TF complement."""
+    guard_setting.ut_concurrency_guard = False
+    sc = _scanner()
+    sc.trades.open_trades = {"a": _open_trade_obj("NIFTY", "5min")}
+    assert sc._prepare_candidate_for_concurrency(_cand("NIFTY", "15min")) is True
 
 
 def test_concurrency_guard_on_blocks_same_index_same_timeframe(guard_setting):

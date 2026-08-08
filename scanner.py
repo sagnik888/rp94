@@ -21104,12 +21104,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             return True
 
-        if not guard_on:
-            return True
-
         existing_trade = existing[0]
+        # UNCONDITIONAL. This test used to sit BELOW `if not guard_on: return True`, and
+        # .env sets UT_CONCURRENCY_GUARD='False', so it was dead at runtime: a second
+        # signal on a chart that already has a working trade opened a SECOND position at
+        # another strike instead of adding a lot to the first — exactly the outcome
+        # requirement 3 exists to prevent, and the case _offer_cascade_add was written
+        # for. Blocking here is what routes the duplicate to the add path.
+        #
+        # ut_concurrency_guard still governs everything below: the cross-timeframe
+        # complement rules, the grade comparison and the instrument-preference logic.
         if getattr(existing_trade, "timeframe", "") == candidate.timeframe:
             return _block("same timeframe already active")
+
+        if not guard_on:
+            return True
 
         if not self._candidate_quality_same_or_better(candidate, existing):
             return _block("cross-TF setup is not same grade/confidence or better")
