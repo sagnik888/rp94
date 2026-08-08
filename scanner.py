@@ -22989,30 +22989,83 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 now = datetime.now(IST).replace(tzinfo=None)
                 still_present = self._live_utbot_signal_still_present(candidate, sig_timestamp)
                 if not still_present:
-                    logger.warning(f"🚨 REPAINT ABORT: Signal vanished for {trade.id}! Exiting immediately.")
-                    self.log_event(f"🚨 REPAINT ABORT: Signal vanished for {candidate.instrument}. Exiting.", "error")
-                    marker = getattr(self, "_mark_post_repaint_recheck", None)
-                    if callable(marker):
-                        marker(candidate, sig_timestamp, now, source="async_repaint_abort")
-                    # Force Exit
-                    # Unbound: partial scanner stubs are a real pattern here, and this
-                    # tracker's whole body sits under one `except Exception` — a missing
-                    # attribute would be swallowed and the abort would silently not fire.
-                    price = Scanner._repaint_abort_exit_price(self, trade, candidate)
-                    if price <= 0:
-                        logger.error(
-                            f"REPAINT ABORT for {trade.id}: no usable mark for "
-                            f"{getattr(trade, 'symbol', '')}; leaving the position to the "
-                            "exit engines rather than booking a zero."
+                    # Every configured repaint MITIGATION was unreachable from here. All
+                    # call sites for the momentum override, the profit hold and the
+                    # option defer sit in _check_session_candidates_breaches_locked, which
+                    # manages dashboard/session rows and never a broker position. So the
+                    # operator's policy — hold a repaint that is already in profit, let a
+                    # fresh option ride normal intrabar flicker to its candle close,
+                    # honour a stabilization momentum override — applied to the paper
+                    # mirror while the real position was market-exited immediately.
+                    mark = Scanner._repaint_abort_exit_price(self, trade, candidate)
+                    hold_reason = ""
+                    # Fail SAFE, not open: if a mitigation cannot be evaluated the abort
+                    # proceeds, which is the behaviour that existed before they were
+                    # wired. Partial scanner stubs are a real pattern here and this whole
+                    # tracker sits under one `except Exception`, so an AttributeError
+                    # raised in here would otherwise swallow the abort entirely — which
+                    # an existing test caught on the first attempt.
+                    try:
+                        override_ctx = Scanner._post_entry_repaint_override_context(
+                            self, candidate, sig_timestamp
+                        )
+                        if override_ctx:
+                            hold_reason = str(
+                                override_ctx.get("reason")
+                                or override_ctx.get("type")
+                                or "confirmed momentum"
+                            )
+                        elif mark > 0 and Scanner._repaint_abort_profit_hold(self, trade, mark):
+                            hold_reason = "position is already in profit"
+                        elif mark > 0:
+                            deferred, defer_text = Scanner._should_defer_option_repaint_abort(
+                                self, trade, mark, now, now >= candle_close_time,
+                            )
+                            if deferred:
+                                hold_reason = defer_text or "option repaint deferred to candle close"
+                    except Exception as exc:
+                        logger.debug(f"Repaint mitigation check unavailable for {trade.id}: {exc}")
+                        hold_reason = ""
+                    if hold_reason:
+                        # Fall through to the candle-close check rather than continue, so
+                        # the tracker still finishes at the close instead of looping on.
+                        marker_key = f"{trade.id}|repaint-hold"
+                        if getattr(self, "_last_repaint_hold", "") != marker_key:
+                            setattr(self, "_last_repaint_hold", marker_key)
+                            logger.info(
+                                f"REPAINT HOLD: {trade.id} arrow vanished but not aborting "
+                                f"— {hold_reason}."
+                            )
+                            self.log_event(
+                                f"Repaint hold for {candidate.instrument}: {hold_reason}.",
+                                "info",
+                            )
+                        self._diag_inc("repaint", "abort_held")
+                    else:
+                        logger.warning(f"🚨 REPAINT ABORT: Signal vanished for {trade.id}! Exiting immediately.")
+                        self.log_event(f"🚨 REPAINT ABORT: Signal vanished for {candidate.instrument}. Exiting.", "error")
+                        marker = getattr(self, "_mark_post_repaint_recheck", None)
+                        if callable(marker):
+                            marker(candidate, sig_timestamp, now, source="async_repaint_abort")
+                        # Force Exit
+                        # Unbound: partial scanner stubs are a real pattern here, and this
+                        # tracker's whole body sits under one `except Exception` — a missing
+                        # attribute would be swallowed and the abort would silently not fire.
+                        price = Scanner._repaint_abort_exit_price(self, trade, candidate)
+                        if price <= 0:
+                            logger.error(
+                                f"REPAINT ABORT for {trade.id}: no usable mark for "
+                                f"{getattr(trade, 'symbol', '')}; leaving the position to the "
+                                "exit engines rather than booking a zero."
+                            )
+                            break
+                        self._close_and_record(
+                            trade.id,
+                            float(price),
+                            "REPAINT_ABORT",
+                            exit_time=now,
                         )
                         break
-                    self._close_and_record(
-                        trade.id,
-                        float(price),
-                        "REPAINT_ABORT",
-                        exit_time=now,
-                    )
-                    break
                 if now >= candle_close_time:
                     setattr(trade, "repaint_guard_checked", True)
                     logger.info(f"✅ Repaint Tracker complete for {trade.id} - final candle-close check passed.")
@@ -24604,6 +24657,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             f"spread={spread_pct:.2f}% bid={bid:.2f} ask={ask:.2f} "
             f"bidPnL=Rs.{executable_pnl:.0f} cost/edge={cost_ratio:.0%}"
         )
+
+    def _repaint_abort_profit_hold(self, trade, mark: float) -> bool:
+        """Whether a repainted LIVE position is already in profit and should be held.
+
+        The session-side sibling `_repaint_abort_held_for_profit` cannot be reused here:
+        it routes through `_candidate_gross_pnl`, which reads `candidate.price`. A Trade
+        carries `entry_price`, so passing one raises inside that helper's try/except and
+        it silently answers False — the mitigation would look wired and never fire.
+
+        Honours the same operator setting, so both paths turn off together.
+        """
+        if not self._setting_enabled(
+            getattr(get_settings(), "repaint_abort_skip_when_profitable", True), True
+        ):
+            return False
+        try:
+            entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+            price = float(mark or 0.0)
+            if entry <= 0 or price <= 0:
+                return False
+            # Options are always BOUGHT, so a bought PE profits on its own premium rising
+            # exactly as a bought CE does. Direction only matters for a futures short.
+            if str(getattr(trade, "inst_type", "") or "").upper() == "OPT":
+                return price > entry
+            if str(getattr(trade, "direction", "LONG") or "LONG").upper() == "SHORT":
+                return price < entry
+            return price > entry
+        except (TypeError, ValueError):
+            return False
 
     def _repaint_abort_exit_price(self, trade, candidate) -> float:
         """The mark to close at when a repaint aborts a just-entered position.
