@@ -403,12 +403,35 @@ class IntelligenceAggregator:
             market_context=chain_quality,
         )
         results["order_flow"] = flow_result
-        results["candle_pressure"] = {**flow_result, "source": "ohlcv_close_position"}
-        if flow_result["signal"] == "BULLISH":
-            score += 0.2 # Increased from 0.15
-        elif flow_result["signal"] == "BEARISH":
-            score -= 0.2 # Increased from 0.15
-        components += 1
+        # Order flow was the ONLY pillar that never abstained: it voted and took a
+        # component unconditionally, unlike volume, OI and PCR just above. An unavailable
+        # read publishes signal NEUTRAL with source "unavailable", so "unknown" was scored
+        # as "balanced" AND added to the denominator, shrinking every other pillar's
+        # contribution by ~1/N. intel_df is the 1-minute frame and the analyzer needs five
+        # live bars, so this bit 09:15-09:19 every single session — and if the 1-minute
+        # frame is empty the aggregator falls back to 5-minute and the dead window
+        # stretches past the 09:20 entry cutoff.
+        # Abstain only on POSITIVE evidence of absence. Volume/OI/PCR use a strict
+        # `is True`, but their analyzers all publish the key; order flow's did not until
+        # now, and a strict test here silently stopped every existing collaborator and
+        # stub from contributing — which is how a helper ends up wired to nothing. Both
+        # markers are checked so a future early-return that forgets the flag still
+        # abstains on its "unavailable" source.
+        flow_available = (
+            flow_result.get("available") is not False
+            and str(flow_result.get("source") or "") != "unavailable"
+        )
+        # Do not stamp a real-looking source onto a reading that did not happen.
+        results["candle_pressure"] = {
+            **flow_result,
+            "source": "ohlcv_close_position" if flow_available else "unavailable",
+        }
+        if flow_available:
+            if flow_result["signal"] == "BULLISH":
+                score += 0.2 # Increased from 0.15
+            elif flow_result["signal"] == "BEARISH":
+                score -= 0.2 # Increased from 0.15
+            components += 1
 
         # ═══ STRESS TEST: Manipulation & Divergence Detection ═══
         # Outsmarting "Stop-loss Hunting" and "False Breakouts"

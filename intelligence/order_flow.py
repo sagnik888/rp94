@@ -90,6 +90,11 @@ class OrderFlowAnalyzer:
                         "source": depth_flow.get("source", "depth"),
                     }
                 )
+            # Only the COMPUTED path is available. Volume, OI and PCR all publish this
+            # key and the aggregator gates both their vote and their component on it;
+            # order flow published nothing, so an absent reading was scored as a neutral
+            # observation AND counted in the denominator.
+            result["available"] = True
             result.update(self._source_context(market_context))
             result["options_flow"] = self._options_flow(options_chain, spot_price, strike_interval)
             confirmation = result["signal"]
@@ -181,6 +186,9 @@ class OrderFlowAnalyzer:
         result = {
             "buy_volume": 0, "sell_volume": 0, "ratio": 1.0, "buy_sell_ratio": 1.0,
             "cum_delta": 0, "buy_pct": 50.0, "signal": "NEUTRAL", "aggressor": "NONE",
+            # "cannot say", not "balanced". The aggregator must abstain, not average a
+            # neutral in — fewer than five live bars is the normal 09:15-09:19 condition.
+            "available": False,
             "source": "unavailable",
             "true_tick_footprint_available": False,
             "limitation": "Broker feed does not provide aggressor-side tick footprint; using OHLCV/L1 proxy",
