@@ -56,19 +56,25 @@ from data.kite_auth import most_recent_token_cutoff  # noqa: E402
 
 # IntelligenceAggregator publishes `averaged_score = sum(votes) / components`, clamped to
 # [-1, 1] and scaled by 100; every consumer normalises it straight back. So the number the
-# gates below test is that MEAN.
+# gates below test is that MEAN of votes.
 #
-# Summing ALL twenty literal score deltas in the aggregator gives 3.00, and that is already
-# a wild over-count because most sit in mutually exclusive if/elif arms. With the minimum
-# plausible five components that is 0.60; with the eight component sites that exist it is
-# 0.375. Measured intent sits around 0.25-0.30.
+# MEASURED, not inferred. Driving the real aggregator with maximally bullish inputs on
+# every pillar (2026-08-08):
 #
-# Any threshold at or above the ceiling is therefore a gate that can never fire while
-# reading, in .env, as though it were tuned. Re-scaling the score or re-basing the
-# thresholds is a calibration decision for the operator; this only makes the dead ones
-# audible. test_intel_score_ceiling_2026_08_08.py re-derives the ceiling from the
-# aggregator's own source so this constant cannot drift silently.
-INTEL_SCORE_CEILING = 0.60
+#     thin evidence, no option chain : sum 0.87 / 3 components = 0.290
+#     full evidence, WITH the chain  : sum 1.07 / 6 components = 0.178
+#
+# Because it is a MEAN, extra evidence dilutes: the chain raises the vote sum 23% but
+# doubles the divisor, so a better-informed read scores LOWER. Live always has a chain,
+# so 0.178 is the ceiling that actually applies, and typical readings sit near 0.05-0.15.
+#
+# The five gates below were written on a 0..1 scale and were rebased on 2026-08-08 to
+# `old x ceiling`, preserving their relative strictness. Anything at or above the ceiling
+# is a gate that can never fire while reading, in .env, as though it were tuned.
+#
+# test_intel_score_ceiling_2026_08_08.py re-measures this against the live aggregator so
+# the constant cannot drift away from the code it describes.
+INTEL_SCORE_CEILING = 0.18
 
 INTEL_SCORE_GATES = (
     "rare_burst_min_intel_score",

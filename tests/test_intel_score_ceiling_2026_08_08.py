@@ -19,13 +19,19 @@ against these configured gates:
     live_5min_special_intel_threshold               0.75
     volume_spike_entry_strong_1min_intel_threshold  0.70
 
-So the rare-burst third-trade permission can never be granted, strong intelligence can
+So the rare-burst third-trade permission could never be granted, strong intelligence could
 never substitute for ADX in the "strong context" tests, and the top severity tier of
-several exit ladders can never fire — while .env reads as if all of it were tuned.
+several exit ladders could never fire — while .env read as if all of it were tuned.
 
-Re-scaling the score, or re-basing the thresholds, is a CALIBRATION decision for the
-operator: either one changes live trading. This module only makes the dead gates audible
-at startup, and pins the arithmetic so the constant cannot drift.
+RESOLVED 2026-08-08. The operator chose Option A: rebase the thresholds onto the real
+scale rather than rescale the score (which would have moved the intelligence number
+everywhere at once, including on the dashboard). The five gates are now 0.107-0.134 —
+see test_intel_gates_are_reachable_2026_08_08, which MEASURES the ceiling by driving the
+real aggregator instead of bounding it statically.
+
+This module keeps the detector honest: the static AST sum stays as a sanity bound, and
+the preflight is exercised against a SYNTHETIC over-high gate rather than the live config,
+so it no longer passes only while that config happens to be broken.
 """
 import ast
 
@@ -55,15 +61,17 @@ def _aggregator_delta_sum_and_components():
 
 # ── the arithmetic the constant rests on ─────────────────────────────────────
 
-def test_the_ceiling_matches_the_aggregator_source():
-    """If the aggregator's votes change, this constant must be re-derived."""
+def test_the_static_bound_is_above_the_measured_ceiling():
+    """The AST sum is a loose UPPER bound; the measured ceiling must sit below it.
+
+    Superseded 2026-08-08. INTEL_SCORE_CEILING was originally this static bound (0.60).
+    It is now the MEASURED maximum (0.18) from driving the real aggregator with maximal
+    inputs — see test_intel_gates_are_reachable_2026_08_08, which re-measures it. The
+    static sum is retained here only as a sanity ceiling on the ceiling.
+    """
     total, components = _aggregator_delta_sum_and_components()
     assert components >= 5, "component count collapsed; re-check the ceiling"
-    generous = total / 5.0
-    assert generous == pytest.approx(INTEL_SCORE_CEILING, abs=0.05), (
-        f"sum of all deltas {total:.2f} over 5 components is {generous:.3f}, but "
-        f"INTEL_SCORE_CEILING says {INTEL_SCORE_CEILING}"
-    )
+    assert INTEL_SCORE_CEILING <= total / 5.0
 
 
 def test_the_realistic_ceiling_is_far_below_the_generous_one():
@@ -100,7 +108,7 @@ def test_an_unreachable_gate_is_reported():
 
 
 def test_a_reachable_gate_is_not_reported():
-    assert unreachable_intel_gates(_settings(rare_burst_min_intel_score=0.25)) == []
+    assert unreachable_intel_gates(_settings(rare_burst_min_intel_score=0.125)) == []
 
 
 def test_every_known_gate_is_checked():
@@ -115,20 +123,24 @@ def test_a_missing_or_junk_setting_is_ignored():
 
 # ── it reaches the operator ──────────────────────────────────────────────────
 
-def test_the_preflight_surfaces_it():
+def test_the_preflight_surfaces_an_unreachable_gate(monkeypatch):
+    """Drives a SYNTHETIC over-high gate.
+
+    This used to read the live config, which meant it passed only while that config was
+    broken. The gates were rebased on 2026-08-08 and it inverted — the same
+    testing-the-config-not-the-code mistake already fixed once in this suite.
+    """
     from config.settings import get_settings
     from engine.safe_mode import validate_real_mode_readiness
 
-    text = " | ".join(validate_real_mode_readiness(get_settings()).get("warnings") or [])
-    assert "can never be met" in text, (
-        "an unreachable intelligence gate is not reported at startup"
-    )
+    s = get_settings()
+    monkeypatch.setattr(s, "rare_burst_min_intel_score", 0.99, raising=False)
+    text = " | ".join(validate_real_mode_readiness(s).get("warnings") or [])
+    assert "can never be met" in text
 
 
-def test_the_live_config_really_has_one():
-    """Guards the premise: if the operator re-bases these, this test should change."""
+def test_the_live_config_now_has_none():
+    """The outcome of Option A: every gate is reachable on the real scale."""
     from config.settings import get_settings
 
-    assert unreachable_intel_gates(get_settings()), (
-        "no unreachable gate in the live config — re-read this module's reasoning"
-    )
+    assert unreachable_intel_gates(get_settings()) == []
