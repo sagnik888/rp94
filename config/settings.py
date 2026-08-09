@@ -1700,6 +1700,11 @@ class Settings(BaseSettings):
     rtracker_enabled: bool = True
     rtracker_data_dir: str = "data_store/rtracker"
     rtracker_report_weeks: int = 8
+    # Days of raw event day-files to keep on disk. 0 keeps everything, which is the
+    # behaviour that let the archive reach 83 MB in 61 days. Any value below
+    # rtracker_report_weeks * 7 is raised to it, so pruning can never delete evidence
+    # the summary still reports on.
+    rtracker_retention_days: int = 0
 
     model_config = SettingsConfigDict(
         env_file='.env',

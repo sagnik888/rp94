@@ -33,7 +33,16 @@ VECTOR_KEYS = (
 )
 
 
+#: Serialises the event APPEND only. The scanner event loop takes this lock
+#: synchronously (_rtracker_record_candidate, called from inside _scan_cycle), so
+#: anything held across it stalls the 100ms exit monitor. Hold it for the write and
+#: nothing else -- never across a full-archive read or a report build.
 _RTRACKER_FILE_LOCK = threading.RLock()
+
+#: Serialises report generation against itself. Deliberately a DIFFERENT lock: the
+#: reports live in their own directory, the 30-minute job is the only writer, and the
+#: scan loop must never queue behind it.
+_RTRACKER_REPORT_LOCK = threading.RLock()
 
 
 class RegimeTracker:
@@ -46,12 +55,18 @@ class RegimeTracker:
         enabled: bool = True,
         max_weeks: int = 8,
         dedupe_size: int = 4096,
+        retention_days: int = 0,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.events_dir = self.root_dir / "events"
         self.reports_dir = self.root_dir / "reports"
         self.enabled = bool(enabled)
         self.max_weeks = max(1, int(max_weeks or 8))
+        # 0 = keep every day-file forever, which is the behaviour this store shipped
+        # with. `max_weeks` only bounds the READ window; it never deleted anything, so
+        # the archive grew unbounded (~1.4 MB/day, 83 MB after 61 days). Pruning is
+        # opt-in because it destroys recorded evidence.
+        self.retention_days = max(0, int(retention_days or 0))
         self._seen: set[str] = set()
         self._seen_order: deque[str] = deque(maxlen=max(128, int(dedupe_size or 4096)))
 
@@ -61,7 +76,41 @@ class RegimeTracker:
             root_dir=str(getattr(settings, "rtracker_data_dir", "data_store/rtracker") or "data_store/rtracker"),
             enabled=_setting_enabled(getattr(settings, "rtracker_enabled", True), True),
             max_weeks=int(getattr(settings, "rtracker_report_weeks", 8) or 8),
+            retention_days=int(getattr(settings, "rtracker_retention_days", 0) or 0),
         )
+
+    def prune_events(self, *, retention_days: Optional[int] = None,
+                     as_of: Optional[datetime] = None) -> Dict[str, Any]:
+        """Delete day-files older than the retention window.
+
+        No-op when retention_days is 0 (the default). Refuses to prune inside the
+        report read window, so a misconfigured retention can never delete evidence
+        the 8-week summary still reports on.
+        """
+        days = self.retention_days if retention_days is None else max(0, int(retention_days or 0))
+        if days <= 0 or not self.events_dir.exists():
+            return {"pruned": 0, "bytes": 0, "files": []}
+        as_of_dt = as_of or _now()
+        floor_days = max(days, self.max_weeks * 7)
+        cutoff = as_of_dt.date() - timedelta(days=floor_days)
+        removed, freed = [], 0
+        with _RTRACKER_FILE_LOCK:
+            for path in sorted(self.events_dir.glob("*.jsonl")):
+                try:
+                    if date.fromisoformat(path.stem) >= cutoff:
+                        continue
+                    size = path.stat().st_size
+                    path.unlink()
+                except (ValueError, OSError):
+                    continue
+                removed.append(path.name)
+                freed += size
+        if removed:
+            logger.info(
+                f"rtracker pruned {len(removed)} day-file(s) older than {cutoff.isoformat()} "
+                f"({freed / 1e6:.1f} MB)"
+            )
+        return {"pruned": len(removed), "bytes": freed, "files": removed}
 
     def record_candidate(
         self,
@@ -117,6 +166,7 @@ class RegimeTracker:
     ) -> Dict[str, Any]:
         weeks = max(1, min(int(weeks or self.max_weeks), 52))
         as_of_dt = as_of or _now()
+        pruned = self.prune_events(as_of=as_of_dt)
         events = self.load_events(weeks=weeks, as_of=as_of_dt)
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for event in events:
@@ -124,15 +174,25 @@ class RegimeTracker:
             iso = event_date.isocalendar()
             grouped[f"{iso.year}-W{iso.week:02d}"].append(event)
 
-        with _RTRACKER_FILE_LOCK:
+        # Build every summary OUTSIDE any lock -- _weekly_summary and
+        # _multi_week_summary re-walk all 44k events, and none of that touches shared
+        # state. Only the writes are serialised, and against the report lock rather
+        # than the append lock the scan loop uses.
+        rendered = []
+        for week_key in sorted(grouped, reverse=True):
+            summary = self._weekly_summary(week_key, grouped[week_key])
+            rendered.append((week_key, summary, self._weekly_markdown(summary)))
+        eight_week = self._multi_week_summary(events, weeks)
+        eight_week_md = self._multi_week_markdown(eight_week)
+
+        with _RTRACKER_REPORT_LOCK:
             self.reports_dir.mkdir(parents=True, exist_ok=True)
             week_reports = []
-            for week_key in sorted(grouped, reverse=True):
-                summary = self._weekly_summary(week_key, grouped[week_key])
+            for week_key, summary, markdown in rendered:
                 json_path = self.reports_dir / f"{week_key}.json"
                 md_path = self.reports_dir / f"{week_key}.md"
                 json_path.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True), encoding="utf-8")
-                md_path.write_text(self._weekly_markdown(summary), encoding="utf-8")
+                md_path.write_text(markdown, encoding="utf-8")
                 week_reports.append(
                     {
                         "week": week_key,
@@ -142,14 +202,14 @@ class RegimeTracker:
                     }
                 )
 
-            eight_week = self._multi_week_summary(events, weeks)
             summary_path = self.reports_dir / f"rtracker_{weeks}_week_summary.md"
             summary_json = self.reports_dir / f"rtracker_{weeks}_week_summary.json"
-            summary_path.write_text(self._multi_week_markdown(eight_week), encoding="utf-8")
+            summary_path.write_text(eight_week_md, encoding="utf-8")
             summary_json.write_text(json.dumps(_json_safe(eight_week), indent=2, sort_keys=True), encoding="utf-8")
         return {
             "weeks_requested": weeks,
             "events": len(events),
+            "pruned_day_files": pruned.get("pruned", 0),
             "weekly_reports": week_reports,
             "summary_markdown": str(summary_path),
             "summary_json": str(summary_json),
@@ -161,14 +221,21 @@ class RegimeTracker:
         events: List[Dict[str, Any]] = []
         if not self.events_dir.exists():
             return events
+        # Snapshot the file list under the lock, then parse OUTSIDE it. Reading the
+        # archive took ~1s against 78MB / 44k events, and holding the append lock for
+        # that long stalls the scanner event loop every 30 minutes. Closed day-files
+        # are immutable; only today's is appended to, and a torn trailing line is
+        # already skipped by the JSONDecodeError guard below.
         with _RTRACKER_FILE_LOCK:
-            for path in sorted(self.events_dir.glob("*.jsonl")):
-                try:
-                    path_day = date.fromisoformat(path.stem)
-                except ValueError:
-                    continue
-                if path_day < start_day or path_day > as_of_dt.date():
-                    continue
+            candidates = sorted(self.events_dir.glob("*.jsonl"))
+        for path in candidates:
+            try:
+                path_day = date.fromisoformat(path.stem)
+            except ValueError:
+                continue
+            if path_day < start_day or path_day > as_of_dt.date():
+                continue
+            try:
                 with path.open("r", encoding="utf-8", errors="ignore") as handle:
                     for line in handle:
                         line = line.strip()
@@ -180,6 +247,9 @@ class RegimeTracker:
                             continue
                         if isinstance(payload, dict):
                             events.append(payload)
+            except OSError:
+                # A day-file pruned or rotated between the snapshot and the read.
+                continue
         events.sort(key=lambda item: str(item.get("timestamp") or ""))
         return events
 
@@ -321,7 +391,20 @@ class RegimeTracker:
                 "reason": str(market_wide_ctx.get("reason") or ""),
             },
             "aggregate": {
+                # Legacy -100..+100 when the aggregate carries it, and the canonical
+                # -1..+1 candidate attribute otherwise -- two scales under one key, so
+                # the archive was not comparable across rows. Record the canonical
+                # value under its own key; `score` keeps its shape for old readers.
                 "score": _safe_float(aggregate_ctx.get("score", _candidate_value(candidate, "intelligence_score", 0.0))),
+                "score_norm": _safe_float(
+                    aggregate_ctx.get("score_norm")
+                    if aggregate_ctx.get("score_norm") is not None
+                    else (
+                        _safe_float(aggregate_ctx.get("score")) / 100.0
+                        if aggregate_ctx.get("score") is not None
+                        else _candidate_value(candidate, "intelligence_score", 0.0)
+                    )
+                ),
                 "signal": str(aggregate_ctx.get("signal") or ""),
                 "regime_score_multiplier": _safe_float(aggregate_ctx.get("regime_score_multiplier", 0.0)),
             },
