@@ -181,6 +181,41 @@ def test_a_genuine_spot_round_trips_unchanged():
     assert Trade.from_dict(t.to_dict()).entry_spot == pytest.approx(24800.0)
 
 
+# ── the same substitution at three sibling sites ─────────────────────────────
+
+@pytest.mark.parametrize("path", ["scanner.py", "engine/scanner_recalculation.py"])
+def test_no_site_resolves_a_spot_from_a_candidate_price(path):
+    """`getattr(cand, 'entry_spot', getattr(cand, 'price', 0.0))` is the same bug with a
+    getattr default instead of an `or`: an OPT candidate with no entry_spot was measured
+    against its own PREMIUM as an index level."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "getattr" or len(node.args) < 3:
+            continue
+        first = node.args[1]
+        if not (isinstance(first, ast.Constant) and first.value == "entry_spot"):
+            continue
+        if "price" in ast.dump(node.args[2]):
+            bad.append(node.lineno)
+    assert not bad, f"{path} lines {bad} still resolve a spot level from a contract price"
+
+
+def test_the_reconstruction_row_no_longer_defaults_to_the_premium():
+    src = open("scanner.py", encoding="utf-8").read()
+    assert "entry_spot=float(getattr(entry_cand, 'entry_spot', 0.0) or 0.0)" in src
+
+
+def test_the_candle_extreme_helper_no_longer_defaults_to_the_premium():
+    from scanner import Scanner
+
+    src = inspect.getsource(Scanner._candidate_candle_extreme_price)
+    assert 'getattr(candidate, "entry_spot", 0.0)' in src
+    assert 'getattr(candidate, "price"' not in src
+
+
 # ── the premise: a spot lookup really can come back empty ────────────────────
 
 def test_the_entry_sites_pass_an_unguarded_spot_lookup():

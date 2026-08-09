@@ -334,7 +334,9 @@ class ScannerRecalculationMixin:
                             instrument_multiplier=1.0,
                             exec_type=getattr(entry_cand, 'exec_type', 'A'),
                             current_price=float(getattr(entry_cand, 'current_price', getattr(entry_cand, 'price', 0.0))),
-                            entry_spot=float(getattr(entry_cand, 'entry_spot', getattr(entry_cand, 'price', 0.0))),
+                            # Never fall back to the candidate PRICE: on an OPT that is the premium,
+                            # and entry_spot is a SPOT-space field every converter keys off.
+                            entry_spot=float(getattr(entry_cand, 'entry_spot', 0.0) or 0.0),
                             status="CLOSED" if exit_price > 0 else "OPEN",
                             broker_order_id=getattr(entry_cand, 'trading_symbol', ''),
                             trading_symbol=getattr(entry_cand, 'trading_symbol', ''),

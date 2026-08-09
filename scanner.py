@@ -430,7 +430,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         instrument_multiplier=1.0,
                         exec_type=getattr(entry_cand, 'exec_type', 'A'),
                         current_price=float(getattr(entry_cand, 'current_price', getattr(entry_cand, 'price', 0.0))),
-                        entry_spot=float(getattr(entry_cand, 'entry_spot', getattr(entry_cand, 'price', 0.0))),
+                        # Never fall back to the candidate PRICE: on an OPT that is the premium,
+                        # and entry_spot is a SPOT-space field every converter keys off.
+                        entry_spot=float(getattr(entry_cand, 'entry_spot', 0.0) or 0.0),
                         status="CLOSED" if exit_price > 0 else "OPEN",
                         # RECONSTRUCTIONS, not confirmed broker positions. These are built
                         # from the day's SIGNAL ledger so the trades panel shows something
@@ -15276,7 +15278,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Estimate the best reached trade price from 1m candle extremes since entry."""
         if getattr(self, "_is_premium_long_candidate", lambda x: False)(candidate):
             return 0.0
-        entry_spot = float(getattr(candidate, "entry_spot", getattr(candidate, "price", 0.0)) or 0.0)
+        # `or candidate.price` here meant an OPT candidate with no entry_spot was measured
+        # against its own PREMIUM as if it were an index level.
+        entry_spot = float(getattr(candidate, "entry_spot", 0.0) or 0.0)
         if entry_spot <= 0:
             return 0.0
         try:
