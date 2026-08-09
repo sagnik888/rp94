@@ -13225,7 +13225,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         else:
             base_seconds = float(getattr(settings, "live_signal_stabilization_seconds", 30.0) or 30.0)
         inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
-        regime = str(getattr(self, "latest_regimes", {}).get(candidate.instrument, "UNKNOWN") or "UNKNOWN")
+        # Own-timeframe regime; latest_regimes[instrument] is the 5-minute label.
+        regime = self._get_trade_regime(candidate, default="UNKNOWN")
         # Fast 1m chassis (SPIKE and/or pure SNAPBACK): short stable window so the
         # move is not gone before entry. Aggressive buffer default 3s (floor 3 /
         # max 15) with two confirming scans. 5m/15m non-spike keep 30–60s.
@@ -18450,7 +18451,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             setattr(candidate, "location_risk", risk_reason)
             setattr(candidate, "location_position_pct", float(position_pct))
             inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
-            regime = str(getattr(self, "latest_regimes", {}).get(candidate.instrument, "UNKNOWN") or "UNKNOWN")
+            # Own-timeframe regime; latest_regimes[instrument] is the 5-minute label.
+            regime = self._get_trade_regime(candidate, default="UNKNOWN")
             reasons_text = " | ".join(str(reason) for reason in (getattr(candidate, "reasons", []) or [])).lower()
             try:
                 intel_abs = abs(float(getattr(candidate, "intelligence_score", 0.0) or 0.0))
@@ -18469,6 +18471,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             trend_pullback_entry = (
                 is_trending_regime(regime)
                 and trend_agrees
+                # Releasing the scalp lock is a PRIVILEGE: it loosens the tightest
+                # profit lock and lets the runner run. A borrowed 5-minute label must
+                # not buy that for a 15-minute candidate. Missing own-TF label keeps
+                # the cautious lock, which is the conservative direction.
+                and self._trade_regime_is_own_timeframe(candidate)
                 and self._setting_enabled(getattr(settings, "trend_entry_skip_scalp_lock", True), True)
             )
             setattr(candidate, "scalp_lock_mode", not trend_pullback_entry)
@@ -18565,11 +18572,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if str(getattr(candidate, "timeframe", "") or "") == "5min" and self._candidate_15m_trend_agrees(candidate):
             return True, "15min trend agreement override"
 
-        current_regime = str(self.latest_regimes.get(candidate.instrument, "UNKNOWN") or "UNKNOWN").upper()
+        # The candidate's OWN timeframe, not the instrument-keyed 5-minute label.
+        # latest_regimes[instrument] IS the 5-minute regime (see its declaration), and
+        # 5m/15m labels disagree in 83% of same-timestamp pairs.
+        current_regime = self._get_trade_regime(candidate, default="UNKNOWN")
 
         # Qualifying B-grade (trending + 15m alignment + ADX momentum) bypasses the
         # grade-preference floor; the strict live gate still enforces the full rule.
-        if SignalProcessor._b_grade_entry_allowed(
+        #
+        # This is a PRIVILEGE — it admits a B-band signal that the floor would refuse —
+        # so it must rest on the candidate's own-timeframe regime. _get_trade_regime
+        # falls back to the 5-minute label so tightening always has something to work
+        # with, and _trade_regime_is_own_timeframe exists precisely to stop that
+        # borrowed label granting anything: "it must NOT be used to grant a privilege:
+        # a 15-minute trade could otherwise enter runner mode on a 5-minute regime."
+        # The rule was enforced for runner mode and not here.
+        if self._trade_regime_is_own_timeframe(candidate) and SignalProcessor._b_grade_entry_allowed(
             float(getattr(candidate, "confidence", 0.0) or 0.0),
             current_regime,
             trend_15m_agrees=self._candidate_15m_trend_agrees(candidate),
@@ -18653,7 +18671,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # protect-first-profit so the scalp-lock arming applies for the rest of the day.
         setattr(candidate, "_late_entry_scalp", self._late_entry_scalp_active(candidate))
         confidence = float(getattr(candidate, "confidence", 0.0) or 0.0)
-        regime = str(self.latest_regimes.get(candidate.instrument, "UNKNOWN") or "UNKNOWN").upper()
+        # Own-timeframe regime; latest_regimes[instrument] is the 5-minute label. Here it
+        # drives the choppy VETO, so a borrowed label is conservative in one direction but
+        # can also fail to veto a chop-bound 15-minute entry when the 5-minute pocket trends.
+        regime = self._get_trade_regime(candidate, default="UNKNOWN")
         # Intraday Momentum Override
         adx_val = getattr(candidate, "adx_value", 0.0)
         momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)

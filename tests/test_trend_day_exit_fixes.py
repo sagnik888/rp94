@@ -85,10 +85,16 @@ def _location_scanner(regime, trend_agrees):
     st = SimpleNamespace(
         mode="REAL",
         latest_regimes={"NIFTY": regime},
+        # Own-timeframe store, empty: the candidate here is 5min, which legitimately
+        # OWNS the instrument-keyed label, so the scalp-lock release is still earned.
+        _timeframe_regimes={},
         candles=SimpleNamespace(get_candles=lambda inst, tf: df),
         _setting_enabled=Scanner._setting_enabled,
+        _timeframe_intel_key=Scanner._timeframe_intel_key,
     )
     st._candidate_15m_trend_agrees = lambda c: trend_agrees
+    st._get_trade_regime = Scanner._get_trade_regime.__get__(st, Scanner)
+    st._trade_regime_is_own_timeframe = Scanner._trade_regime_is_own_timeframe.__get__(st, Scanner)
     st._market_location_entry_gate = Scanner._market_location_entry_gate.__get__(st, Scanner)
     return st
 

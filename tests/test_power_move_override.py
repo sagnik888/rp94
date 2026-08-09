@@ -382,7 +382,9 @@ def test_volume_spike_gets_fast_but_stable_live_confirmation(settings):
         rr=2.5,
         volume_spike_entry=True,
     )
-    st = SimpleNamespace(latest_regimes={"NIFTY": "VOLATILE"})
+    st = SimpleNamespace(latest_regimes={"NIFTY": "VOLATILE"}, _timeframe_regimes={})
+    st._timeframe_intel_key = Scanner._timeframe_intel_key
+    st._get_trade_regime = Scanner._get_trade_regime.__get__(st, Scanner)
     st._live_signal_stabilization_requirements = (
         Scanner._live_signal_stabilization_requirements.__get__(st, Scanner)
     )

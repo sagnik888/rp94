@@ -76,12 +76,20 @@ def test_option_grade_allows_b_in_trend_only(settings):
 _INST = ["_passes_live_trade_ready_gate", "_passes_candidate_grade_preference",
          "_passes_timeframe_entry_policy", "_market_location_entry_gate",
          "_candidate_15m_trend_agrees", "_gate_block",
-         "_late_entry_scalp_active", "_set_scalp_lock", "_minutes_to_force_exit"]
-_STAT = ["_normalize_signal_grade_preference", "_setting_enabled", "_is_quad_prime_raw_candidate"]
+         "_late_entry_scalp_active", "_set_scalp_lock", "_minutes_to_force_exit",
+         # The gates resolve the CANDIDATE's own-timeframe regime rather than the
+         # instrument-keyed 5-minute label, so the stub needs the resolver pair.
+         "_get_trade_regime", "_trade_regime_is_own_timeframe"]
+_STAT = ["_normalize_signal_grade_preference", "_setting_enabled",
+         "_is_quad_prime_raw_candidate", "_timeframe_intel_key"]
 
 
-def _stub(regime):
-    st = SimpleNamespace(mode="REAL", latest_regimes={"NIFTY": regime})
+def _stub(regime, tf_regimes=None):
+    # `latest_regimes` is instrument-keyed and IS the 5-minute label; `_timeframe_regimes`
+    # is where a candidate's own-timeframe label lives. Empty by default, so
+    # _get_trade_regime falls back to latest_regimes exactly as these tests expect.
+    st = SimpleNamespace(mode="REAL", latest_regimes={"NIFTY": regime},
+                         _timeframe_regimes=dict(tf_regimes or {}))
     for m in _INST:
         setattr(st, m, getattr(Scanner, m).__get__(st, Scanner))
     for m in _STAT:
@@ -96,10 +104,31 @@ def _cand(g, c, tf, inst, a, adx):
                            trend_15m_agrees=a, reasons=[])
 
 
-def _live_trades(s, g, c, tf, inst, reg, a, adx):
-    gp = _stub(reg)._passes_candidate_grade_preference(_cand(g, c, tf, inst, a, adx))[0]
-    lr = _stub(reg)._passes_live_trade_ready_gate(_cand(g, c, tf, inst, a, adx))
+def _live_trades(s, g, c, tf, inst, reg, a, adx, own_tf_regime=True):
+    # `reg` is the market state for THIS candidate, so publish it on the candidate's own
+    # timeframe. Previously it was only ever written to latest_regimes -- the 5-minute,
+    # instrument-keyed label -- so a 15-minute candidate was being admitted on the
+    # 5-minute pocket. That is the privilege _trade_regime_is_own_timeframe forbids.
+    # own_tf_regime=False reproduces the old shape: 5-minute label only.
+    tf_regimes = {f"NIFTY_{tf}": reg} if own_tf_regime else {}
+    gp = _stub(reg, tf_regimes)._passes_candidate_grade_preference(_cand(g, c, tf, inst, a, adx))[0]
+    lr = _stub(reg, tf_regimes)._passes_live_trade_ready_gate(_cand(g, c, tf, inst, a, adx))
     return gp and lr
+
+
+def test_a_15min_b_grade_is_not_admitted_on_the_5min_regime(settings):
+    """The privilege must rest on the candidate's OWN timeframe.
+
+    Same inputs as test_live_gate_b_trades_in_trend[15min], except the trending label
+    exists only on the 5-minute pocket. 5m/15m regimes disagree in 83% of same-timestamp
+    pairs, so this is not a corner case.
+    """
+    settings.signal_grade_preference = "A"
+    assert _live_trades(settings, "B", 0.52, "15min", "FUT", "TRENDING_UP", True, 30.0,
+                        own_tf_regime=False) is False
+    # ...and a 5-minute candidate legitimately OWNS that same label.
+    assert _live_trades(settings, "B", 0.52, "5min", "FUT", "TRENDING_UP", True, 30.0,
+                        own_tf_regime=False) is True
 
 
 @pytest.mark.parametrize("tf", ["5min", "15min"])
