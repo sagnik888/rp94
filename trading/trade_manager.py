@@ -3643,7 +3643,17 @@ class TradeManager:
             trading_symbol=trading_symbol,
             symbol_token=symbol_token,
             exec_type=exec_type,
-            entry_spot=entry_spot or price,
+            # NEVER default the index-spot field to the CONTRACT price. On an OPT,
+            # `price` is the option PREMIUM (~120) against a spot of ~24,850, and every
+            # spot<->premium converter keys off this field -- one missing spot tick at
+            # entry fabricated lakhs of P&L and fired TARGET_HIT on it. On a FUT it is
+            # the futures LTP, which differs from spot by the basis.
+            #
+            # 0.0 is a supported value, not a hole: every reader guards `entry_spot > 0`
+            # and falls back to holding entry_price (see update_trade below, "do NOT use
+            # spot price as option price"). That guard was unreachable while this line
+            # guaranteed entry_spot > 0 whenever price > 0.
+            entry_spot=float(entry_spot or 0.0),
             spot_stop=spot_stop,
             spot_target=spot_target,
             is_ghost=is_ghost,
