@@ -28,7 +28,9 @@ async def test_broker_repaint_tracker_checks_signal_at_candle_close(monkeypatch)
     )
     closed = []
     dummy = SimpleNamespace(
-        _live_utbot_signal_still_present=lambda _candidate, _timestamp: True,
+        # Tri-state now: the tracker asks WHY the arrow is missing, so "cannot tell"
+        # (an empty scan cache) can no longer masquerade as "vanished".
+        _repaint_signal_status=lambda _candidate, _timestamp: "PRESENT",
         candles=SimpleNamespace(get_latest_price=lambda _instrument: 101.0),
         _close_and_record=lambda *args, **_kwargs: closed.append(args),
         log_event=lambda *_args: None,
@@ -60,7 +62,7 @@ async def test_broker_repaint_tracker_aborts_at_final_check_if_signal_vanished(m
     )
     closed = []
     dummy = SimpleNamespace(
-        _live_utbot_signal_still_present=lambda _candidate, _timestamp: False,
+        _repaint_signal_status=lambda _candidate, _timestamp: "VANISHED",
         candles=SimpleNamespace(get_latest_price=lambda _instrument: 99.0),
         _close_and_record=lambda *args, **_kwargs: closed.append(args),
         log_event=lambda *_args: None,

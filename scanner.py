@@ -5544,6 +5544,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         return "PRESENT"
 
+    def _repaint_absence_is_definite(self, candidate: TradeCandidate, sig_timestamp) -> bool:
+        """True only when the arrow is PROVABLY gone or flipped — never on 'cannot tell'.
+
+        `_repaint_signal_status` returns UNKNOWN for an empty scan cache, and the cache is
+        cleared out from under an in-flight repaint check by ordinary operator actions: a
+        settings save (configure), perform_system_recalibration, a scanner-engine switch
+        (invalidate_chart_caches) and the day rollover all call `_cached_results.clear()`.
+
+        Reading that through a True/False wrapper made "I cannot see the arrow" identical
+        to "the arrow is gone", so a click during a live trade booked a REPAINT_ABORT on
+        no evidence. Callers re-check on a timer, so refusing to conclude costs one cycle.
+        """
+        try:
+            return self._repaint_signal_status(candidate, sig_timestamp) in {"VANISHED", "FLIPPED"}
+        except Exception:
+            # Fail SAFE: an unreadable status is "cannot tell", not "gone".
+            return False
+
     def _live_utbot_signal_still_present(self, candidate: TradeCandidate, sig_timestamp) -> bool:
         """True when the UT1 signal with the same timestamp still matches this candidate."""
         return self._repaint_signal_status(candidate, sig_timestamp) == "PRESENT"
@@ -14608,7 +14626,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if self._repaint_close_check_in_window(sig_ts, tf, latest_time):
                     still = True
                     try:
-                        still = bool(self._live_utbot_signal_still_present(trade_like, sig_ts))
+                        # Definite absence only — an empty scan cache must not raise a
+                        # post_close_repaint severity flag on "cannot tell".
+                        still = not self._repaint_absence_is_definite(trade_like, sig_ts)
                     except Exception:
                         still = not bool(getattr(trade_like, "_repaint_aborted", False))
                     if not still:
@@ -19845,7 +19865,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             setattr(previous, "_next_repaint_check", next_check)
 
                         if latest_time >= next_check:
-                            still_present = self._live_utbot_signal_still_present(previous, sig_ts)
+                            still_present = not self._repaint_absence_is_definite(previous, sig_ts)
                             self._diag_inc("repaint_guard", "checked")
                             if still_present:
                                 setattr(previous, "_repaint_absent_checks", 0)
@@ -19943,7 +19963,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
                         self._diag_inc("repaint_guard", "passed")
                     else:
-                        still_present = self._live_utbot_signal_still_present(previous, sig_ts)
+                        still_present = not self._repaint_absence_is_definite(previous, sig_ts)
                         self._diag_inc("repaint_guard", "checked")
                         if not still_present:
                             override_ctx = self._post_entry_repaint_override_context(previous, sig_ts)
@@ -23126,8 +23146,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 await asyncio.sleep(recheck_seconds) # Re-check for repaint (default 20s)
 
                 now = datetime.now(IST).replace(tzinfo=None)
-                still_present = self._live_utbot_signal_still_present(candidate, sig_timestamp)
-                if not still_present:
+                # "Cannot tell" is NOT evidence of a repaint. _repaint_signal_status
+                # returns UNKNOWN when the scan cache is empty, and the cache is cleared
+                # out from under a live tracker by ordinary operator actions: a settings
+                # save (configure), perform_system_recalibration, a scanner-engine switch
+                # (invalidate_chart_caches) and the day rollover all call
+                # _cached_results.clear(). The boolean wrapper collapsed UNKNOWN into
+                # "vanished", so one of those clicks market-exited a real position on no
+                # evidence at all.
+                #
+                # Only a DEFINITE absence may abort. UNKNOWN falls through to the
+                # candle-close check below and re-reads in recheck_seconds, so a genuine
+                # repaint is still caught on the next pass — a cleared cache costs one
+                # 20s cycle instead of a forced exit. Read the status directly rather
+                # than through _live_utbot_signal_still_present, whose True/False cannot
+                # distinguish "gone" from "cannot see".
+                if Scanner._repaint_absence_is_definite(self, candidate, sig_timestamp):
                     # Every configured repaint MITIGATION was unreachable from here. All
                     # call sites for the momentum override, the profit hold and the
                     # option defer sit in _check_session_candidates_breaches_locked, which

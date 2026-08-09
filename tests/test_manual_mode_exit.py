@@ -1517,7 +1517,7 @@ def _scanner_for_repaint_override_test(candidate, override_ctx):
     scanner._candidate_stop_hit = lambda *_args, **_kwargs: False
     scanner._candidate_target_hit = lambda *_args, **_kwargs: False
     scanner._live_signal_candle_has_closed = lambda *_args, **_kwargs: False
-    scanner._live_utbot_signal_still_present = lambda *_args, **_kwargs: False
+    scanner._repaint_signal_status = lambda *_args, **_kwargs: "VANISHED"
     scanner._post_entry_repaint_override_context = lambda *_args, **_kwargs: override_ctx
     scanner._repaint_abort_held_for_profit = lambda *_args, **_kwargs: False
     scanner._should_defer_option_repaint_abort = lambda *_args, **_kwargs: (False, "")
