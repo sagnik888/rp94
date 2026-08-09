@@ -182,7 +182,11 @@ class KiteDataSource:
         return max(sizes.items(), key=lambda item: item[1])[0]
 
     def lot_size_mismatches(self, configured: Dict[str, int]) -> List[Tuple[str, int, int]]:
-        """(index, configured, exchange) for each index whose JSON lot size is wrong."""
+        """(index, configured, exchange) for each index whose JSON lot size is wrong.
+
+        An empty list means "no DISAGREEMENT was found" — which is not the same as
+        "all four were checked". Ask lot_size_unresolved() for the difference.
+        """
         out: List[Tuple[str, int, int]] = []
         for name, size in (configured or {}).items():
             try:
@@ -192,6 +196,27 @@ class KiteDataSource:
             actual = self.option_lot_size(name)
             if mine > 0 and actual and actual != mine:
                 out.append((str(name), mine, int(actual)))
+        return sorted(out)
+
+    def lot_size_unresolved(self, configured: Dict[str, int]) -> List[str]:
+        """Indices the contract master holds no option rows for, so nothing was checked.
+
+        option_lot_size returns None when the master carries no CE/PE rows for a name,
+        and the mismatch loop treats that falsy value as agreement. So a contract
+        master that failed to load reported "clean" — the cross-check passing loudest
+        exactly when it had no data. load_instruments keeps the previous cache on ANY
+        exchange failure, and the checker's provider requests four exchanges where
+        contract resolution requests two, so its master goes empty in cases where
+        trading itself keeps working.
+        """
+        out: List[str] = []
+        for name, size in (configured or {}).items():
+            try:
+                mine = int(size or 0)
+            except (TypeError, ValueError):
+                continue
+            if mine > 0 and not self.option_lot_size(name):
+                out.append(str(name))
         return sorted(out)
 
     def instrument_token(self, tradingsymbol: str, exchange: str) -> Optional[int]:

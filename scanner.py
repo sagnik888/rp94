@@ -129,6 +129,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.is_running = False
         self.scan_interval = 1.0
         self.last_scan_time = None
+        # Whole-cycle duration INCLUDING the payload build and the websocket
+        # broadcast. `latency` measures only up to _update_active_trades, so it
+        # cannot see the tail it is most likely to be slow in. Carried from the
+        # previous cycle because this cycle's is not known until after the send.
+        self._last_cycle_ms = 0
         self.scan_count = 0
         self.mode = trading_mode # Master Mode Control
         self._state_file = "data_store/trade_state.json"
@@ -6448,6 +6453,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "trades": self._build_dashboard_trade_payload(),
                 "scan_count": self.scan_count,
                 "latency": latency_ms,
+                # Previous cycle's END-TO-END duration. `latency` above stops before
+                # the payload build, the dashboard cache, the warm-memory write and
+                # the broadcast itself, so on its own it hides the slowest tail.
+                "cycle_ms": self._last_cycle_ms,
                 "timestamp": scan_completed_at.isoformat(),
                 "simulation_id": self.simulation_id
             })
@@ -6455,13 +6464,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._update_dashboard_cache(results)
             self._last_sent_sim_id = self.simulation_id
             self._save_warm_memory()
-
-            if latency_ms > 10000 and not cycle_is_warmup:
-                self._diag_inc("latency", "high_latency_events")
-                logger.warning(f"⚠️ High Latency: {latency_ms}ms")
-                
-            if latency_ms > 30000 and self.scan_count > 2 and not getattr(self, "is_warmup", False):
-                self.log_event(f"⚠️ System Freeze/Hang Detected (Latency: {latency_ms}ms). Please click the UT1 Logo (Top-Left) to hard-refresh.", "error")
 
             # â• â•  DASHBOARD THROTTLE â• â•
             # Force broadcast if data updated OR at least every 1s
@@ -6479,8 +6481,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 except Exception as e:
                     logger.error(f"Failed to broadcast update: {e}")
 
+            # Everything is done now, so this is the real cost of a cycle. The
+            # high-latency and freeze alarms are judged on it rather than on
+            # `latency_ms`, which stopped before the payload build, the chart
+            # stripping, the dashboard cache, the warm-memory disk write and the
+            # broadcast — the very work a freeze is most likely to be stuck in.
+            cycle_ms = round((time.time() - t0) * 1000)
+            self._last_cycle_ms = cycle_ms
+            self._diagnostics.setdefault("latency", {})["last_cycle_ms"] = cycle_ms
+
+            if cycle_ms > 10000 and not cycle_is_warmup:
+                self._diag_inc("latency", "high_latency_events")
+                logger.warning(f"⚠️ High Latency: {cycle_ms}ms (scan phase {latency_ms}ms)")
+
+            if cycle_ms > 30000 and self.scan_count > 2 and not getattr(self, "is_warmup", False):
+                self.log_event(f"⚠️ System Freeze/Hang Detected (Latency: {cycle_ms}ms). Please click the UT1 Logo (Top-Left) to hard-refresh.", "error")
+
             if self.scan_count % 10 == 0:
-                logger.info(f"âœ… Scan Cycle {self.scan_count} Finished | Latency: {latency_ms}ms")
+                logger.info(f"âœ… Scan Cycle {self.scan_count} Finished | Latency: {latency_ms}ms | Cycle: {cycle_ms}ms")
         finally:
             self._calculation_lock = False
             self.is_calculating = False

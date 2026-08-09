@@ -64,6 +64,10 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # "structurally unconfirmed", which disables let-winners-run and arms the blunt
     # sub-1R give-back guard on a position whose source candle closed hours earlier.
     "repaint_guard_checked",
+    # gtt_arm_uncertain: a possible orphaned server-side trigger. Losing this on a
+    # restart is how a duplicate GTT goes unreconciled until both it and the SL-M
+    # fire, double-exiting the position into a naked reversed leg.
+    "gtt_arm_uncertain",
     # Scale-out state. An in-flight reduce that did not survive a restart would be
     # re-submitted against lots that are already gone.
     "partial_derisk_done", "partial_reduce_order_id",
@@ -245,6 +249,7 @@ class DatabaseManager:
                     "reversal_watch_required": "INTEGER",
                     "is_reversion_scalp": "INTEGER",
                     "repaint_guard_checked": "INTEGER",
+                    "gtt_arm_uncertain": "INTEGER",
                     "partial_derisk_done": "INTEGER",
                     "partial_reduce_order_id": "TEXT",
                     "partial_reduce_requested_quantity": "INTEGER",

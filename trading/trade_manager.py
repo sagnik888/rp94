@@ -145,6 +145,11 @@ class Trade:
     # disables let-winners-run and arms the blunt sub-1R give-back guard on a position
     # whose source candle closed hours earlier.
     repaint_guard_checked: bool = False
+    # A GTT was armed without being able to prove no prior trigger existed, or its
+    # placement came back ambiguous. Either way a duplicate server-side trigger may be
+    # resting against this contract with no local id, and two triggers firing exits
+    # the position twice — the second fill opening a naked reversed leg.
+    gtt_arm_uncertain: bool = False
     market_regime: str = ""   # Regime at entry (for post-hoc attribution)
     data_provenance: str = "" # LIVE / HISTORICAL / RECOVERY / EOD — data source of the entry
     price_action_verdict: str = "" # FAVORABLE/NEUTRAL/ADVERSE from the price-action patch (advisory)
@@ -318,6 +323,7 @@ class Trade:
             "signal_fire_mode": self.signal_fire_mode,
             "entered_intracandle": self.entered_intracandle,
             "repaint_guard_checked": self.repaint_guard_checked,
+            "gtt_arm_uncertain": self.gtt_arm_uncertain,
             "market_regime": self.market_regime,
             "data_provenance": self.data_provenance,
             "price_action_verdict": self.price_action_verdict,
@@ -473,6 +479,7 @@ class Trade:
             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
             entered_intracandle=bool(data.get("entered_intracandle", True)),
             repaint_guard_checked=bool(data.get("repaint_guard_checked", False)),
+            gtt_arm_uncertain=bool(data.get("gtt_arm_uncertain", False)),
             market_regime=str(data.get("market_regime") or ""),
             data_provenance=str(data.get("data_provenance") or ""),
             price_action_verdict=str(data.get("price_action_verdict") or ""),
@@ -1049,13 +1056,25 @@ class TradeManager:
         # Nor stack one we armed but never recorded — a lost acknowledgement on a
         # previous cycle leaves an active trigger with no local id.
         finder = getattr(self.broker, "find_gtt_stop", None)
+        scan_state = ""
         if callable(finder):
-            try:
-                prior = finder(trade.trading_symbol) or {}
-            except Exception:
-                prior = {}
+            def _scan() -> dict:
+                try:
+                    return finder(trade.trading_symbol) or {}
+                except Exception as exc:
+                    # A raising finder is the same evidence as UNKNOWN: we cannot
+                    # tell. Collapsing it to {} made it indistinguishable from NONE.
+                    return {"state": "UNKNOWN", "trigger_id": "", "reason": str(exc)}
+
+            prior = _scan()
+            if str(prior.get("state") or "") == "UNKNOWN":
+                # "Cannot tell" was falling straight through to placer() — the same
+                # never-conclude-from-a-failure rule the SL-M path already follows,
+                # broken here. One retry usually resolves a transient scan failure.
+                prior = _scan()
+            scan_state = str(prior.get("state") or "")
             prior_id = str(prior.get("trigger_id") or "")
-            if str(prior.get("state") or "") == "FOUND" and prior_id:
+            if scan_state == "FOUND" and prior_id:
                 # find_gtt_stop matches the CONTRACT, not the trade — no side, quantity
                 # or trigger level. Two trades on one strike is supported, so adopting
                 # blindly points both at one trigger: this trade would sit behind the
@@ -1080,12 +1099,36 @@ class TradeManager:
                     "instead of arming a second one."
                 )
                 return True
+        # Still UNKNOWN after the retry. Arm anyway — this runs only because the SL-M
+        # was refused, so declining would leave the position with NO server-side stop,
+        # which is worse than a possible duplicate trigger. But flag it, so a duplicate
+        # is reconciled by a human rather than sitting silent until both fire.
+        if scan_state == "UNKNOWN":
+            logger.error(
+                f"GTT scan for {trade.trading_symbol} is UNKNOWN after a retry; arming "
+                "anyway because the position is otherwise unprotected. A duplicate "
+                "trigger may exist."
+            )
+            trade.gtt_arm_uncertain = True
+
         try:
             trigger_id = placer(
                 trade.trading_symbol, qty, side, trigger,
                 last_price=float(getattr(trade, "current_price", 0.0) or trade.entry_price),
                 product_type=self.product_type,
             )
+        except BrokerOrderAmbiguous as exc:
+            # The trigger may or may not exist server-side and we have no id for it.
+            # This is exactly what creates the orphan the scan above cannot see, so
+            # record it rather than returning a bare False.
+            trade.gtt_arm_uncertain = True
+            self._mark_recovery(
+                trade,
+                f"GTT arm ambiguous for {trade.trading_symbol}: {exc}. A server-side "
+                "trigger may exist with no local id.",
+            )
+            logger.error(f"GTT fallback ambiguous for {trade.trading_symbol}: {exc}")
+            return False
         except Exception as exc:
             logger.error(f"GTT fallback failed for {trade.trading_symbol}: {exc}")
             return False

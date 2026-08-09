@@ -424,6 +424,20 @@ def validate_real_mode_readiness(
                         f"exchange uses {actual}. Every order would be sized on the wrong "
                         "multiple and refused as an invalid quantity."
                     )
+                # An empty mismatch list meant "clean" whether or not anything was
+                # actually compared: option_lot_size returns None for a contract
+                # master with no rows, and the loop above reads that as agreement. So
+                # the check reported loudest exactly when it was blind. Say which.
+                unresolved = getattr(source, "lot_size_unresolved", None)
+                if callable(unresolved):
+                    names = unresolved(configured)
+                    if names:
+                        warnings.append(
+                            "lot-size cross-check could not run for "
+                            + ", ".join(names)
+                            + ": the Kite contract master holds no option rows for "
+                            "them, so a stale lot size would not be caught."
+                        )
         except FileNotFoundError:
             pass
         except Exception as exc:
