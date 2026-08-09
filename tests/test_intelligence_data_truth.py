@@ -176,13 +176,23 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     # OI/PCR components into the score, and the published value is rounded to 1dp.
     # The dampening chain itself is unchanged, which the two assertions above pin.
     #
-    # 2.5, previously 3.8: this candle set trips the divergence detector, and the
-    # divergence vote (+/-0.30, larger than any counted pillar) now increments
-    # `components` like every other vote of its size. Denominator 2 -> 3, so
-    # 0.5 * 0.15 / 3 = 0.025 -> 2.5. Before the fix that vote's weight moved with how
-    # many UNRELATED pillars happened to have data.
-    assert aggregate["score"] == 10.0
+    # 5.8, previously 10.0 (and 2.5 / 3.8 before that). The dampening chain above is
+    # untouched; what changed is the DIVISOR.
+    #
+    # This read carries three pillars -- order_flow 0.20 + regime 0.25 + divergence 0.30 =
+    # 0.75 of evidence -- out of the 1.30 a healthy read carries (no option chain, no traded
+    # volume). Dividing 0.075 by its OWN 0.75 scored it as though partial evidence were the
+    # whole picture and published 10.0. That is the same defect that let a regime-only read
+    # publish 100.0 / STRONG_BUY: conviction measured against whatever happened to be
+    # available. Divided by the FULL_EVIDENCE_MASS floor it is 0.075 / 1.30 = 5.8.
+    #
+    # A RANGING-dampened read on 58% of the evidence should sit near zero, so 5.8 is the
+    # honest number here and 10.0 was the flattering one.
+    assert aggregate["score"] == 5.8
     assert aggregate["signal"] == "HOLD"
+    # The evidence this rests on is now stated rather than implied.
+    assert aggregate["evidence_mass"] == 0.75
+    assert aggregate["evidence_ratio"] == round(0.75 / 1.30, 3)
 
 
 def test_greeks_engine_keeps_expiry_day_values_nonzero():

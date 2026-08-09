@@ -14,6 +14,20 @@ from intelligence.regime_detector import RegimeDetector
 from intelligence.order_flow import OrderFlowAnalyzer
 
 
+#: Evidence mass a HEALTHY live read carries -- the sum of the maximum vote of the pillars
+#: that are present whenever the feed and the option chain are both working:
+#:
+#:     volume 0.35 + oi 0.10 + pcr 0.20 + oi_wall 0.20 + regime 0.25 + order_flow 0.20
+#:
+#: top_down (0.35) needs session/anchor/breadth context and divergence (0.30) only fires on a
+#: detected trap, so neither belongs in the baseline; a read carrying them is BETTER than
+#: fully informed and divides by its own larger mass.
+#:
+#: This is the FLOOR on the score's denominator. It exists because dividing by the evidence
+#: actually present let one pillar publish full conviction -- see the note in analyze().
+FULL_EVIDENCE_MASS = 1.30
+
+
 class IntelligenceAggregator:
     """Combines all market intelligence sources into a single score"""
 
@@ -155,6 +169,18 @@ class IntelligenceAggregator:
         # -- with the option chain present the ceiling fell from 0.29 to 0.178 -- so every
         # threshold in the system, including this module's own 0.3/0.6 BUY/STRONG_BUY,
         # was unreachable. On this scale those read as written again.
+        #
+        # CORRECTED 2026-08-09. Dividing by the evidence actually present made the score a
+        # measure of DIRECTION but not of how much was known, so thin evidence produced full
+        # conviction. Regime is the only pillar that counts unconditionally, so whenever the
+        # option chain was unauthoritative, order flow abstained and volume was unavailable --
+        # the 09:15-09:19 state, and any feed outage -- regime alone owned the denominator:
+        # 0.25/0.25 = 1.0, published as 100.0 / STRONG_BUY on the least-informed read of the
+        # session. Reproduced: one pillar, components_analyzed=1, score=100.0.
+        #
+        # The denominator now has a FLOOR of the evidence mass a fully-informed read carries,
+        # so a pillar set thinner than that cannot inflate its own conviction. Above the floor
+        # nothing changes, which is why the measured ceiling and every gate are untouched.
         max_possible = 0.0
         regime_score_multiplier = 1.0
 
@@ -237,6 +263,12 @@ class IntelligenceAggregator:
         if volume_available:
             components += 1
             max_possible += 0.35  # volume
+        elif profile_signal or aroon_trend:
+            # They still voted (up to +/-0.07 above) and the 0.35 volume budget that would
+            # have covered them was not taken, so without this the numerator carried a term
+            # the denominator never budgeted for and score could exceed max_possible --
+            # measured 0.32 against 0.25, an averaged_score of 1.28 silently clamped to 1.0.
+            max_possible += 0.07  # price-structure + aroon, standing alone
 
         # 2. OI
         if intelligence_chain is not None:
@@ -564,7 +596,12 @@ class IntelligenceAggregator:
         # Final Score Aggregation (Scaled to -100 to +100 for SignalManager)
         score_before_regime_dampening = score
         score *= regime_score_multiplier
-        averaged_score = (score / max_possible) if max_possible > 0 else 0.0
+        # Divide by at least the evidence mass of a fully-informed read. Below that floor
+        # this reduces to score / FULL_EVIDENCE_MASS, so a thin pillar set is scored on the
+        # same yardstick as a complete one instead of being graded against itself.
+        averaged_score = (
+            (score / max(max_possible, FULL_EVIDENCE_MASS)) if max_possible > 0 else 0.0
+        )
         # Normalize *before* scaling so the public contract can never escape
         # [-100, +100].  The old order computed final_score from an unclamped
         # value and clamped a different variable afterward.
@@ -597,6 +634,12 @@ class IntelligenceAggregator:
             # that need the number rather than the display string must use this one
             # (engine.intelligence_score.aggregate_intelligence_score).
             "score_norm": round(score, 4),
+            # How much of a fully-informed read's evidence this score rests on. Diagnostic
+            # only, deliberately: the SCORE is already damped by it, so no gate has to be
+            # rewired to consult this. components_analyzed had the opposite problem -- it was
+            # published for exactly this purpose and never read by anything.
+            "evidence_mass": round(max_possible, 3),
+            "evidence_ratio": round(min(1.0, max_possible / FULL_EVIDENCE_MASS), 3),
             "signal": final_signal,
             "components_analyzed": components,
             "instrument": instrument,
