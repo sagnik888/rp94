@@ -107,7 +107,11 @@ class MarketIntelSnapshotStore:
                 score = float(row.get("intel_score") or 0.0)
             except (TypeError, ValueError):
                 continue
-            if ts >= cutoff and score > 0:
+            # `score > 0` discarded every BEARISH reading. This system buys PEs on a
+            # bearish view, so the slope could only ever be measured for bullish reads --
+            # a decaying bearish case was invisible. 0.0 is also a legitimate neutral
+            # score, not a missing one. Time is the only filter that belongs here.
+            if ts >= cutoff:
                 points.append((ts, score))
         if len(points) < max(2, int(min_points)):
             return None
@@ -225,7 +229,18 @@ class MarketIntelSnapshotStore:
             # The aggregate score, kept so the DIRECTION of the evidence is recoverable
             # later. Every pillar below is a point-in-time reading; none of them says
             # whether the case for the trade is strengthening or decaying.
-            "intel_score": _safe_float(intel_result.get("score")),
+            #
+            # This read `intel_result.get("score")`, and the aggregator publishes the
+            # score inside results["aggregate"], never at the top level -- there is no
+            # results["score"] anywhere. So every snapshot stored 0.0, score_trend could
+            # never assemble two points, and the decay guard silently returned "cannot
+            # say" forever. Legacy -100..+100 scale on purpose: the consumer's threshold
+            # is loss_guard_intel_decay_min_slope = -1.0 "points per minute".
+            "intel_score": _safe_float(
+                (intel_result.get("aggregate") or {}).get("score")
+                if isinstance(intel_result.get("aggregate"), dict)
+                else None
+            ),
             "primary_pcr": _safe_float(pcr.get("primary_pcr") or pcr.get("pcr_oi")),
             "pcr_oi": _safe_float(pcr.get("pcr_oi")),
             "pcr_near_oi": _safe_float(pcr.get("pcr_near_oi")),

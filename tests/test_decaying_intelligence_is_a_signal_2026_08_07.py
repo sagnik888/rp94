@@ -171,3 +171,66 @@ def test_the_snapshot_records_the_score_it_needs():
     assert '"intel_score"' in inspect.getsource(S._build_snapshot), (
         "snapshots no longer carry the aggregate score, so no trend can be computed"
     )
+
+
+# ── the writer, 2026-08-09 ───────────────────────────────────────────────────
+# Every test above pokes `_raw` directly, which is why a broken WRITER stayed
+# invisible: push_snapshot read intel_result["score"], and the aggregator publishes
+# the score inside results["aggregate"] -- there is no top-level "score" key at all.
+# So every stored snapshot held 0.0, score_trend never assembled two points, and the
+# decay guard answered "cannot say" for the life of the process.
+
+
+def _agg(score):
+    """An aggregator-shaped payload: the score lives under "aggregate"."""
+    return {"aggregate": {"score": score, "score_norm": score / 100.0}, "regime": {}}
+
+
+def test_push_snapshot_actually_records_the_aggregate_score():
+    s = SnapshotStore()
+    s.push_snapshot("NIFTY", None, intel_result=_agg(62.5), timestamp=time.time())
+    assert s._raw["NIFTY"][-1]["intel_score"] == pytest.approx(62.5), (
+        "the writer is reading a key the aggregator never publishes"
+    )
+
+
+def test_a_top_level_score_key_is_not_what_the_aggregator_publishes():
+    """The premise. If this ever becomes true, the old read would have been fine."""
+    import inspect
+
+    from intelligence.intelligence_aggregator import IntelligenceAggregator
+
+    src = inspect.getsource(IntelligenceAggregator.analyze)
+    assert 'results["score"]' not in src and "results['score']" not in src
+
+
+def test_a_slope_is_measurable_end_to_end_through_push_snapshot():
+    s = SnapshotStore()
+    base = time.time() - 300.0
+    for i, sc in enumerate([70.0, 65.0, 60.0, 55.0, 50.0]):
+        s.push_snapshot("NIFTY", None, intel_result=_agg(sc), timestamp=base + i * 60.0)
+    assert s.score_trend("NIFTY") == pytest.approx(-5.0)
+
+
+# ── bidirectional: a decaying BEARISH case must be visible too ───────────────
+
+def test_a_decaying_bearish_case_is_not_discarded():
+    """`score > 0` dropped every bearish row, so a bought PE whose case was
+    evaporating produced no slope at all."""
+    slope = _store([-70.0, -65.0, -60.0, -55.0, -50.0]).score_trend("NIFTY")
+    assert slope == pytest.approx(5.0), (
+        "a bearish reading is still filtered out, so PE trades get no decay signal"
+    )
+
+
+def test_a_strengthening_bearish_case_reports_a_negative_slope():
+    assert _store([-50.0, -55.0, -60.0, -65.0, -70.0]).score_trend("NIFTY") == pytest.approx(-5.0)
+
+
+def test_a_neutral_zero_reading_is_a_reading_not_a_gap():
+    assert _store([0.0, -2.0, -4.0, -6.0]).score_trend("NIFTY") == pytest.approx(-2.0)
+
+
+def test_a_sign_flip_is_tracked_across_zero():
+    """Bullish conviction collapsing through neutral into bearish."""
+    assert _store([20.0, 10.0, 0.0, -10.0, -20.0]).score_trend("NIFTY") == pytest.approx(-10.0)
