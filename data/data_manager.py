@@ -8,12 +8,17 @@ import json
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from loguru import logger
 from data.market_data import MarketDataProvider
 
 class DataManager:
-    def __init__(self, data_provider: MarketDataProvider):
+    def __init__(self, data_provider: MarketDataProvider, intel_memory: Any = None):
         self.data = data_provider
+        # The live IntelligenceMemory, when there is one. It owns intelligence_history
+        # .json and rewrites it wholesale on save(), so pruning the file behind its
+        # back is undone by the next periodic save.
+        self.intel_memory = intel_memory
         self.data_dir = Path("data_store")
         self.candles_dir = self.data_dir / "candles"
         self.intel_file = self.data_dir / "intelligence_history.json"
@@ -138,33 +143,72 @@ class DataManager:
                 logger.error(f"❌ [DataManager] Error pruning {file.name}: {e}")
 
     def _prune_intelligence(self):
-        """Prune intelligence_history.json to keep only last 65 days."""
+        """Prune intelligence_history.json to keep only last 65 days.
+
+        The previous implementation filtered the store's KEYS against an ISO date
+        string. But IntelligenceMemory keys each instrument by FIELD NAME --
+        {"timestamps": [...], "pcr": [...], "regime": [...]} -- and every field name
+        begins with a lowercase letter, which sorts above any "2026-..." cutoff. So
+        `k >= cutoff_iso` was True for all of them, new_size always equalled
+        orig_size, and the documented 65-day retention silently never ran. Not an
+        over-delete: a pure no-op.
+
+        Records are index-aligned parallel lists, so the cut is positional, taken
+        against the epoch seconds in "timestamps".
+        """
+        try:
+            cutoff_epoch = (datetime.now() - timedelta(days=self.RETENTION_INTEL)).timestamp()
+        except Exception:
+            return
+
+        # Prefer the live writer: it holds the authoritative copy and rewrites the
+        # file on every save, so a file-level prune would be undone minutes later.
+        memory = getattr(self, "intel_memory", None)
+        pruner = getattr(memory, "prune_older_than", None)
+        if callable(pruner):
+            try:
+                removed = pruner(cutoff_epoch) or {}
+                if removed:
+                    total = sum(removed.values())
+                    logger.info(
+                        f"🧹 [DataManager] Pruned {total} intelligence points older than "
+                        f"{self.RETENTION_INTEL} days"
+                    )
+                return
+            except Exception as e:
+                logger.error(f"❌ [DataManager] Error pruning intelligence memory: {e}")
+                return
+
+        # No live writer (offline maintenance): prune the file directly, same shape.
         if not self.intel_file.exists():
             return
-            
         try:
-            cutoff_date = datetime.now() - timedelta(days=self.RETENTION_INTEL)
-            cutoff_iso = cutoff_date.isoformat()
-            
             with open(self.intel_file, "r") as f:
                 data = json.load(f)
-                
+
             orig_size = 0
             new_size = 0
-            
             for instrument, records in data.items():
-                orig_size += len(records)
-                # Assuming records is a list of dicts with a 'timestamp' key
-                # Alternatively, intelligence history might be keyed by timestamp.
-                if isinstance(records, dict):
-                    # Keyed by timestamp string
-                    data[instrument] = {k: v for k, v in records.items() if k >= cutoff_iso}
-                    new_size += len(data[instrument])
-                elif isinstance(records, list):
-                    # List of dicts
-                    data[instrument] = [r for r in records if r.get("timestamp", "") >= cutoff_iso]
-                    new_size += len(data[instrument])
-                    
+                if not isinstance(records, dict):
+                    continue
+                stamps = records.get("timestamps")
+                if not isinstance(stamps, list) or not stamps:
+                    continue
+                orig_size += len(stamps)
+                cut = len(stamps)
+                for idx, ts in enumerate(stamps):
+                    try:
+                        if float(ts) >= cutoff_epoch:
+                            cut = idx
+                            break
+                    except (TypeError, ValueError):
+                        cut = idx
+                        break
+                for key, series in records.items():
+                    if isinstance(series, list) and len(series) == len(stamps):
+                        records[key] = series[cut:]
+                new_size += len(records.get("timestamps", []))
+
             if new_size < orig_size:
                 with open(self.intel_file, "w") as f:
                     json.dump(data, f)

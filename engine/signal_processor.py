@@ -1,7 +1,7 @@
 import pandas as pd
 import copy
 import re
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional
 from loguru import logger
@@ -409,8 +409,48 @@ class TradeCandidate:
     raw_union_entry: bool = False
 
 
+def _sig_date(signal) -> Optional[date]:
+    """The calendar date of a signal, or None when it carries no usable timestamp.
+
+    Accepts either a signal object with a ``timestamp`` attribute or a bare
+    datetime/date. The bare case is checked FIRST because datetime itself has a
+    ``timestamp`` *method* -- reading the attribute would hand back a bound method
+    and quietly resolve to None.
+
+    Every caller of _estimate_opt_premium used to omit trade_date, which disabled
+    both the DTE boost and the historical-VIX lookup. Returning None preserves that
+    old behaviour for an unusable timestamp rather than raising on the hot path.
+    """
+    if isinstance(signal, datetime):
+        return signal.date()
+    if isinstance(signal, date):
+        return signal
+    ts = getattr(signal, "timestamp", None)
+    if ts is None or callable(ts):
+        return None
+    try:
+        if isinstance(ts, datetime):
+            return ts.date()
+        if isinstance(ts, date):
+            return ts
+        parsed = pd.to_datetime(ts)
+        # NaN/None parse to NaT rather than raising, and NaT.date() is NaT again --
+        # which would sail out of here as a truthy non-date.
+        if parsed is None or pd.isna(parsed):
+            return None
+        return parsed.date()
+    except Exception:
+        return None
+
+
 def _estimate_opt_premium(spot_price: float, scanner=None, instrument: str = "", trade_date=None) -> float:
-    """Dynamic option premium estimation based on VIX"""
+    """Dynamic option premium estimation based on VIX.
+
+    ``instrument`` and ``trade_date`` gate the DTE boost and the historical-VIX
+    average. Every call site omitted them for the life of this function, so
+    dte_boost was pinned at 1.0 and HISTORICAL runs silently priced against TODAY's
+    live VIX -- lookahead bias in every backtest.
+    """
     base_pct = 0.012
     vix_val = 15.0
     if scanner and trade_date is not None and hasattr(scanner, "_vix_data"):
@@ -1888,7 +1928,7 @@ class SignalProcessor:
                 
             # Estimate entry/stop/target/exit using _simulate_actual_option_exit
             # Estimate entry premium (1.2% of spot)
-            est_entry = _estimate_opt_premium(price, scanner)
+            est_entry = _estimate_opt_premium(price, scanner, instrument, _sig_date(start_ts))
             spot_stop_dist = abs(float(price) - float(trailing_stop))
             sim_mult = 0.5
             natural_sl_premium_dist = abs(spot_stop_dist * sim_mult)
@@ -2975,7 +3015,7 @@ class SignalProcessor:
                                     )
                                 requested = int(getattr(scanner, "user_lots_fut", {}).get(instrument, 1) or 1)
                             else:
-                                hist_entry_px = float(_estimate_opt_premium(s1.price, scanner) or 0.0)
+                                hist_entry_px = float(_estimate_opt_premium(s1.price, scanner, instrument, _sig_date(s1)) or 0.0)
                                 natural = abs(float(index_stop_distance or 0.0) * abs(float(sim_multiplier or 0.5)))
                                 max_sl = hist_entry_px * (float(scanner.options_sl_pct or 15.0) / 100.0)
                                 hist_stop_px = max(0.05, hist_entry_px - max(0.05, min(natural, max_sl)))
@@ -3047,7 +3087,7 @@ class SignalProcessor:
                                         continue
                                     qty = hist_lots * lot_size
                                 else:
-                                    entry_premium = _estimate_opt_premium(s1.price, scanner)
+                                    entry_premium = _estimate_opt_premium(s1.price, scanner, instrument, _sig_date(s1))
                             else:
                                 entry_premium = s1.price
                             
@@ -3782,7 +3822,7 @@ class SignalProcessor:
                                     sim_inst = "OPT"
                                     sim_option_type = "CE" if direction == "LONG" else "PE"
                                     sim_multiplier = 0.5
-                                    entry_premium = _estimate_opt_premium(last_s.price, scanner)
+                                    entry_premium = _estimate_opt_premium(last_s.price, scanner, instrument, _sig_date(last_s))
                                     spot_diff = eod_price - last_s.price if direction == "LONG" else last_s.price - eod_price
                                     exit_premium = entry_premium + (spot_diff * sim_multiplier)
                                 else: # AUTO
@@ -3799,7 +3839,7 @@ class SignalProcessor:
                                     sim_option_type = ("CE" if direction == "LONG" else "PE") if sim_inst == "OPT" else ""
                                     sim_multiplier = 0.5 if sim_inst == "OPT" else 1.0
                                     if sim_inst == "OPT":
-                                        entry_premium = _estimate_opt_premium(last_s.price, scanner)
+                                        entry_premium = _estimate_opt_premium(last_s.price, scanner, instrument, _sig_date(last_s))
                                         spot_diff = eod_price - last_s.price if direction == "LONG" else last_s.price - eod_price
                                         exit_premium = entry_premium + (spot_diff * sim_multiplier)
                                     else:
@@ -3904,7 +3944,7 @@ class SignalProcessor:
                                         entry_premium - max(0.05, entry_premium * (scanner.options_sl_pct / 100.0)),
                                     )
                                     if sim_inst == "OPT" and not option_df.empty:
-                                        est_entry = _estimate_opt_premium(last_s.price, scanner)
+                                        est_entry = _estimate_opt_premium(last_s.price, scanner, instrument, _sig_date(last_s))
                                         spot_stop_dist = abs(float(last_s.price) - float(last_s.trailing_stop))
                                         natural_sl_premium_dist = abs(spot_stop_dist * sim_multiplier)
                                         max_sl_dist = est_entry * (scanner.options_sl_pct / 100.0)
@@ -5740,7 +5780,9 @@ class SignalProcessor:
                         )
                 # Final lots come from resolve_trade_lots (fixed settings lots).
             else:
-                est_premium = _estimate_opt_premium(spot, getattr(self, "scanner", None))
+                est_premium = _estimate_opt_premium(
+                    spot, getattr(self, "scanner", None), instrument, _sig_date(best_sig)
+                )
                 # No capital hardcap on lots when auto sizing is OFF (default).
                 cap_based_lots = None
                 

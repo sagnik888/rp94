@@ -203,6 +203,54 @@ class IntelligenceMemory:
                 for key in m:
                     m[key] = m[key][-self._max_points:]
 
+    def prune_older_than(self, cutoff_epoch: float) -> Dict[str, int]:
+        """Drop every recorded point older than ``cutoff_epoch``.
+
+        Prunes by POSITION, not by key. The store keeps index-aligned parallel lists
+        per instrument ({"timestamps": [...], "pcr": [...], ...}), so the retention
+        cut is an index into ``timestamps`` applied to every sibling list.
+
+        Must run here rather than against the JSON file: this object holds the
+        authoritative copy in memory and rewrites the file wholesale on save(), so a
+        file-level prune would be silently undone by the next periodic save.
+        """
+        cutoff = float(cutoff_epoch or 0.0)
+        removed: Dict[str, int] = {}
+        if cutoff <= 0:
+            return removed
+        with self._lock:
+            for instrument, values in self.memory.items():
+                if not isinstance(values, dict):
+                    continue
+                stamps = values.get("timestamps")
+                if not isinstance(stamps, list) or not stamps:
+                    continue
+                cut = 0
+                for cut, ts in enumerate(stamps):
+                    try:
+                        if float(ts) >= cutoff:
+                            break
+                    except (TypeError, ValueError):
+                        break
+                else:
+                    cut = len(stamps)
+                if cut <= 0:
+                    continue
+                for key, series in values.items():
+                    # Only slice lists that are actually aligned with timestamps; a
+                    # ragged one would shear its rows against the wrong points.
+                    if isinstance(series, list) and len(series) == len(stamps):
+                        values[key] = series[cut:]
+                removed[instrument] = cut
+            if removed:
+                logger.info(
+                    "Pruned intelligence memory: "
+                    + ", ".join(f"{k} -{v}" for k, v in sorted(removed.items()))
+                )
+        if removed:
+            self.save()
+        return removed
+
     def get_history(self, instrument: str) -> Dict[str, List[Any]]:
         """Get the full recorded history for an instrument"""
         with self._lock:

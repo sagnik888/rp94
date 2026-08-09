@@ -499,7 +499,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.system_power = "ON"
         
         from data.data_manager import DataManager
-        self.data_manager = DataManager(self.data)
+        self.data_manager = DataManager(self.data, intel_memory=self.intel_memory)
         
         self.is_calculating = False
         self.is_warmup = False
