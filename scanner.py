@@ -6848,6 +6848,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tf = str(timeframe or "5min").lower()
         key = self._timeframe_intel_key(instrument, tf)
         now = float(at if at is not None else time.time())
+        # Stamp the bundle with its own capture time. _intel_age_seconds otherwise has
+        # nothing embedded to read and falls through to _last_intel_fetch[instrument] --
+        # the BARE key, which is only written for 5min (or a legacy mirror). A 15min
+        # trade's staleness guard was therefore measuring how recently the 5MIN bundle
+        # refreshed, so a frozen 15min bundle never aged past the 90s bound and could
+        # fire OI_PCR_REVERSAL on evidence captured much earlier.
+        #
+        # Stamping beats swapping in the timeframe-qualified key: when 15min history is
+        # not ready the reader legitimately RETURNS the 5min bundle, and this ages
+        # whichever bundle was actually handed back. Assigned, not setdefault, so it
+        # stays exactly in step with _intel_cache_time[key] on every re-cache.
+        intel_result["as_of"] = now
         self._intel_cache[key] = intel_result
         if not hasattr(self, "_intel_cache_time"):
             self._intel_cache_time = {}
@@ -25916,7 +25928,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
                 # Update price and stop in memory so UI shows it, but do NOT close it!
                 if trade.inst_type == "OPT":
-                    pass
+                    # `new_stop` is SPOT space; trade.current_stop is PREMIUM space (it is
+                    # compared against trade.current_price just above). Assigning new_stop
+                    # here would store ~24,800 in a field tested against a ~150 premium, so
+                    # `150 <= 24800` would fire a spurious TRAILING_STOP alert on every
+                    # option, every tick. The old `pass` avoided that but froze the stop at
+                    # whatever it held when the mode flipped, so a runner gave back its
+                    # whole gain with the dashboard still showing the entry stop.
+                    #
+                    # Convert, then ratchet one way only. A bought option is always long
+                    # premium, so the stop may only rise -- and spot_to_prem divides through
+                    # entry_spot, which is a field this codebase has already had corrupted,
+                    # so a monotonic guard keeps a bad conversion from LOOSENING a live stop.
+                    try:
+                        prem_stop = float(spot_to_prem(new_stop))
+                    except Exception:
+                        prem_stop = 0.0
+                    if prem_stop > float(trade.current_stop or 0.0):
+                        trade.current_stop = prem_stop
                 else:
                     trade.current_stop = new_stop
                 continue
