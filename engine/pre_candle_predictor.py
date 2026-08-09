@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, Optional
 
 import pandas as pd
 
-from engine.intelligence_score import normalize_intelligence_score
+from engine.intelligence_score import aggregate_intelligence_score, normalize_intelligence_score
 
 
 PULLBACK_NOISE = "PULLBACK_NOISE"
@@ -303,8 +303,8 @@ def build_pre_candle_prediction(
     )
     state_tf = mtf_states.get(tf, {}) or {}
     adx = _safe_float(state_tf.get("adx_value"))
-    intel_score = normalize_intelligence_score(
-        ((intel_result.get("aggregate") or {}).get("score") if isinstance(intel_result, Mapping) else 0.0)
+    intel_score = aggregate_intelligence_score(
+        (intel_result.get("aggregate") or {}) if isinstance(intel_result, Mapping) else None
     )
     order_flow_signal = _signal_direction((intel_result.get("order_flow") or {}).get("signal") if isinstance(intel_result, Mapping) else "")
     pcr_signal = _signal_direction((intel_result.get("pcr") or {}).get("signal") if isinstance(intel_result, Mapping) else "")

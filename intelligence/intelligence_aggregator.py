@@ -591,6 +591,12 @@ class IntelligenceAggregator:
 
         results["aggregate"] = {
             "score": round(final_score, 1),
+            # The SAME conviction on the canonical -1..+1 scale. `score` above is
+            # legacy -100..+100 and rounds to 1dp, so a neutral read publishes as
+            # e.g. 0.9 -- indistinguishable by magnitude from 90% conviction. Readers
+            # that need the number rather than the display string must use this one
+            # (engine.intelligence_score.aggregate_intelligence_score).
+            "score_norm": round(score, 4),
             "signal": final_signal,
             "components_analyzed": components,
             "instrument": instrument,

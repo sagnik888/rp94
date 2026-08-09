@@ -49,7 +49,7 @@ from engine.recalculation_worker import ProcessRecalculationWorker
 from engine.settings_persistence import schedule_settings_save
 from engine.safe_mode import validate_real_mode_readiness
 from engine.pre_candle_predictor import build_pre_candle_prediction
-from engine.intelligence_score import normalize_intelligence_score
+from engine.intelligence_score import aggregate_intelligence_score, normalize_intelligence_score
 from engine.market_regime import is_risky_regime, is_trending_regime, regime_aligns, uses_tight_trailing
 from intelligence.outcome_calibration import OutcomeCalibrationStore
 from intelligence.regime_detector import RegimeDetector
@@ -9540,9 +9540,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.intel_memory.record(name, scan_ts, intel_result)
         if self.scan_count % 300 == 0: self._schedule_intel_memory_save() # Periodically persist
 
-        intel_score = normalize_intelligence_score(
-            intel_result.get("aggregate", {}).get("score", 0)
-        )
+        intel_score = aggregate_intelligence_score(intel_result.get("aggregate", {}))
         regime = intel_result.get("regime", {}).get("regime", "UNKNOWN")
         if self._intel_result_cacheable(intel_result):
             # `at=now` only when this is a FRESH computation. On the cache-hit path
@@ -11846,7 +11844,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ctx = ctx if isinstance(ctx, dict) else self._trade_like_market_intelligence_context(trade_like)
         try:
             aggregate = ctx.get("aggregate", {}) if isinstance(ctx, dict) and isinstance(ctx.get("aggregate"), dict) else {}
-            return normalize_intelligence_score(float(aggregate.get("score", 0.0) or 0.0))
+            return aggregate_intelligence_score(aggregate)
         except Exception:
             return 0.0
 
@@ -17970,9 +17968,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     if isinstance(intel, dict) and isinstance(intel.get("aggregate"), dict)
                     else {}
                 )
-                signed = normalize_intelligence_score(
-                    float(aggregate.get("score", 0.0) or 0.0)
-                )
+                signed = aggregate_intelligence_score(aggregate)
                 aligned = self._view_aligned_intel_score(view, signed)
                 if aligned <= -abs(thr):
                     return "intel_block"
@@ -20273,7 +20269,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         try:
             ctx = self._candidate_market_intelligence_context(candidate)
             aggregate = ctx.get("aggregate", {}) if isinstance(ctx, dict) and isinstance(ctx.get("aggregate"), dict) else {}
-            return normalize_intelligence_score(float(aggregate.get("score", 0.0) or 0.0))
+            return aggregate_intelligence_score(aggregate)
         except Exception:
             return 0.0
 
@@ -20471,7 +20467,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             signed_intel = 0.0
         if abs(signed_intel) < 1e-9:
-            signed_intel = normalize_intelligence_score(float(aggregate.get("score", 0.0) or 0.0))
+            signed_intel = aggregate_intelligence_score(aggregate)
         min_intel = float(getattr(settings, "rare_burst_min_intel_score", 0.70) or 0.70)
         intel_aligns = signed_intel >= min_intel if signal_type == "BUY" else signed_intel <= -min_intel
         if not intel_aligns:
@@ -21781,7 +21777,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 breadth_context=contexts.get("breadth_context"),
             )
             agg = intel_res.get("aggregate", {}) if isinstance(intel_res, dict) else {}
-            intel_score = normalize_intelligence_score(agg.get("score", 0.0))
+            intel_score = aggregate_intelligence_score(agg)
             regime = (intel_res.get("regime", {}) or {}).get("regime", "UNKNOWN")
             result = (intel_score, regime)
             cache[cache_key] = result
