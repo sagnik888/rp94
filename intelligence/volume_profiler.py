@@ -33,6 +33,13 @@ STUB_BAR_FRACTION = 0.05
 # over; a longer run is a dead feed and must be reported as absent, not measured.
 MAX_STUB_WALKBACK = 4
 
+# A time-of-day average below this fraction of a typical bar is not a yardstick — it is a
+# slot with no real trading in it (after the close, a reconnect, a stray out-of-hours
+# tick). Dividing by it manufactured 4x-7x "surges" on a shut market. 0.20 clears the
+# genuinely quiet parts of a live session by a wide margin: the U-shaped intraday profile
+# bottoms out near 0.4x the daily median at midday, twice this floor.
+TIME_OF_DAY_MIN_SUPPORT_FRACTION = 0.20
+
 
 def volume_window_is_homogeneous(frame) -> bool:
     """False when the window mixes volume UNITS, so no ratio across it is meaningful.
@@ -298,6 +305,33 @@ class VolumeProfiler:
                     same_slot_nonzero = same_slot_volume[same_slot_volume > 0]
                     tod_source = same_slot_nonzero if len(same_slot_nonzero) >= 2 else same_slot_volume
                     tod_avg = float(tod_source.tail(10).mean())
+                    # A time-of-day slot is only a yardstick if it has real support.
+                    # `len(same_slot) >= 2` and `tod_avg > 0` never asked how much
+                    # activity that slot normally carries, so an OFF-SESSION slot — bars
+                    # the builder creates after the close, on a reconnect, or from a stray
+                    # out-of-hours tick — collapsed the denominator to a couple of ticks
+                    # while the current bar held tens. Live symptom: 4x-7x on the intel
+                    # panel with the market shut, and is_surge TRUE with it, which is what
+                    # volume_spike_entry / one_way_cascade / quality_hybrid_thrust read.
+                    #
+                    # active_mask cannot be reused here: it is a same-DATE filter, not a
+                    # market-hours one. Instead require the slot's average to be a
+                    # believable fraction of a typical bar for the day being measured. A
+                    # genuine in-session slot sits near that median and stays confident;
+                    # a dead slot cannot mint a surge out of its own emptiness.
+                    typical_bar = 0.0
+                    try:
+                        stats_nonzero = volume_for_stats[volume_for_stats > 0]
+                        if len(stats_nonzero) >= 5:
+                            typical_bar = float(stats_nonzero.median())
+                    except Exception:
+                        typical_bar = 0.0
+                    if (
+                        typical_bar > 0
+                        and tod_avg > 0
+                        and tod_avg < TIME_OF_DAY_MIN_SUPPORT_FRACTION * typical_bar
+                    ):
+                        tod_avg = 0.0  # unsupported slot -> fall back to ROLLING_AVG
                     if tod_avg > 0:
                         relative_volume_ratio = measured_vol / tod_avg
                         volume_confidence = 65 if is_proxy else 75
