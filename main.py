@@ -141,9 +141,19 @@ def start_angelone_log_cleaner():
                             logger.info(f"Triggering automated Expiry-Based DB Pruning for {current_month_str}...")
                             try:
                                 db = DatabaseManager()
-                                db.cleanup_old_records(days=31)
-                                with open(cleanup_marker, "w") as f:
-                                    f.write(current_month_str)
+                                # Gate the marker on the prune actually succeeding.
+                                # cleanup_old_records swallows its own exceptions, so
+                                # writing the marker on a normal return marked the month
+                                # "done" after a VACUUM that failed on a locked database,
+                                # and every remaining hourly tick that month then skipped.
+                                if db.cleanup_old_records(days=31):
+                                    with open(cleanup_marker, "w") as f:
+                                        f.write(current_month_str)
+                                else:
+                                    logger.warning(
+                                        "Monthly DB prune did not complete; leaving the "
+                                        "marker unset so the next hourly tick retries."
+                                    )
                             except Exception as db_err:
                                 logger.error(f"Failed DB Pruning: {db_err}")
 

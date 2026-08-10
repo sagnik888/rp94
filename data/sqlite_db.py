@@ -4,7 +4,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from loguru import logger
 import pytz
@@ -124,29 +124,42 @@ class DatabaseManager:
         # Explicit calls remain executable so the cleanup contract can be tested
         # safely against an isolated/in-memory database.
         retention_days = max(1, int(days))
-        cutoff_modifier = f"-{retention_days} days"
+        # SQLite's date('now')/datetime('now') are UTC, but every row in these tables is
+        # written on IST wall-clock, so the cutoff sat 5h30m behind the data: a "30 day"
+        # retention was really 30 days and 5.5 hours. The skew was strictly conservative
+        # — it over-retained and could never delete early — so this is the window meaning
+        # what it says, not a data-loss fix. Computed in Python and bound as a literal
+        # rather than stacking SQLite modifiers, which is easier to read and to test.
+        cutoff_dt = datetime.now(IST) - timedelta(days=retention_days)
+        cutoff_date = cutoff_dt.strftime("%Y-%m-%d")
+        cutoff_ts = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
         with self.write_lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute(
-                    "DELETE FROM session_signals WHERE date < date('now', ?)",
-                    (cutoff_modifier,),
+                    "DELETE FROM session_signals WHERE date < ?",
+                    (cutoff_date,),
                 )
                 cursor.execute(
-                    "DELETE FROM signal_decisions WHERE date < date('now', ?)",
-                    (cutoff_modifier,),
+                    "DELETE FROM signal_decisions WHERE date < ?",
+                    (cutoff_date,),
                 )
                 cursor.execute(
                     "DELETE FROM trades "
-                    "WHERE COALESCE(exit_timestamp, exit_time) < datetime('now', ?) "
+                    "WHERE COALESCE(exit_timestamp, exit_time) < ? "
                     "AND status = 'CLOSED'",
-                    (cutoff_modifier,),
+                    (cutoff_ts,),
                 )
                 self.conn.commit()
                 cursor.execute("VACUUM")
                 logger.info("Database cleanup completed and vacuumed.")
+                return True
             except Exception as e:
                 logger.error(f"Error during DB cleanup: {e}")
+                # Reported, not raised — but the caller needs to know, because the
+                # monthly prune in main.py writes its "already done this month" marker
+                # on the strength of this returning normally.
+                return False
                 
     def _create_tables(self):
         with self.write_lock:
