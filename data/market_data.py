@@ -1390,7 +1390,21 @@ class MarketDataProvider:
 
         def on_connect(ws, response):
             self._kite_ws_connected = True
-            self._last_kite_ws_tick = time.time()
+            # Deliberately does NOT stamp _last_kite_ws_tick. Connecting is not a tick.
+            # That field is the only input to kite_stream_stalled (market_source_health.py),
+            # so stamping it here meant a socket reconnecting faster than the 45s freshness
+            # bound while delivering NOTHING read as a healthy feed: broker_degraded,
+            # all_brokers_unavailable, the "Kite feed silent" critical and the Yahoo arm
+            # all stayed quiet on a dead stream.
+            #
+            # Not zeroed either, which is the tempting mirror of the Fyers on_open at ~744.
+            # Fyers pairs its 0.0 with _fyers_ws_connected_since and a stall predicate that
+            # measures the no-tick case from connect time; build_source_health has no such
+            # pairing — when kite_age is None it falls back to provider UPTIME, which
+            # mid-session is hours, so zeroing would report a stalled feed on every healthy
+            # reconnect. Leaving the last real tick alone makes every case fall out right:
+            # never ticked -> still 0.0 -> uptime branch keeps the cold-start grace; ticked
+            # before -> the age keeps growing until a real tick lands.
             logger.info("🔌 Kite WebSocket Connected")
             tokens = sorted({int(t) for t in self._active_kite_tokens if str(t).isdigit()})
             if tokens:
