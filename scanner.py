@@ -12284,6 +12284,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return signal in bearish
         return False
 
+    @staticmethod
+    def _clear_loss_threat_confirmation(trade_like) -> None:
+        """Drop the LOSS_THREAT confirmation latch.
+
+        Called on EVERY path that stops short of an exit, so a confirmation can never be
+        assembled out of observations taken minutes apart under different conditions. A
+        latch that survives its own preconditions is worse than none: it would let a
+        stale first sighting complete against an unrelated second one.
+        """
+        try:
+            setattr(trade_like, "_loss_threat_confirmation", None)
+        except Exception:
+            pass
+
     def _round_trip_cost_rs(self, trade_like, inst_type: str = "") -> float:
         """What it costs to open and close this position, in rupees.
 
@@ -12409,12 +12423,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         loss_mode = current_pnl <= 0.0
         if not loss_mode:
+            # Back above water: any half-built loss confirmation is void.
+            self._clear_loss_threat_confirmation(trade_like)
             if peak < min_peak:
                 return False, "", f"peak Rs.{peak:.0f} below near-peak arm Rs.{min_peak:.0f}"
             if retention < min_retention:
                 return False, "", f"retention {retention:.0%} below near-peak threshold {min_retention:.0%}"
         else:
             if not self._setting_enabled(getattr(settings, "peak_threat_exit_loss_enabled", True), True):
+                self._clear_loss_threat_confirmation(trade_like)
                 return False, "", "loss threat exit disabled"
             # A position is negative from its first tick, because the entry pays the ask
             # and the mark is the LTP/bid. Cutting there costs a full round trip to avoid
@@ -12426,6 +12443,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             cost_floor = round_trip * cost_multiple
             if cost_floor > 0 and abs(current_pnl) < cost_floor:
+                self._clear_loss_threat_confirmation(trade_like)
                 return False, "", (
                     f"loss Rs.{abs(current_pnl):.0f} is under the Rs.{cost_floor:.0f} "
                     "round-trip cost; exiting here cannot beat the spread"
@@ -12435,6 +12453,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if min_hold > 0:
                 held = self._trade_like_age_seconds(trade_like, latest_time)
                 if held is not None and held < min_hold:
+                    self._clear_loss_threat_confirmation(trade_like)
                     return False, "", (
                         f"held {held:.0f}s, under the {min_hold:.0f}s minimum before a "
                         "loss-threat exit may fire"
@@ -12444,11 +12463,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 float(getattr(settings, "peak_threat_exit_loss_max_loss_r", 0.35) or 0.35),
             )
             if risk > 0 and abs(current_pnl) > risk * max_loss_r:
+                self._clear_loss_threat_confirmation(trade_like)
                 return False, "", f"loss Rs.{current_pnl:.0f} beyond peak-threat loss cap {max_loss_r:.2f}R"
 
         score = 0
         reasons: List[str] = []
         severe = False
+        # WHICH kinds of evidence spoke, not just how much they scored. Ported from the
+        # restore_point_51 build, whose loss arm required at least two distinct domains
+        # with `price` among them before it would cut. Without it, five soft intel votes
+        # look identical to a real price break — which is how 2026-08-10 produced nine
+        # exits with no price evidence in them at all.
+        evidence_domains: set = set()
 
         context_price = float(current_price or 0.0)
         try:
@@ -12475,6 +12501,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 reasons.append("1min emergency")
             if not price_ctx.get("trend_supportive"):
                 score += 2
+                evidence_domains.add("price")
                 reasons.append(f"trend support lost ({price_ctx.get('reason')})")
             elif int(price_ctx.get("trend_votes", 0) or 0) <= 1:
                 score += 1
@@ -12488,6 +12515,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             live_ctx = {}
         if live_ctx.get("adverse"):
             score += 2
+            evidence_domains.add("live_market")
             reasons.append(
                 f"live context adverse regime={live_ctx.get('live_regime')} "
                 f"peers {live_ctx.get('cross_opp')}/{live_ctx.get('cross_peers')}"
@@ -12511,9 +12539,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         if aligned_intel <= -adverse_intel:
             score += 2
+            evidence_domains.add("fresh_intel")
             reasons.append(f"adverse intel {aligned_intel:.2f}")
         elif aligned_intel <= -0.15:
             score += 1
+            evidence_domains.add("fresh_intel")
             reasons.append(f"soft adverse intel {aligned_intel:.2f}")
 
         for label, payload, points in (
@@ -12528,6 +12558,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 continue
             if self._intel_signal_opposes_view(signal, view):
                 score += points
+                evidence_domains.add("fresh_intel")
                 reasons.append(f"{label} {signal} opposes {view}")
             elif self._intel_signal_aligns_view(signal, view):
                 reasons.append(f"{label} {signal} supports")
@@ -12587,6 +12618,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         reversal_prob = float(vector.get("reversal_prob", 0.0) or 0.0)
         if adverse_prob >= 0.55 or reversal_prob >= 0.65:
             score += 2
+            evidence_domains.add("regime")
             reasons.append(f"regime vector adverse {adverse_prob:.2f}/reversal {reversal_prob:.2f}")
 
         verdict = str(getattr(trade_like, "price_action_verdict", "") or "").upper()
@@ -12615,12 +12647,77 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         if loss_mode:
             min_score = max(1, int(getattr(settings, "peak_threat_exit_loss_min_score", 6) or 6))
-            if score >= min_score:
-                return True, "LOSS_THREAT_EXIT", (
-                    f"adverse threat score {score}>={min_score}; current Rs.{current_pnl:.0f}; "
-                    + "; ".join(dict.fromkeys(reasons))
+            # ── domain breadth, with price mandatory ──────────────────────────
+            # A score alone cannot distinguish "the tape broke" from "five soft intel
+            # votes agree it might". Cutting a live position is a price decision, so
+            # price evidence is required and at least one other domain must corroborate.
+            min_domains = max(
+                1, int(getattr(settings, "peak_threat_exit_loss_min_domains", 2) or 2)
+            )
+            domains_ready = "price" in evidence_domains and len(evidence_domains) >= min_domains
+            if score < min_score or not domains_ready:
+                self._clear_loss_threat_confirmation(trade_like)
+                return False, "", (
+                    f"loss threat score {score}/{min_score}, domains "
+                    f"{len(evidence_domains)}/{min_domains}"
+                    + ("" if "price" in evidence_domains else " (no price evidence)")
+                    + "; " + "; ".join(dict.fromkeys(reasons))
                 )
-            return False, "", f"loss threat score {score}<{min_score}; " + "; ".join(dict.fromkeys(reasons))
+
+            # ── the same evidence, twice, on a clock that actually moved ──────
+            # Scanner cycles can run several times against one market timestamp, so
+            # counting calls would manufacture persistence. The observation clock must
+            # advance, and the SIGNATURE (which domains spoke) must match — a different
+            # mix of evidence restarts the count rather than completing it.
+            try:
+                latest_aware = (
+                    latest_time
+                    if getattr(latest_time, "tzinfo", None) is not None
+                    else IST.localize(latest_time)
+                )
+                observation_ts = float(latest_aware.timestamp())
+            except Exception:
+                self._clear_loss_threat_confirmation(trade_like)
+                return False, "", "loss threat awaiting a valid confirmation clock"
+
+            confirm_seconds = max(
+                0.0,
+                float(getattr(settings, "peak_threat_exit_loss_confirm_seconds", 3.0) or 0.0),
+            )
+            signature = tuple(sorted(evidence_domains))
+            confirmation = getattr(trade_like, "_loss_threat_confirmation", None)
+            if (
+                not isinstance(confirmation, dict)
+                or tuple(confirmation.get("signature", ())) != signature
+            ):
+                setattr(
+                    trade_like,
+                    "_loss_threat_confirmation",
+                    {"signature": signature, "first_at": observation_ts, "last_at": observation_ts},
+                )
+                if confirm_seconds > 0:
+                    return False, "", (
+                        f"loss threat confirmation 1/2; score {score}; domains "
+                        f"{','.join(signature)}; adverse Rs.{abs(current_pnl):.0f}"
+                    )
+            else:
+                first_at = float(confirmation.get("first_at", observation_ts) or observation_ts)
+                last_at = float(confirmation.get("last_at", first_at) or first_at)
+                if confirm_seconds > 0 and (
+                    observation_ts <= last_at or observation_ts - first_at < confirm_seconds
+                ):
+                    confirmation["last_at"] = max(last_at, observation_ts)
+                    return False, "", (
+                        f"loss threat confirming {max(0.0, observation_ts - first_at):.1f}s/"
+                        f"{confirm_seconds:.1f}s; score {score}; domains {','.join(signature)}"
+                    )
+
+            self._clear_loss_threat_confirmation(trade_like)
+            return True, "LOSS_THREAT_EXIT", (
+                f"confirmed threat score {score}>={min_score}; domains "
+                f"{','.join(signature)}; adverse Rs.{abs(current_pnl):.0f}; "
+                + "; ".join(dict.fromkeys(reasons))
+            )
 
         base_score = max(1, int(getattr(settings, "peak_threat_exit_min_score", 5) or 5))
         severe_score = max(1, int(getattr(settings, "peak_threat_exit_severe_score", 4) or 4))

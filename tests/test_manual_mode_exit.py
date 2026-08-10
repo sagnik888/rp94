@@ -2238,22 +2238,34 @@ def test_loss_threat_exit_cuts_small_loser_on_strong_adverse_evidence():
         },
     )
 
-    should_exit, reason, ctx = scanner._peak_threat_exit_decision(
-        trade,
-        current_price=700.05,
-        current_pnl_rs=-210.0,
-        peak_pnl=300.0,
-        initial_risk_rs=848.4,
-        latest_time=datetime(2026, 7, 8, 12, 14),
-        regime="RANGING",
-        inst_type="OPT",
-        option_type="PE",
-        direction="SHORT",
-    )
+    def _look(at):
+        return scanner._peak_threat_exit_decision(
+            trade,
+            current_price=700.05,
+            current_pnl_rs=-210.0,
+            peak_pnl=300.0,
+            initial_risk_rs=848.4,
+            latest_time=at,
+            regime="RANGING",
+            inst_type="OPT",
+            option_type="PE",
+            direction="SHORT",
+        )
+
+    # CHANGED 2026-08-10: the loss arm now requires the same evidence twice, at least
+    # peak_threat_exit_loss_confirm_seconds apart on the MARKET clock, with price among
+    # the domains. This trade has price (fast reversal, 0/3 trend votes), live_market and
+    # fresh_intel, so it still cuts — it just has to be seen holding.
+    first_exit, _first_reason, first_ctx = _look(datetime(2026, 7, 8, 12, 14))
+    assert first_exit is False
+    assert "confirmation 1/2" in first_ctx
+
+    should_exit, reason, ctx = _look(datetime(2026, 7, 8, 12, 14, 4))
 
     assert should_exit is True
     assert reason == "LOSS_THREAT_EXIT"
-    assert "current Rs.-210" in ctx
+    assert "adverse Rs.210" in ctx
+    assert "price" in ctx
 
 
 def test_eod_loss_minimize_exits_near_breakeven_loser():

@@ -55,7 +55,7 @@ TODAY = [
 ]
 
 
-def _scanner(neutral_tape=True, trend_votes=0):
+def _scanner(neutral_tape=True, trend_votes=0, live_adverse=False):
     s = Scanner.__new__(Scanner)
     s._setting_enabled = lambda v, d=True: bool(v) if v is not None else d
     s._trade_direction_view = lambda t, **k: "LONG"
@@ -75,6 +75,9 @@ def _scanner(neutral_tape=True, trend_votes=0):
     s._view_aligned_intel_score = lambda v, x: x
     s._intel_signal_opposes_view = lambda g, v: not neutral_tape
     s._intel_signal_aligns_view = lambda g, v: False
+    s._live_direction_context = lambda *a, **k: {
+        "adverse": live_adverse, "supportive": False, "live_regime": "X",
+        "cross_opp": 2, "cross_peers": 3}
     return s
 
 
@@ -124,6 +127,18 @@ def _charged(trade) -> float:
     return float(estimate_trade_charges(
         trade.entry_price, trade.entry_price, qty, "OPT", get_settings(),
         instrument=trade.instrument))
+
+
+def _confirmed(s, trade, pnl, held, gap=5):
+    """Run the decision to a VERDICT.
+
+    The loss arm now needs the same evidence signature twice, at least
+    peak_threat_exit_loss_confirm_seconds apart on the market clock. A single call can
+    only ever answer "confirmation 1/2", so a test that calls once and asserts False
+    proves nothing about the guard.
+    """
+    _decide(s, trade, pnl, held)
+    return _decide(s, trade, pnl, held + gap)
 
 
 def _decide(s, trade, pnl, held):
@@ -207,7 +222,7 @@ def test_a_loss_beyond_the_real_cost_still_exits_on_adverse_evidence():
     s = _scanner(neutral_tape=False)
     midcap = _trade("MIDCPNIFTY", 174.50, 120)
     floor = Scanner._round_trip_cost_rs(s, midcap, inst_type="OPT")
-    ok, _r, _c = _decide(s, midcap, -(floor * 1.3), 500)
+    ok, _r, _c = _confirmed(s, midcap, -(floor * 1.3), 500)
     assert ok is True, "the floor must bound the guard, not disable it"
 
 
@@ -235,15 +250,15 @@ def test_the_floor_scales_with_position_size():
 
 def test_a_blank_tape_no_longer_reaches_the_threshold():
     """It scored exactly 6 of 6 before; four of those points were 'do not know'."""
-    ok, _r, ctx = _decide(_scanner(), _trade(), -180.0, 600)
+    ok, _r, ctx = _confirmed(_scanner(), _trade(), -180.0, 600)
     assert ok is False
-    assert "score 4<6" in ctx or "score 5<6" in ctx, ctx
+    assert "score 4/6" in ctx or "score 5/6" in ctx, ctx
 
 
 def test_a_genuinely_adverse_tape_still_exits():
     """The guard must keep working on real evidence."""
     s = _scanner(neutral_tape=False)
-    ok, reason, ctx = _decide(s, _trade(), -180.0, 600)
+    ok, reason, ctx = _confirmed(s, _trade(), -180.0, 600)
     assert ok is True, ctx
     assert reason == "LOSS_THREAT_EXIT"
 
@@ -258,7 +273,7 @@ def test_no_exit_inside_the_minimum_hold(held):
 
 
 def test_past_the_minimum_hold_the_guard_is_live_again():
-    ok, _r, _c = _decide(_scanner(neutral_tape=False), _trade(), -180.0, 61)
+    ok, _r, _c = _confirmed(_scanner(neutral_tape=False), _trade(), -180.0, 61)
     assert ok is True
 
 
@@ -267,7 +282,7 @@ def test_an_unknowable_age_does_not_block_the_guard():
     disarm the exit for any row without an entry stamp."""
     t = _trade()
     del t.entry_time
-    ok, _r, _c = _decide(_scanner(neutral_tape=False), t, -180.0, 600)
+    ok, _r, _c = _confirmed(_scanner(neutral_tape=False), t, -180.0, 600)
     assert ok is True
 
 

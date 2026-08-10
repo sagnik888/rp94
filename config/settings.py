@@ -832,6 +832,14 @@ class Settings(BaseSettings):
     # evidence against the trade, the same defect pattern as the repaint and
     # single-pillar-conviction bugs. Off means only genuinely opposing reads score.
     peak_threat_exit_neutral_counts: bool = False
+    # Ported from restore_point_51, whose loss arm required BOTH of these before cutting.
+    # min_domains: how many distinct evidence kinds must speak (price is mandatory on top
+    # of this) — a score alone cannot tell "the tape broke" from "soft intel agrees".
+    # confirm_seconds: the same domain signature must be seen twice, that far apart on the
+    # MARKET clock. Scanner cycles repeat against one timestamp, so counting calls would
+    # manufacture persistence; the clock must actually advance.
+    peak_threat_exit_loss_min_domains: int = 2
+    peak_threat_exit_loss_confirm_seconds: float = 3.0
     # A same-index loss run used to be measured on the GLOBAL exit tape, so any other
     # index's completed trade cleared it. With four books interleaving, the
     # max_consecutive_losses halt became unreachable: on 2026-08-10 NIFTY lost four
