@@ -459,6 +459,13 @@ class Settings(BaseSettings):
     ut_timeframe_entry_policy: Literal["PRIMARY_15", "INCLUDE_5MIN"] = "INCLUDE_5MIN"
     ut_5min_option_min_confidence: float = 0.60
     ut_5min_loss_cooldown_minutes: int = 45
+    # Enforces the line above. Until 2026-08-10 that value was read by nothing but two
+    # broadcast payloads: the real post-loss block was the flat (and regime-scoped)
+    # index_cooldown_minutes, so a configured 45 meant an actual 3. Ships False so
+    # turning the gate on is an explicit decision — at four indices and a ~360-minute
+    # entry window a 45-minute per-index lockout caps each index near 8 entries, which
+    # is a material change to how much the system trades.
+    ut_5min_loss_cooldown_enabled: bool = False
     live_b_grade_min_confidence: float = 0.50  # Top-of-band floor for dedicated B-grade entries (trending + 15m align + ADX>=25)
 
     # ─── Confidence calibration (de-saturation) ──────────────

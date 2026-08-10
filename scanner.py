@@ -714,7 +714,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         what "3 consecutive NIFTY losses" means to an operator watching one chart. Set
         consecutive_loss_streak_per_index=False to restore the global-tape behaviour.
         """
-        instrument = str(instrument or "").split()[0].upper()
+        # split() on an empty string yields [], so [0] raised IndexError and the guard
+        # below was unreachable — on the exit-recording path, where a blank instrument
+        # would have thrown instead of being ignored.
+        parts = str(instrument or "").split()
+        instrument = parts[0].upper() if parts else ""
         if not instrument:
             return 0
         streaks = getattr(self, "_losses_today", None)
@@ -2183,7 +2187,74 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 remaining = max(0.0, self.index_cooldown_minutes - diff)
                 return False, f"Cooldown active: {remaining:.0f}m remaining ({cooldown_basis})"
 
+        blocked, loss_reason = self._post_loss_cooldown_block(instrument, signal_time)
+        if blocked:
+            return False, loss_reason
+
         return True, ""
+
+    def _post_loss_cooldown_block(self, instrument: str, signal_time) -> Tuple[bool, str]:
+        """Hold an index out for ut_5min_loss_cooldown_minutes after a LOSING exit.
+
+        SHIPS DISABLED (ut_5min_loss_cooldown_enabled defaults False) so behaviour is
+        unchanged until an operator opts in. Until 2026-08-10 the setting was configured
+        at 45 and read by nothing but two broadcast payloads — the real post-loss block
+        was the flat 3-minute index cooldown, which is additionally regime-scoped, so an
+        operator reading the dashboard believed in a protection that did not exist.
+
+        Deliberately NOT bypassed by the stop-out re-entry allowance or the reversion
+        window: those exist to re-enter a trend that stopped out early, which is the
+        precise behaviour a post-loss cooldown is meant to interrupt. It stacks on top of
+        the flat cooldown rather than replacing it.
+
+        "Most recent outcome on this index was a loss" is read off the per-index streak,
+        which resets to 0 on any non-loss, so no new state is needed: a non-zero streak
+        means _last_exit_time for that index IS the losing exit.
+        """
+        # split() on an empty string yields [], so [0] would raise rather than fall
+        # through to the guard below.
+        parts = str(instrument or "").split()
+        instrument = parts[0].upper() if parts else ""
+        if not instrument:
+            return False, ""
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "ut_5min_loss_cooldown_enabled", False), False
+        ):
+            return False, ""
+        try:
+            minutes = float(getattr(settings, "ut_5min_loss_cooldown_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            return False, ""
+        if minutes <= 0:
+            return False, ""
+        streak = int((getattr(self, "_losses_today", None) or {}).get(instrument, 0) or 0)
+        if streak < 1:
+            return False, ""
+        last_exit = (getattr(self, "_last_exit_time", None) or {}).get(instrument)
+        if not last_exit:
+            return False, ""
+        clock = (
+            signal_time
+            if str(getattr(self, "mode", "") or "").upper() == "HISTORICAL"
+            else datetime.now(IST).replace(tzinfo=None)
+        )
+        if clock is None:
+            return False, ""
+        if getattr(clock, "tzinfo", None) is not None:
+            clock = clock.astimezone(IST).replace(tzinfo=None)
+        last_naive = (
+            last_exit.astimezone(IST).replace(tzinfo=None)
+            if getattr(last_exit, "tzinfo", None) is not None
+            else last_exit.replace(tzinfo=None)
+        )
+        diff = max(0.0, (clock - last_naive).total_seconds() / 60.0)
+        if diff >= minutes:
+            return False, ""
+        return True, (
+            f"Post-loss cooldown: {max(0.0, minutes - diff):.0f}m remaining "
+            f"after {streak} loss(es) on {instrument}"
+        )
 
     def get_broadcast_config(self):
         """Standardized config payload for UI broadcasting"""
