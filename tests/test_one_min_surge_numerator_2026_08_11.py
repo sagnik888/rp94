@@ -88,10 +88,14 @@ def test_the_basis_is_reported_so_a_gate_can_tell_them_apart():
 
 # ── the tick fallback: built, and off ────────────────────────────────────────
 
-def test_the_tick_proxy_is_disabled_by_default(_pinned):
-    assert bool(getattr(_pinned, "surge_tick_proxy_enabled", False)) is False
+def test_the_tick_proxy_is_now_calibrated_and_on(_pinned):
+    """Superseded within the same night. This shipped OFF while its threshold was
+    uncalibrated; the follow-up cut a basis-independent floor from the real candles
+    (percentile rank, matched to the traded 2.2x strictness) and switched it on.
+    See test_surge_is_basis_independent_2026_08_11.py."""
+    assert bool(getattr(_pinned, "surge_tick_proxy_enabled", False)) is True
     m = _metrics(_frame(last_volume=0.0, ticks=100, last_ticks=400))
-    assert m is None, "the uncalibrated tick proxy fired while shipped off"
+    assert m is not None and m["volume_basis"] == "TICK_ACTIVITY"
 
 
 def test_the_tick_proxy_measures_participation_when_enabled(_pinned):

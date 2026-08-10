@@ -1439,7 +1439,11 @@ class Settings(BaseSettings):
     # measure available. Ships OFF until a session of real tick data exists to cut the
     # threshold against; tick counts are far less dispersed than traded quantity, so the
     # traded floor cannot simply be reused on them.
-    surge_tick_proxy_enabled: bool = False
+    surge_tick_proxy_enabled: bool = True
+    # Calibrated on the real 1min candles, not guessed: ratio>=2.2 admits 4.73% of
+    # measurable traded-volume bars and rank>=97 admits 4.98% — matched strictness in a
+    # form that survives the change of measurement basis.
+    surge_tick_percentile_floor: float = 97.0
     volume_spike_entry_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_adx_threshold: float = 25.0

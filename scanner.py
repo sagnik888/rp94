@@ -10515,8 +10515,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # cannot see this: it only protects the delta INSIDE one bar.
                 return None
             prior_vol = Scanner._surge_prior_mean(prior)
-            if prior_vol is None:
-                return None
             # The NUMERATOR was never guarded. _surge_prior_mean fixed the denominator
             # (zero bars were dragging it down and FABRICATING 4x/10x surges), but the
             # signal bar's own volume is read raw — and on a cash index the live right
@@ -10532,7 +10530,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # this codebase's cardinal error. Unmeasurable must read as unmeasurable.
             measured_vol = float(last.get("volume", 0.0) or 0.0)
             volume_basis = "TRADED"
-            if measured_vol <= 0.0:
+            # Either side being unmeasurable sends this to the proxy. Checking the
+            # denominator first and returning early would have killed the fallback in
+            # exactly the case it exists for: on a cash index the WHOLE window can be
+            # volume-less, so _surge_prior_mean answers None and the tick path would
+            # never be reached.
+            if measured_vol <= 0.0 or prior_vol is None:
                 # Tick activity is the only participation measure a cash index publishes
                 # in real time (CandleBuilder maintains tick_count per bar). Used for
                 # BOTH sides of the ratio so it stays like-for-like, and tagged so the
@@ -10551,9 +10554,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 proxy = Scanner._surge_tick_ratio(recent)
                 if proxy is None:
                     return None
-                volume_ratio, volume_basis = proxy, "TICK_ACTIVITY"
+                volume_ratio, surge_pct = proxy
+                volume_basis = "TICK_ACTIVITY"
             else:
                 volume_ratio = measured_vol / prior_vol
+                surge_pct = Scanner._surge_percentile(
+                    pd.to_numeric(prior["volume"], errors="coerce").fillna(0.0),
+                    measured_vol,
+                )
             tr = (prior["high"] - prior["low"]).abs()
             atr = float(tr.tail(14).mean()) if len(tr) else 0.0
             range_atr_ratio = (rng / atr) if atr > 0 else 0.0
@@ -10566,6 +10574,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "range_atr_ratio": range_atr_ratio,
                 "close_location": close_location,
                 "volume_basis": volume_basis,
+                "surge_percentile": float(surge_pct) if surge_pct is not None else -1.0,
             }
         except Exception as exc:
             logger.debug(f"Candle thrust metrics failed for {instrument} {timeframe}: {exc}")
@@ -10573,12 +10582,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     @staticmethod
     def _surge_tick_ratio(recent):
-        """Participation surge from tick_count when traded volume is unmeasurable.
+        """(ratio, percentile) of the signal bar's tick activity within its window.
 
-        Same shape as _surge_prior_mean — zero bars are EXCLUDED from the mean rather
-        than averaged in, and at least 5 measured bars are required, so a thin window
-        reads as unmeasurable instead of as a breakout. Returns None when tick activity
-        cannot be measured either, which keeps "no data" distinct from "no surge".
+        Same shape as _surge_prior_mean — zero bars are EXCLUDED rather than averaged
+        in, and at least 5 measured bars are required, so a thin window reads as
+        unmeasurable instead of as a breakout. Returns None when tick activity cannot be
+        measured either, keeping "no data" distinct from "no surge".
+
+        The PERCENTILE is what the gate judges, not the ratio. A fixed ratio floor is
+        basis-dependent: traded volume is heavily tailed (a z-score of 5 still admits
+        4.7% of 1min bars) while tick counts are near-Poisson, so reusing the 2.2x
+        traded floor on ticks would admit almost nothing and leave 1min as dead as it
+        was. Percentile rank is uniform for any continuous distribution, so the SAME
+        threshold means the same thing on either measurement — "among the busiest N% of
+        recent minutes for this instrument, right now".
+
+        Calibrated on the real 1min candles: ratio>=2.2 admits 4.73% of measurable
+        traded-volume bars, and rank>=97 admits 4.98% — the same strictness, expressed
+        in a form that survives the change of basis.
         """
         try:
             import pandas as _pd
@@ -10596,7 +10617,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             mean = float(measured.mean())
             if mean <= 0:
                 return None
-            return last_ticks / mean
+            pct = 100.0 * float((measured < last_ticks).mean())
+            return last_ticks / mean, pct
+        except Exception:
+            return None
+
+    @staticmethod
+    def _surge_percentile(prior_series, last_value):
+        """Where the signal bar sits within its own measured window, 0-100."""
+        try:
+            measured = prior_series[prior_series > 0]
+            if len(measured) < 5 or float(last_value) <= 0:
+                return None
+            return 100.0 * float((measured < float(last_value)).mean())
         except Exception:
             return None
 
@@ -11791,6 +11824,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 signal_type=str(signal_type or ""),
                 depth_usable=depth_usable,
                 ofr=ofr,
+                volume_basis=str(metrics.get("volume_basis", "TRADED")),
+                surge_percentile=float(metrics.get("surge_percentile", -1.0)),
             )
             if not confirmed:
                 return None

@@ -514,6 +514,8 @@ def volume_spike_entry_confirmed(
     signal_type: str = "",
     depth_usable: bool = False,
     ofr: float = 0.0,
+    volume_basis: str = "TRADED",
+    surge_percentile: float = -1.0,
 ) -> bool:
     """Confirm a fast 1min/5min directional volume-spike entry.
 
@@ -566,9 +568,26 @@ def volume_spike_entry_confirmed(
             settings=settings,
         ):
             return False
+    # The surge test is basis-aware. A fixed ratio floor only means what it was cut for:
+    # traded volume is heavily tailed (a z-score of 5 still admits 4.7% of 1min bars)
+    # while tick activity is near-Poisson, so applying the 2.2x traded floor to ticks
+    # would admit almost nothing and leave 1min as dead as the zero-numerator bug left
+    # it. Percentile rank is uniform for any continuous distribution, so one threshold
+    # carries the same meaning on either measurement.
+    #
+    # Calibrated on the real 1min candles: ratio>=2.2 admits 4.73% of measurable
+    # traded-volume bars and rank>=97 admits 4.98% — the same strictness, in a form that
+    # survives the change of basis. TRADED readings keep the ratio test untouched, so
+    # 5min and 15min behaviour is unchanged.
+    if str(volume_basis or "TRADED").upper() == "TICK_ACTIVITY":
+        floor_pct = float(
+            getattr(settings, "surge_tick_percentile_floor", 97.0) or 97.0
+        )
+        surge_ok = float(surge_percentile or -1.0) >= floor_pct
+    else:
+        surge_ok = float(volume_ratio or 0.0) >= volume_floor
     return bool(
-        float(volume_ratio or 0.0)
-        >= volume_floor
+        surge_ok
         and float(range_atr_ratio or 0.0)
         >= float(getattr(settings, "volume_spike_entry_min_range_atr_ratio", 1.5) or 1.5)
         and float(close_location or 0.0)
