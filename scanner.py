@@ -913,6 +913,34 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         getattr(self, "_prev_close_cache", {}).clear()
         getattr(self, "_vix_session_open_cache", {}).clear()
         getattr(self, "_breadth_asof_cache", {}).clear()
+        # Regime VOTE memory is session-anchored for exactly the same reason.
+        # RegimeDetector keeps one label per bar and smooths by majority over the last 5,
+        # so a process left running overnight met today's gap-down with four of
+        # yesterday's TRENDING_UP bars still in the window: _smooth_regime returned
+        # TRENDING_UP and _recent_trend_regime agreed (ups=4>=3). For the first ~20
+        # minutes every consumer was wrong at once — regime_aligns admitted BUYs into the
+        # gap, uses_tight_trailing left live SHORTs on the loose trend trail, and
+        # _regime_opposes_direction withheld LIVE_REVERSAL_EXIT.
+        #
+        # The only other reset_history() call is guarded by mode == "HISTORICAL", so
+        # nothing cleared this in REAL. Safe to clear: _smooth_regime returns None on an
+        # empty history and _recent_trend_regime returns None below three entries, so the
+        # detector falls back to today's raw label until it has real votes. Indicator
+        # warm-up is untouched — ADX/ATR still read the multi-day candle frame; only the
+        # vote memory resets.
+        try:
+            regime_reset = getattr(
+                getattr(getattr(self, "intel", None), "regime", None),
+                "reset_history",
+                None,
+            )
+            if callable(regime_reset):
+                regime_reset()
+            getattr(self, "latest_regimes", {}).clear()
+            getattr(self, "_timeframe_regimes", {}).clear()
+        except Exception as exc:
+            # Never let this stop the rollover; broker reconciliation runs below.
+            logger.error(f"Session rollover regime reset failed: {exc}")
         try:
             self.market_info = self.expiry.pre_market_check()
         except Exception as exc:
