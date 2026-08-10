@@ -4210,6 +4210,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def _morning_refresh_is_complete_for_day(self, session_day: str) -> bool:
         return getattr(self, "_morning_refresh_last_date", None) == session_day
 
+    def _live_open_catchup_due(self, session_day: str, now_ist: datetime) -> bool:
+        """True when a capped/incomplete premarket warm still owes one live-open pass.
+
+        Separate from _morning_refresh_is_complete_for_day on purpose: that flag bounds
+        the retry loop and must keep saying "stop retrying", while this answers the
+        different question of whether the day was actually warmed. Latched by
+        _morning_refresh_catchup_done_date so it can only ever answer True once a day.
+        """
+        if getattr(self, "_morning_refresh_catchup_done_date", None) == session_day:
+            return False
+        summary = self._morning_refresh_summary_for_day(session_day)
+        if not summary or summary.get("complete"):
+            return False
+        if not self._setting_enabled(
+            getattr(get_settings(), "morning_refresh_catchup_at_live_open", True), True
+        ):
+            return False
+        try:
+            return now_ist.time() >= self._clock_setting("real_mode_live_start", "09:15:00")
+        except Exception:
+            return False
+
     def _morning_refresh_summary_for_day(self, session_day: str) -> Dict[str, Any]:
         summary = getattr(self, "_morning_refresh_summary", None) or {}
         if str(summary.get("session_day") or "") != str(session_day):
@@ -4422,6 +4444,39 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """
         session_day = now_ist.date().isoformat()
         if self._morning_refresh_is_complete_for_day(session_day):
+            # An "accepted incomplete" day is NOT a warmed day. The attempt cap sets
+            # _morning_refresh_last_date purely to stop blocking scans forever, but
+            # completeness is also what this early return tests, so the 09:15 catch-up
+            # below became unreachable for exactly the days that needed it most:
+            # pre-open the option chains are empty, so with require_all_chains every
+            # attempt between 09:00 and 09:15 fails and burns the budget.
+            #
+            # Handled here rather than by loosening _morning_refresh_is_complete_for_day:
+            # that would let the flow fall through, re-schedule, re-hit the cap and return
+            # True on every scan — holding signal work for the session, which is the
+            # failure the cap was written to prevent. Completeness must keep gating the
+            # retry loop, so this grants exactly ONE pass and re-arms immediately: the
+            # latch is set BEFORE scheduling, so it cannot loop even if the pass fails.
+            if self._live_open_catchup_due(session_day, now_ist):
+                self._morning_refresh_catchup_done_date = session_day
+                attempts = getattr(self, "_morning_refresh_attempts", None)
+                if isinstance(attempts, dict):
+                    attempts[session_day] = 0
+                self.log_event(
+                    "Live-open catch-up refresh: re-warming missing morning keys after "
+                    "capped premarket pass.",
+                    "data",
+                )
+                self._schedule_morning_market_refresh(
+                    indices,
+                    now_ist,
+                    reason="live_open_catchup",
+                    force_full=False,
+                )
+            # Non-blocking, matching the live_incomplete_partial branch below: the day
+            # already holds partial data, and holding signal work at the open — the one
+            # moment it matters most — to wait on a provider that has already failed its
+            # premarket attempts is the worse trade. The re-warm lands in the background.
             return False
         if getattr(self, "_morning_refresh_inflight", False):
             return True
