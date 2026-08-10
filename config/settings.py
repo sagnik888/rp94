@@ -2000,15 +2000,49 @@ class Settings(BaseSettings):
         except Exception:
             _INERT = {}
 
+        # A value that still equals its dataclass default is NOT a configuration
+        # choice, and writing it makes it one. .env wins over the class default
+        # (model_config env_file), so the moment a field is persisted at its default it
+        # is pinned there for good: changing the default in code afterwards does nothing,
+        # because the file shadows it. Measured 2026-08-11 — 681 of 741 keys in .env sat
+        # at their default, i.e. 92% of the file was pinning nobody had asked for, and a
+        # setting added in code was frozen at its first-ever default the moment the
+        # running scanner next persisted (surge_tick_proxy_enabled did exactly that).
+        #
+        # Keys ALREADY in .env are still refreshed, so nothing an operator has set — or
+        # that a previous build pinned — silently changes underneath them. This only
+        # stops NEW defaults being written, which is what makes a default upgradeable.
+        model_fields = getattr(type(self), "model_fields", {}) or {}
+
+        def _is_untouched_default(field_name: str, value) -> bool:
+            field = model_fields.get(field_name)
+            if field is None:
+                return False
+            try:
+                default = field.get_default(call_default_factory=True)
+            except TypeError:          # older pydantic signature
+                try:
+                    default = field.get_default()
+                except Exception:
+                    return False
+            except Exception:
+                return False
+            try:
+                return bool(value == default)
+            except Exception:
+                return False
+
         for key, val in data.items():
             if key in _INERT:
+                continue
+            env_key = key.upper()
+            if env_key not in existing_values and _is_untouched_default(key, val):
                 continue
             # Handle list/dict serialization (e.g. active_indices)
             if isinstance(val, (list, dict)):
                 str_val = json.dumps(val)
             else:
                 str_val = str(val)
-            env_key = key.upper()
             if env_key in PROTECTED_SECRET_ENV_KEYS and not _clean_env_secret(str_val):
                 existing_secret = existing_values.get(env_key)
                 if _clean_env_secret(existing_secret):
