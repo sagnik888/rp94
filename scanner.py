@@ -12294,11 +12294,38 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         settings = get_settings()
         kind = str(inst_type or getattr(trade_like, "inst_type", "") or "OPT").upper()
         try:
-            if kind == "OPT":
-                return max(0.0, float(getattr(settings, "opt_cost", 80.0) or 0.0))
-            return max(0.0, float(getattr(settings, "fut_cost", 200.0) or 0.0))
+            flat = max(0.0, float(
+                getattr(settings, "opt_cost", 80.0) if kind == "OPT"
+                else getattr(settings, "fut_cost", 200.0)
+            ) or 0.0)
         except (TypeError, ValueError):
-            return 0.0
+            flat = 0.0
+        # Price the ACTUAL position, not a flat placeholder. The flat opt_cost is 80 while
+        # the real bill scales with turnover: a MIDCPNIFTY 174.50 x 120 round trip is
+        # Rs.205. Judging "is this loss bigger than the cost of closing" against 80 while
+        # the row is charged 205 lets through exactly the exits this floor exists to stop
+        # — measured on the 2026-08-10 13:04 row, a Rs.168 loss cut at a Rs.205 cost.
+        try:
+            from engine.trade_accounting import estimate_trade_charges
+
+            qty = int(getattr(trade_like, "lots", 0) or 0) * int(getattr(trade_like, "lot_size", 0) or 0)
+            if qty <= 0:
+                qty = int(getattr(trade_like, "quantity", 0) or getattr(trade_like, "broker_quantity", 0) or 0)
+            entry_px = float(
+                getattr(trade_like, "entry_price", 0.0)
+                or getattr(trade_like, "price", 0.0)
+                or 0.0
+            )
+            if qty > 0 and entry_px > 0:
+                modelled = float(estimate_trade_charges(
+                    entry_px, entry_px, qty, kind, settings,
+                    instrument=str(getattr(trade_like, "instrument", "") or ""),
+                ))
+                if modelled > 0:
+                    return modelled
+        except Exception:
+            pass
+        return flat
 
     @staticmethod
     def _trade_like_age_seconds(trade_like, latest_time) -> Optional[float]:

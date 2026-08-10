@@ -86,6 +86,46 @@ def _trade(index="NIFTY", entry=234.90, lot=65):
         lots=1, lot_size=lot)
 
 
+@pytest.fixture(autouse=True)
+def _pin_charge_settings():
+    """Pin the charge inputs this file reasons about.
+
+    get_settings() is a process-wide singleton and other tests in this suite mutate it
+    (tests/test_audit_trading_fixes.py sets opt_cost / slippage_opt_pct /
+    slippage_auto_calibration_enabled on the shared object). Without pinning, the floor
+    assertions here pass alone and fail in a full run purely on test order. Restored
+    afterwards so this file does not become the next leak.
+    """
+    from config.settings import get_settings
+
+    s = get_settings()
+    saved = {k: getattr(s, k, None) for k in
+             ("opt_cost", "fut_cost", "slippage_opt_pct", "slippage_auto_calibration_enabled")}
+    s.opt_cost = 80.0
+    s.fut_cost = 200.0
+    s.slippage_opt_pct = 0.30
+    s.slippage_auto_calibration_enabled = False
+    yield
+    for k, v in saved.items():
+        if v is not None:
+            setattr(s, k, v)
+
+
+def _flat_opt_cost() -> float:
+    from config.settings import get_settings
+    return float(getattr(get_settings(), "opt_cost", 80.0) or 80.0)
+
+
+def _charged(trade) -> float:
+    """What estimate_trade_charges bills this exact row, under whatever settings are live."""
+    from config.settings import get_settings
+    from engine.trade_accounting import estimate_trade_charges
+    qty = int(trade.lots) * int(trade.lot_size)
+    return float(estimate_trade_charges(
+        trade.entry_price, trade.entry_price, qty, "OPT", get_settings(),
+        instrument=trade.instrument))
+
+
 def _decide(s, trade, pnl, held):
     return Scanner._peak_threat_exit_decision(
         s, trade, current_price=trade.entry_price, current_pnl_rs=pnl, peak_pnl=0.0,
@@ -136,10 +176,59 @@ def test_a_loss_larger_than_the_round_trip_may_still_be_judged():
     assert "round-trip cost" not in ctx
 
 
-def test_the_floor_follows_the_configured_cost():
+def test_the_floor_prices_the_actual_position_not_a_flat_placeholder():
+    """The 13:04 row is why. The flat opt_cost is Rs.80, but a MIDCPNIFTY 174.50 x 120
+    round trip costs Rs.205 — and the row WAS charged 205. Judging "is this loss worth
+    the cost of closing" against 80 let through a Rs.168 loss cut at a Rs.205 cost, which
+    is the exact trade this floor exists to refuse."""
+    # Asserted as a RELATIONSHIP, not a magic number: another test in this suite mutates
+    # the shared get_settings() singleton, so any hardcoded rupee figure here passes alone
+    # and fails in a full run. The contract is that the floor equals what the row is
+    # actually charged.
     s = _scanner()
-    assert Scanner._round_trip_cost_rs(s, _trade(), inst_type="OPT") == 80.0
-    assert Scanner._round_trip_cost_rs(s, _trade(), inst_type="FUT") == 200.0
+    midcap = _trade("MIDCPNIFTY", 174.50, 120)
+    floor = Scanner._round_trip_cost_rs(s, midcap, inst_type="OPT")
+    assert floor == pytest.approx(_charged(midcap), rel=0.02), (
+        f"floor Rs.{floor:.0f} does not match the Rs.{_charged(midcap):.0f} the row pays"
+    )
+    assert floor > _flat_opt_cost(), "the floor is still the flat placeholder"
+
+
+def test_the_1304_row_is_refused_by_the_corrected_floor():
+    s = _scanner(neutral_tape=False)
+    midcap = _trade("MIDCPNIFTY", 174.50, 120)
+    floor = Scanner._round_trip_cost_rs(s, midcap, inst_type="OPT")
+    ok, _r, ctx = _decide(s, midcap, -(floor * 0.8), 500)
+    assert ok is False, f"still cut a loss smaller than the cost of cutting it: {ctx}"
+    assert "round-trip cost" in ctx
+
+
+def test_a_loss_beyond_the_real_cost_still_exits_on_adverse_evidence():
+    s = _scanner(neutral_tape=False)
+    midcap = _trade("MIDCPNIFTY", 174.50, 120)
+    floor = Scanner._round_trip_cost_rs(s, midcap, inst_type="OPT")
+    ok, _r, _c = _decide(s, midcap, -(floor * 1.3), 500)
+    assert ok is True, "the floor must bound the guard, not disable it"
+
+
+def test_the_floor_falls_back_to_the_flat_cost_when_it_cannot_price_the_row():
+    from types import SimpleNamespace as NS
+
+    s = _scanner()
+    bare = NS(instrument="NIFTY", inst_type="OPT")   # no lots/lot_size/price
+    assert Scanner._round_trip_cost_rs(s, bare, inst_type="OPT") == 80.0
+    assert Scanner._round_trip_cost_rs(s, bare, inst_type="FUT") == 200.0
+
+
+def test_the_floor_scales_with_position_size():
+    """A 3-lot position costs more to close than a 1-lot, so its floor must be higher."""
+    s = _scanner()
+    one = _trade("NIFTY", 232.85, 65)
+    three = _trade("NIFTY", 232.85, 65)
+    three.lots = 3
+    assert _charged(three) > _charged(one), "premise: 3 lots must cost more to close"
+    assert (Scanner._round_trip_cost_rs(s, three, inst_type="OPT")
+            > Scanner._round_trip_cost_rs(s, one, inst_type="OPT"))
 
 
 # ── 2. neutral is not adverse ────────────────────────────────────────────────
