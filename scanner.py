@@ -7764,17 +7764,92 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     int(getattr(settings, "loss_guard_oi_pcr_votes_winning", 3) or 3),
                 )
         min_votes = max(1, int(min_votes))
-        if direction == "LONG" and bearish_votes >= min_votes:
-            return (
-                f"OI_PCR_REVERSAL bearish votes={bearish_votes}/{min_votes} "
-                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}"
+
+        # ── corroboration from the pillars this decision never looked at ──
+        # The bundle already carries volume, regime and a divergence alert; only
+        # PCR/OI/flow were ever read. Widening it by simply adding voters would be
+        # wrong in BOTH directions: keeping min_votes at 2/3 while adding three more
+        # ways to reach it makes every exit easier (cutting winners), and scaling
+        # min_votes to 4/6 makes it unreachable for a LOSING trade, because the added
+        # pillars are usually NEUTRAL — the loss-guard reversal would stop firing and
+        # losers would be held longer. Both are the failure this codebase keeps
+        # repeating: a threshold inherited across a change in what it measures.
+        #
+        # So corroboration may only move the bar in the direction that is safe:
+        #   losing  + extras CONFIRM  -> exit one vote sooner  (cut the loser faster)
+        #   winning + extras OPPOSE   -> demand one vote more  (protect the runner)
+        # With neutral extras — the common case — behaviour is byte-identical to before.
+        adjusted_min = min_votes
+        corroboration = ""
+        if self._setting_enabled(
+            getattr(settings, "intel_reversal_corroboration_enabled", True), True
+        ):
+            confirm, oppose, detail = self._intel_reversal_corroboration(
+                direction, intel_result
             )
-        if direction == "SHORT" and bullish_votes >= min_votes:
+            need = max(
+                1, int(getattr(settings, "intel_reversal_corroboration_votes", 2) or 2)
+            )
+            if is_losing and confirm >= need:
+                adjusted_min = max(1, min_votes - 1)
+                corroboration = f" corroborated[{detail}]"
+            elif not is_losing and oppose >= need:
+                adjusted_min = min_votes + 1
+                corroboration = f" contested[{detail}]"
+
+        if direction == "LONG" and bearish_votes >= adjusted_min:
             return (
-                f"OI_PCR_REVERSAL bullish votes={bullish_votes}/{min_votes} "
-                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}"
+                f"OI_PCR_REVERSAL bearish votes={bearish_votes}/{adjusted_min} "
+                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}{corroboration}"
+            )
+        if direction == "SHORT" and bullish_votes >= adjusted_min:
+            return (
+                f"OI_PCR_REVERSAL bullish votes={bullish_votes}/{adjusted_min} "
+                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}{corroboration}"
             )
         return None
+
+    def _intel_reversal_corroboration(
+        self, direction: str, intel_result: Optional[Dict[str, Any]]
+    ) -> Tuple[int, int, str]:
+        """(confirm, oppose, detail) from volume / regime / divergence.
+
+        Reads only fields the bundle actually publishes — volume.signal is
+        BULLISH_VOLUME|BEARISH_VOLUME|NEUTRAL, regime carries the smoothed label, and
+        divergence_alert is a BOOLEAN trap flag (price rising while flow distributes),
+        so it cannot vote a side. It counts toward CONFIRM only, because "price and
+        flow disagree" is a reason to doubt the position, never a reason to hold it.
+        """
+        if not isinstance(intel_result, dict):
+            return 0, 0, ""
+        want_bear = str(direction or "").upper() == "LONG"
+        confirm = oppose = 0
+        parts = []
+
+        vol = intel_result.get("volume") if isinstance(intel_result.get("volume"), dict) else {}
+        vol_signal = str(vol.get("signal") or "NEUTRAL").upper()
+        if "BEARISH" in vol_signal or "BULLISH" in vol_signal:
+            vol_bear = "BEARISH" in vol_signal
+            if vol_bear == want_bear:
+                confirm += 1; parts.append("vol")
+            else:
+                oppose += 1
+
+        reg = intel_result.get("regime") if isinstance(intel_result.get("regime"), dict) else {}
+        label = str(
+            reg.get("smoothed_regime") or reg.get("regime") or ""
+        ).upper()
+        if "DOWN" in label or "UP" in label:
+            reg_bear = "DOWN" in label
+            if reg_bear == want_bear:
+                confirm += 1; parts.append("regime")
+            else:
+                oppose += 1
+
+        if bool(intel_result.get("divergence_alert")):
+            confirm += 1; parts.append("divergence")
+
+        return confirm, oppose, "+".join(parts)
 
     def _intel_exit_blocked_by_trend(self, position, regime) -> bool:
         """Whether to IGNORE a contrarian OI/PCR reversal exit because the position is

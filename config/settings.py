@@ -519,6 +519,13 @@ class Settings(BaseSettings):
     loss_guard_grind_range_mult: float = 1.50  # cumulative adverse ≥ mult × median range
     loss_guard_intel_max_age_seconds: float = 90.0  # older intel is stale for acceleration
     loss_guard_oi_pcr_votes_winning: int = 3  # hard exit while profitable
+    # The reversal exit reads PCR/OI/flow only, though the bundle also carries volume,
+    # regime and a divergence alert. Corroboration from those may move the vote bar by
+    # ONE, and only the safe way: a losing trade exits a vote sooner when they confirm,
+    # a winning trade demands a vote more when they oppose. Neutral extras (the common
+    # case) leave the decision byte-identical to the 3-pillar behaviour.
+    intel_reversal_corroboration_enabled: bool = True
+    intel_reversal_corroboration_votes: int = 2
     loss_guard_oi_pcr_votes_losing: int = 2   # faster OI/PCR exit when already red
     loss_guard_opt_premium_melt_pct: float = 8.0  # premium drop % → melt reverse signal
     loss_guard_opt_premium_melt_severity: int = 2
