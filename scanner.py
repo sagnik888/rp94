@@ -3796,12 +3796,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # If real_broker is missing, try to connect and initialize it now
                 if not hasattr(self.trades, "real_broker") or not self.trades.real_broker:
                     logger.info("📡 Attempting dynamic REAL broker connection...")
-                    if not self.data.is_connected:
-                        self.data.connect()
+                    from data.kite_auth import get_kite_auth
+                    from trading.kite_broker import KiteBroker
 
-                    if self.data.is_connected:
-                        from data.kite_auth import get_kite_auth
-                        from trading.kite_broker import KiteBroker
+                    # Ask the AUTHORITY, not the latch. self.data.is_connected is a plain
+                    # attribute written at connect()/rebind_kite() and never revoked, so
+                    # after a mid-session token death it is stale-True: the reconnect was
+                    # skipped, KiteBroker was built around kite=None, and the log still
+                    # said "connection successful" while every entry and every protective
+                    # exit was refused terminally by _require_api.
+                    kite_auth = get_kite_auth(settings)
+                    if kite_auth.kite is None or not self.data.is_connected:
+                        self.data.connect()
+                        kite_auth = get_kite_auth(settings)
+
+                    if kite_auth.kite is not None:
                         # account_id/instance_id are REQUIRED for the cross-process
                         # execution lease. Without account_id the broker builds no lease
                         # at all and every guard silently fails OPEN — two UT1 processes
@@ -3813,7 +3822,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         # account id came from angelone_client_id, so the fallback would
                         # have produced a broker that could not trade AND had no lease —
                         # failing open on the one guard that must never fail open.
-                        kite_auth = get_kite_auth(settings)
                         new_real_broker = KiteBroker(
                             kite=kite_auth.kite,
                             auth=kite_auth,
@@ -3824,6 +3832,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self.data.on_kite_reauth = new_real_broker.replace_api
                         logger.info("âœ… Dynamic Kite broker connection successful")
                     else:
+                        # No broker is constructed here on purpose. A KiteBroker around
+                        # kite=None accepts orders and refuses every one of them at
+                        # _require_api, which reads as a working REAL mode.
                         logger.error("â Œ CRITICAL: No Kite session for REAL mode — log in at /api/kite_login")
 
                 if hasattr(self.trades, "real_broker") and self.trades.real_broker:
@@ -23188,7 +23199,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # 20s cycle instead of a forced exit. Read the status directly rather
                 # than through _live_utbot_signal_still_present, whose True/False cannot
                 # distinguish "gone" from "cannot see".
-                if Scanner._repaint_absence_is_definite(self, candidate, sig_timestamp):
+                absence_definite = Scanner._repaint_absence_is_definite(
+                    self, candidate, sig_timestamp
+                )
+                # Keep the persistence counters the operator's two defer caps are made of.
+                # _repaint_absent_checks / _repaint_first_absent_at were written ONLY on
+                # session TradeCandidates, never on the real Trade this tracker holds, so
+                # inside _should_defer_option_repaint_abort absent_checks was pinned at 1
+                # and first_absent was always None: the "abort after 2 checks / 55s"
+                # limits could not trip, and a genuinely repainted option rode to candle
+                # close instead — up to 5 minutes on a 5min signal, 15 on a 15min one.
+                #
+                # Maintained here rather than by raising the default at the read site:
+                # a higher default would trip the cap on the FIRST absent check and turn
+                # the defer off entirely, the opposite of what the operator configured.
+                if not absence_definite:
+                    setattr(trade, "_repaint_absent_checks", 0)
+                    setattr(trade, "_repaint_first_absent_at", None)
+                else:
+                    setattr(
+                        trade,
+                        "_repaint_absent_checks",
+                        int(getattr(trade, "_repaint_absent_checks", 0) or 0) + 1,
+                    )
+                    if getattr(trade, "_repaint_first_absent_at", None) is None:
+                        setattr(trade, "_repaint_first_absent_at", now)
+                if absence_definite:
                     # Every configured repaint MITIGATION was unreachable from here. All
                     # call sites for the momentum override, the profit hold and the
                     # option defer sit in _check_session_candidates_breaches_locked, which
@@ -23210,6 +23246,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             self, candidate, sig_timestamp
                         )
                         if override_ctx:
+                            # A confirming override restarts the persistence clock, exactly
+                            # as the session mirror does — otherwise a held trade would
+                            # accumulate absent checks and trip the cap on evidence the
+                            # override already answered.
+                            setattr(trade, "_repaint_absent_checks", 0)
+                            setattr(trade, "_repaint_first_absent_at", None)
                             hold_reason = str(
                                 override_ctx.get("reason")
                                 or override_ctx.get("type")

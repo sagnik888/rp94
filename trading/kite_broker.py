@@ -671,6 +671,11 @@ class KiteBroker(Broker):
                     f"Protective stop for {symbol} did not complete; it may be resting ({exc})"
                 ) from exc
             logger.error(f"Kite rejected protective stop for {symbol}: {exc}")
+            # An IP-permission refusal is not an order problem and will refuse every
+            # order until a human edits the allow-list. This path returns None and the
+            # position is left with no server-side stop, so it is the LAST place that
+            # should stay quiet about the cause. The latch de-duplicates per address.
+            self._escalate_if_ip_blocked(f"{type(exc).__name__}: {exc}")
             return None
         order_id = str(order_id or "")
         if not order_id or order_id == "None":
@@ -831,6 +836,7 @@ class KiteBroker(Broker):
             # Must be False on refusal: a True here records a trigger the exchange
             # never accepted, and every later tightening check trusts that value.
             logger.error(f"Kite refused protective-stop modify for {symbol}: {exc}")
+            self._escalate_if_ip_blocked(f"{type(exc).__name__}: {exc}")
             return False
 
     # ── cancellation ─────────────────────────────────────────────────────────
@@ -849,6 +855,7 @@ class KiteBroker(Broker):
             # False on refusal. emergency_flatten_trade() reads a True as proof the
             # SL-M is gone and market-exits on top of it.
             logger.error(f"Kite refused cancellation of {order_id}: {exc}")
+            self._escalate_if_ip_blocked(f"{type(exc).__name__}: {exc}")
             return False
 
     # ── reads ────────────────────────────────────────────────────────────────
