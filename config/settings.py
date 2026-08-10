@@ -842,6 +842,12 @@ class Settings(BaseSettings):
     # bundled NSE holiday list is versioned by year and an uncovered year fails CLOSED —
     # correct, but silent: the system runs, scans and serves a dashboard while placing
     # nothing. Warning early turns a five-month fuse into a routine data update.
+    # The unfilled tail of a partially filled ENTRY. The 12s cancel/replace timer stops
+    # applying the moment a partial fill lands (it requires position is None AND
+    # ENTRY_SUBMITTED), so the remainder used to rest untouched all session — and a late
+    # spike could fill it while the protective stop still covered only the first tranche.
+    partial_entry_remainder_cancel_enabled: bool = True
+    partial_entry_remainder_timeout_seconds: float = 120.0
     calendar_coverage_warn_days: int = 45
     peak_threat_exit_loss_min_domains: int = 2
     peak_threat_exit_loss_confirm_seconds: float = 3.0

@@ -1043,6 +1043,100 @@ class TradeManager:
         self.save_state()
         return True
 
+    def _withdraw_stale_entry_remainder(self, trade: Trade, filled_qty: int, expected_qty: int) -> None:
+        """Cancel the unfilled tail of a partially filled ENTRY once it has gone stale.
+
+        The 12s cancel/replace timer only runs while `position is None` and
+        execution_status == 'ENTRY_SUBMITTED'. The instant a partial fill lands, a
+        position row exists and the status becomes 'PARTIAL', so BOTH preconditions are
+        permanently false and nothing ages the remainder again. The PARTIAL branch
+        re-reads the fill and re-arms protection every pass, but never touches the order
+        still resting at the exchange.
+
+        So a 3-lot entry that fills 1 leaves 2 working all session. Hours later a spike
+        sweeps them: the position becomes 3 lots while the protective stop covers 1, and
+        until the next reconcile tick two lots are naked. Meanwhile P&L, risk headroom
+        and the concentration guards were all sized on 1 lot for the whole interval.
+
+        The cancel is PROVEN, not acknowledged — same rule as the stale-entry replace.
+        cancel_order_confirmed answers True only for a broker-confirmed terminal
+        non-fill, False when the order actually filled, and None when it cannot tell.
+        A False or None must NOT be read as "the remainder is gone": the next reconcile
+        pass re-reads the position and arms protection for whatever really filled.
+        """
+        order_id = str(getattr(trade, "broker_order_id", "") or "")
+        if not order_id or filled_qty >= expected_qty:
+            return
+        if getattr(trade, "entry_remainder_withdrawn", False):
+            return
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not _setting_enabled(
+            getattr(settings, "partial_entry_remainder_cancel_enabled", True), True
+        ):
+            return
+        timeout = max(
+            5.0,
+            float(getattr(settings, "partial_entry_remainder_timeout_seconds", 120.0) or 120.0),
+        )
+        submitted = getattr(trade, "entry_submitted_at", None)
+        if submitted is None:
+            return
+        try:
+            if isinstance(submitted, str):
+                submitted = datetime.fromisoformat(submitted)
+            if submitted.tzinfo is None:
+                submitted = IST.localize(submitted)
+            age = (datetime.now(IST) - submitted.astimezone(IST)).total_seconds()
+        except Exception:
+            return
+        if age < timeout:
+            return
+
+        confirm = getattr(self.broker, "cancel_order_confirmed", None)
+        if not callable(confirm):
+            return
+        try:
+            cancelled = confirm(order_id, "NORMAL")
+        except Exception as exc:
+            logger.error(
+                f"Could not withdraw the unfilled remainder of {trade.id} "
+                f"({trade.trading_symbol}): {exc}"
+            )
+            return
+
+        if cancelled is True:
+            trade.entry_remainder_withdrawn = True
+            trade.pending_execution = False
+            trade.execution_error = (
+                f"Entry filled {filled_qty} of {expected_qty}; unfilled remainder "
+                "withdrawn after it went stale"
+            )
+            logger.warning(
+                f"[PARTIAL ENTRY] {trade.id} {trade.trading_symbol}: filled "
+                f"{filled_qty}/{expected_qty} and the remainder rested {age:.0f}s. "
+                "Cancel proven — position stands at the filled quantity."
+            )
+            self._log_ui(
+                f"Withdrew the unfilled {expected_qty - filled_qty} of "
+                f"{trade.trading_symbol}; the trade stands at {filled_qty}.",
+                "warning",
+            )
+        elif cancelled is False:
+            # It filled while we were cancelling. Say so and let the next reconcile
+            # pass size protection on the real quantity.
+            logger.warning(
+                f"[PARTIAL ENTRY] {trade.id} {trade.trading_symbol}: the remainder "
+                "filled during the cancel; protection will be re-armed on the full size."
+            )
+        else:
+            logger.error(
+                f"[PARTIAL ENTRY] {trade.id} {trade.trading_symbol}: remainder state "
+                "UNKNOWN after a cancel attempt; leaving it for the next pass rather "
+                "than assuming it is gone."
+            )
+
     def _arm_gtt_fallback(self, trade: Trade, qty: int, side: str, trigger: float) -> bool:
         """Arm a server-side GTT stop. Only valid when NO SL-M is working.
 
@@ -3201,6 +3295,8 @@ class TradeManager:
                         trade,
                         "Broker protection unavailable",
                     )
+                if filled_qty < expected_qty:
+                    self._withdraw_stale_entry_remainder(trade, filled_qty, expected_qty)
             elif (
                 trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
                 and abs(net_qty) < expected_qty
