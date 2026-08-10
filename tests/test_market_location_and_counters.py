@@ -1812,22 +1812,62 @@ def test_daily_counters_restore_manual_session_entries_and_losses():
     assert scanner._last_exit_time["BANKNIFTY"] == exit_row.exit_timestamp
 
 
-def test_consecutive_index_losses_require_uninterrupted_same_index_exit_tape():
+def test_consecutive_index_losses_survive_another_index_exiting():
+    """CHANGED 2026-08-10. This asserted that ANY other index's completed trade cleared
+    NIFTY's run, measured on the global exit tape. With four books interleaving that made
+    the max_consecutive_losses halt unreachable: measured live that day, NIFTY lost four
+    times and the streak read 1, 1, 1, 2 because SENSEX and BANKNIFTY exits kept clearing
+    it, so the halt at 3 never fired and a fourth losing entry was allowed.
+
+    A NIFTY run is now broken only by a NIFTY outcome that is not a loss — what
+    "3 consecutive NIFTY losses" means to someone watching one chart."""
     scanner = Scanner.__new__(Scanner)
     scanner._losses_today = {}
     scanner._last_loss_outcome_instrument = ""
+    scanner._setting_enabled = lambda v, d=True: bool(v) if v is not None else d
 
     assert scanner._record_consecutive_loss_outcome("NIFTY", -100.0) == 1
     assert scanner._record_consecutive_loss_outcome("NIFTY", -200.0) == 2
 
-    # Any completed trade for another index interrupts NIFTY's run, even when
-    # that intervening trade is itself a loss.
+    # Another index losing does NOT clear NIFTY.
     assert scanner._record_consecutive_loss_outcome("MIDCPNIFTY", -50.0) == 1
-    assert scanner._losses_today["NIFTY"] == 0
-    assert scanner._record_consecutive_loss_outcome("NIFTY", -300.0) == 1
+    assert scanner._losses_today["NIFTY"] == 2
+    assert scanner._record_consecutive_loss_outcome("NIFTY", -300.0) == 3
 
-    # A win also breaks the run.
+    # Only NIFTY's own non-loss breaks NIFTY's run.
     assert scanner._record_consecutive_loss_outcome("SENSEX", 250.0) == 0
+    assert scanner._losses_today["NIFTY"] == 3
+    assert scanner._record_consecutive_loss_outcome("NIFTY", 250.0) == 0
+    assert scanner._losses_today["NIFTY"] == 0
+
+
+def test_todays_interleaved_sequence_now_reaches_the_halt():
+    """The live 2026-08-10 exit order. Under the old global tape NIFTY peaked at 2."""
+    scanner = Scanner.__new__(Scanner)
+    scanner._losses_today = {}
+    scanner._last_loss_outcome_instrument = ""
+    scanner._setting_enabled = lambda v, d=True: bool(v) if v is not None else d
+
+    sequence = ["SENSEX", "NIFTY", "BANKNIFTY", "NIFTY", "SENSEX",
+                "BANKNIFTY", "NIFTY", "NIFTY", "SENSEX"]
+    peak = {}
+    for name in sequence:
+        streak = scanner._record_consecutive_loss_outcome(name, -100.0)
+        peak[name] = max(peak.get(name, 0), streak)
+    assert peak["NIFTY"] == 4, peak
+    assert peak["NIFTY"] >= 3, "the max_consecutive_losses halt would still never fire"
+
+
+def test_the_global_tape_behaviour_is_still_available():
+    """Kept behind consecutive_loss_streak_per_index=False."""
+    scanner = Scanner.__new__(Scanner)
+    scanner._losses_today = {}
+    scanner._last_loss_outcome_instrument = ""
+    scanner._setting_enabled = lambda v, d=True: False
+
+    assert scanner._record_consecutive_loss_outcome("NIFTY", -100.0) == 1
+    assert scanner._record_consecutive_loss_outcome("NIFTY", -200.0) == 2
+    assert scanner._record_consecutive_loss_outcome("MIDCPNIFTY", -50.0) == 1
     assert scanner._losses_today["NIFTY"] == 0
 
 
@@ -1872,7 +1912,11 @@ def test_daily_counter_rebuild_merges_exit_sources_in_global_chronological_order
 
     scanner._reset_daily_counters()
 
-    assert scanner._losses_today["NIFTY"] == 0
+    # CHANGED 2026-08-10 with the per-index streak. The subject of this test is that the
+    # rebuild merges both exit sources in global chronological order; the NIFTY figure is
+    # incidental. Two NIFTY losses, never broken by a NIFTY win, is now 2 — the
+    # MIDCPNIFTY loss that follows no longer clears another index's run.
+    assert scanner._losses_today["NIFTY"] == 2
     assert scanner._losses_today["MIDCPNIFTY"] == 1
 
 

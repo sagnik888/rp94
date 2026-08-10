@@ -701,11 +701,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         return instrument, timeframe, direction, str(source_time or ""), symbol, lane
 
     def _record_consecutive_loss_outcome(self, instrument: str, pnl: float) -> int:
-        """Track an uninterrupted same-index loss run on the global exit tape.
+        """Track this index's own uninterrupted loss run.
 
-        Any completed trade for another index interrupts this index's run,
-        regardless of whether the intervening trade won or lost. This matches
-        the operator-visible meaning of "N consecutive NIFTY losses".
+        This used to be measured on the GLOBAL exit tape: any completed trade for another
+        index reset this index's run. With four indices trading simultaneously that makes
+        the max_consecutive_losses halt structurally unreachable, because the four books
+        interleave. Measured on 2026-08-10: NIFTY lost four times and the streak read
+        1, 1, 1, 2 — SENSEX and BANKNIFTY exits kept clearing it — so the halt at 3 never
+        fired and NIFTY was allowed a fourth losing entry.
+
+        A NIFTY run is now broken only by a NIFTY outcome that is not a loss, which is
+        what "3 consecutive NIFTY losses" means to an operator watching one chart. Set
+        consecutive_loss_streak_per_index=False to restore the global-tape behaviour.
         """
         instrument = str(instrument or "").split()[0].upper()
         if not instrument:
@@ -715,14 +722,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._losses_today = {}
             streaks = self._losses_today
 
-        previous_instrument = str(
-            getattr(self, "_last_loss_outcome_instrument", "") or ""
-        ).upper()
-        for other in list(streaks):
-            if str(other).upper() != instrument:
-                streaks[other] = 0
-        if previous_instrument and previous_instrument != instrument:
-            streaks[instrument] = 0
+        if not self._setting_enabled(
+            getattr(get_settings(), "consecutive_loss_streak_per_index", True), True
+        ):
+            previous_instrument = str(
+                getattr(self, "_last_loss_outcome_instrument", "") or ""
+            ).upper()
+            for other in list(streaks):
+                if str(other).upper() != instrument:
+                    streaks[other] = 0
+            if previous_instrument and previous_instrument != instrument:
+                streaks[instrument] = 0
 
         if float(pnl or 0.0) < 0.0:
             streaks[instrument] = int(streaks.get(instrument, 0) or 0) + 1
@@ -10074,14 +10084,42 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if getattr(candidate, "action", "ENTRY") == "NO_ENTRY":
             return 0.0
         settings = get_settings()
-        # Dashboard/session signals are advisory marks, not simulated fills.
-        # Show their configured round-trip cost without inventing additional
-        # slippage on every live LTP refresh.
-        charges = (
+        # Dashboard/session signals are advisory marks, not simulated fills, so this must
+        # stay deterministic in (entry, exit, qty) and add no per-tick slippage.
+        #
+        # It used to be the FLAT opt_cost/fut_cost, which understates the real bill by
+        # about half: measured 2026-08-10, a NIFTY 232.85 x 65 round trip is Rs.171 under
+        # estimate_trade_charges but was shown as Rs.80. The mirror is what the operator
+        # reads to judge whether a strategy pays, so it has to charge what REAL mode will.
+        # The flat figure remains the fallback when the real model cannot price the row.
+        is_opt = self._is_premium_long_candidate(candidate)
+        flat = (
             float(getattr(settings, "opt_cost", 80.0) or 80.0)
-            if self._is_premium_long_candidate(candidate)
+            if is_opt
             else float(getattr(settings, "fut_cost", 200.0) or 200.0)
         )
+        charges = flat
+        try:
+            from engine.trade_accounting import estimate_trade_charges
+
+            # Same basis as _candidate_gross_pnl just above, so cost and gross agree.
+            qty = int(getattr(candidate, "lots", 1) or 1) * int(getattr(candidate, "lot_size", 1) or 1)
+            entry_px = float(getattr(candidate, "price", 0.0) or 0.0)
+            if qty > 0 and entry_px > 0 and float(exit_px or 0.0) > 0:
+                modelled = float(
+                    estimate_trade_charges(
+                        entry_px,
+                        float(exit_px),
+                        qty,
+                        "OPT" if is_opt else "FUT",
+                        settings,
+                        instrument=str(getattr(candidate, "instrument", "") or ""),
+                    )
+                )
+                if modelled > 0:
+                    charges = modelled
+        except Exception:
+            charges = flat
         return round(self._candidate_gross_pnl(candidate, exit_px) - charges, 2)
 
     @staticmethod
@@ -12246,6 +12284,52 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return signal in bearish
         return False
 
+    def _round_trip_cost_rs(self, trade_like, inst_type: str = "") -> float:
+        """What it costs to open and close this position, in rupees.
+
+        Any exit taken to avoid a loss SMALLER than this figure is value-destroying
+        before it is anything else. The dashboard's own per-trade cost settings are the
+        source, so the floor moves with whatever the operator has configured.
+        """
+        settings = get_settings()
+        kind = str(inst_type or getattr(trade_like, "inst_type", "") or "OPT").upper()
+        try:
+            if kind == "OPT":
+                return max(0.0, float(getattr(settings, "opt_cost", 80.0) or 0.0))
+            return max(0.0, float(getattr(settings, "fut_cost", 200.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _trade_like_age_seconds(trade_like, latest_time) -> Optional[float]:
+        """Seconds since the fill, or None when it cannot be established.
+
+        None means "cannot tell" and callers must NOT treat it as old — the same
+        never-conclude-from-absence rule the repaint guard now follows.
+        """
+        if latest_time is None:
+            return None
+        entered = (
+            getattr(trade_like, "entry_time", None)
+            or getattr(trade_like, "entry_timestamp", None)
+            or getattr(trade_like, "signal_time", None)
+        )
+        if entered is None:
+            return None
+        try:
+            start = pd.Timestamp(entered)
+            now = pd.Timestamp(latest_time)
+            if start.tzinfo is not None:
+                start = start.tz_convert(IST).tz_localize(None)
+            if now.tzinfo is not None:
+                now = now.tz_convert(IST).tz_localize(None)
+            age = float((now - start).total_seconds())
+        except Exception:
+            return None
+        if age != age or age < 0:
+            return None
+        return age
+
     def _peak_threat_exit_decision(
         self,
         trade_like,
@@ -12305,6 +12389,29 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         else:
             if not self._setting_enabled(getattr(settings, "peak_threat_exit_loss_enabled", True), True):
                 return False, "", "loss threat exit disabled"
+            # A position is negative from its first tick, because the entry pays the ask
+            # and the mark is the LTP/bid. Cutting there costs a full round trip to avoid
+            # a loss smaller than that round trip, which cannot come out ahead.
+            round_trip = self._round_trip_cost_rs(trade_like, inst_type=inst_type)
+            cost_multiple = max(
+                0.0,
+                float(getattr(settings, "peak_threat_exit_loss_min_cost_multiple", 1.0) or 0.0),
+            )
+            cost_floor = round_trip * cost_multiple
+            if cost_floor > 0 and abs(current_pnl) < cost_floor:
+                return False, "", (
+                    f"loss Rs.{abs(current_pnl):.0f} is under the Rs.{cost_floor:.0f} "
+                    "round-trip cost; exiting here cannot beat the spread"
+                )
+            # Nor before the trade has had time to print anything of its own.
+            min_hold = max(0.0, float(getattr(settings, "peak_threat_exit_min_hold_seconds", 60.0) or 0.0))
+            if min_hold > 0:
+                held = self._trade_like_age_seconds(trade_like, latest_time)
+                if held is not None and held < min_hold:
+                    return False, "", (
+                        f"held {held:.0f}s, under the {min_hold:.0f}s minimum before a "
+                        "loss-threat exit may fire"
+                    )
             max_loss_r = max(
                 0.05,
                 float(getattr(settings, "peak_threat_exit_loss_max_loss_r", 0.35) or 0.35),
@@ -12398,7 +12505,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             elif self._intel_signal_aligns_view(signal, view):
                 reasons.append(f"{label} {signal} supports")
             elif signal in {"HOLD", "NEUTRAL", "MIXED"}:
-                score += 1 if label in {"aggregate", "order-flow"} else 0
+                # "Unclear" is not "against". These two pillars used to contribute 2 of
+                # the 6 points an exit needs, so a merely uninformative tape could carry
+                # a third of the case for closing a position on its own.
+                if self._setting_enabled(
+                    getattr(settings, "peak_threat_exit_neutral_counts", False), False
+                ):
+                    score += 1 if label in {"aggregate", "order-flow"} else 0
                 reasons.append(f"{label} neutral")
 
         try:
@@ -19147,6 +19260,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             nonlocal changed
             self._diag_inc("exit_reasons", exit_reason)
             calc_pnl = self._candidate_net_pnl(previous, exit_px)
+            # Record WHY. The reason string carries the threat score and the individual
+            # votes behind it, and none of it was ever written down — on 2026-08-10 nine
+            # LOSS_THREAT_EXITs fired and the log held only the downstream reversion line,
+            # so the decision could not be reconstructed from the logs at all.
+            logger.info(
+                f"[EXIT {exit_reason}] {previous.instrument} {previous.timeframe} "
+                f"{previous.direction} @ {exit_px:.2f} net Rs.{calc_pnl:.0f} — {reason_text}"
+            )
 
             exit_candidate = TradeCandidate(
                 instrument=previous.instrument,

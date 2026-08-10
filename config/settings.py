@@ -815,6 +815,28 @@ class Settings(BaseSettings):
     peak_threat_exit_loss_enabled: bool = True
     peak_threat_exit_loss_min_score: int = 6
     peak_threat_exit_loss_max_loss_r: float = 0.35
+    # The loss arm used to fire on `current_pnl <= 0.0` — ANY negative, including one
+    # rupee of bid-ask spread. Closing costs a round trip (opt_cost/fut_cost), so an exit
+    # taken while the price loss is smaller than that cost destroys value by construction:
+    # on 2026-08-10 nine trades were cut for price losses of Rs.10-91 at Rs.80 a round
+    # trip, and half the day's loss was pure cost. The loss must now be at least this
+    # multiple of the round trip before the arm is live. 0 restores the old behaviour.
+    peak_threat_exit_loss_min_cost_multiple: float = 1.0
+    # No loss-threat exit inside this many seconds of entry. The same day produced exits
+    # 4s, 33s and 60s after a fill, on signals that had just spent 31s in stabilization —
+    # the position was cut before its own thesis had a chance to print a bar.
+    peak_threat_exit_min_hold_seconds: float = 60.0
+    # Whether a NEUTRAL/HOLD/MIXED intelligence read counts toward the adverse score.
+    # It used to add +1 each for the aggregate and order-flow pillars, so an unclear tape
+    # contributed 2 of the 6 points needed to exit — absence of evidence scored as
+    # evidence against the trade, the same defect pattern as the repaint and
+    # single-pillar-conviction bugs. Off means only genuinely opposing reads score.
+    peak_threat_exit_neutral_counts: bool = False
+    # A same-index loss run used to be measured on the GLOBAL exit tape, so any other
+    # index's completed trade cleared it. With four books interleaving, the
+    # max_consecutive_losses halt became unreachable: on 2026-08-10 NIFTY lost four
+    # times and the streak read 1, 1, 1, 2, so the halt at 3 never fired.
+    consecutive_loss_streak_per_index: bool = True
     # Post-entry cross-index correlation read: while a trade is live, if a broad set
     # of the OTHER active indices' live regimes turn against the position (peers need
     # not all correlate — non-directional peers just don't vote), take the profit.
