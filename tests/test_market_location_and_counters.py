@@ -1310,7 +1310,10 @@ def test_15min_choppy_scalp_guard_blocks_known_low_volume(monkeypatch):
         option_type="CE",
         direction="LONG",
         signal_timestamp=signal_ts,
-        intelligence_score=0.24,
+        # Above fifteen_min_choppy_scalp_min_intel_score (0.35 since 2026-08-11) so the
+        # VOLUME condition under test is what blocks, not the intel floor. Was 0.24 when
+        # that floor was 0.20.
+        intelligence_score=0.40,
         volume_ratio=1.01,
     )
 
@@ -1412,7 +1415,10 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
                 grade="A+",
                 confidence=0.90,
                 signal_timestamp=signal_ts,
-                intelligence_score=0.24,
+                # Above fifteen_min_choppy_scalp_min_intel_score (0.35 since 2026-08-11) so the
+        # VOLUME condition under test is what blocks, not the intel floor. Was 0.24 when
+        # that floor was 0.20.
+        intelligence_score=0.40,
             )
 
             assert scanner._passes_live_trade_ready_gate(candidate) is True, f"{mode} {instrument}"

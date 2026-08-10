@@ -914,7 +914,18 @@ class Settings(BaseSettings):
     # seeds may chase further (still bounded, still scalp-locked/tight-SL).
     missed_signal_reentry_cascade_max_chase_atr: float = 2.0
     missed_signal_reentry_min_confidence: float = 0.55
-    missed_signal_reentry_min_intel_score: float = 0.20
+    # Exception-route intelligence floors, measured 2026-08-11 against 824 real
+    # aggregator reads over the stored index candles. These are the fraction of a
+    # fully-informed max-conviction read a candidate must show, and 0.20 admitted 39%
+    # of all reads — 2 in 5 is not an exception. 0.35 admits ~15% (1 in 7). Not raised
+    # further (0.40 -> 8%, 0.50 -> 2%) because the measurement covers the thin-evidence
+    # regime with no option chain; confirm against a live session before tightening.
+    #
+    # These were 0.20/0.20/0.25 in rp46-2.1 and restore_point_51 too, but the aggregate
+    # normaliser changed underneath them: it divided by the COUNT of voting pillars and
+    # now divides by their WEIGHT MASS, so the same evidence scores ~3.5x higher and the
+    # thresholds were never re-cut to match.
+    missed_signal_reentry_min_intel_score: float = 0.35
     missed_signal_reentry_min_trend_adx: float = 24.0
     missed_signal_reentry_min_remaining_minutes: float = 8.0
     missed_signal_reentry_allow_trend_context: bool = True
@@ -1390,7 +1401,7 @@ class Settings(BaseSettings):
     midcap_15min_risky_stabilization_seconds: float = 60.0 # Extra buffer for MIDCPNIFTY 15min risky option signals in chop/weak tape
     midcap_15min_risky_stabilization_min_scans: int = 3 # Require repeated confirmation when MIDCPNIFTY 15min volume/intel is weak
     midcap_15min_risky_stabilization_min_volume_ratio: float = 1.05 # Basic volume floor for MIDCPNIFTY 15min risky stabilization
-    midcap_15min_risky_stabilization_min_intel_score: float = 0.25 # Absolute signed-intel floor to skip the extra MIDCPNIFTY buffer
+    midcap_15min_risky_stabilization_min_intel_score: float = 0.35 # Absolute signed-intel floor to skip the extra MIDCPNIFTY buffer
     live_15min_entry_cutoff_grace_seconds: float = 90.0 # Let a 15min signal formed by cutoff finish its live buffer
     live_intrabar_signal_entries: bool = True # Detect forming-candle UT1 arrows before candle close
     # ─── Late-Session Power-Move Override ────────────────────
@@ -1552,7 +1563,7 @@ class Settings(BaseSettings):
     live_15min_momentum_adx_threshold: float = 24.0
     live_15min_momentum_intel_threshold: float = 0.65
     fifteen_min_choppy_scalp_guard_enabled: bool = True
-    fifteen_min_choppy_scalp_min_intel_score: float = 0.20
+    fifteen_min_choppy_scalp_min_intel_score: float = 0.35
     fifteen_min_choppy_scalp_min_volume_ratio: float = 1.05
     fifteen_min_choppy_scalp_micro_max_skew_seconds: float = 240.0
     fifteen_min_choppy_scalp_min_close_location: float = 0.55
