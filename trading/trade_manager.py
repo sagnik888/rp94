@@ -2161,6 +2161,32 @@ class TradeManager:
         entry_side = "BUY" if trade.inst_type == "OPT" else (
             "BUY" if str(trade.direction).upper() in {"LONG", "BUY"} else "SELL"
         )
+        # Every new entry funnels through _entry_margin_verdict, which both checks the
+        # exact Kite order margin against free cash AND reserves it so a concurrent entry
+        # cannot spend the same rupees. The add path did neither. The missing reservation
+        # was the sharper half: with no record that this money is committed, an ordinary
+        # entry arriving seconds later reads `available - outstanding` as if the add had
+        # never happened, passes its own preflight, and the account over-commits — exactly
+        # the race the reservation ledger exists to prevent. Nothing else gated it either:
+        # _entry_risk_admission is entry_risk_budget_enabled-gated and that ships False,
+        # so an enabled scale-in had no rupee gate at all.
+        #
+        # Same fail-open contract as an entry: a missing or erroring margin endpoint must
+        # never stop trading, only a definitive "not enough money" may. Refusing here
+        # touches nothing on the parent position — it is still running, still protected by
+        # the stop that covers its current quantity.
+        preflight = self._entry_margin_verdict(
+            trade.trading_symbol, quantity, entry_side, price
+        )
+        if preflight is not None and not preflight.get("ok", True):
+            logger.error(
+                f"Scale-in refused for {trade.trading_symbol} x{quantity}: "
+                f"{preflight.get('limitation') or preflight.get('reason') or 'insufficient margin'}"
+            )
+            return
+        reservations = [str((preflight or {}).get("reservation_id") or "")]
+        reservations = [r for r in reservations if r]
+
         # The existing stop is NOT cancelled first. It covers the quantity currently held,
         # so leaving it armed means a failed add changes nothing and a filled add is
         # merely under-protected on the new lots until the re-arm below — never naked, and
@@ -2172,6 +2198,8 @@ class TradeManager:
                 **self._tag_kwargs(self.broker.place_order, trade, "ADD"),
             )
         except (BrokerOrderRejected, PermissionError) as exc:
+            # Definite refusal: this order consumed nothing, so give the margin back.
+            self._release_margin_reservations(reservations)
             logger.error(f"Scale-in refused for {trade.trading_symbol}: {exc}")
             return
         except BrokerOrderAmbiguous as exc:
@@ -2185,6 +2213,11 @@ class TradeManager:
             )
             return
         if not order_id:
+            # No order id and no exception: nothing was accepted, so the margin is free.
+            # (An AMBIGUOUS acknowledgement above deliberately keeps its reservation —
+            # that order may be live, and letting the next entry spend money it might
+            # already be consuming is how an account over-commits on orders it cannot see.)
+            self._release_margin_reservations(reservations)
             logger.warning(f"Scale-in for {trade.trading_symbol} returned no order id.")
             return
 
