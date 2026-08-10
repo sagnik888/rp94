@@ -12022,7 +12022,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # call site reaches this one.
         ceiling_band = Scanner._profit_lock_ratio_ceiling(self)
         if ladder_pnl >= 3000.0:
-            # Major wins tighten from 90% at Rs.3000 toward the ceiling at Rs.5000+.
+            # Major wins tighten from 85% at Rs.3000 toward the ceiling at Rs.5000+.
+            # (Read 90% until 2026-08-11 — stale since the tier base was re-tuned to
+            # 0.85; the trailing line of this block already stated the real figure.)
             #
             # That ceiling used to be 1.0, and a ratio of exactly 1.0 puts the floor ON
             # the peak price. Price has to come off the peak for any later tick to exist,
