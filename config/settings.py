@@ -1431,6 +1431,15 @@ class Settings(BaseSettings):
     # 1min continuous scalps require high-burst/spike context (ADX/intel/power)
     # plus volume/range/close floors — not weak 1min noise.
     one_min_scalping_high_burst_only: bool = True
+    # A cash index publishes no traded volume in real time: measured 13 of the last 20
+    # 1min bars carry volume 0 on every index (5min 1/20, 15min 0/20), because it only
+    # arrives with the periodic Fyers backfill. The signal bar of a fresh 1min entry is
+    # therefore almost always unmeasurable, and the surge ratio read 0.00x — which is
+    # why no 1min trade has ever fired. tick_count is the only live participation
+    # measure available. Ships OFF until a session of real tick data exists to cut the
+    # threshold against; tick counts are far less dispersed than traded quantity, so the
+    # traded floor cannot simply be reused on them.
+    surge_tick_proxy_enabled: bool = False
     volume_spike_entry_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_adx_threshold: float = 25.0

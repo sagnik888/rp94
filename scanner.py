@@ -10517,7 +10517,43 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             prior_vol = Scanner._surge_prior_mean(prior)
             if prior_vol is None:
                 return None
-            volume_ratio = float(last["volume"]) / prior_vol
+            # The NUMERATOR was never guarded. _surge_prior_mean fixed the denominator
+            # (zero bars were dragging it down and FABRICATING 4x/10x surges), but the
+            # signal bar's own volume is read raw — and on a cash index the live right
+            # edge carries no traded volume at all: measured 13 of the last 20 bars on
+            # 1min for every index, versus 1/20 on 5min and 0/20 on 15min. A fresh 1min
+            # signal therefore always computed 0 / prior_mean = 0.00x and could never
+            # clear the 2.2x floor that this comment block itself calls "the only route
+            # a 1min signal has into a live entry". That is why no 1min trade has ever
+            # appeared, live or in backtest: the fix for the false positive created a
+            # permanent false negative.
+            #
+            # 0.00x is a DEFINITE claim ("no surge") built from ABSENT data, which is
+            # this codebase's cardinal error. Unmeasurable must read as unmeasurable.
+            measured_vol = float(last.get("volume", 0.0) or 0.0)
+            volume_basis = "TRADED"
+            if measured_vol <= 0.0:
+                # Tick activity is the only participation measure a cash index publishes
+                # in real time (CandleBuilder maintains tick_count per bar). Used for
+                # BOTH sides of the ratio so it stays like-for-like, and tagged so the
+                # gate can apply a threshold calibrated to ticks rather than to volume —
+                # tick counts are far less dispersed than traded quantity, so reusing the
+                # traded floor on them would be the same inherited-threshold mistake.
+                if not Scanner._setting_enabled(
+                    getattr(get_settings(), "surge_tick_proxy_enabled", False), False
+                ):
+                    # Ships OFF: a tick threshold cannot be calibrated until a live
+                    # session has been recorded, and guessing one would re-run tonight's
+                    # other finding (a threshold applied to a quantity it was not cut
+                    # for). Until then this abstains, which is honest — and no worse
+                    # than today, where the same bar silently scored 0.00x.
+                    return None
+                proxy = Scanner._surge_tick_ratio(recent)
+                if proxy is None:
+                    return None
+                volume_ratio, volume_basis = proxy, "TICK_ACTIVITY"
+            else:
+                volume_ratio = measured_vol / prior_vol
             tr = (prior["high"] - prior["low"]).abs()
             atr = float(tr.tail(14).mean()) if len(tr) else 0.0
             range_atr_ratio = (rng / atr) if atr > 0 else 0.0
@@ -10529,9 +10565,39 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "volume_ratio": volume_ratio,
                 "range_atr_ratio": range_atr_ratio,
                 "close_location": close_location,
+                "volume_basis": volume_basis,
             }
         except Exception as exc:
             logger.debug(f"Candle thrust metrics failed for {instrument} {timeframe}: {exc}")
+            return None
+
+    @staticmethod
+    def _surge_tick_ratio(recent):
+        """Participation surge from tick_count when traded volume is unmeasurable.
+
+        Same shape as _surge_prior_mean — zero bars are EXCLUDED from the mean rather
+        than averaged in, and at least 5 measured bars are required, so a thin window
+        reads as unmeasurable instead of as a breakout. Returns None when tick activity
+        cannot be measured either, which keeps "no data" distinct from "no surge".
+        """
+        try:
+            import pandas as _pd
+
+            if "tick_count" not in getattr(recent, "columns", []):
+                return None
+            ticks = _pd.to_numeric(recent["tick_count"], errors="coerce").fillna(0.0)
+            if len(ticks) < 2:
+                return None
+            last_ticks = float(ticks.iloc[-1])
+            prior = ticks.iloc[:-1]
+            measured = prior[prior > 0]
+            if last_ticks <= 0 or len(measured) < 5:
+                return None
+            mean = float(measured.mean())
+            if mean <= 0:
+                return None
+            return last_ticks / mean
+        except Exception:
             return None
 
     def _market_wide_reversal_context(
