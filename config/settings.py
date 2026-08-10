@@ -1649,6 +1649,12 @@ class Settings(BaseSettings):
     # delay = min(max_seconds, seconds * 2^(failures-1)).
     angel_rest_backoff_seconds: float = 12.0
     angel_rest_backoff_max_seconds: float = 60.0
+    # Kite REST throttle backoff, same ladder. Much shorter than the Angel figures above
+    # because Kite's published limits are per-SECOND (historical 3/s, quote 1/s), so a
+    # 12s floor would idle the data path for whole scan cycles to clear a sub-second
+    # window. Applied per endpoint, and only on a recognised rate-limit refusal.
+    kite_rest_backoff_seconds: float = 1.0
+    kite_rest_backoff_max_seconds: float = 8.0
     # ── 2026-07-03 session-audit fixes ──
     # Bounded option-quote retry before dropping a live candidate (transient
     # chain hiccups cost 16 tradeable candidates that session).

@@ -17,6 +17,7 @@ Two things here are genuine upgrades over the AngelOne path, not just translatio
 from __future__ import annotations
 
 import threading
+import time as _time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +60,13 @@ class KiteDataSource:
         self._instruments: Dict[str, List[Dict[str, Any]]] = {}
         self._by_symbol: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._loaded_on: Optional[date] = None
+        # Per-endpoint throttle cooldown. AngelOne had this (_mark_angel_rest_backoff and
+        # the SharedApiRateLimiter stack); the Kite migration removed the broker and left
+        # its rate-limit layer wired to dead code, so a 429 was swallowed into an empty
+        # frame and the identical burst re-fired on the next scan tick, holding the
+        # throttle open indefinitely.
+        self._throttle_until: Dict[str, float] = {}
+        self._throttle_failures: Dict[str, int] = {}
 
     @property
     def kite(self):
@@ -70,20 +78,85 @@ class KiteDataSource:
     def is_connected(self) -> bool:
         return self.kite is not None
 
+    @staticmethod
+    def _is_throttle(exc: Exception) -> bool:
+        """True for a rate-limit refusal, as opposed to any other failure.
+
+        Deliberately narrow. Backing off on the wrong exception starves the data path,
+        which is a worse outcome than the hammering this exists to stop — so an
+        unrecognised failure is NOT treated as a throttle.
+        """
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return any(
+            marker in text
+            for marker in ("too many request", "rate limit", "429", "throttle")
+        )
+
+    def _throttled(self, context: str, now_ts: float) -> bool:
+        return now_ts < float(self._throttle_until.get(context, 0.0) or 0.0)
+
+    def _mark_throttled(self, context: str, now_ts: float) -> float:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        base = float(getattr(settings, "kite_rest_backoff_seconds", 1.0) or 1.0)
+        ceiling = float(getattr(settings, "kite_rest_backoff_max_seconds", 8.0) or 8.0)
+        failures = int(self._throttle_failures.get(context, 0)) + 1
+        self._throttle_failures[context] = failures
+        cooldown = min(max(0.1, ceiling), max(0.1, base) * (2 ** (failures - 1)))
+        self._throttle_until[context] = now_ts + cooldown
+        return cooldown
+
+    def _clear_throttle(self, context: str) -> None:
+        if context in self._throttle_failures:
+            self._throttle_failures.pop(context, None)
+            self._throttle_until.pop(context, None)
+
+    def throttle_status(self) -> Dict[str, Any]:
+        """What the health payload reports. The Angel equivalents it replaces were frozen
+        at False/0 behind a permanently-None smart_api, so a throttled Kite feed showed a
+        green pacing indicator while _call swallowed 429s into empty frames."""
+        now_ts = _time.time()
+        active = {
+            ctx: round(until - now_ts, 2)
+            for ctx, until in self._throttle_until.items()
+            if until > now_ts
+        }
+        return {
+            "kite_rest_backoff_active": bool(active),
+            "kite_rest_backoff_contexts": active,
+            "kite_rest_backoff_failures": sum(self._throttle_failures.values()),
+        }
+
     def _call(self, context: str, fn, default=None):
         api = self.kite
         if api is None:
             logger.debug(f"Kite {context} skipped: no authenticated session")
             return default
+        now_ts = _time.time()
+        if self._throttled(context, now_ts):
+            # Returning `default` is what the exception path already did on a throttle;
+            # the difference is that the request is not sent, so the broker's window is
+            # allowed to drain instead of being kept open by the retry.
+            logger.debug(f"Kite {context} skipped: throttled for another "
+                         f"{self._throttle_until[context] - now_ts:.1f}s")
+            return default
         try:
-            return fn(api)
+            result = fn(api)
         except Exception as exc:
-            from trading.kite_broker import classify_kite_exception
-
             if type(exc).__name__ == "TokenException" and self._auth is not None:
                 self._auth.invalidate(f"{context}: {exc}")
-            logger.warning(f"Kite {context} failed: {type(exc).__name__}: {exc}")
+            if self._is_throttle(exc):
+                cooldown = self._mark_throttled(context, now_ts)
+                logger.warning(
+                    f"Kite {context} throttled: {type(exc).__name__}: {exc} — "
+                    f"backing off {cooldown:.1f}s"
+                )
+            else:
+                logger.warning(f"Kite {context} failed: {type(exc).__name__}: {exc}")
             return default
+        self._clear_throttle(context)
+        return result
 
     # ── contract master ──────────────────────────────────────────────────────
     def load_instruments(self, exchanges: Tuple[str, ...] = ("NFO", "BFO", "NSE", "BSE"),
