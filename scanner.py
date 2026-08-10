@@ -10087,39 +10087,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Dashboard/session signals are advisory marks, not simulated fills, so this must
         # stay deterministic in (entry, exit, qty) and add no per-tick slippage.
         #
-        # It used to be the FLAT opt_cost/fut_cost, which understates the real bill by
-        # about half: measured 2026-08-10, a NIFTY 232.85 x 65 round trip is Rs.171 under
-        # estimate_trade_charges but was shown as Rs.80. The mirror is what the operator
-        # reads to judge whether a strategy pays, so it has to charge what REAL mode will.
-        # The flat figure remains the fallback when the real model cannot price the row.
-        is_opt = self._is_premium_long_candidate(candidate)
-        flat = (
+        # The flat opt_cost/fut_cost IS the real broker bill: measured against Zerodha's
+        # published rates, a NIFTY 232.85 x 65 option round trip is Rs.75 (brokerage 40 +
+        # STT 15.14 + exchange 10.60 + GST 9.11 + stamp 0.45), and the four indices span
+        # Rs.68-86 against a configured 80.
+        #
+        # estimate_trade_charges is deliberately NOT used here. Its own docstring says it
+        # returns "flat cost + modeled slippage", and on these rows that slippage doubles
+        # the figure to Rs.149-206. These are advisory marks, not simulated fills — the
+        # exit price already IS where the row would print — so adding a modeled spread on
+        # top charges the same cost twice. I had swapped this to the model on 2026-08-10
+        # believing the flat figure understated the bill; it does not, and the comment
+        # this replaced was right.
+        charges = (
             float(getattr(settings, "opt_cost", 80.0) or 80.0)
-            if is_opt
+            if self._is_premium_long_candidate(candidate)
             else float(getattr(settings, "fut_cost", 200.0) or 200.0)
         )
-        charges = flat
-        try:
-            from engine.trade_accounting import estimate_trade_charges
-
-            # Same basis as _candidate_gross_pnl just above, so cost and gross agree.
-            qty = int(getattr(candidate, "lots", 1) or 1) * int(getattr(candidate, "lot_size", 1) or 1)
-            entry_px = float(getattr(candidate, "price", 0.0) or 0.0)
-            if qty > 0 and entry_px > 0 and float(exit_px or 0.0) > 0:
-                modelled = float(
-                    estimate_trade_charges(
-                        entry_px,
-                        float(exit_px),
-                        qty,
-                        "OPT" if is_opt else "FUT",
-                        settings,
-                        instrument=str(getattr(candidate, "instrument", "") or ""),
-                    )
-                )
-                if modelled > 0:
-                    charges = modelled
-        except Exception:
-            charges = flat
         return round(self._candidate_gross_pnl(candidate, exit_px) - charges, 2)
 
     @staticmethod
@@ -12314,31 +12298,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ) or 0.0)
         except (TypeError, ValueError):
             flat = 0.0
-        # Price the ACTUAL position, not a flat placeholder. The flat opt_cost is 80 while
-        # the real bill scales with turnover: a MIDCPNIFTY 174.50 x 120 round trip is
-        # Rs.205. Judging "is this loss bigger than the cost of closing" against 80 while
-        # the row is charged 205 lets through exactly the exits this floor exists to stop
-        # — measured on the 2026-08-10 13:04 row, a Rs.168 loss cut at a Rs.205 cost.
-        try:
-            from engine.trade_accounting import estimate_trade_charges
-
-            qty = int(getattr(trade_like, "lots", 0) or 0) * int(getattr(trade_like, "lot_size", 0) or 0)
-            if qty <= 0:
-                qty = int(getattr(trade_like, "quantity", 0) or getattr(trade_like, "broker_quantity", 0) or 0)
-            entry_px = float(
-                getattr(trade_like, "entry_price", 0.0)
-                or getattr(trade_like, "price", 0.0)
-                or 0.0
-            )
-            if qty > 0 and entry_px > 0:
-                modelled = float(estimate_trade_charges(
-                    entry_px, entry_px, qty, kind, settings,
-                    instrument=str(getattr(trade_like, "instrument", "") or ""),
-                ))
-                if modelled > 0:
-                    return modelled
-        except Exception:
-            pass
+        # The flat configured cost is the real round trip (Rs.68-86 measured across the
+        # four indices, configured 80). estimate_trade_charges would add ~Rs.90 of MODELED
+        # SLIPPAGE on top, which would make this floor roughly twice the true cost of
+        # closing and suppress exits that are genuinely worth taking.
         return flat
 
     @staticmethod

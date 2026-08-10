@@ -32,9 +32,16 @@ Four defects combined:
    measured on the GLOBAL exit tape, so any other index's exit cleared it. NIFTY lost
    four times and the streak read 1, 1, 1, 2.
 
-Plus two reporting defects: the exit's reason string was never logged (the day was
-undiagnosable from logs), and the mirror charges a flat Rs.80 where the real model
-computes Rs.149-186 — so the dashboard understated the cost by about half.
+Plus one reporting defect: the exit's reason string was never logged, so the day was
+undiagnosable from the logs.
+
+CORRECTION (same day): this file originally also claimed the mirror's flat Rs.80
+understated the bill against estimate_trade_charges' Rs.149-206. That was wrong. Checked
+against Zerodha's published option rates, a NIFTY 232.85 x 65 round trip is Rs.75.34 —
+brokerage 40 + STT 15.14 + exchange 10.60 + GST 9.11 + stamp 0.45 — and the four indices
+span Rs.68-86 against a configured opt_cost of 80. The flat figure was correct. The
+model's extra ~Rs.90 is MODELED SLIPPAGE, which belongs in simulated fills, not in an
+advisory mark-to-market row whose exit price already is where it would print.
 """
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -191,22 +198,38 @@ def test_a_loss_larger_than_the_round_trip_may_still_be_judged():
     assert "round-trip cost" not in ctx
 
 
-def test_the_floor_prices_the_actual_position_not_a_flat_placeholder():
-    """The 13:04 row is why. The flat opt_cost is Rs.80, but a MIDCPNIFTY 174.50 x 120
-    round trip costs Rs.205 — and the row WAS charged 205. Judging "is this loss worth
-    the cost of closing" against 80 let through a Rs.168 loss cut at a Rs.205 cost, which
-    is the exact trade this floor exists to refuse."""
-    # Asserted as a RELATIONSHIP, not a magic number: another test in this suite mutates
-    # the shared get_settings() singleton, so any hardcoded rupee figure here passes alone
-    # and fails in a full run. The contract is that the floor equals what the row is
-    # actually charged.
+def test_the_floor_is_the_real_broker_round_trip():
+    """CORRECTED 2026-08-10. This first asserted the floor should follow
+    estimate_trade_charges, which returns "flat cost + MODELED SLIPPAGE" — Rs.149-206 on
+    these rows. That is not what a round trip costs.
+
+    Checked against Zerodha's published option rates, a NIFTY 232.85 x 65 round trip is
+    Rs.75.34: brokerage 40 (flat Rs.20 x 2 legs) + STT 15.14 (0.1% sell premium) +
+    exchange 10.60 + GST 9.11 + stamp 0.45. Across the four indices the range is
+    Rs.68-86 against a configured opt_cost of 80 — so the flat figure was right all
+    along, and using the slippage-inflated model made this floor roughly twice the true
+    cost of closing, which suppresses exits that are genuinely worth taking."""
     s = _scanner()
-    midcap = _trade("MIDCPNIFTY", 174.50, 120)
-    floor = Scanner._round_trip_cost_rs(s, midcap, inst_type="OPT")
-    assert floor == pytest.approx(_charged(midcap), rel=0.02), (
-        f"floor Rs.{floor:.0f} does not match the Rs.{_charged(midcap):.0f} the row pays"
+    floor = Scanner._round_trip_cost_rs(s, _trade("MIDCPNIFTY", 174.50, 120), inst_type="OPT")
+    assert floor == pytest.approx(_flat_opt_cost()), (
+        f"floor is Rs.{floor:.0f}; the real broker round trip is Rs.68-86"
     )
-    assert floor > _flat_opt_cost(), "the floor is still the flat placeholder"
+    assert 60.0 <= floor <= 100.0, "the configured cost drifted outside the real range"
+
+
+def test_the_futures_floor_uses_its_own_configured_cost():
+    s = _scanner()
+    bare = SimpleNamespace(instrument="NIFTY", inst_type="FUT")
+    assert Scanner._round_trip_cost_rs(s, bare, inst_type="FUT") == 200.0
+
+
+def test_the_slippage_model_is_not_used_for_the_floor():
+    """estimate_trade_charges adds ~Rs.90 of modeled slippage on top of the real bill.
+    That belongs in simulated fills, not in "what does it cost me to close"."""
+    import inspect
+
+    src = inspect.getsource(Scanner._round_trip_cost_rs)
+    assert "estimate_trade_charges(" not in src.replace("# ", "")
 
 
 def test_the_1304_row_is_refused_by_the_corrected_floor():
@@ -235,15 +258,19 @@ def test_the_floor_falls_back_to_the_flat_cost_when_it_cannot_price_the_row():
     assert Scanner._round_trip_cost_rs(s, bare, inst_type="FUT") == 200.0
 
 
-def test_the_floor_scales_with_position_size():
-    """A 3-lot position costs more to close than a 1-lot, so its floor must be higher."""
+def test_the_floor_does_not_scale_with_position_size():
+    """CORRECTED: opt_cost is a per-TRADE round trip, not a per-lot one. Brokerage is a
+    flat Rs.20 an order however many lots it carries, so a 3-lot exit costs the same
+    Rs.20 to send as a 1-lot. The percentage components (STT, exchange, GST) do scale,
+    which is why the real figure drifts Rs.68-86 across sizes — but not enough to justify
+    a per-position model here, and the previous version of this test wrongly demanded
+    one."""
     s = _scanner()
     one = _trade("NIFTY", 232.85, 65)
     three = _trade("NIFTY", 232.85, 65)
     three.lots = 3
-    assert _charged(three) > _charged(one), "premise: 3 lots must cost more to close"
     assert (Scanner._round_trip_cost_rs(s, three, inst_type="OPT")
-            > Scanner._round_trip_cost_rs(s, one, inst_type="OPT"))
+            == Scanner._round_trip_cost_rs(s, one, inst_type="OPT"))
 
 
 # ── 2. neutral is not adverse ────────────────────────────────────────────────
