@@ -23,6 +23,30 @@ from loguru import logger
 
 from concurrent.futures import ThreadPoolExecutor
 
+
+def order_filled_quantity(row: Any) -> float:
+    """Quantity an order actually executed, across the field names Kite uses.
+
+    A TERMINAL status is not the same as UNFILLED: Kite reports an order that partially
+    executed and was then cancelled as CANCELLED with a non-zero filled quantity. Any
+    caller deciding "nothing happened, act as if this order never existed" has to read
+    this, not the status string alone.
+
+    Returns 0.0 for a missing/unparseable row, which reads as "no evidence of a fill" —
+    callers must not treat that as proof of absence.
+    """
+    if not isinstance(row, dict):
+        return 0.0
+    for field in ("filledshares", "filled_quantity", "filledQuantity", "filled"):
+        try:
+            value = abs(float(row.get(field) or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
 class Broker:
     """Base Broker Interface"""
     def __init__(self):
@@ -191,18 +215,7 @@ class Broker:
                     #
                     # A partial fill IS a fill, so it answers False under this contract.
                     # Callers already treat anything other than True as "do not act".
-                    filled = 0.0
-                    for field in (
-                        "filledshares", "filled_quantity", "filledQuantity", "filled",
-                    ):
-                        try:
-                            value = abs(float(row.get(field) or 0.0))
-                        except (TypeError, ValueError):
-                            continue
-                        if value > 0:
-                            filled = value
-                            break
-                    return filled <= 0
+                    return order_filled_quantity(row) <= 0
                 if status in filled_terminal:
                     return False
             if time.monotonic() >= deadline:

@@ -26,6 +26,7 @@ from loguru import logger
 from data.sqlite_db import db
 from trading.performance_metrics import annualize_sharpe, format_sharpe_pair
 from trading.trade_dashboard import build_dashboard_rows
+from trading.broker import order_filled_quantity
 from trading.order_retry import (
     execute_order_with_retry,
     BrokerOrderAmbiguous,
@@ -2907,6 +2908,42 @@ class TradeManager:
                     ).total_seconds()
                     status_text = self._order_status_text(order_status)
                     if status_text in {"rejected", "cancelled", "canceled"}:
+                        # A TERMINAL status is not the same as UNFILLED. Kite reports an
+                        # order that partially executed and was then cancelled as
+                        # CANCELLED with a non-zero filled quantity, and this branch used
+                        # to read the status STRING alone — booking the trade CLOSED at
+                        # pnl 0 and popping it out of open_trades while that quantity sat
+                        # live at the broker with no protective stop and no local row.
+                        # The positions snapshot is taken once at the top of the pass
+                        # while get_order_status is called live per trade, so `position
+                        # is None` here does NOT mean flat.
+                        filled_qty = order_filled_quantity(order_status)
+                        if filled_qty > 0:
+                            trade.broker_quantity = int(filled_qty)
+                            trade.execution_status = "PARTIAL"
+                            trade.pending_execution = True
+                            trade.execution_error = (
+                                f"{status_text} after filling {int(filled_qty)}; "
+                                "position is live at the broker"
+                            )
+                            logger.critical(
+                                f"[PARTIAL FILL ON {status_text.upper()}] {trade.id} "
+                                f"{trade.trading_symbol}: {int(filled_qty)} filled and "
+                                "live. Arming protection instead of closing the row."
+                            )
+                            try:
+                                self.ensure_broker_protection(trade, int(filled_qty))
+                            except Exception as exc:
+                                logger.error(
+                                    f"Protection failed for partial fill on {trade.id}: {exc}"
+                                )
+                                self._mark_recovery(
+                                    trade,
+                                    f"{int(filled_qty)} filled on a {status_text} order "
+                                    "and the protective stop could not be armed.",
+                                )
+                            changed = True
+                            continue
                         trade.status = "CLOSED"
                         trade.pending_execution = False
                         trade.execution_status = "REJECTED"
