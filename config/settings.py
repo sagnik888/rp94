@@ -1745,7 +1745,16 @@ class Settings(BaseSettings):
     weak_market_scalp_mode_enabled: bool = True
     weak_market_scalp_min_day_confidence: float = 0.60
     weak_market_scalp_max_rr: float = 1.5
-    max_consecutive_losses: int = 3
+    # 3 halted an index for the rest of the day on a 3-loss run. Simulated over the
+    # measured 59.8% win rate and v7's unconstrained arrival rate (3.61 trades/index/day,
+    # 30 days x 4 indices): k=3 blocks ~13 trades and fires ~10 halts, k=4 blocks ~3 and
+    # fires ~2.6, k=5 blocks ~1. Raising to 4 recovers ~10 trades (~Rs 7,800 at the
+    # measured Rs 784/trade) and still halts an index that is genuinely broken, one trade
+    # later. k=5 makes the protection close to vacuous.
+    #
+    # Per-index remains correct: the old global tape interleaved four indices so the halt
+    # never fired at all. This tunes a working guard rather than reverting to a broken one.
+    max_consecutive_losses: int = 4
     index_cooldown_minutes: float = 4.0
     # ── Regime-scoped cooldown (2026-07-10) ──
     # UT1 is a flip engine: after an opposite-signal exit the reverse entry IS
