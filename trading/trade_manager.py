@@ -3746,7 +3746,7 @@ class TradeManager:
         if self.broker and trading_symbol and symbol_token and not is_warmup and not is_ghost:
             order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
             
-            def place_bg():
+            def _place_bg_body():
                 # Every retry runs the preflight again and takes its own reservation.
                 # Collected so a definitive rejection can hand all of them back at once.
                 reservations: List[str] = []
@@ -3887,6 +3887,39 @@ class TradeManager:
                 if on_execution_result:
                     on_execution_result(trade, False)
             
+
+            def place_bg():
+                """Run the entry task, and never let an exception vanish into the queue.
+
+                AsyncExecutionQueue catches and logs whatever escapes a task, then moves
+                on — the worker survives, but the TRADE does not get cleaned up. Every
+                statement after execute_order_with_retry returns is unprotected
+                (save_state, _log_ui, _alert_blocking_broker_condition, the
+                on_execution_result callback), so a throw there left the row sitting in
+                open_trades with pending_execution True, holding a position slot and
+                counting against exposure while nothing rested at the exchange.
+
+                RECOVERY_REQUIRED, not "closed": an arbitrary exception says nothing
+                about whether the order reached the broker, and concluding "not placed"
+                from a failure is the mistake this codebase keeps making. The pending
+                flags are deliberately left alone for the same reason.
+                """
+                try:
+                    return _place_bg_body()
+                except Exception as exc:
+                    logger.critical(
+                        f"[ENTRY TASK ESCAPED] {trade.id} {trade.trading_symbol}: {exc}. "
+                        "Broker state unknown; marking for reconciliation."
+                    )
+                    try:
+                        self._mark_recovery(
+                            trade,
+                            f"entry task raised after submission ({exc}); the order may or "
+                            "may not be live at the broker.",
+                        )
+                    except Exception:
+                        pass
+                    return None
             from engine.async_queue import execution_queue
             # `is False` and not `not ...`: submit() is documented -> bool, and a test
             # double or simulation stub that returns None means "I do not signal", not
@@ -4203,7 +4236,7 @@ class TradeManager:
         broker = self.broker
         product_type = self.product_type
 
-        def close_bg():
+        def _close_bg_body():
             with self._lock:
                 current = self.open_trades.get(trade.id)
                 if (
@@ -4325,6 +4358,34 @@ class TradeManager:
             if on_exit_result:
                 on_exit_result(trade, False)
 
+
+        def close_bg():
+            """Run the exit task, and never let an exception vanish into the queue.
+
+            Same hazard as the entry task: the queue logs and continues, leaving the row
+            pending_exit against what may be a live broker position.
+
+            pending_exit is deliberately NOT cleared here. An exception raised AFTER the
+            exit order was accepted would then permit a second exit on top of a live one,
+            which is worse than the stranded row. RECOVERY_REQUIRED is the signal a human
+            reconciles from, and the session-end sweep already routes on it.
+            """
+            try:
+                return _close_bg_body()
+            except Exception as exc:
+                logger.critical(
+                    f"[EXIT TASK ESCAPED] {trade.id} {trade.trading_symbol}: {exc}. "
+                    "Broker state unknown; marking for reconciliation."
+                )
+                try:
+                    self._mark_recovery(
+                        trade,
+                        f"exit task raised after submission ({exc}); the exit may or may "
+                        "not have reached the broker.",
+                    )
+                except Exception:
+                    pass
+                return None
         from engine.async_queue import execution_queue
         if execution_queue.submit(f"CloseOrder_{trade.trading_symbol}", close_bg) is False:
             # submit() returns False on shutdown and when the queue is still full after a

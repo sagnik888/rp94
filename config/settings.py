@@ -838,6 +838,11 @@ class Settings(BaseSettings):
     # confirm_seconds: the same domain signature must be seen twice, that far apart on the
     # MARKET clock. Scanner cycles repeat against one timestamp, so counting calls would
     # manufacture persistence; the clock must actually advance.
+    # Days of remaining exchange-calendar coverage below which readiness warns. The
+    # bundled NSE holiday list is versioned by year and an uncovered year fails CLOSED —
+    # correct, but silent: the system runs, scans and serves a dashboard while placing
+    # nothing. Warning early turns a five-month fuse into a routine data update.
+    calendar_coverage_warn_days: int = 45
     peak_threat_exit_loss_min_domains: int = 2
     peak_threat_exit_loss_confirm_seconds: float = 3.0
     # A same-index loss run used to be measured on the GLOBAL exit tape, so any other

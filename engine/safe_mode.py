@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -148,6 +148,44 @@ def unreachable_intel_gates(settings) -> list[tuple[str, float]]:
     return found
 
 
+def calendar_coverage_status(data_provider, now) -> dict:
+    """Which years the exchange calendar actually covers, and how long that lasts.
+
+    The bundled NSE holiday list is versioned by year. Any date outside the covered
+    years is treated as a holiday — deliberate, because trading a year whose holidays
+    cannot be verified is the worse failure. But that cliff arrives silently: the
+    system keeps running, scanning and serving a dashboard while placing nothing.
+
+    Reporting how many days remain lets the operator fix it in advance instead of
+    discovering it on the first morning of an uncovered year.
+    """
+    years = set()
+    try:
+        for day in getattr(data_provider, "nse_holidays", None) or set():
+            head = str(day)[:4]
+            if head.isdigit():
+                years.add(int(head))
+    except Exception:
+        return {"years": [], "current_covered": True, "days_remaining": None}
+    if not years:
+        # No calendar loaded at all: is_market_holiday does not fail closed in that
+        # case (`if coverage_years and ...`), so this is not the cliff.
+        return {"years": [], "current_covered": True, "days_remaining": None}
+    last = max(years)
+    try:
+        expires = date(last, 12, 31)
+        remaining = (expires - now.date()).days
+    except Exception:
+        return {"years": sorted(years), "current_covered": now.year in years,
+                "days_remaining": None}
+    return {
+        "years": sorted(years),
+        "current_covered": now.year in years,
+        "days_remaining": remaining,
+        "expires_on": expires.isoformat(),
+    }
+
+
 def validate_real_mode_readiness(
     settings: Any,
     data_provider: Any = None,
@@ -248,11 +286,45 @@ def validate_real_mode_readiness(
         except Exception as exc:
             warnings.append(f"source health unavailable: {exc}")
 
+        # Distinguish a real holiday from an EXPIRED calendar before reporting either.
+        # An uncovered year fails CLOSED — correctly, since trading a year whose holidays
+        # cannot be verified is worse — but it surfaced as the bare string "market
+        # holiday", which on an ordinary Monday reads like the exchange is shut rather
+        # than like the software has run out of data. The system then runs, scans and
+        # shows a dashboard while placing nothing, with one CRITICAL line as the only
+        # evidence.
+        coverage = calendar_coverage_status(data_provider, now)
         try:
             if data_provider.is_market_holiday(now):
-                blockers.append("market holiday")
+                if coverage.get("years") and not coverage.get("current_covered"):
+                    blockers.append(
+                        f"exchange calendar covers {coverage['years'][0]}-{coverage['years'][-1]} "
+                        f"only, so every {now.year} date reads as a holiday and NO trade can be "
+                        "placed. Add this year's dates to data_store/market_holidays.json."
+                    )
+                else:
+                    blockers.append("market holiday")
         except Exception as exc:
             warnings.append(f"holiday calendar check unavailable: {exc}")
+
+        # Warn while there is still time to act, rather than on the morning it stops.
+        try:
+            remaining = coverage.get("days_remaining")
+            warn_days = max(
+                0, int(getattr(settings, "calendar_coverage_warn_days", 45) or 0)
+            )
+            if (
+                coverage.get("current_covered")
+                and remaining is not None
+                and 0 <= remaining <= warn_days
+            ):
+                warnings.append(
+                    f"exchange calendar runs out on {coverage.get('expires_on')} "
+                    f"({remaining} days). After that every session reads as a holiday and "
+                    "trading stops silently — update data_store/market_holidays.json."
+                )
+        except Exception as exc:
+            warnings.append(f"calendar coverage check unavailable: {exc}")
 
     # Free cash vs what one lot actually costs. An account that cannot fund a single
     # lot will have EVERY entry refused by RMS, which surfaces only as a generic
