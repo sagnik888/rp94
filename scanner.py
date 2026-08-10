@@ -23684,6 +23684,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "trade",
                     )
                     continue
+                # CANDLE_CLOSE only. In INTRACANDLE every candidate meets the entry cutoff
+                # inside the stabilization block below, but that whole block is skipped in
+                # closed-candle mode, leaving just the wave-level any() above — which is
+                # not per candidate and only runs once the clock is already past
+                # ut_5min_no_entry_after. A bar that closed inside the window but is
+                # processed after it therefore entered unchecked.
+                # Confined to this branch on purpose: applying the cutoff this early in
+                # INTRACANDLE would reject candidates the buffer is still entitled to
+                # mature, which is a live-path behaviour change this does not want.
+                if not intrabar_enabled and not self._entry_cutoff_allows_candidate(
+                    candidate, source_now
+                ):
+                    self.log_signal_decision_once(
+                        f"{candidate.instrument}|{candidate.timeframe}|"
+                        f"{getattr(candidate, 'signal_timestamp', '')}|closed-cutoff",
+                        f"Entry cutoff: {candidate.instrument} {candidate.timeframe} "
+                        f"candle closed past the no-entry policy.",
+                        "trade",
+                    )
+                    continue
                 timing_eligible.append(candidate)
             candidates = timing_eligible
             if not intrabar_enabled:
