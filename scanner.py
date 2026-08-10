@@ -16877,6 +16877,50 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return "Non-reentry rejection"
         return ""
 
+    def _drop_missed_reentry_seed(self, candidate, reason: str = "") -> bool:
+        """Withdraw a signal from the missed-signal re-entry pool.
+
+        The stabilization gate discards a candidate when its UT1 arrow VANISHES or
+        FLIPS — the indicator withdrawing its own claim. That discard already cleans up
+        _last_signal_identity, _candidate_process_cache and _raw_utbot_activity_keys, but
+        it never removed the re-entry SEED, so the same signal could be re-admitted from
+        the pool moments later.
+
+        Measured live on 2026-08-10:
+
+            12:55:51  [STABILIZATION] Rejected MIDCPNIFTY 5min LONG: UT1 arrow vanished
+            12:55:57  Live Gate: missed-signal re-entry admitting MIDCPNIFTY 5min LONG,
+                      age 355s
+
+        Six seconds apart, on a signal already six minutes old. _missed_reentry_blocked_
+        reason does list "REPAINT" as a hard block, but it matches on the reason TEXT of
+        the original soft rejection — which was written long before the arrow vanished
+        and says nothing about repainting. The block was real and simply never consulted
+        about this event, so the seed has to be withdrawn at the source.
+        """
+        store = getattr(self, "_missed_reentry_candidates", None)
+        if not isinstance(store, dict) or not candidate:
+            return False
+        instrument = str(getattr(candidate, "instrument", "") or "").upper()
+        rows = store.get(instrument)
+        if not rows:
+            return False
+        try:
+            key = self._candidate_history_key(candidate)
+        except Exception:
+            return False
+        kept = [row for row in rows if self._candidate_history_key(row) != key]
+        if len(kept) == len(rows):
+            return False
+        store[instrument] = kept
+        logger.info(
+            f"[STABILIZATION] Withdrew {instrument} {getattr(candidate, 'timeframe', '')} "
+            f"{getattr(candidate, 'direction', '')} from the missed-signal re-entry pool: "
+            f"{reason or 'arrow withdrawn'}."
+        )
+        self._diag_inc("stabilization", "reentry_seed_withdrawn")
+        return True
+
     def _remember_missed_reentry_seed(
         self,
         candidate: TradeCandidate,
@@ -23857,6 +23901,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             source="stabilization_repaint_gate",
                         )
                         self._forget_signal_display_rows(c)
+                        # The indicator has withdrawn this arrow. Withdraw it from the
+                        # re-entry pool too, or the missed-signal path re-admits the same
+                        # discarded signal within seconds.
+                        self._drop_missed_reentry_seed(
+                            c,
+                            reason=(
+                                "arrow flipped to the opposite side"
+                                if flipped
+                                else "arrow vanished during stabilization"
+                            ),
+                        )
                         keys_to_remove.append(key)
                         dedup_key = f"{c.instrument}_{c.timeframe}"
                         identity = f"{sig_timestamp.replace(tzinfo=None).isoformat()}|{getattr(c, 'source_signal_type', '')}" if sig_timestamp else ""
