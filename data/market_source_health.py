@@ -24,6 +24,18 @@ def build_source_health(
     kite_tick = float(getattr(provider, "_last_kite_ws_tick", 0.0) or 0.0)
     kite_age = None if kite_tick <= 0 else max(0.0, now - kite_tick)
     kite_health = bool(provider.is_connected)
+    # provider.is_connected is a plain attribute assigned at connect()/rebind_kite() and
+    # never revoked, so a token invalidated mid-session leaves it True forever.
+    # KiteDataSource.is_connected is a live property (`auth.kite is not None`) and
+    # _mark_auth_required sets that to None, so it does track a dead session.
+    #
+    # Reported ALONGSIDE rather than folded into kite_health on purpose: kite_health
+    # feeds all_brokers_unavailable, which gates REAL mode, and tightening a trading
+    # gate on an observability defect risks refusing to trade through a transient auth
+    # blip. The authoritative recovery path already exists (main.py's RuntimeWatchdog
+    # polls kite_auth.status()["auth_required"] and raises a latched alert); this makes
+    # the same fact visible in the health snapshot the rest of the system reads.
+    kite_session_live = bool(getattr(getattr(provider, "kite", None), "is_connected", False))
     fyers_available = provider.fyers is not None and not provider._fyers_auth_required
     fyers_health = bool(fyers_available and (fyers_fresh if is_live else True))
 
@@ -72,6 +84,9 @@ def build_source_health(
 
     return {
         "kite": kite_health,
+        # Live order capability. `kite` above is the latched connect-time flag and stays
+        # True after a mid-session token death; this one goes False with the session.
+        "kite_session_live": kite_session_live,
         "kite_tick_age_seconds": round(kite_age, 2) if kite_age is not None else None,
         "kite_stream_stalled": kite_stream_stalled,
         "kite_data_fresh": kite_data_fresh,

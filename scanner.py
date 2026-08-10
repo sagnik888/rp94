@@ -751,6 +751,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._last_exit_time = {}
             self._counted_entry_keys = set()
             self._counted_outcome_signatures = set()
+            # _stop_out_reentries was never cleared here, so the "once per index per
+            # DAY" allowance its docstring promises was really once per PROCESS
+            # LIFETIME: a process kept alive across sessions had stop-out re-entry
+            # permanently disabled on any index that used it once.
+            self._stop_out_reentries = {}
             self._last_loss_outcome_instrument = ""
             self._last_reset_date = today
             closed_today = []
@@ -21136,6 +21141,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 return False, ""
 
             for trade_id, trade in list(getattr(self.trades, "open_trades", {}).items()):
+                # Reconstructed session-ledger rows are inserted into open_trades with
+                # status OPEN at startup, and dict order puts them AHEAD of anything
+                # opened later. Every sibling guard filters them (_opposite_direction
+                # _stack_block, _is_live_book_trade, _bucket_open_count,
+                # _effective_max_positions) — this loop did not. Because the loop
+                # RETURNS on its first match, a matching ghost consumed the single
+                # cascade offer and the live position behind it was never asked, while
+                # the log reported a successful add.
+                if bool(getattr(trade, "is_ghost", False)):
+                    continue
                 if str(getattr(trade, "instrument", "") or "").split()[0].upper() != base:
                     continue
                 if str(getattr(trade, "timeframe", "") or "") != timeframe:
