@@ -364,6 +364,18 @@ def _request_authorized(request: Request) -> bool:
 # and known numeric fields are type/range-validated before the scanner sees them.
 _BASE_COMMAND_FIELDS = {"cmd", "request_id"}
 _ADVANCED_CONFIG_FIELDS = {
+    "block_opposite_direction_stack",
+    "consecutive_loss_streak_per_index",
+    "surge_tick_proxy_enabled",
+    "intel_reversal_corroboration_enabled",
+    "partial_entry_remainder_cancel_enabled",
+    "morning_refresh_catchup_at_live_open",
+    "surge_tick_percentile_floor",
+    "intel_reversal_corroboration_votes",
+    "partial_entry_remainder_timeout_seconds",
+    "kite_rest_backoff_seconds",
+    "kite_rest_backoff_max_seconds",
+    "calendar_coverage_warn_days",
     "lean_routing_to_options",
     "price_action_module_enabled",
     "price_action_block_adverse",
@@ -595,6 +607,12 @@ _ADVANCED_CONFIG_FIELDS = {
     "pullback_hedge_max_hold_minutes",
 }
 _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
+    "block_opposite_direction_stack",
+    "consecutive_loss_streak_per_index",
+    "surge_tick_proxy_enabled",
+    "intel_reversal_corroboration_enabled",
+    "partial_entry_remainder_cancel_enabled",
+    "morning_refresh_catchup_at_live_open",
     "pullback_hedge_enabled",
     "stop_out_reentry_enabled",
     "per_timeframe_grading_enabled",
@@ -1692,6 +1710,22 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 rare_dual_tf_min_confidence=msg.get("rare_dual_tf_min_confidence"),
                 rare_dual_tf_prefer_opt_second=msg.get("rare_dual_tf_prefer_opt_second"),
                 one_min_scalping_high_burst_only=msg.get("one_min_scalping_high_burst_only"),
+                # Added 2026-08-11. Whitelisting alone is not enough — the 2026-07-10
+                # regression noted above was exactly this: the control appears in the UI
+                # and is silently discarded. These are the A/B levers for the backtest
+                # trade-count gap plus the 1min lane and the widened exit vote.
+                block_opposite_direction_stack=msg.get("block_opposite_direction_stack"),
+                consecutive_loss_streak_per_index=msg.get("consecutive_loss_streak_per_index"),
+                surge_tick_proxy_enabled=msg.get("surge_tick_proxy_enabled"),
+                intel_reversal_corroboration_enabled=msg.get("intel_reversal_corroboration_enabled"),
+                partial_entry_remainder_cancel_enabled=msg.get("partial_entry_remainder_cancel_enabled"),
+                morning_refresh_catchup_at_live_open=msg.get("morning_refresh_catchup_at_live_open"),
+                surge_tick_percentile_floor=msg.get("surge_tick_percentile_floor"),
+                intel_reversal_corroboration_votes=msg.get("intel_reversal_corroboration_votes"),
+                partial_entry_remainder_timeout_seconds=msg.get("partial_entry_remainder_timeout_seconds"),
+                kite_rest_backoff_seconds=msg.get("kite_rest_backoff_seconds"),
+                kite_rest_backoff_max_seconds=msg.get("kite_rest_backoff_max_seconds"),
+                calendar_coverage_warn_days=msg.get("calendar_coverage_warn_days"),
                 # Pullback hedge (operator A/B; ships OFF — see _ADVANCED_CONFIG_FIELDS).
                 # Must be forwarded explicitly: whitelisting alone silently drops the
                 # control (2026-07-10 regression noted above).
