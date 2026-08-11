@@ -10335,6 +10335,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         return round(self._candidate_gross_pnl(candidate, exit_px) - charges, 2)
 
+    # A ratio this far above anything the tape has ever produced is corrupt data, not a
+    # market event. Measured across every stored series: the highest GENUINE reading is
+    # 310x (SENSEX 1min, whose volume base is thin enough that one busy minute against a
+    # small average is legitimate), and p99.9 across series runs 4.7-69x. A malformed bar
+    # produced 1e12 in the stress harness and would have cleared every surge gate.
+    #
+    # 1000x sits ~3x above the highest real reading, so it cannot reject a genuine surge,
+    # and it is many orders of magnitude below corruption. Treated as UNMEASURABLE rather
+    # than clamped: a number this size is not evidence of anything, and this codebase's
+    # recurring failure is exactly that — turning absent or broken data into a verdict.
+    SURGE_RATIO_IMPLAUSIBLE = 1000.0
+
     @staticmethod
     def _surge_prior_mean(prior):
         """Average volume of the prior bars, or None when it cannot be measured.
@@ -10569,6 +10581,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 close_location = (close - low) / rng
             else:
                 close_location = (high - close) / rng
+            if not np.isfinite(volume_ratio) or volume_ratio > Scanner.SURGE_RATIO_IMPLAUSIBLE:
+                logger.warning(
+                    f"Implausible surge ratio for {instrument} {timeframe}: "
+                    f"{volume_ratio:.1f}x on {volume_basis} — treating as unmeasurable."
+                )
+                return None
             return {
                 "volume_ratio": volume_ratio,
                 "range_atr_ratio": range_atr_ratio,
