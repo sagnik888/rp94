@@ -75,6 +75,58 @@ def test_an_ordinary_bar_is_unaffected():
     assert _ratio(1000.0) == pytest.approx(1.0)
 
 
+# ── range/ATR has the identical shape ───────────────────────────────────────
+
+def _range_ratio(prior_range, last_range=500.0, bars=60):
+    """A dead-flat window drives ATR toward zero; the next real bar divides by it."""
+    sc = Scanner.__new__(Scanner)
+    idx = pd.date_range("2026-08-11 09:15", periods=bars, freq="5min")
+    c = np.full(bars, 24000.0)
+    df = pd.DataFrame(
+        {"open": c, "high": c + prior_range, "low": c, "close": c,
+         "volume": np.full(bars, 1000.0)}, index=idx)
+    df.iloc[-1, df.columns.get_loc("high")] = 24000.0 + last_range
+    df.iloc[-1, df.columns.get_loc("close")] = 24000.0 + last_range * 0.98
+    sc.candles = type("C", (), {"get_candles": staticmethod(lambda i, t: df)})()
+    m = Scanner._candle_thrust_metrics(sc, "NIFTY", "5min", "BUY")
+    return None if m is None else m["range_atr_ratio"]
+
+
+@pytest.mark.parametrize("prior", [0.4, 0.1, 0.001])
+def test_a_near_zero_atr_abstains(prior):
+    """Measured 500,000x in the stress harness, against gates that sit at 1.2-1.5x."""
+    assert _range_ratio(prior) is None
+
+
+@pytest.mark.parametrize("prior,expected", [(250.0, 2.0), (5.0, 100.0), (1.8, 277.8)])
+def test_real_range_expansion_is_untouched(prior, expected):
+    """279x is the highest genuine reading across every stored series (MIDCPNIFTY 1min);
+    1min legitimately reaches 130-280x while 5min/15min stay under 17x."""
+    r = _range_ratio(prior)
+    assert r is not None and r == pytest.approx(expected, rel=0.02)
+
+
+def test_a_perfectly_flat_window_was_already_safe():
+    """atr == 0 yields 0.0 and fails the gate; it is the NEAR-zero case that bit."""
+    sc = Scanner.__new__(Scanner)
+    idx = pd.date_range("2026-08-11 09:15", periods=60, freq="5min")
+    c = np.full(60, 24000.0)
+    df = pd.DataFrame({"open": c, "high": c, "low": c, "close": c,
+                       "volume": np.full(60, 1000.0)}, index=idx)
+    df.iloc[-1, df.columns.get_loc("high")] = 24500.0
+    df.iloc[-1, df.columns.get_loc("close")] = 24490.0
+    sc.candles = type("C", (), {"get_candles": staticmethod(lambda i, t: df)})()
+    m = Scanner._candle_thrust_metrics(sc, "NIFTY", "5min", "BUY")
+    assert m is not None and m["range_atr_ratio"] == 0.0
+
+
+def test_one_bound_covers_both_ratios():
+    """Volume max 310x, range max 279x — close enough that a single ceiling with ~3x
+    headroom serves both."""
+    assert Scanner.SURGE_RATIO_IMPLAUSIBLE >= 310.0 * 3
+    assert Scanner.SURGE_RATIO_IMPLAUSIBLE >= 279.0 * 3
+
+
 # ── the guard it backs up is label-only, which is why this was needed ────────
 
 def test_the_homogeneity_guard_does_not_look_at_magnitudes():

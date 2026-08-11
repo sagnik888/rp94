@@ -10587,6 +10587,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     f"{volume_ratio:.1f}x on {volume_basis} — treating as unmeasurable."
                 )
                 return None
+            # range/ATR has the identical shape and the identical failure. A dead-flat
+            # window (a halt, a stale feed repeating one price, a motionless pre-open)
+            # drives ATR toward zero, and the next real bar then divides by it: measured
+            # 500,000x in the stress harness against gates that sit at 1.2-1.5x, so the
+            # range test stops protecting anything. A truly flat window is already safe
+            # (atr == 0 yields 0.0 and fails the gate); it is the NEAR-zero one that bites.
+            #
+            # Same measured discipline as above: the highest genuine reading across every
+            # stored series is 279x (MIDCPNIFTY 1min — 1min legitimately reaches 130-280x
+            # while 5min/15min stay under 17x), so a bound anywhere near the typical range
+            # would reject real bars. The same 1000x ceiling clears it by ~3.6x.
+            if not np.isfinite(range_atr_ratio) or range_atr_ratio > Scanner.SURGE_RATIO_IMPLAUSIBLE:
+                logger.warning(
+                    f"Implausible range/ATR for {instrument} {timeframe}: "
+                    f"{range_atr_ratio:.1f}x — treating as unmeasurable."
+                )
+                return None
             return {
                 "volume_ratio": volume_ratio,
                 "range_atr_ratio": range_atr_ratio,
