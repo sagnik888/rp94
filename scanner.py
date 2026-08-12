@@ -13446,6 +13446,79 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         return False
 
     @staticmethod
+    def _clear_exit_confirmation(trade_like, attr_name: str) -> None:
+        """Drop a named exit-confirmation latch."""
+        try:
+            setattr(trade_like, attr_name, None)
+        except Exception:
+            pass
+
+    def _exit_confirmation_ready(
+        self,
+        trade_like,
+        attr_name: str,
+        signature,
+        latest_time,
+        confirm_seconds: float,
+    ) -> Tuple[bool, str]:
+        """Require two distinct observations separated by a bounded interval.
+
+        Ported from restore_point_51, which confirms BOTH sides of the near-peak
+        guard through this one helper. This build had it on the loss side only
+        (inline), so a single high-scoring tick cut a winner outright.
+
+        Scanner cycles can run several times against the same market timestamp, so
+        counting calls would manufacture persistence — the latch advances only when
+        the observation clock advances. Callers drop it on every path that stops
+        short of an exit, so a confirmation can never be assembled from observations
+        taken minutes apart under different conditions.
+        """
+        try:
+            observed = latest_time
+            if getattr(observed, "tzinfo", None) is None:
+                observed = pd.Timestamp(observed).tz_localize(IST)
+            else:
+                observed = pd.Timestamp(observed).tz_convert(IST)
+            observed_ts = float(observed.timestamp())
+        except Exception:
+            Scanner._clear_exit_confirmation(trade_like, attr_name)
+            return False, "invalid confirmation clock"
+
+        required = max(0.5, float(confirm_seconds or 0.0))
+        canonical = (
+            tuple(signature) if isinstance(signature, (list, tuple, set)) else (str(signature),)
+        )
+        state = getattr(trade_like, attr_name, None)
+        if not isinstance(state, dict) or tuple(state.get("signature", ())) != canonical:
+            try:
+                setattr(
+                    trade_like,
+                    attr_name,
+                    {
+                        "signature": list(canonical),
+                        "first_at": observed_ts,
+                        "last_at": observed_ts,
+                        "observations": 1,
+                    },
+                )
+            except Exception:
+                return True, "confirmation state unavailable"
+            return False, f"confirmation 1/2 (0.0/{required:.1f}s)"
+
+        first_at = float(state.get("first_at", observed_ts) or observed_ts)
+        last_at = float(state.get("last_at", first_at) or first_at)
+        observations = max(1, int(state.get("observations", 1) or 1))
+        if observed_ts > last_at:
+            observations += 1
+            state["last_at"] = observed_ts
+            state["observations"] = observations
+        elapsed = max(0.0, observed_ts - first_at)
+        if observations >= 2 and elapsed >= required:
+            Scanner._clear_exit_confirmation(trade_like, attr_name)
+            return True, f"confirmed {observations} observations over {elapsed:.1f}s"
+        return False, f"confirming {observations}/2 ({elapsed:.1f}/{required:.1f}s)"
+
+    @staticmethod
     def _clear_loss_threat_confirmation(trade_like) -> None:
         """Drop the LOSS_THREAT confirmation latch.
 
@@ -13608,7 +13681,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             0.05,
             min(1.0, float(getattr(settings, "peak_threat_exit_min_retention", 0.72) or 0.72)),
         )
-        loss_mode = current_pnl <= 0.0
+        # P&L reaching here is GROSS/executable-mark in both the session and
+        # TradeManager paths, so an exactly-flat premium is not a loss — it only
+        # becomes one once the eventual row adds the round trip. restore_point_51
+        # draws the line at < -1e-9 for that reason; this build called flat a loss
+        # and routed it to the loss branch's bookkeeping.
+        loss_mode = current_pnl < -1e-9
         if not loss_mode:
             # Back above water: any half-built loss confirmation is void.
             self._clear_loss_threat_confirmation(trade_like)
@@ -13657,13 +13735,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     except Exception:
                         pass
                     if age_seconds < min_age:
+                        Scanner._clear_exit_confirmation(trade_like, "_peak_threat_confirmation")
                         return False, "", (
                             f"near-peak threat observing post-entry tape "
                             f"{age_seconds:.1f}s/{min_age:.1f}s"
                         )
             if peak < min_peak:
+                Scanner._clear_exit_confirmation(trade_like, "_peak_threat_confirmation")
                 return False, "", f"peak Rs.{peak:.0f} below near-peak arm Rs.{min_peak:.0f}"
             if retention < min_retention:
+                Scanner._clear_exit_confirmation(trade_like, "_peak_threat_confirmation")
                 return False, "", f"retention {retention:.0%} below near-peak threshold {min_retention:.0%}"
         else:
             if not self._setting_enabled(getattr(settings, "peak_threat_exit_loss_enabled", True), True):
@@ -13969,11 +14050,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         severe_score = max(1, int(getattr(settings, "peak_threat_exit_severe_score", 4) or 4))
         required = severe_score if severe and retention >= 0.90 else base_score
         if score >= required:
+            # Same two-observation rule the loss branch above already applies. A
+            # winner is not cut on one tick's reading of the tape.
+            confirmed, confirm_detail = self._exit_confirmation_ready(
+                trade_like,
+                "_peak_threat_confirmation",
+                tuple(sorted(evidence_domains)),
+                latest_time,
+                float(getattr(settings, "peak_threat_exit_confirm_seconds", 5.0) or 5.0),
+            )
+            if not confirmed:
+                return False, "", (
+                    f"near-peak threat {confirm_detail}; score {score}>={required}; "
+                    f"retained {retention:.0%}"
+                )
             return True, "PEAK_THREAT_EXIT", (
                 f"near-peak threat score {score}>={required}; retained {retention:.0%} "
                 f"of peak Rs.{peak:.0f}, current Rs.{current_pnl:.0f}; "
                 + "; ".join(dict.fromkeys(reasons))
             )
+        Scanner._clear_exit_confirmation(trade_like, "_peak_threat_confirmation")
         return False, "", (
             f"peak threat score {score}<{required}; retained {retention:.0%}; "
             + "; ".join(dict.fromkeys(reasons))

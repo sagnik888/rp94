@@ -1055,6 +1055,11 @@ class Settings(BaseSettings):
     # "gap/synthetic marks at the open can manufacture an instant peak that arms
     # this exit on a seconds-old position (2026-07-15; ledger rows exited 1-22s
     # after entry)". This build kept the loss-side hold above and lost this one.
+    # The winner exit must survive two observations, as the loss exit already does
+    # (peak_threat_exit_loss_confirm_seconds). Ported from restore_point_51, which
+    # confirms both sides; this build confirmed only losses, so a single tick that
+    # scored high enough cut a winner outright.
+    peak_threat_exit_confirm_seconds: float = 5.0
     peak_threat_exit_min_age_enabled: bool = True
     peak_threat_exit_min_age_seconds: float = 45.0
     peak_threat_exit_open_window_end: str = "09:30"

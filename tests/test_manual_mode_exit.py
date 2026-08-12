@@ -2363,18 +2363,25 @@ def test_peak_threat_exit_takes_near_peak_winner_on_adverse_evidence():
         },
     )
 
-    should_exit, reason, ctx = scanner._peak_threat_exit_decision(
-        trade,
-        current_price=757.05,
-        current_pnl_rs=1500.0,
-        peak_pnl=1554.0,
-        initial_risk_rs=848.4,
-        latest_time=datetime(2026, 7, 8, 12, 14),
-        regime="RANGING",
-        inst_type="OPT",
-        option_type="PE",
-        direction="SHORT",
-    )
+    def _observe(at):
+        return scanner._peak_threat_exit_decision(
+            trade,
+            current_price=757.05,
+            current_pnl_rs=1500.0,
+            peak_pnl=1554.0,
+            initial_risk_rs=848.4,
+            latest_time=at,
+            regime="RANGING",
+            inst_type="OPT",
+            option_type="PE",
+            direction="SHORT",
+        )
+
+    # A winner needs the same two observations the loss side already required
+    # (peak_threat_exit_confirm_seconds); one tick no longer cuts it.
+    first_exit, _first_reason, _first_ctx = _observe(datetime(2026, 7, 8, 12, 14))
+    assert first_exit is False
+    should_exit, reason, ctx = _observe(datetime(2026, 7, 8, 12, 14, 10))
 
     assert should_exit is True
     assert reason == "PEAK_THREAT_EXIT"
@@ -2472,30 +2479,27 @@ def test_peak_threat_exit_is_bidirectional_for_ce_and_pe():
         market_intelligence_context={"aggregate": {"signal": "BUY"}, "oi": {"signal": "BULLISH"}},
     )
 
-    ce_exit = scanner._peak_threat_exit_decision(
-        ce,
-        current_price=132.0,
-        current_pnl_rs=1600.0,
-        peak_pnl=1650.0,
-        initial_risk_rs=900.0,
-        latest_time=datetime(2026, 7, 8, 12, 14),
-        regime="RANGING",
-        inst_type="OPT",
-        option_type="CE",
-        direction="LONG",
-    )
-    pe_exit = scanner._peak_threat_exit_decision(
-        pe,
-        current_price=132.0,
-        current_pnl_rs=1600.0,
-        peak_pnl=1650.0,
-        initial_risk_rs=900.0,
-        latest_time=datetime(2026, 7, 8, 12, 14),
-        regime="RANGING",
-        inst_type="OPT",
-        option_type="PE",
-        direction="SHORT",
-    )
+    def _twice(row, option_type, direction):
+        kwargs = dict(
+            current_price=132.0,
+            current_pnl_rs=1600.0,
+            peak_pnl=1650.0,
+            initial_risk_rs=900.0,
+            regime="RANGING",
+            inst_type="OPT",
+            option_type=option_type,
+            direction=direction,
+        )
+        scanner._peak_threat_exit_decision(
+            row, latest_time=datetime(2026, 7, 8, 12, 14), **kwargs
+        )
+        return scanner._peak_threat_exit_decision(
+            row, latest_time=datetime(2026, 7, 8, 12, 14, 10), **kwargs
+        )
+
+    # Two observations each — a winner is no longer cut on one tick.
+    ce_exit = _twice(ce, "CE", "LONG")
+    pe_exit = _twice(pe, "PE", "SHORT")
 
     assert ce_exit[0] is True and ce_exit[1] == "PEAK_THREAT_EXIT"
     assert pe_exit[0] is True and pe_exit[1] == "PEAK_THREAT_EXIT"
