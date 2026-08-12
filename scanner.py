@@ -19264,8 +19264,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             and confidence >= min_conf
             and (adx_val >= 25.0 or intel_abs >= 0.70 or trend_15m_agrees)
         )
-
-        allowed = bool(high_grade or multi_confirmed or b_grade_ok or market_wide or one_way_cascade or exceptional_spike)
+        # A market-wide reversal / one-way cascade is CONTEXT: it answers "may we be
+        # positioned this way right now", which is why it was introduced — to relax
+        # the opposite-EXPOSURE block for a cycle. It says nothing about whether this
+        # particular signal is worth trading, so it may not also serve as the quality
+        # floor. Every other term here already carries a confidence bar (0.70 / 0.55 /
+        # 0.50 / 0.50); these two carried none, so any flip admitted anything.
+        #
+        # 2026-08-12 12:42: NIFTY (C, 12%) and SENSEX (C, 13%), solo-source, trend15
+        # disagreeing, both admitted on this flag alone and both dead inside 90s for
+        # -Rs.268 and -Rs.155. At 12:44 the same gate refused MIDCPNIFTY at B+/67%
+        # with ADX 30 and trend15 agreeing. exceptional_spike is the template: a
+        # special context that still has to clear quad_prime_raw_min_confidence.
+        context_entry = bool((market_wide or one_way_cascade) and confidence >= min_conf)
+        allowed = bool(high_grade or multi_confirmed or b_grade_ok or context_entry or exceptional_spike)
         if not allowed:
             context = (
                 f"solo_sources={source_count}, grade={grade}, conf={confidence:.0%}, "
