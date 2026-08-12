@@ -15539,14 +15539,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         instrument: str = "",
         latest_time=None,
     ) -> Optional[float]:
-        """Age of intel snapshot in seconds; None if unknown."""
+        """Age of intel snapshot in seconds; None if unknown.
+
+        Every timestamp here is reduced to a TRUE epoch before subtracting. The
+        naive values this codebase passes as `latest_time` are IST wall clocks, and
+        pd.Timestamp(naive).timestamp() reads them as UTC — which inflated the epoch
+        by the 19800s IST offset. _cache_timeframe_intel stores `as_of = time.time()`,
+        a true epoch, so that offset landed straight in the age: on 2026-08-12 two
+        EARLY_LOSS_CUT decisions were taken against `intel stale 19804s>90s` and
+        `19801s>90s` when the intel was in fact 4 and 1 seconds old.
+
+        The datetime-candidate branch below made the same naive-as-UTC assumption, so
+        its error cancelled and those readings were correct. That inconsistency is
+        why this survived — the function was right on one path and wrong on the
+        other. Localise, never assume.
+        """
         now_ts = None
         try:
             if latest_time is not None:
-                lt = latest_time
-                if getattr(lt, "tzinfo", None) is not None:
-                    lt = lt.astimezone(IST).replace(tzinfo=None)
-                now_ts = float(pd.Timestamp(lt).timestamp())
+                lt = pd.Timestamp(latest_time)
+                if lt.tzinfo is None:
+                    lt = lt.tz_localize(IST)
+                now_ts = float(lt.timestamp())
             else:
                 now_ts = float(datetime.now(IST).timestamp())
         except Exception:
@@ -15581,8 +15595,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         return val
                     continue
                 ts = pd.Timestamp(raw)
-                if ts.tzinfo is not None:
-                    ts = ts.tz_convert(IST).tz_localize(None)
+                if ts.tzinfo is None:
+                    # Naive intel stamps are IST wall clock, same as latest_time.
+                    ts = ts.tz_localize(IST)
                 return max(0.0, now_ts - float(ts.timestamp()))
             except Exception:
                 continue
