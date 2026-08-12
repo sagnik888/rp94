@@ -19263,6 +19263,52 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     cleaned.append(part)
         return set(cleaned)
 
+    def _market_wide_candidate_quality(self, candidate: TradeCandidate) -> Tuple[bool, str]:
+        """Minimum local quality required before cross-index relief is considered.
+
+        Ported back from restore_point_51, where the raw-entry floor read
+        `market_wide and market_wide_ok`. This build had lost the helper entirely,
+        leaving the flag bare, so a market-wide reversal carried ANY signal past the
+        quality floor — 2026-08-12 admitted grade C at 12% and 13%, both dead inside
+        90 seconds, while the same gate refused a B+ at 67% minutes later.
+
+        Peer names live under `core_indices`/`indices` in this build's context
+        (restore_point_51 called them `peer_indices`); all three are read so the
+        guard travels with either shape. A context that names no OTHER index is not
+        evidence of a market-wide move — but an absent/malformed context is missing
+        evidence, not disproof, so it leaves the grade and confidence bars to decide
+        rather than blocking outright.
+        """
+        settings = get_settings()
+        try:
+            confidence = float(getattr(candidate, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        grade = str(getattr(candidate, "grade", "") or "")
+        min_grade = str(getattr(settings, "market_wide_reversal_min_grade", "B+") or "B+").upper()
+        min_conf = float(getattr(settings, "market_wide_reversal_min_confidence", 0.60) or 0.60)
+
+        context = getattr(candidate, "market_wide_reversal_context", None)
+        if isinstance(context, dict):
+            peers: List[Any] = []
+            for key in ("peer_indices", "core_indices", "indices"):
+                value = context.get(key)
+                if isinstance(value, (list, tuple, set)):
+                    peers.extend(value)
+            candidate_base = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+            independent = {
+                str(peer or "").split()[0].upper()
+                for peer in peers
+                if str(peer or "").strip()
+            } - {candidate_base}
+            if not independent:
+                return False, "market-wide reversal lacks an independently confirmed peer"
+        if SignalProcessor._grade_rank(grade) < SignalProcessor._grade_rank(min_grade):
+            return False, f"market-wide reversal needs {min_grade}+ local grade"
+        if confidence < min_conf:
+            return False, f"market-wide reversal needs >= {min_conf:.0%} local confidence"
+        return True, "market-wide reversal quality confirmed"
+
     def _quad_prime_raw_entry_decision(
         self,
         candidate: TradeCandidate,
@@ -19332,8 +19378,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # -Rs.268 and -Rs.155. At 12:44 the same gate refused MIDCPNIFTY at B+/67%
         # with ADX 30 and trend15 agreeing. exceptional_spike is the template: a
         # special context that still has to clear quad_prime_raw_min_confidence.
-        context_entry = bool((market_wide or one_way_cascade) and confidence >= min_conf)
-        allowed = bool(high_grade or multi_confirmed or b_grade_ok or context_entry or exceptional_spike)
+        market_wide_ok, _market_wide_note = self._market_wide_candidate_quality(candidate)
+        cascade_entry = bool(one_way_cascade and confidence >= min_conf)
+        allowed = bool(
+            high_grade
+            or multi_confirmed
+            or b_grade_ok
+            or (market_wide and market_wide_ok)
+            or cascade_entry
+            or exceptional_spike
+        )
         if not allowed:
             context = (
                 f"solo_sources={source_count}, grade={grade}, conf={confidence:.0%}, "

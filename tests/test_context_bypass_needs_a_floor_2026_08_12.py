@@ -38,11 +38,13 @@ def _scanner():
     return sc
 
 
-def _candidate(confidence, grade="C", **flags):
+def _candidate(confidence, grade="C", peers=("BANKNIFTY",), **flags):
     cand = SimpleNamespace(
         grade=grade, confidence=confidence, timeframe="15min", adx_value=0.0,
         intelligence_score=0.0, volume_spike_entry=False, power_move=False,
         market_wide_reversal_entry=False, one_way_cascade_entry=False,
+        instrument="NIFTY",
+        market_wide_reversal_context={"core_indices": list(peers), "indices": list(peers)},
     )
     for key, value in flags.items():
         setattr(cand, key, value)
@@ -74,14 +76,67 @@ def test_the_context_bypass_still_works_for_a_signal_worth_taking(flag):
     assert "quality floor failed" not in reason
 
 
-def test_the_floor_is_the_same_one_every_other_bypass_uses():
+def test_the_cascade_floor_is_the_one_every_other_bypass_uses():
     floor = float(getattr(get_settings(), "quad_prime_raw_min_confidence", 0.50))
 
-    below, _s1, _r1 = _decide(_candidate(floor - 0.01, market_wide_reversal_entry=True))
-    at, _s2, _r2 = _decide(_candidate(floor, market_wide_reversal_entry=True))
+    below, _s1, _r1 = _decide(_candidate(floor - 0.01, one_way_cascade_entry=True))
+    at, _s2, _r2 = _decide(_candidate(floor, one_way_cascade_entry=True))
 
     assert below is False
     assert at is True
+
+
+# ── the market-wide guard restored from restore_point_51 ─────────────────────
+# _market_wide_candidate_quality was absent from this build entirely, taking the
+# B+ / 60% / independently-confirmed-peer requirements with it.
+
+def test_market_wide_needs_the_old_builds_grade_and_confidence():
+    settings = get_settings()
+    min_conf = float(getattr(settings, "market_wide_reversal_min_confidence", 0.60))
+
+    good, _s, _r = _decide(_candidate(min_conf, grade="B+", market_wide_reversal_entry=True))
+    weak_conf, _s2, r2 = _decide(
+        _candidate(min_conf - 0.01, grade="B+", market_wide_reversal_entry=True)
+    )
+    weak_grade, _s3, r3 = _decide(
+        _candidate(0.80, grade="B", market_wide_reversal_entry=True)
+    )
+
+    assert good is True
+    assert weak_conf is False and "quality floor failed" in r2
+    assert weak_grade is False and "quality floor failed" in r3
+
+
+def test_market_wide_needs_an_independently_confirmed_peer():
+    """A "market-wide" reversal naming only this index is not market-wide.
+
+    B+ at 60% is the band where ONLY this bypass can admit: too low for
+    high_grade (0.70), one source so not multi_confirmed, and above the B band
+    that b_grade_ok governs.
+    """
+    alone, _s, _r = _decide(
+        _candidate(0.60, grade="B+", peers=("NIFTY",), market_wide_reversal_entry=True)
+    )
+    none, _s2, _r2 = _decide(
+        _candidate(0.60, grade="B+", peers=(), market_wide_reversal_entry=True)
+    )
+    with_peer, _s3, _r3 = _decide(
+        _candidate(0.60, grade="B+", peers=("SENSEX",), market_wide_reversal_entry=True)
+    )
+
+    assert alone is False
+    assert none is False
+    assert with_peer is True
+
+
+def test_the_quality_helper_reports_why_it_refused():
+    sc = _scanner()
+    ok, why = sc._market_wide_candidate_quality(
+        _candidate(0.20, grade="C", market_wide_reversal_entry=True)
+    )
+
+    assert ok is False
+    assert "grade" in why or "confidence" in why
 
 
 def test_todays_two_admissions_are_now_refused():

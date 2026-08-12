@@ -537,6 +537,12 @@ class Settings(BaseSettings):
     # entry window a 45-minute per-index lockout caps each index near 8 entries, which
     # is a material change to how much the system trades.
     ut_5min_loss_cooldown_enabled: bool = False
+    # Local quality a candidate must have before a cross-index reversal may carry it
+    # past the raw quality floor. Ported back from restore_point_51, where the bypass
+    # read `market_wide and market_wide_ok`; this build had lost the guard and the
+    # bare flag admitted anything (2026-08-12: grade C at 12% and 13%).
+    market_wide_reversal_min_grade: Literal["B", "B+", "A", "A+"] = "B+"
+    market_wide_reversal_min_confidence: float = 0.60
     live_b_grade_min_confidence: float = 0.50  # Top-of-band floor for dedicated B-grade entries (trending + 15m align + ADX>=25)
 
     # ─── Confidence calibration (de-saturation) ──────────────
