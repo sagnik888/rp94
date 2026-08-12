@@ -545,6 +545,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._trades_today = {} # {instrument: count}
         self._losses_today = {} # {instrument: count}
         self._last_exit_time = {} # {instrument: timestamp}
+        self._last_exit_direction = {} # {index: LONG|SHORT of the last exit}
         self._counted_entry_keys = set()
         self._counted_outcome_signatures = set()
         self._last_loss_outcome_instrument = ""
@@ -763,6 +764,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._trades_today = {}
             self._losses_today = {}
             self._last_exit_time = {}
+            self._last_exit_direction = {}
             self._counted_entry_keys = set()
             self._counted_outcome_signatures = set()
             # _stop_out_reentries was never cleared here, so the "once per index per
@@ -870,6 +872,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 exit_time = self._closed_outcome_time(outcome)
                 if exit_time != datetime.min:
                     self._last_exit_time[instrument] = exit_time
+                self._note_index_exit_direction(instrument, outcome)
             logger.info("📅 Daily over-trading counters reset.")
 
     def _rollover_session_if_needed(self, now_ist: datetime) -> bool:
@@ -1761,13 +1764,42 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.debug(f"Session range unavailable for {instrument}: {exc}")
             return None
 
-    def _index_cooldown_applies(self, instrument: str) -> Tuple[bool, str]:
+    def _note_index_exit_direction(self, instrument: str, trade_like) -> None:
+        """Remember which way an index was positioned when it last exited.
+
+        The trend-tape cooldown bypass is justified by the FLIP (see
+        _index_cooldown_applies), and a flip is a change of direction — which
+        cannot be established without knowing the direction that just closed.
+        Nothing was recorded, so the bypass could not tell a reversal from the
+        same losing bet placed again.
+        """
+        direction = str(getattr(trade_like, "direction", "") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return
+        base = str(instrument or "").split()[0].upper()
+        if not base:
+            return
+        if not isinstance(getattr(self, "_last_exit_direction", None), dict):
+            self._last_exit_direction = {}
+        self._last_exit_direction[base] = direction
+
+    def _index_cooldown_applies(self, instrument: str, direction: str = "") -> Tuple[bool, str]:
         """Whether the post-exit cooldown should gate this index right now.
 
         UT1 is a flip engine — after an opposite-signal exit the reverse entry
         IS the trade, so a blanket cooldown eats reversals. Scoped mode (default)
         applies the cooldown ONLY in chop/range/no-movement pockets where
         post-exit churn is the real risk; trend/normal tape skips it.
+
+        That bypass is about the FLIP, so it is granted only to a genuine one.
+        Re-entering the SAME direction that just exited is not the reversal this
+        was written for — it is the position that just failed, placed again
+        (2026-08-12: NIFTY bought calls at 13:26, was cut at 13:27, bought the
+        same calls again at 13:31 and was cut again, all inside a TRENDING_DOWN
+        tape; six of that session's nine losing exits were repeats of two
+        strikes). A same-direction re-entry that genuinely deserves another go
+        still reaches _stop_out_reentry_allowed, which asks whether the trend is
+        actually still running instead of inferring it from the regime label.
         """
         settings = get_settings()
         if not self._setting_enabled(
@@ -1784,6 +1816,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             day_type = "UNDECIDED"
         if day_type == "RANGE_DAY":
             return True, "range-day mood"
+        last_direction = str(
+            (getattr(self, "_last_exit_direction", None) or {}).get(base, "") or ""
+        ).upper()
+        new_direction = str(direction or "").upper()
+        if last_direction and new_direction == last_direction:
+            return True, (
+                f"same-direction re-entry ({new_direction}) after a {last_direction} exit"
+            )
         return False, f"trend/normal tape ({regime or 'UNKNOWN'}/{day_type})"
 
     def _index_short_span_move_pct(
@@ -2365,7 +2405,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Rule 3: Cooldown Period — regime-scoped (chop/range only by default);
         # flip reversals on trend tape re-enter immediately. The post-major-win
         # reversion window (when enabled) bypasses the cooldown outright.
-        cooldown_on, cooldown_basis = self._index_cooldown_applies(instrument)
+        cooldown_on, cooldown_basis = self._index_cooldown_applies(instrument, direction)
         if cooldown_on and self._reversion_window_active(instrument):
             cooldown_on = False
             logger.info(
@@ -17852,6 +17892,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             exit_time = self._closed_outcome_time(outcome)
             if exit_time != datetime.min:
                 self._last_exit_time[instrument] = exit_time
+            self._note_index_exit_direction(instrument, outcome)
             logger.info(
                 f"📊 {instrument} Exit Tape: uninterrupted same-index losses={streak}"
             )
@@ -26721,8 +26762,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     float(getattr(closed_trade, "pnl", 0.0) or 0.0),
                 )
 
-            # Record exit time for cooldown
+            # Record exit time and direction for cooldown
             self._last_exit_time[instrument] = exit_time if exit_time else datetime.now(IST).replace(tzinfo=None)
+            self._note_index_exit_direction(instrument, closed_trade)
             self._trades_today.setdefault(instrument, 0)
             logger.info(
                 f"📊 {instrument} Tracker: Daily Trades={self._trades_today[instrument]}, "
@@ -27725,6 +27767,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             float(getattr(closed_trade, "pnl", 0.0) or 0.0),
                         )
                     self._last_exit_time[trade.instrument] = latest_time if latest_time else datetime.now(IST).replace(tzinfo=None)
+                    self._note_index_exit_direction(trade.instrument, trade)
                     self._trades_today.setdefault(trade.instrument, 0)
                     logger.info(
                         f"📊 {trade.instrument} Tracker (SL/TP): "

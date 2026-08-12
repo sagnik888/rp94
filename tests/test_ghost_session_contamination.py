@@ -62,7 +62,7 @@ def test_ghost_rows_excluded_from_daily_budget_counters():
     sc.max_consecutive_losses = 3
     sc.index_cooldown_minutes = 0
     sc._dynamic_trade_budget = lambda instrument: (14, "test_budget")
-    sc._index_cooldown_applies = lambda instrument: (False, "")
+    sc._index_cooldown_applies = lambda *_a: (False, "")
     sc._reversion_window_active = lambda instrument, now=None: False
 
     ghosts = [

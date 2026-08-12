@@ -53,7 +53,7 @@ def _scanner_stub():
     sc.max_consecutive_losses = 5
     sc.index_cooldown_minutes = 0
     sc._dynamic_trade_budget = lambda i: (14, "quad")
-    sc._index_cooldown_applies = lambda i: (False, "")
+    sc._index_cooldown_applies = lambda *_a: (False, "")
     sc._reversion_window_active = lambda i, now=None: False
     return sc
 

@@ -150,7 +150,7 @@ def _budget_scanner(monkeypatch, *, trades_today, losses_today, settings=None):
     sc._dynamic_trade_budget = lambda instrument: (2, "test budget")
     sc._last_exit_time = {"NIFTY": NOW - timedelta(minutes=1)}  # inside cooldown
     sc.mode = "HISTORICAL"
-    sc._index_cooldown_applies = lambda instrument: (True, "test")
+    sc._index_cooldown_applies = lambda *_a: (True, "test")
     sc._reversion_window_active = lambda instrument: False
     sc.log_event = lambda *a, **k: None
     return sc
