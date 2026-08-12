@@ -35,6 +35,69 @@ from trading.order_retry import (
 )
 
 
+def sample_pnl_path(holder, pnl=None, entry_time=None) -> None:
+    """Append a bounded (seconds_since_entry, pnl) sample to `holder.pnl_path`.
+
+    Shared by the two objects that independently track a live position's P&L: the Trade
+    in this module and the TradeCandidate the scanner monitors (which is what rtracker
+    actually records). One implementation, because two would drift and the whole point
+    of the path is that it can be trusted.
+
+    Called from monitor loops that run every ~100ms, so it is written to do nothing in
+    the common case. Three bounds keep it cheap and the record small:
+
+      * TIME    — at most one sample per pnl_path_min_interval_seconds
+      * MOTION  — unless P&L moved by pnl_path_min_move_rs, which keeps a fast reversal
+                  legible instead of letting the timer average it away
+      * SIZE    — a hard cap; first and last samples are always kept and the middle is
+                  thinned by dropping every other one, so a long trade loses resolution
+                  rather than losing its tail
+
+    Median hold in the measured book is 1.2 minutes, so at the 2s default a typical
+    trade stores ~36 samples and the cap is never approached.
+    """
+    from config.settings import get_settings
+
+    settings = get_settings()
+    if not _setting_enabled(getattr(settings, "pnl_path_logging_enabled", True), True):
+        return
+    try:
+        if entry_time is None:
+            entry_time = getattr(holder, "entry_time", None) or getattr(
+                holder, "entry_timestamp", None
+            )
+        if entry_time is None:
+            return
+        if pnl is None:
+            pnl = getattr(holder, "pnl", 0.0)
+        pnl = float(pnl or 0.0)
+
+        path = getattr(holder, "pnl_path", None)
+        if not isinstance(path, list):
+            path = []
+            setattr(holder, "pnl_path", path)
+
+        ref = entry_time if getattr(entry_time, "tzinfo", None) else IST.localize(entry_time)
+        elapsed = max(0.0, (datetime.now(IST) - ref).total_seconds())
+
+        if path:
+            last_t, last_pnl = path[-1]
+            min_gap = float(getattr(settings, "pnl_path_min_interval_seconds", 2.0) or 2.0)
+            min_move = float(getattr(settings, "pnl_path_min_move_rs", 50.0) or 50.0)
+            if (elapsed - last_t) < min_gap and abs(pnl - last_pnl) < min_move:
+                return
+
+        path.append((round(elapsed, 2), round(pnl, 2)))
+
+        cap = int(getattr(settings, "pnl_path_max_samples", 400) or 400)
+        if cap > 2 and len(path) > cap:
+            # Keep both ends; halve the resolution of everything between them.
+            setattr(holder, "pnl_path", [path[0]] + path[1:-1:2] + [path[-1]])
+    except Exception as exc:
+        # Diagnostics must never interfere with a live position.
+        logger.debug(f"P&L path sample skipped: {exc}")
+
+
 def _setting_enabled(value, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
@@ -136,6 +199,14 @@ class Trade:
     charges: float = 0.0
     peak_pnl: float = 0.0
     max_drawdown: float = 0.0
+    # Bounded (seconds_since_entry, pnl) samples. peak_pnl and max_drawdown are the only
+    # shape a closed trade has ever recorded, and from those three numbers the question
+    # "would a tighter trail have kept more?" is not answerable: a rule that exits at
+    # f x peak fires only if the P&L fell to that level AFTER the peak, and the ORDER of
+    # the peak and the trough is exactly what a max cannot carry. On the 2026-08-11 book
+    # that gap put the answer between -Rs.18,114 and +Rs.10,988 — a range wide enough to
+    # be useless. The path closes it. See _sample_pnl_path for the cost bound.
+    pnl_path: List[Tuple[float, float]] = field(default_factory=list)
     is_ghost: bool = False
     is_reversion_scalp: bool = False
     signal_fire_mode: str = "INTRACANDLE"
@@ -321,6 +392,10 @@ class Trade:
             "instrument_multiplier": self.instrument_multiplier,
             "peak_pnl": self.peak_pnl,
             "max_drawdown": self.max_drawdown,
+            # Persisted so a mid-session restart does not leave a trade with a path that
+            # starts partway through — a truncated path reads as a trade that never
+            # visited the levels it actually visited.
+            "pnl_path": [[float(t), float(p)] for t, p in (self.pnl_path or [])],
             "signal_fire_mode": self.signal_fire_mode,
             "entered_intracandle": self.entered_intracandle,
             "repaint_guard_checked": self.repaint_guard_checked,
@@ -477,6 +552,11 @@ class Trade:
             peak_pnl=data.get("peak_pnl", 0.0),
             max_drawdown=data.get("max_drawdown", 0.0),
             is_ghost=bool(data.get("is_ghost", False)),
+            pnl_path=[
+                (float(row[0]), float(row[1]))
+                for row in (data.get("pnl_path") or [])
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ],
             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
             entered_intracandle=bool(data.get("entered_intracandle", True)),
             repaint_guard_checked=bool(data.get("repaint_guard_checked", False)),
@@ -810,6 +890,34 @@ class TradeManager:
         return 1 if trade.direction in {"LONG", "BUY"} else -1
 
     @staticmethod
+    def _slippage_sample_is_a_real_fill(trade: Trade, leg: str) -> bool:
+        """Whether this leg may contribute to the realized-slippage EWMA.
+
+        SlippageTracker.record documents itself as taking "one real fill", and
+        trade_accounting lets the measured EWMA REPLACE the static per-leg assumption
+        once slippage_calibration_min_samples is reached. So anything that is not a
+        broker fill does not merely add noise — it overrides the model with itself.
+
+        2026-08-11: slippage_stats.json held 12,051 FUT samples at ewma_frac exactly
+        0.0, every row stamped last_leg "ENTRY". The exit leg has always required an
+        exit_order_id and skipped a fill equal to its reference; the entry leg required
+        neither, so simulated entries whose "fill" was the signal price recorded a
+        perfect zero, 12,051 times. That drove modelled futures slippage to the floor of
+        _FUT_CALIBRATION_BOUNDS (0.2bp) — a backtest grading its own execution.
+
+        Two necessary conditions for a real fill, and both are plain dataclass fields:
+        the trade is not a ghost, and the leg has a broker order id.
+        """
+        if bool(getattr(trade, "is_ghost", False)):
+            return False
+        order_id = (
+            getattr(trade, "exit_order_id", "")
+            if str(leg or "").upper() == "EXIT"
+            else getattr(trade, "broker_order_id", "")
+        )
+        return bool(str(order_id or "").strip())
+
+    @staticmethod
     def _record_entry_slippage(trade: Trade, fill_price: float) -> None:
         """Measure the real entry fill against the signal price that triggered it.
 
@@ -822,11 +930,17 @@ class TradeManager:
             fill = float(fill_price or 0.0)
             if reference <= 0 or fill <= 0:
                 return
+            # entry_slippage itself is still stamped below for any trade — it is
+            # reporting. Only the shared EWMA, which overrides the cost model, is
+            # restricted to real broker fills.
+            record_to_ewma = TradeManager._slippage_sample_is_a_real_fill(trade, "ENTRY")
             if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}:
                 adverse = fill - reference
             else:
                 adverse = reference - fill
             trade.entry_slippage = round(adverse, 4)
+            if not record_to_ewma:
+                return
             from engine.slippage_tracker import get_slippage_tracker
 
             get_slippage_tracker().record(
@@ -856,6 +970,8 @@ class TradeManager:
             else:
                 adverse = fill - reference
             trade.exit_slippage = round(adverse, 4)
+            if not TradeManager._slippage_sample_is_a_real_fill(trade, "EXIT"):
+                return
             from engine.slippage_tracker import get_slippage_tracker
 
             get_slippage_tracker().record(
@@ -2266,6 +2382,109 @@ class TradeManager:
                     return abs(signed)
             time.sleep(0.2)
         return None
+
+    def _sample_pnl_path(self, trade) -> None:
+        return sample_pnl_path(trade)
+
+    @staticmethod
+    def _session_live_start() -> dtime:
+        """Configured regular-session open (default 09:15:00)."""
+        from config.settings import get_settings
+
+        label = str(
+            getattr(get_settings(), "real_mode_live_start", "09:15:00") or "09:15:00"
+        ).strip()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(label, fmt).time()
+            except ValueError:
+                continue
+        return dtime(9, 15, 0)
+
+    def _entry_mark_admission(
+        self, *, inst_type: str, price: float, signal_time: Optional[datetime],
+        entry_time: Optional[datetime], touch_quote: Optional[Dict[str, Any]],
+        trading_symbol: str, is_recovery: bool,
+    ) -> Tuple[bool, str]:
+        """Refuse an entry built on a pre-open signal or a stale entry mark.
+
+        The 2026-07-28 loss (see config/settings.py, entry_preopen_signal_guard_enabled)
+        was NOT a trading loss: a 09:10 pre-open signal executed at 09:15:34 on a
+        previous-close mark of 131.70 against a live contract at 52.30, round-tripped in
+        40ms for -Rs.10,402. Two independent checks, because neither covers the other:
+
+          (a) SIGNAL FRESHNESS. A signal stamped before the session open was computed on
+              pre-open data that never traded. Nothing downstream re-derives it, so the
+              staleness survives all the way to the order.
+          (b) MARK CONSISTENCY. An option's LTP reads yesterday's close until its first
+              trade of the day prints, while the bid/ask are live from the first moment.
+              A mark far outside the touch quote is therefore stale by construction.
+
+        (b) needs a usable touch quote and (a) does not, so (a) still covers the open
+        when the feed is not yet quoting. Recovery entries bypass both, matching
+        _entry_risk_admission: a recovery re-establishes protection on exposure that
+        already exists, and refusing it strands the very position this protects.
+        """
+        from config.settings import get_settings
+
+        if is_recovery:
+            return True, ""
+        settings = get_settings()
+
+        if _setting_enabled(
+            getattr(settings, "entry_preopen_signal_guard_enabled", True), True
+        ) and signal_time is not None and entry_time is not None:
+            try:
+                live_start = self._session_live_start()
+                # Compare wall-clock in the session's own terms. Both stamps are IST in
+                # this system; normalising defensively keeps a naive/aware mix from
+                # raising inside an entry path.
+                sig_local = signal_time.astimezone(IST) if signal_time.tzinfo else signal_time
+                ent_local = entry_time.astimezone(IST) if entry_time.tzinfo else entry_time
+                if (
+                    sig_local.date() == ent_local.date()
+                    and sig_local.time() < live_start
+                    and ent_local.time() >= live_start
+                ):
+                    return False, (
+                        f"signal {sig_local.strftime('%H:%M:%S')} predates the "
+                        f"{live_start.strftime('%H:%M')} session open "
+                        f"(entry {ent_local.strftime('%H:%M:%S')})"
+                    )
+            except Exception as exc:
+                # A clock comparison must never stop trading.
+                logger.debug(f"Pre-open signal guard skipped: {exc}")
+
+        if not _setting_enabled(
+            getattr(settings, "entry_mark_touch_validation_enabled", True), True
+        ):
+            return True, ""
+        if str(inst_type or "").upper() != "OPT":
+            return True, ""
+        quote = touch_quote if isinstance(touch_quote, dict) else {}
+        if not quote or not bool(quote.get("usable", False)):
+            return True, ""
+        try:
+            bid = float(quote.get("bid") or 0.0)
+            ask = float(quote.get("ask") or 0.0)
+            mark = float(price or 0.0)
+        except (TypeError, ValueError):
+            return True, ""
+        if mark <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+            return True, ""
+        max_mult = float(getattr(settings, "entry_mark_max_ask_multiple", 1.50) or 1.50)
+        min_mult = float(getattr(settings, "entry_mark_min_bid_multiple", 0.50) or 0.50)
+        if max_mult > 0 and mark > ask * max_mult:
+            return False, (
+                f"entry mark {mark:.2f} is {mark / ask:.2f}x the live ask {ask:.2f} "
+                f"on {trading_symbol or inst_type} (stale mark)"
+            )
+        if min_mult > 0 and mark < bid * min_mult:
+            return False, (
+                f"entry mark {mark:.2f} is {mark / bid:.2f}x the live bid {bid:.2f} "
+                f"on {trading_symbol or inst_type} (stale mark)"
+            )
+        return True, ""
 
     def _entry_risk_admission(
         self, *, inst_type: str, direction: str, price: float, trailing_stop: float,
@@ -3762,6 +3981,18 @@ class TradeManager:
             if not can:
                 logger.warning(f"Cannot open trade: {reason}")
                 return None
+            # Is the price we are about to trade on real? Checked before anything sizes,
+            # logs or reaches the broker, because a stale mark poisons the stop, the
+            # target and every P&L reading derived from them.
+            mark_ok, mark_reason = self._entry_mark_admission(
+                inst_type=inst_type, price=price, signal_time=signal_time,
+                entry_time=now, touch_quote=execution_touch_quote,
+                trading_symbol=trading_symbol, is_recovery=is_recovery,
+            )
+            if not mark_ok:
+                logger.warning(f"Entry refused on mark validation: {mark_reason}")
+                self._log_ui(f"Entry refused: {mark_reason}", "warning")
+                return None
             # Would accepting this candidate make the BOOK unsafe at its configured
             # stops? can_open_trade counts positions; the circuit breaker measures a book
             # that already exists. Neither refuses the entry that creates the breach.
@@ -4214,6 +4445,7 @@ class TradeManager:
         # Track peak and drawdown
         trade.peak_pnl = max(trade.peak_pnl, trade.pnl)
         trade.max_drawdown = max(trade.max_drawdown, trade.peak_pnl - trade.pnl)
+        self._sample_pnl_path(trade)
 
         if recovery_required or getattr(trade, "pending_exit", False):
             now = time.monotonic()

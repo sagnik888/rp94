@@ -112,12 +112,20 @@ def test_every_armed_tier_matches_the_operator_schedule(peak, lo, hi):
 
 
 def test_below_the_arming_threshold_there_is_no_lock_at_all():
-    """Rs.300 is not a 100%-breathing tier — the ladder has simply not armed yet.
+    """Rs.200 is not a 100%-breathing tier — the ladder has simply not armed yet.
 
     _profit_lock_min_peak gates the whole ladder, so the schedule only describes peaks
-    that have cleared it. A first draft listed Rs.300 as a 50% tier and failed here.
+    that have cleared it. A first draft listed the un-armed peak as a 50% tier and
+    failed here.
+
+    The probe was Rs.300 until 2026-08-11, when the non-scalp arm dropped from a
+    hardcoded Rs.500 to Rs.250 (these calls pass no initial risk, so the base IS the
+    arm) — measured, because the median live trade peaks at Rs.274 and 45 of 106 trades
+    went green then closed red under the old floor. Rs.300 is now an armed 50% tier and
+    Rs.200 is the un-armed case this test is about.
     """
-    assert _ratio(300.0) == 0.0
+    assert _ratio(200.0) == 0.0
+    assert _ratio(300.0) == 0.50, "Rs.300 should now be an armed tier, not un-armed"
 
 
 def test_a_young_winner_breathes_far_more_than_a_mature_one():

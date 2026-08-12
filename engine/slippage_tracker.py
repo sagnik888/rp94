@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -107,19 +107,47 @@ class SlippageTracker:
         inst_type: str,
         instrument: str = "",
         min_samples: int = 5,
+        max_age_days: Optional[float] = None,
     ) -> Optional[float]:
         """Measured per-leg slippage as a fraction of price, or None if not enough
-        real samples yet. Prefers the per-instrument estimate over the aggregate."""
+        recent real samples yet. Prefers the per-instrument estimate over the aggregate.
+
+        Age-bounded because the caller does not merely consult this number, it SUBSTITUTES
+        it for the static assumption. A sample count is not evidence of currency: the FUT
+        rows carried 12,051 samples from a broker integration that has since been retired,
+        and with no age test they would have outranked the static model indefinitely.
+        """
         min_samples = max(1, int(min_samples or 1))
+        cutoff = None
+        if max_age_days is not None and float(max_age_days) > 0:
+            cutoff = datetime.now() - timedelta(days=float(max_age_days))
         with self._lock:
             for key in reversed(self._keys(inst_type, instrument)):
                 row = self._stats.get(key)
-                if row and int(row.get("count", 0) or 0) >= min_samples:
-                    try:
-                        return float(row.get("ewma_frac", 0.0) or 0.0)
-                    except (TypeError, ValueError):
-                        continue
+                if not row or int(row.get("count", 0) or 0) < min_samples:
+                    continue
+                if cutoff is not None and not self._row_is_fresh(row, cutoff):
+                    continue
+                try:
+                    return float(row.get("ewma_frac", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
         return None
+
+    @staticmethod
+    def _row_is_fresh(row: Dict, cutoff: datetime) -> bool:
+        """A row with no readable timestamp is treated as stale, not as fresh.
+
+        The rows that predate updated_at are exactly the legacy ones this bound exists
+        to exclude, so an unparseable stamp must not be read as a pass.
+        """
+        stamp = str(row.get("updated_at") or "").strip()
+        if not stamp:
+            return False
+        try:
+            return datetime.fromisoformat(stamp) >= cutoff
+        except ValueError:
+            return False
 
     def snapshot(self) -> Dict[str, Dict]:
         with self._lock:

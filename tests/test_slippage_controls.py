@@ -150,7 +150,11 @@ class _StubTracker:
     def __init__(self, frac):
         self._frac = frac
 
-    def calibrated_fraction(self, inst_type, instrument="", min_samples=5):
+    def calibrated_fraction(self, inst_type, instrument="", min_samples=5,
+                            max_age_days=None):
+        # max_age_days accepted since 2026-08-11. _calibrated_leg_fraction swallows every
+        # exception and falls back to statics, so a stub that rejects a new kwarg fails
+        # as a silent wrong NUMBER rather than a TypeError.
         return self._frac
 
 
@@ -208,6 +212,10 @@ def _trade(**overrides):
         entry_price=100.0, entry_time=datetime(2026, 7, 1, 10, 0),
         trailing_stop=90.0, current_stop=90.0, lots=1, lot_size=65, grade="A",
         inst_type="OPT", signal_entry_price=100.0,
+        # Broker order ids since 2026-08-11: the EWMA takes real fills only, after
+        # 12,051 simulated entries pinned measured futures slippage to zero. These tests
+        # assert the SIGN convention, which is unchanged, so they describe real fills.
+        broker_order_id="251108000123", exit_order_id="251108000999",
     )
     base.update(overrides)
     return Trade(**base)

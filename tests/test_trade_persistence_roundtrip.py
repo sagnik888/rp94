@@ -56,6 +56,11 @@ UNPERSISTED_BY_DESIGN = {
     "raw_union_entry", "signal_entry_price", "signal_fire_mode", "source_engine",
     "source_engines",
     "signal_timestamp",   # alias; the value persists under signal_time
+    # Diagnostics only — nothing reads the path to manage a position; it exists so the
+    # "would a tighter trail have kept more?" question is answerable offline. The copy
+    # the analysis actually reads lives on the TradeCandidate, which persists whole via
+    # json.dumps into session_signals.payload, so the offline record is not lost here.
+    "pnl_path",
 }
 
 

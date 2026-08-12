@@ -35,7 +35,7 @@ from engine.signal_quality_policy import is_top_tier_setup
 from intelligence.intelligence_aggregator import IntelligenceAggregator
 from intelligence.memory import IntelligenceMemory
 from intelligence.snapshot_store import MarketIntelSnapshotStore
-from trading.trade_manager import Trade, TradeManager, IST
+from trading.trade_manager import Trade, TradeManager, IST, sample_pnl_path
 from trading.performance_tracker import PerformanceTracker
 from engine.risk_manager import RiskManager
 from engine.signal_processor import SignalProcessor, TradeCandidate
@@ -957,9 +957,134 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         return True
 
+    def _entry_intel_snapshot(self, candidate) -> Dict[str, Any]:
+        """Freeze the intel that existed when this entry was accepted.
+
+        The engine computes volume ratios, PCR, cumulative OI, order flow, breadth,
+        VWAP position, VIX percentile and the full greeks — and almost none of it
+        survived into the trade record. Measured over 239 accepted trades:
+
+            volume.volume_ratio      recorded on   2%
+            grading.* pillars        recorded on  33%
+            PCR / OI / order_flow    no field existed at all
+
+        Which is why the question "does the intel predict which trades travel?" could
+        not be answered from the tracker. The per-minute intelligence_history.json holds
+        these series, but it is a rolling 5,000-point window (~10 days) and only 76 of
+        240 trades were still joinable to it — the evidence expires before it is used.
+
+        Field paths deliberately mirror intelligence/memory.py's own store() calls, so
+        there is ONE definition of where each value lives. Observation only: nothing
+        reads this to make a decision, and it must never be able to break an entry.
+        """
+        snap: Dict[str, Any] = {}
+        try:
+            instrument = str(getattr(candidate, "instrument", "") or "").split()[0]
+            timeframe = str(getattr(candidate, "timeframe", "5min") or "5min")
+            intel = self._cached_timeframe_intel(instrument, timeframe, allow_fallback=True) or {}
+            if not isinstance(intel, dict):
+                return {}
+
+            def dig(*path, default=None):
+                cur: Any = intel
+                for p in path:
+                    if not isinstance(cur, dict):
+                        return default
+                    cur = cur.get(p)
+                return default if cur is None else cur
+
+            def num(value):
+                try:
+                    f = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return f if f == f and abs(f) != float("inf") else None
+
+            # The regime CONTEXT, not just its label. The exit row records hard_label and
+            # adx and drops the rest: atr_pct, bb_width, confidence and kaufman_er are all
+            # 0% populated on EXIT rows against 99% on ACCEPTED. So the market can turn
+            # mid-trade and nothing in the record shows it — and kaufman_er, the one
+            # measure that separates a one-way grind from chop of the same SIZE, is never
+            # present on a single traded row (0 of 240). Freezing it here makes both the
+            # entry conditions and any change against them visible.
+            snap["regime_label"] = str(dig("regime", "regime", default="") or "")
+            snap["regime_confidence"] = num(dig("regime", "confidence"))
+            snap["kaufman_er"] = num(dig("regime", "kaufman_er"))
+            snap["adx"] = num(dig("regime", "adx"))
+            snap["atr_pct"] = num(dig("regime", "atr_pct"))
+            snap["bb_width"] = num(dig("regime", "bb_width"))
+            snap["vol_buy_sell_ratio"] = num(dig("volume", "buy_sell_ratio"))
+            snap["volume_ratio"] = num(dig("volume", "volume_ratio"))
+            snap["oi_signal"] = str(dig("oi", "signal", default="") or "")
+            ca = dig("oi", "cumulative_analysis", default={}) or {}
+            if isinstance(ca, dict):
+                snap["total_call_oi"] = num(ca.get("total_call_oi"))
+                snap["total_put_oi"] = num(ca.get("total_put_oi"))
+            pcr = dig("pcr", default={})
+            snap["pcr"] = num(pcr.get("pcr", pcr.get("pcr_oi")) if isinstance(pcr, dict) else pcr)
+            snap["order_ratio"] = num(dig("order_flow", "ratio"))
+            # The OI/PCR pillars as they voted at acceptance, so a later
+            # OI_PCR_REVERSAL can prove the book actually turned rather than
+            # re-reading the condition the entry was admitted under. Stored only
+            # when the chain existed — absent evidence must not read as a benign
+            # zero (see _intel_reversal_is_new_evidence).
+            entry_direction = str(getattr(candidate, "direction", "") or "").upper()
+            if entry_direction in {"LONG", "SHORT"} and Scanner._intel_evidence_is_usable(
+                self, intel
+            ):
+                snap["adverse_votes"] = Scanner._intel_adverse_votes(
+                    self, entry_direction, intel
+                )
+            snap["aggregate_score"] = num(dig("aggregate", "score"))
+            snap["breadth_aligned"] = num(dig("breadth_context", "aligned_count"))
+            snap["breadth_bias"] = str(dig("breadth_context", "bias", default="") or "")
+            snap["day_type"] = str(dig("session_context", "day_type", default="") or "")
+            snap["session_confidence"] = num(dig("session_context", "confidence"))
+            snap["close_above_vwap_pct"] = num(dig("session_context", "close_above_vwap_pct"))
+            greeks = dig("greeks", default={}) or {}
+            if isinstance(greeks, dict):
+                snap["iv_percentile"] = num(greeks.get("iv_percentile"))
+                side = "call" if str(getattr(candidate, "option_type", "")).upper() == "CE" else "put"
+                leg = greeks.get(side) or greeks.get("call") or {}
+                if isinstance(leg, dict):
+                    for g in ("delta", "gamma", "theta", "vega", "iv"):
+                        snap[f"{g}"] = num(leg.get(g))
+            # VIX is fetched live and percentile-ranked, but reaches the record only as
+            # a grading penalty that was non-zero on 3 of 76 rows.
+            try:
+                cached = (getattr(self, "_premium_cache", {}) or {}).get("INDIAVIX") or {}
+                vix = num(cached.get("price"))
+                snap["india_vix"] = vix
+                if vix is not None:
+                    snap["vix_percentile"] = num(self._vix_percentile(vix, datetime.now(IST)))
+            except Exception:
+                pass
+            return {k: v for k, v in snap.items() if v not in (None, "")}
+        except Exception as exc:
+            # Diagnostics must never interfere with an entry.
+            logger.debug(f"Entry intel snapshot skipped: {exc}")
+            return {}
+
     def _record_accepted_entry(self, candidate: TradeCandidate, trade=None) -> None:
         """Count each accepted live/manual entry exactly once."""
         self._reset_daily_counters()
+        # Every acceptance route reaches here, so the snapshot is taken once, at the
+        # moment of acceptance, from the intel that actually produced the decision.
+        if not getattr(candidate, "entry_intel", None) and self._setting_enabled(
+            getattr(get_settings(), "entry_intel_snapshot_enabled", True), True
+        ):
+            setattr(candidate, "entry_intel", self._entry_intel_snapshot(candidate))
+        # Auto mode manages the live Trade, not the candidate, and Trade has no
+        # entry_intel field of its own — so without this copy the acceptance
+        # evidence never reaches the object the exit guards actually read, and
+        # _intel_reversal_is_new_evidence silently falls back to its first-reading
+        # latch on every automated trade. Copied, not shared, for the same reason
+        # _inherit_exit_entry_metadata copies.
+        if trade is not None and not getattr(trade, "entry_intel", None):
+            try:
+                setattr(trade, "entry_intel", dict(getattr(candidate, "entry_intel", None) or {}))
+            except Exception as exc:
+                logger.debug(f"Entry intel not carried to trade: {exc}")
         # Snapshot the ENTRY-time quote verification so later feed staleness can
         # never rewrite the acceptance evidence (2026-07-03 session audit).
         if not hasattr(candidate, "entry_quote_verified"):
@@ -1567,7 +1692,74 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if bonus:
                 budget += bonus
                 basis.append(f"trend-phase +{bonus}")
+        budget, vol_note = self._range_scaled_trade_budget(instrument, budget)
+        if vol_note:
+            basis.append(vol_note)
         return min(20, budget), ", ".join(basis) if basis else "static"
+
+    def _range_scaled_trade_budget(self, instrument: str, budget: int) -> Tuple[int, str]:
+        """Shrink the entry budget when the day is offering less to trade.
+
+        Measured across the stored sessions, trades taken per 1% of median daily range:
+
+            W30  0.97% range   15.0 trades/day   15.5 per 1%
+            W31  0.62%         8.6               13.8
+            W32  0.77%        13.0               16.9
+            W33  0.64%        12.0               18.8
+
+        Activity did not fall with opportunity — it rose against it. Holding the trade
+        count while the range contracts 34% means the extra trades come from further
+        down the quality curve, and the median peak fell Rs.533 -> Rs.78 over the same
+        stretch. This ties the budget to the range the day has actually printed so far.
+
+        Uses the session's OWN range to date, not a forecast, and only ever reduces —
+        a quiet morning that turns into a trending afternoon widens the measured range
+        and the budget recovers with it.
+        """
+        settings = get_settings()
+        base = int(budget or 0)
+        if not self._setting_enabled(
+            getattr(settings, "range_scaled_budget_enabled", True), True
+        ):
+            return base, ""
+        try:
+            reference = float(getattr(settings, "range_scaled_budget_reference_pct", 0.90) or 0.90)
+            floor = int(getattr(settings, "range_scaled_budget_min_trades", 3) or 3)
+        except (TypeError, ValueError):
+            return base, ""
+        if reference <= 0:
+            return base, ""
+        measured = self._session_range_pct(instrument)
+        if measured is None or measured <= 0:
+            # No measurement is not evidence of a quiet day.
+            return base, ""
+        scaled = int(round(base * min(1.0, measured / reference)))
+        scaled = max(floor, min(base, scaled))
+        if scaled >= base:
+            return base, ""
+        return scaled, f"range {measured:.2f}% of {reference:.2f}% -> {scaled}"
+
+    def _session_range_pct(self, instrument: str) -> Optional[float]:
+        """Today's high-low as a percent of the session open, or None if unknowable."""
+        try:
+            df = self.candles.get_candles(str(instrument or "").split()[0], "5min")
+            if df is None or getattr(df, "empty", True) or len(df) < 2:
+                return None
+            today = datetime.now(IST).date()
+            idx = getattr(df, "index", None)
+            if idx is None or not hasattr(idx, "date"):
+                return None
+            day = df[idx.date == today]
+            if day.empty:
+                return None
+            hi = float(day["high"].max()); lo = float(day["low"].min())
+            op = float(day["open"].iloc[0])
+            if op <= 0 or hi <= lo:
+                return None
+            return (hi - lo) / op * 100.0
+        except Exception as exc:
+            logger.debug(f"Session range unavailable for {instrument}: {exc}")
+            return None
 
     def _index_cooldown_applies(self, instrument: str) -> Tuple[bool, str]:
         """Whether the post-exit cooldown should gate this index right now.
@@ -7713,6 +7905,166 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         }
         return predictions
 
+    @staticmethod
+    def _first_present_number(mapping, *keys) -> Optional[float]:
+        """First key that EXISTS and parses to a finite number; None when none do.
+
+        Deliberately NOT `m.get(a) or m.get(b) or default`. That idiom treats a real
+        0.0 as absent, and the two are different measurements:
+
+        - order flow is a buy/sell ratio, so 0.0 means every trade hit the sell side
+          — the most bearish value the pillar can produce. `or 1.0` rewrote it as
+          perfectly balanced and dropped its vote, silencing exactly the reading that
+          most deserved to count;
+        - a present 0.0 also fell through to the NEXT key, so a live zero could be
+          answered with a stale alternate field.
+
+        Malformed and non-finite values return None (unknown) rather than a default,
+        because an unknown pillar must not vote — _peak_threat_exit_decision already
+        states the rule: "'Unclear' is not 'against'". This codebase has paid for the
+        opposite reading before (the 1min surge numerator read absent data as zero;
+        a zero VIX read as a real measurement).
+        """
+        if not isinstance(mapping, dict):
+            return None
+        for key in keys:
+            if key not in mapping:
+                continue
+            value = mapping.get(key)
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                logger.debug(f"Intel pillar {key}={value!r} is not a number; treated as unknown.")
+                continue
+            if number != number or abs(number) == float("inf"):
+                logger.debug(f"Intel pillar {key}={value!r} is not finite; treated as unknown.")
+                continue
+            return number
+        return None
+
+    def _intel_pillar_votes(self, intel_result) -> Tuple[int, int, Optional[float], Optional[float]]:
+        """(bearish, bullish, pcr_value, flow_ratio) from the OI/PCR/flow pillars.
+
+        One definition of how the three pillars vote, so the entry reference and the
+        live exit reading are always scored by the same rule. The two values are
+        None when that pillar had nothing to say; an unknown pillar casts no vote in
+        either direction.
+        """
+        if not isinstance(intel_result, dict):
+            return 0, 0, None, None
+        pcr = intel_result.get("pcr", {}) if isinstance(intel_result.get("pcr"), dict) else {}
+        oi = intel_result.get("oi", {}) if isinstance(intel_result.get("oi"), dict) else {}
+        flow = intel_result.get("order_flow", {}) if isinstance(intel_result.get("order_flow"), dict) else {}
+
+        pcr_signal = str(pcr.get("contrarian_signal") or pcr.get("signal") or "NEUTRAL").upper()
+        oi_signal = str(oi.get("signal") or "NEUTRAL").upper()
+        flow_signal = str(flow.get("signal") or "NEUTRAL").upper()
+        pcr_value = Scanner._first_present_number(pcr, "primary_pcr", "pcr_oi", "pcr")
+        flow_ratio = Scanner._first_present_number(flow, "ratio", "buy_sell_ratio")
+
+        bearish_votes = sum(
+            [
+                pcr_signal in {"BEARISH", "STRONG_BEARISH"},
+                oi_signal == "BEARISH",
+                flow_signal == "BEARISH" or (flow_ratio is not None and flow_ratio <= 0.85),
+            ]
+        )
+        bullish_votes = sum(
+            [
+                pcr_signal in {"BULLISH", "STRONG_BULLISH"},
+                oi_signal == "BULLISH",
+                flow_signal == "BULLISH" or (flow_ratio is not None and flow_ratio >= 1.15),
+            ]
+        )
+        return bearish_votes, bullish_votes, pcr_value, flow_ratio
+
+    def _intel_adverse_votes(self, direction: str, intel_result) -> int:
+        """Pillar votes AGAINST a position facing `direction`."""
+        bearish, bullish, _pcr, _flow = Scanner._intel_pillar_votes(self, intel_result)
+        return bullish if str(direction or "").upper() == "SHORT" else bearish
+
+    def _intel_evidence_is_usable(self, intel_result) -> bool:
+        """Whether the bundle actually carries OI/PCR/flow evidence.
+
+        An absent option chain reads as PCR 0 with the flow ratio defaulted to 1.0,
+        which scores zero votes either way — indistinguishable from a genuinely
+        balanced book unless usability is asked about directly. 2026-08-12 09:15:10
+        logged `PCR=0, Call Delta=0` for MIDCPNIFTY seven seconds after its entry:
+        no chain had been fetched yet that session.
+        """
+        if not isinstance(intel_result, dict):
+            return False
+        pcr = intel_result.get("pcr", {}) if isinstance(intel_result.get("pcr"), dict) else {}
+        oi = intel_result.get("oi", {}) if isinstance(intel_result.get("oi"), dict) else {}
+        flow = intel_result.get("order_flow", {}) if isinstance(intel_result.get("order_flow"), dict) else {}
+        # A PCR of exactly 0 is this codebase's own sentinel for an absent chain —
+        # kite_market_data.put_call_ratio returns 0.0 for an empty frame — so it is
+        # the one pillar where zero means "no evidence" rather than a reading.
+        pcr_value = Scanner._first_present_number(pcr, "primary_pcr", "pcr_oi", "pcr")
+        if pcr_value is not None and pcr_value > 0:
+            return True
+        if str(oi.get("signal") or "").upper() not in {"", "NEUTRAL"}:
+            return True
+        return Scanner._first_present_number(flow, "ratio", "buy_sell_ratio") is not None
+
+    def _intel_reversal_is_new_evidence(
+        self, trade_like, direction: str, intel_result
+    ) -> Tuple[bool, str]:
+        """Whether the book has turned against this trade SINCE it was accepted.
+
+        OI_PCR_REVERSAL claims a reversal, so it owes a reference to have reversed
+        from. Two ways it had none, both seen on 2026-08-12:
+
+        - The entry was accepted before the day's first option chain existed
+          (MIDCPNIFTY 09:15:03, `PCR=0` still at 09:15:10). The first usable reading,
+          at 09:15:26, was then read as a reversal and closed the trade 24s after
+          entry. It is the reference, not the trigger — so it is latched as one.
+        - The book already leaned this way when the entry was accepted. The entry
+          gate saw that and admitted the trade anyway; the same reading later is the
+          condition it was accepted under, not a turn against it.
+
+        Reference votes come from the entry snapshot (_entry_intel_snapshot, scored
+        with the same _intel_pillar_votes rule) and otherwise from the first usable
+        reading, latched onto the trade. Deteriorating evidence still exits: the
+        adverse count only has to exceed the reference by one vote.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "intel_reversal_requires_new_evidence", True), True
+        ):
+            return True, ""
+        # An unusable reading scores no votes anyway; leave it to the vote bar.
+        if not Scanner._intel_evidence_is_usable(self, intel_result):
+            return True, ""
+        current = Scanner._intel_adverse_votes(self, direction, intel_result)
+        entry_intel = getattr(trade_like, "entry_intel", None)
+        reference = None
+        source = ""
+        if isinstance(entry_intel, dict) and entry_intel.get("adverse_votes") is not None:
+            try:
+                reference = int(entry_intel.get("adverse_votes"))
+                source = "at entry"
+            except (TypeError, ValueError):
+                reference = None
+        if reference is None:
+            latched = getattr(trade_like, "_intel_reversal_baseline", None)
+            if latched is None:
+                try:
+                    setattr(trade_like, "_intel_reversal_baseline", current)
+                except Exception:
+                    return True, ""
+                latched = current
+            try:
+                reference = int(latched)
+            except (TypeError, ValueError):
+                return True, ""
+            source = "at first reading (entry had no chain)"
+        if current > reference:
+            return True, ""
+        return False, f"{current} adverse votes, same {reference} {source}"
+
     def _intel_reversal_reason(
         self,
         direction: str,
@@ -7723,29 +8075,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     ) -> Optional[str]:
         if not isinstance(intel_result, dict):
             return None
-        pcr = intel_result.get("pcr", {}) if isinstance(intel_result.get("pcr"), dict) else {}
-        oi = intel_result.get("oi", {}) if isinstance(intel_result.get("oi"), dict) else {}
-        flow = intel_result.get("order_flow", {}) if isinstance(intel_result.get("order_flow"), dict) else {}
-
-        pcr_signal = str(pcr.get("contrarian_signal") or pcr.get("signal") or "NEUTRAL").upper()
-        oi_signal = str(oi.get("signal") or "NEUTRAL").upper()
-        flow_signal = str(flow.get("signal") or "NEUTRAL").upper()
-        pcr_value = float(pcr.get("primary_pcr") or pcr.get("pcr_oi") or 0.0)
-        flow_ratio = float(flow.get("ratio") or flow.get("buy_sell_ratio") or 1.0)
-
-        bearish_votes = sum(
-            [
-                pcr_signal in {"BEARISH", "STRONG_BEARISH"},
-                oi_signal == "BEARISH",
-                flow_signal == "BEARISH" or flow_ratio <= 0.85,
-            ]
-        )
-        bullish_votes = sum(
-            [
-                pcr_signal in {"BULLISH", "STRONG_BULLISH"},
-                oi_signal == "BULLISH",
-                flow_signal == "BULLISH" or flow_ratio >= 1.15,
-            ]
+        bearish_votes, bullish_votes, pcr_value, flow_ratio = Scanner._intel_pillar_votes(
+            self, intel_result
         )
 
         direction = str(direction or "").upper()
@@ -7797,15 +8128,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 adjusted_min = min_votes + 1
                 corroboration = f" contested[{detail}]"
 
+        # A pillar that said nothing is reported as unknown. Printing the old
+        # defaults (PCR 0.00, OFR 1.00) put a number that was never measured into
+        # the exit record, which is how the absent-reads-as-zero defect stayed
+        # invisible in the logs for so long.
+        pcr_text = "n/a" if pcr_value is None else f"{pcr_value:.2f}"
+        flow_text = "n/a" if flow_ratio is None else f"{flow_ratio:.2f}"
         if direction == "LONG" and bearish_votes >= adjusted_min:
             return (
                 f"OI_PCR_REVERSAL bearish votes={bearish_votes}/{adjusted_min} "
-                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}{corroboration}"
+                f"PCR={pcr_text} OFR={flow_text}{corroboration}"
             )
         if direction == "SHORT" and bullish_votes >= adjusted_min:
             return (
                 f"OI_PCR_REVERSAL bullish votes={bullish_votes}/{adjusted_min} "
-                f"PCR={pcr_value:.2f} OFR={flow_ratio:.2f}{corroboration}"
+                f"PCR={pcr_text} OFR={flow_text}{corroboration}"
             )
         return None
 
@@ -8002,6 +8339,77 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception as e:
             logger.debug(f"Premium fetch failed for {trade.trading_symbol}: {e}")
         return None
+
+    def _candidate_entry_mark_refusal(self, candidate) -> str:
+        """Refuse an accepted OPT candidate whose recorded premium is no longer real.
+
+        The real-order path reprices at execution — _execution_levels replaces the
+        candidate's premium with _get_live_premium_cached before the order is built — and
+        TradeManager.open_trade then validates the mark. The MANUAL path does neither: it
+        stamps accepted_by_gate on the candidate as-is, and every P&L figure downstream is
+        computed from that recorded price.
+
+        2026-08-11 15:09:36: NIFTY 24500PE was accepted at 133.00 while spot stood at
+        24453.65. On a same-day-expiry PE that strike is worth its intrinsic Rs.46, and
+        the contract's true price was 40.65 — the mark was ~2.5 hours stale (the same
+        contract legitimately printed 133 at 12:25, when spot was lower). Stop, target and
+        R:R were all derived from it, EARLY_LOSS_CUT read a 13.89R loss 190 MILLISECONDS
+        later, and the book took -Rs.6,083 that the market never charged.
+
+        Two conditions, because either alone gives false refusals: the premium must
+        diverge by a large FRACTION, and the gap must be material in RUPEES so a cheap
+        contract ticking 5 paise is not treated as a stale mark.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "candidate_entry_mark_validation_enabled", True), True
+        ):
+            return ""
+        if str(getattr(candidate, "inst_type", "") or "").upper() != "OPT":
+            return ""
+        try:
+            mark = float(getattr(candidate, "price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if mark <= 0:
+            return ""
+        try:
+            # Non-blocking: this runs inside the scan loop, and a missing quote must
+            # cost the check rather than the cycle.
+            fresh = self._get_live_premium_cached(candidate, allow_blocking=False)
+        except Exception as exc:
+            logger.debug(f"Entry-mark refresh failed for {getattr(candidate,'trading_symbol','')}: {exc}")
+            return ""
+        try:
+            fresh = float(fresh or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if fresh <= 0:
+            # No opinion is not evidence of a good mark, but refusing on a missing quote
+            # would stop trading whenever the feed hiccups.
+            return ""
+        qty = max(
+            1,
+            int(getattr(candidate, "lots", 0) or 0) * int(getattr(candidate, "lot_size", 0) or 0),
+        )
+        divergence = abs(mark - fresh) / mark
+        gap_rs = abs(mark - fresh) * qty
+        try:
+            max_pct = float(
+                getattr(settings, "candidate_entry_mark_max_divergence_pct", 25.0) or 25.0
+            ) / 100.0
+            min_gap = float(
+                getattr(settings, "candidate_entry_mark_min_gap_rs", 500.0) or 500.0
+            )
+        except (TypeError, ValueError):
+            max_pct, min_gap = 0.25, 500.0
+        if max_pct > 0 and divergence > max_pct and gap_rs >= min_gap:
+            return (
+                f"entry mark {mark:.2f} is {divergence:.0%} from the live premium "
+                f"{fresh:.2f} on {getattr(candidate, 'trading_symbol', '') or 'OPT'} "
+                f"(Rs.{gap_rs:,.0f} of phantom P&L)"
+            )
+        return ""
 
     def _candidate_execution_touch_quote(self, candidate: TradeCandidate) -> Dict[str, Any]:
         """Best-effort executable bid/ask quote; never changes signal scoring."""
@@ -10156,6 +10564,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "action": getattr(candidate, "action", "ENTRY"),
             "peak_pnl": float(getattr(candidate, "peak_pnl", 0.0) or 0.0),
             "max_drawdown": float(getattr(candidate, "max_drawdown", 0.0) or 0.0),
+            # Persisted so a mid-session restart does not leave a trade with a path that
+            # begins partway through — a truncated path reads as a position that never
+            # visited levels it did visit, which is worse than no path at all.
+            "pnl_path": [[float(t), float(p)] for t, p in (getattr(candidate, "pnl_path", None) or [])],
             "runner_mode": bool(getattr(candidate, "runner_mode", False)),
             "initial_stop": float(getattr(candidate, "initial_stop", getattr(candidate, "stop", 0.0)) or 0.0),
             "entry_spot": float(getattr(candidate, "entry_spot", 0.0) or 0.0),
@@ -11649,6 +12061,55 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return vwap_ctx
         return self._structure_break_context(instrument, timeframe, sig, as_of=signal_timestamp)
 
+    def _latched_cascade_override(
+        self, candidate, ctx: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Hold a confirmed cascade for the rest of this signal's stabilization window.
+
+        A one-way cascade is evidence about a move that ALREADY happened — a synchronised
+        multi-index thrust with breadth and volume behind it. Re-proving it on every scan
+        asks a different question: "is the thrust still printing this instant?", and the
+        answer goes false the moment volume ticks under its ratio, even though nothing
+        about the original evidence changed.
+
+        2026-08-11 09:15, MIDCPNIFTY 15min SHORT — the correct side on the only hour of
+        the day that moved:
+
+            Re-admitting: arrow flickered but one-way downside cascade:
+                          core 3/3, total 4, volume 4>=3 at 1.40x
+            Re-admitting: (same)
+            Rejected:     UT1 arrow vanished after 13.7s
+
+        Re-admitted twice on maximal confirmation, then killed anyway. Across that
+        session 252 signals entered the buffer and 48 matured — 19%.
+
+        The latch does NOT weaken the FLIP check: _stabilization_repaint_override_context
+        returns None on a FLIPPED arrow before this is ever reached, so a signal the
+        source has CONTRADICTED still dies. This only covers an arrow that went QUIET,
+        which is exactly the distinction that function's own docstring draws.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "stabilization_cascade_latch_enabled", True), True
+        ):
+            return ctx
+        if ctx:
+            try:
+                latched = dict(ctx)
+                latched["latched"] = True
+                latched["reason"] = (
+                    f"{ctx.get('reason', ctx.get('type', 'confirmed cascade'))} (held)"
+                )
+                setattr(candidate, "_stabilization_cascade_latch", latched)
+            except Exception:
+                pass
+            return ctx
+        prior = getattr(candidate, "_stabilization_cascade_latch", None)
+        if isinstance(prior, dict) and prior:
+            self._diag_inc("stabilization", "cascade_latch_held")
+            return prior
+        return None
+
     def _stabilization_repaint_override_context(
         self,
         candidate: TradeCandidate,
@@ -11702,7 +12163,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Generic relief must not re-admit flickering shorts. Late-session
             # flickers are stricter on both sides: require the 1m+5m, breadth,
             # reclaim and volume basket instead of trusting a stale regime flip.
-            return late_reclaim_ctx or cascade_ctx
+            return self._latched_cascade_override(candidate, late_reclaim_ctx or cascade_ctx)
         return self._entry_reversal_relief_context(
             getattr(candidate, "instrument", ""),
             getattr(candidate, "timeframe", ""),
@@ -11905,12 +12366,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     ) -> float:
         """Minimum peak P&L before SMART_PROFIT_LOCK can arm."""
         settings = get_settings()
-        min_peak = 500.0
+        base_peak = float(getattr(settings, "profit_lock_min_peak_rs", 500.0) or 500.0)
+        min_peak = base_peak
         risk = abs(float(initial_risk_rs or 0.0))
-        normal_r_mult = float(getattr(settings, "profit_lock_min_r_multiple", 1.0) or 1.0)
+        normal_r_mult = float(getattr(settings, "profit_lock_min_r_multiple", 0.20) or 0.20)
         if scalp_mode:
             r_mult = float(getattr(settings, "scalp_profit_lock_min_r_multiple", 0.50) or 0.50)
-            min_peak = 500.0
+            min_peak = base_peak
             regime_text = str(getattr(trade_like, "market_regime", "") or "").upper()
             choppy_scalp = bool(getattr(trade_like, "fifteen_min_choppy_scalp_entry", False)) or (
                 bool(trade_like is not None)
@@ -11928,12 +12390,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 r_mult = float(getattr(settings, "fifteen_min_choppy_scalp_profit_lock_r_multiple", 0.20) or 0.20)
             if risk > 0 and r_mult > 0:
                 min_peak = max(min_peak, min(risk * r_mult, Scanner._profit_lock_arm_cap_rs(self, trade_like)))
-        elif self._setting_enabled(getattr(settings, "let_winners_run", True), True):
-            r_mult = normal_r_mult
-            if risk > 0 and r_mult > 0:
-                # Delay only the small-tier lock; never past the major-win threshold
-                # (>= Rs.3000), so a big win is always protected by MAJOR_WIN_GUARD.
-                min_peak = max(min_peak, min(risk * r_mult, Scanner._profit_lock_arm_cap_rs(self, trade_like)))
+        else:
+            # The non-scalp base is its own setting. Measured over 12 sessions the shared
+            # Rs.500 base beat risk*r_mult on only 5 of 59 non-scalp rows, so the
+            # R-multiple below is what actually sets this arm and the base is the
+            # backstop under it. See config/settings.py profit_lock_min_r_multiple.
+            #
+            # Applied OUTSIDE the let_winners_run test on purpose: that flag adds the
+            # R-multiple DELAY, so gating the base on it too would make switching
+            # let-winners-run OFF arm later than leaving it on.
+            min_peak = float(
+                getattr(settings, "profit_lock_nonscalp_min_peak_rs", 250.0) or 250.0
+            )
+            if self._setting_enabled(getattr(settings, "let_winners_run", True), True):
+                r_mult = normal_r_mult
+                if risk > 0 and r_mult > 0:
+                    # Delay only the small-tier lock; never past the major-win threshold
+                    # (>= Rs.3000), so a big win is always protected by MAJOR_WIN_GUARD.
+                    min_peak = max(min_peak, min(risk * r_mult, Scanner._profit_lock_arm_cap_rs(self, trade_like)))
         # EOD-proximity (Fix 2): within the square-off window a trade cannot run to
         # 1R, so collapse the arm to a small peak so protection engages in time
         # instead of letting a winner round-trip until the forced EOD kill.
@@ -11944,7 +12418,98 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             eod_min = float(eod_min_raw if eod_min_raw is not None else 1.0)
             eod_arm = max(eod_min, risk * eod_r) if risk > 0 else eod_min
             min_peak = min(min_peak, eod_arm)
-        return min_peak
+        # Same floor as the give-back arm: the EOD collapse above can drive this to
+        # Rs.1, and a lock armed below the round-trip cost banks less than it pays.
+        return max(min_peak, Scanner._profit_protect_cost_floor_rs(self, trade_like))
+
+    def _smart_lock_floor_collapse(self, peak_pnl: float, current_pnl_rs: float) -> bool:
+        """Whether the absolute keep-floor may cut this trade.
+
+        The keep-floor is COLLAPSE protection, not a profit cap: it may only fire
+        on a trade that actually earned MORE than the floor and then gave it back.
+
+        2026-08-12: the non-scalp lock arms at Rs.250 (profit_lock_nonscalp_min_peak_rs)
+        while the keep-floor is Rs.450, so `current < floor` was true by construction
+        the instant the lock armed — the arm sits BELOW the floor. Four winners were
+        market-exited at their own peak (current == peak, no give-back at all) 18-194s
+        after entry for Rs.170-212 net; the same signals in restore_point_51 ran to
+        Rs.1,749 and Rs.3,124. Every large win must cross the Rs.250-450 band on its
+        way up, so nothing may cut a trade inside that band. Give-backs below the
+        floor stay owned by _peak_giveback_or_reversal_exit, which has the arm
+        ladder, the round-trip cost floor and the trend-runner exemption.
+        """
+        floor = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
+        return float(peak_pnl or 0.0) > floor and float(current_pnl_rs or 0.0) < floor
+
+    def _smart_lock_backstop_ratio(self, lock_ratio: float, scalp_mode: bool) -> float:
+        """Peak retention at which the P&L-space backstop may fire.
+
+        The backstop exists for the case where the price-space lock stop was delayed
+        or clamped (option breathing room) and so never registered as a stop hit. It
+        must never fire BEFORE the ladder it backs up: _profit_lock_floor already
+        returns the retention it chose, tiered by peak and loosened to 0.38 in
+        VOLATILE/BREAKOUT where the median winner gives back 49% and survives
+        (_first_rung_regime_retention).
+
+        2026-08-12: the session path gated on a flat 0.65 while the ladder floor is
+        0.50 (0.38 fast regimes), and the live path used a hard-coded 0.45 — the same
+        faded winner was cut in signal mode and held in auto. Worse, signal mode
+        booked the exit at the ladder's floor price, BELOW the mark the trade was
+        actually trading at. The ladder's own ratio now drives both paths, so the
+        backstop fires exactly when the trade is below its trail and not one tick
+        earlier. The constants remain only for the no-floor case, where lock_stop is
+        0 too and nothing but a floor collapse can exit.
+        """
+        ratio = float(lock_ratio or 0.0)
+        if ratio > 0:
+            return ratio
+        return 0.70 if scalp_mode else 0.65
+
+    def _first_rung_regime_retention(self, trade_like=None, timeframe: str = "") -> float:
+        """Retention for the sub-Rs.1,000 rung, by the regime the trade lives in.
+
+        lock_ratio is the fraction of peak RETAINED, so the floor sits at ratio x peak
+        and BREATHING is 1 - ratio. Loosening therefore means a LOWER number, not a
+        higher one. Returned into a min(), so this can only ever loosen the 0.50
+        schedule; regimes not listed return 1.0 and leave it untouched.
+
+        Measured heat as a fraction of peak, across every winner in 47 stored sessions:
+
+            TRENDING_UP    8%     RANGING        35%
+            TRENDING_DOWN 28%     BREAKOUT_DOWN  43%
+                                  BREAKOUT_UP    47%
+                                  VOLATILE       49%
+
+        At a 0.50 floor a trade is stopped once it gives back half its peak. In VOLATILE
+        the MEDIAN winner gives back 49% — so the floor sits directly on top of the
+        pullback those winners routinely make and survive, and roughly half of them are
+        cut at movement that was never a reversal. 0.38 (62% breathing) clears the
+        measured median with room to spare while still banking a third of the peak.
+
+        TRENDING_UP is deliberately excluded: 8% heat against a median peak of Rs.3,070
+        means the existing leash is nowhere near binding, and loosening it there would
+        give back real money for nothing.
+        """
+        settings = get_settings()
+        if not Scanner._setting_enabled(
+            getattr(settings, "first_rung_regime_retention_enabled", True), True
+        ):
+            return 1.0
+        if trade_like is None:
+            return 1.0
+        try:
+            regime = str(Scanner._get_trade_regime(self, trade_like, default="")).upper()
+        except Exception:
+            return 1.0
+        if regime not in {"VOLATILE", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
+            return 1.0
+        try:
+            loose = float(getattr(settings, "first_rung_fast_regime_retention", 0.38) or 0.38)
+        except (TypeError, ValueError):
+            loose = 0.38
+        # Bounded: under 0.30 the lock stops protecting anything, and at/over 0.50 the
+        # min() in the caller makes it a no-op — so the band is where it can still act.
+        return max(0.30, min(0.50, loose))
 
     def _profit_lock_arm_cap_rs(self, trade_like=None) -> float:
         """Ceiling on how late the profit lock may arm, in rupees.
@@ -12087,6 +12652,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # closing trades on ordinary bid/ask breathing before the move developed.
             # 50% is the operator's schedule (2026-08-08) and supersedes the flat band.
             lock_ratio = 0.50
+            # ...except that 50% is measured to sit ON TOP of normal breathing in the
+            # fast regimes. Heat as a fraction of peak, taken from every winner in 47
+            # stored sessions:
+            #     TRENDING_UP 8%   TRENDING_DOWN 28%   RANGING 35%
+            #     BREAKOUT_DOWN 43%   BREAKOUT_UP 47%   VOLATILE 49%
+            # A 50% floor in VOLATILE or BREAKOUT therefore fires at roughly the median
+            # pullback those winners always make — it cuts them at movement that was
+            # never a reversal. TRENDING_UP is left alone: 8% heat against a median peak
+            # of Rs.3,070 means the existing leash is nowhere near binding there.
+            lock_ratio = min(lock_ratio, Scanner._first_rung_regime_retention(self, trade_like, timeframe))
         reason = "MAJOR_WIN_GUARD" if ladder_pnl >= 3000.0 else "SMART_PROFIT_LOCK"
         if reason == "MAJOR_WIN_GUARD" and trade_like is not None:
             inst_type = str(getattr(trade_like, "inst_type", "") or "").upper()
@@ -12109,7 +12684,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Clamp into the operator's breathing band. The tiers above still order the
         # trades — more gain, tighter lock — but the ladder may no longer leave a big
         # winner on a 5% leash nor hand a small one back nearly half its gain.
-        lock_ratio = max(Scanner._profit_lock_ratio_floor(self), min(ceiling_band, lock_ratio))
+        # profit_lock_min_ratio is a guard against a misconfigured floor, not a claim
+        # that 50% breathing is enough everywhere — and left as a hard clamp it silently
+        # undid the regime rung above, which is measured to need 62% in the fast regimes.
+        # It yields to that rule and to nothing else: _first_rung_regime_retention
+        # returns 1.0 for every other regime, so this min() is a no-op there.
+        ratio_floor = min(
+            Scanner._profit_lock_ratio_floor(self),
+            Scanner._first_rung_regime_retention(self, trade_like, timeframe),
+        )
+        lock_ratio = max(ratio_floor, min(ceiling_band, lock_ratio))
         lock_ratio = round(lock_ratio, 4)
         locked_points = (peak_pnl * lock_ratio) / (qty * inst_mult)
         if str(direction).upper() == "SHORT":
@@ -12141,12 +12725,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         mins = self._minutes_to_force_exit(now)
         return 0.0 <= mins <= window
 
-    def _profit_giveback_arm(self, initial_risk_rs: float, now=None, nontrend_scope: bool = False) -> float:
+    def _profit_giveback_arm(
+        self, initial_risk_rs: float, now=None, nontrend_scope: bool = False,
+        trade_like=None,
+    ) -> float:
         """Peak P&L (Rs) at which the sub-1R give-back guard becomes active (Fix 1).
         Near square-off the arm is lowered further so modest peaks are protected.
         Non-trend sessions use a lower arm: at 1-lot size the Rs.500 floor sits
         above 0.40R, so the guard could mathematically never arm (2026-07-03:
-        four sub-0.5R peaks round-tripped to full stops under that floor)."""
+        four sub-0.5R peaks round-tripped to full stops under that floor).
+
+        Whatever the ladders say, the arm never drops below what a round trip costs.
+        2026-08-11 15:11: PROFIT_GIVEBACK_GUARD closed BANKNIFTY 57400PE to protect a
+        peak of Rs.36 and booked -Rs.44, because the position paid Rs.80 to open and
+        close. Inside the EOD window the arm collapses to eod_protect_min_peak_rs
+        (Rs.1), so any trivial blip armed a protective exit that could not come out
+        ahead. The loss side of peak-threat already refuses on exactly this reasoning
+        (see _round_trip_cost_rs); the profit side had no such floor."""
         settings = get_settings()
         min_rs = float(getattr(settings, "profit_giveback_min_peak_rs", 500.0) or 500.0)
         r_mult = float(getattr(settings, "profit_giveback_arm_r_multiple", 0.40) or 0.40)
@@ -12161,7 +12756,106 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             eod_r = float(eod_r_raw if eod_r_raw is not None else 0.0)
             eod_min = float(eod_min_raw if eod_min_raw is not None else 1.0)
             arm = min(arm, max(eod_min, risk * eod_r) if risk > 0 else eod_min)
-        return arm
+        return max(arm, Scanner._profit_protect_cost_floor_rs(self, trade_like))
+
+    # Measured peak potential by regime — the median PEAK of every winning trade in the
+    # 47 stored sessions, normalised against RANGING (Rs.809):
+    #   TRENDING_UP Rs.3,070 (3.8x)   BREAKOUT_UP Rs.1,608 (2.0x)   VOLATILE Rs.1,064 (1.3x)
+    #   RANGING     Rs.  809 (1.0x)   TRENDING_DOWN Rs.605 (0.7x)   BREAKOUT_DOWN Rs.562 (0.7x)
+    # Deliberately compressed into a narrow band rather than used raw: the raw ratios
+    # come from as few as 3 winners in some cells, and a 3.8x arm in TRENDING_UP would
+    # stop PEAK_THREAT_EXIT arming there at all — the opposite of the intent.
+    _REGIME_PEAK_SCALE = {
+        "TRENDING_UP": 1.25,
+        "BREAKOUT_UP": 1.15,
+        "VOLATILE": 1.00,
+        "RANGING": 0.85,
+        "TRENDING_DOWN": 0.85,
+        "BREAKOUT_DOWN": 0.85,
+    }
+
+    def _profit_threshold_scale(self, trade_like=None, initial_risk_rs: float = 0.0) -> float:
+        """Multiplier on the ABSOLUTE rupee floors of every profit-side exit.
+
+        Those floors — Rs.750 peak-threat, Rs.500/250 lock, Rs.500 give-back — are fixed
+        rupees, while the moves they are meant to catch scale with volatility. When the
+        market quietened from a 0.97% median daily range (W30) to 0.64% (W33), the share
+        of trades ever reaching a Rs.750 peak fell 43% -> 4%, and PEAK_THREAT_EXIT — which
+        banks 87% of peak on big trades — fired once in a week. The floors did not move,
+        so the best exit in the system simply went dormant and LOSS_THREAT_EXIT rose from
+        30% to 50% of all exits. Win rate followed: 47.8% -> 12.5%.
+
+        Note what is NOT being changed. Each arm is max(absolute_floor, risk x r_multiple)
+        and the R-multiple half ALREADY scales — initial_risk_rs is an ATR-derived stop
+        distance times quantity. Only the floor is blind, and the max() makes it dominate
+        precisely when risk is small, i.e. exactly in the quiet markets where it hurts.
+
+        Volatility term: the trade's own risk against a reference, which needs no new
+        plumbing and captures instrument, timeframe and size at once. Regime term: the
+        measured peak potential of the regime, so a trend is allowed to develop before
+        the lock arms while chop banks sooner. Bounded hard in both directions — this
+        tunes an existing threshold, it does not remove one.
+        """
+        settings = get_settings()
+        if not Scanner._setting_enabled(
+            getattr(settings, "profit_threshold_scaling_enabled", True), True
+        ):
+            return 1.0
+        try:
+            reference = float(getattr(settings, "profit_threshold_reference_risk_rs", 1000.0) or 1000.0)
+            lo = float(getattr(settings, "profit_threshold_scale_min", 0.35) or 0.35)
+            hi = float(getattr(settings, "profit_threshold_scale_max", 2.00) or 2.00)
+        except (TypeError, ValueError):
+            return 1.0
+        if reference <= 0 or lo <= 0 or hi < lo:
+            return 1.0
+        scale = 1.0
+        try:
+            risk = abs(float(initial_risk_rs or 0.0))
+        except (TypeError, ValueError):
+            risk = 0.0
+        if risk > 0:
+            # Absent risk is not evidence of a quiet market — the floor stands unscaled.
+            scale *= risk / reference
+        if Scanner._setting_enabled(
+            getattr(settings, "profit_threshold_regime_scaling_enabled", True), True
+        ) and trade_like is not None:
+            try:
+                regime = str(Scanner._get_trade_regime(self, trade_like, default="")).upper()
+            except Exception:
+                regime = ""
+            scale *= Scanner._REGIME_PEAK_SCALE.get(regime, 1.0)
+        return max(lo, min(hi, scale))
+
+    def _profit_protect_cost_floor_rs(self, trade_like=None) -> float:
+        """Smallest peak worth protecting: the round trip it costs to take the profit.
+
+        A protective exit below this is value-destroying by construction — it pays a
+        full round trip to bank less than the round trip. Returns 0.0 when disabled or
+        when the cost cannot be established, so it can only ever raise an arm.
+
+        Every internal call is made through the class rather than `self`, because the
+        arm helpers are deliberately callable with a duck-typed self (see
+        _profit_lock_floor's getattr dance) and a bound lookup raises there.
+        """
+        settings = get_settings()
+        if not Scanner._setting_enabled(
+            getattr(settings, "profit_protect_cost_floor_enabled", True), True
+        ):
+            return 0.0
+        try:
+            multiple = max(
+                0.0,
+                float(getattr(settings, "profit_protect_min_cost_multiple", 1.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            multiple = 1.0
+        if multiple <= 0:
+            return 0.0
+        try:
+            return Scanner._round_trip_cost_rs(self, trade_like) * multiple
+        except Exception:
+            return 0.0
 
     def _current_day_type(self, instrument: str) -> str:
         """Latest session-context day classification for an instrument ('UNDECIDED' when unknown).
@@ -12671,12 +13365,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # closing and suppress exits that are genuinely worth taking.
         return flat
 
+    def _position_is_underwater(self, trade_like, net_pnl_rs: float) -> bool:
+        """Whether the MARKET has moved against this position.
+
+        Net P&L at the instant of entry is minus the round trip the trade owes in
+        brokerage and taxes, so `net < 0` is true for every trade the moment it
+        opens and says nothing about direction. The relaxed 2-vote OI/PCR reversal
+        bar exists for a trade the market has actually turned on; handed to every
+        newborn trade it becomes a coin-flip exit on the first intel sample after
+        entry, at the bar meant for confirmed losers.
+
+        2026-08-12 09:15:27: MIDCPNIFTY 14975CE (A+, 95%) was entered at 09:15:03
+        with no option chain fetched yet — PCR still read 0 at 09:15:10. The
+        session's FIRST chain arrived at 09:15:26 and voted 2/2 bearish, closing the
+        trade flat 24s after entry for -Rs.80. At the 3-vote winner bar those same
+        two votes hold. Same reasoning the loss side of peak-threat already applies
+        through _round_trip_cost_rs: the cost is identical for every trade and
+        carries no directional information, so it may not decide direction.
+        """
+        cost = abs(float(Scanner._round_trip_cost_rs(self, trade_like) or 0.0))
+        return float(net_pnl_rs or 0.0) < -cost
+
     @staticmethod
     def _trade_like_age_seconds(trade_like, latest_time) -> Optional[float]:
         """Seconds since the fill, or None when it cannot be established.
 
         None means "cannot tell" and callers must NOT treat it as old — the same
-        never-conclude-from-absence rule the repaint guard now follows.
+        never-conclude-from-absence rule the repaint guard now follows. A candle clock
+        BEHIND the entry also yields None: direction-safety, so an inconsistent clock
+        cannot manufacture an age (see test_the_age_helper_is_direction_safe).
         """
         if latest_time is None:
             return None
@@ -12700,6 +13417,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if age != age or age < 0:
             return None
         return age
+
+    def _peak_threat_flow_points(self, trade_like, order_flow, view: str) -> Tuple[int, str]:
+        """Threat points from the order-flow pillar: (points, reason).
+
+        `or 0.0` followed by `if flow_ratio > 0` read a genuine 0.0 as absent, so the
+        most sell-heavy tape the pillar can report — every trade on the sell side —
+        contributed nothing to a LONG's threat score, while a merely missing feed
+        reached the same conclusion for the opposite reason. Unknown now scores
+        nothing explicitly and a real extreme scores, per this function's own rule
+        that "'Unclear' is not 'against'".
+        """
+        flow_ratio = Scanner._first_present_number(order_flow, "ratio", "buy_sell_ratio")
+        if flow_ratio is None:
+            return 0, ""
+        if str(view or "").upper() == "LONG" and flow_ratio < 0.75:
+            return 1, f"sell-heavy flow {flow_ratio:.2f}"
+        if str(view or "").upper() == "SHORT" and flow_ratio > 1.25:
+            return 1, f"buy-heavy flow {flow_ratio:.2f}"
+        return 0, ""
 
     def _peak_threat_exit_decision(
         self,
@@ -12741,9 +13477,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if view not in {"LONG", "SHORT"}:
             return False, "", "unknown trade view"
 
+        # The Rs.750 floor is what went dormant as the market quietened: across the
+        # stored sessions the share of trades ever reaching it fell 43% -> 4% while this
+        # number stayed fixed, and PEAK_THREAT_EXIT — the 87%-capture exit — stopped
+        # firing. Scaled by volatility and regime; the r-multiple term already scaled.
         min_peak = max(
             0.0,
-            float(getattr(settings, "peak_threat_exit_min_peak_rs", 750.0) or 750.0),
+            float(getattr(settings, "peak_threat_exit_min_peak_rs", 750.0) or 750.0)
+            * Scanner._profit_threshold_scale(self, trade_like, risk),
             risk * float(getattr(settings, "peak_threat_exit_min_peak_r", 0.35) or 0.35),
         )
         retention = (current_pnl / peak) if peak > 0.0 else 0.0
@@ -12782,6 +13523,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             min_hold = max(0.0, float(getattr(settings, "peak_threat_exit_min_hold_seconds", 60.0) or 0.0))
             if min_hold > 0:
                 held = self._trade_like_age_seconds(trade_like, latest_time)
+                # latest_time is the CANDLE clock, and an intracandle entry is stamped
+                # AFTER the bar it fired inside — a fill at 15:09:36 against the 15:05:00
+                # bar computes -276s, which the helper correctly refuses as an
+                # inconsistent clock. But INTRACANDLE is the default fire mode, so that
+                # refusal was the NORMAL case, and None reaching the test below meant the
+                # 60s hold never applied: 54 of 98 LOSS_THREAT_EXITs fired inside it, 16
+                # within five seconds, together -Rs.11,869.
+                #
+                # The helper's contract is right and stays as it is. What this guard
+                # actually needs is how long the POSITION has been open, which the wall
+                # clock knows exactly. Live only — in a replay "now" is meaningless, so
+                # HISTORICAL keeps the candle-derived answer and its None.
+                if held is None and str(getattr(self, "mode", "") or "").upper() != "HISTORICAL":
+                    held = self._trade_like_age_seconds(trade_like, datetime.now(IST))
+                # A still-unknown age does NOT block: refusing a row with no entry stamp
+                # would disarm the exit entirely (test_an_unknowable_age_does_not_block_
+                # the_guard, 2026-08-10).
                 if held is not None and held < min_hold:
                     self._clear_loss_threat_confirmation(trade_like)
                     return False, "", (
@@ -12902,17 +13660,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     score += 1 if label in {"aggregate", "order-flow"} else 0
                 reasons.append(f"{label} neutral")
 
-        try:
-            flow_ratio = float(order_flow.get("ratio") or order_flow.get("buy_sell_ratio") or 0.0)
-        except Exception:
-            flow_ratio = 0.0
-        if flow_ratio > 0:
-            if view == "LONG" and flow_ratio < 0.75:
-                score += 1
-                reasons.append(f"sell-heavy flow {flow_ratio:.2f}")
-            elif view == "SHORT" and flow_ratio > 1.25:
-                score += 1
-                reasons.append(f"buy-heavy flow {flow_ratio:.2f}")
+        flow_points, flow_reason = Scanner._peak_threat_flow_points(self, trade_like, order_flow, view)
+        score += flow_points
+        if flow_reason:
+            reasons.append(flow_reason)
 
         volume_ratio = 0.0
         try:
@@ -13346,7 +14097,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 special or repaint_window or nontrend_scope or not special_only
             ) and not trend_runner_active:
                 gb_arm = self._profit_giveback_arm(
-                    initial_risk_rs, now=latest_time, nontrend_scope=nontrend_scope
+                    initial_risk_rs, now=latest_time, nontrend_scope=nontrend_scope,
+                    trade_like=trade_like,
                 )
                 base_gb_ratio = float(getattr(settings, "profit_giveback_exit_ratio", 0.50) or 0.50)
                 gb_ratio, gb_ratio_context = self._eod_profit_giveback_ratio(
@@ -13387,7 +14139,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # so reading it first let a 5-minute flip fire LIVE_REVERSAL_EXIT against a
             # profitable 15-minute position its own chart still supported.
             live_regime = regime or live_regime
-            rev_arm = self._profit_giveback_arm(initial_risk_rs, now=latest_time)
+            rev_arm = self._profit_giveback_arm(
+                initial_risk_rs, now=latest_time, trade_like=trade_like
+            )
             fade_ratio = float(getattr(settings, "live_reversal_exit_fade_ratio", 0.85) or 0.85)
             if peak_pnl >= rev_arm and current_pnl_rs < peak_pnl * fade_ratio:
                 if self._regime_opposes_direction(view, live_regime):
@@ -13829,6 +14583,47 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 return 300
         return 300
 
+    def _thrust_scaled_stabilization_seconds(self, candidate, base_seconds: float) -> float:
+        """Shorten the stabilization wait when the bar itself is moving hard.
+
+        A flat 30s on a 5-minute candle demands 10% of that candle's life as stillness,
+        and the UT1 arrow is least stable exactly when price is moving fastest — so the
+        wait is longest precisely where the opportunity is shortest. 2026-08-11: 252
+        signals entered the buffer, 48 matured (19%), and 63 of the deaths came inside
+        the first two seconds.
+
+        Deliberately a STEP, not a ramp: a proportional scale invites tuning a curve on
+        noise, while the question here is binary — is this bar an ordinary drift or a
+        thrust? The thresholds reuse the same range/ATR and volume-ratio measures the
+        surge gates already run on, so there is one definition of "thrust" in the system.
+
+        Can only ever SHORTEN, never extend, and never below the floor.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "stabilization_thrust_scaling_enabled", True), True
+        ):
+            return base_seconds
+        try:
+            base = float(base_seconds or 0.0)
+            floor = float(getattr(settings, "stabilization_thrust_min_seconds", 10.0) or 10.0)
+            if base <= floor:
+                return base
+            range_atr = float(getattr(candidate, "range_atr_ratio", 0.0) or 0.0)
+            vol_ratio = float(getattr(candidate, "volume_ratio", 0.0) or 0.0)
+            min_range = float(getattr(settings, "stabilization_thrust_range_atr", 1.50) or 1.50)
+            min_vol = float(getattr(settings, "stabilization_thrust_volume_ratio", 1.50) or 1.50)
+        except (TypeError, ValueError):
+            return base_seconds
+        # Absent metrics are not evidence of a thrust — the full wait stands.
+        thrust = (min_range > 0 and range_atr >= min_range) or (
+            min_vol > 0 and vol_ratio >= min_vol
+        )
+        if not thrust:
+            return base
+        self._diag_inc("stabilization", "thrust_shortened")
+        return max(floor, min(base, floor))
+
     def _live_signal_stabilization_requirements(self, candidate: TradeCandidate) -> Tuple[float, int, bool]:
         """Return live buffer seconds and stable-scan count before a forming signal may mature."""
         settings = get_settings()
@@ -13869,11 +14664,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if (
             bool(getattr(candidate, "market_ltp_shock_entry", False))
             or bool(getattr(candidate, "market_wide_reversal_entry", False))
+            # A one-way cascade is the SAME class of evidence as a market-wide reversal —
+            # a synchronised multi-index thrust with breadth and volume behind it — and
+            # until 2026-08-11 it drew the full 30s while the reversal drew 8. That
+            # difference is the whole of that session: the cascade-confirmed SHORT on the
+            # only hour that moved sat in the buffer and died at 13.7s.
+            or bool(getattr(candidate, "one_way_cascade_entry", False))
         ):
             shock_seconds = float(
                 getattr(settings, "market_ltp_shock_stabilization_seconds", 8.0) or 8.0
             )
             return max(5.0, min(10.0, shock_seconds)), 2, True
+        base_seconds = self._thrust_scaled_stabilization_seconds(candidate, base_seconds)
         risky_option = inst_type == "OPT" and is_risky_regime(regime)
         if (
             str(getattr(candidate, "instrument", "") or "").split()[0].upper() == self.MIDCAP_CORRELATED_INDEX
@@ -16331,6 +17133,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(exit_candidate, attr, getattr(entry_candidate, attr))
         if hasattr(entry_candidate, "source_engines"):
             setattr(exit_candidate, "source_engines", list(getattr(entry_candidate, "source_engines", []) or []))
+        # Copied, not referenced: the entry row keeps accumulating samples on some exit
+        # routes, and a shared list would let the recorded path grow after the exit.
+        if hasattr(entry_candidate, "pnl_path"):
+            setattr(exit_candidate, "pnl_path", list(getattr(entry_candidate, "pnl_path", []) or []))
+        # The intel that produced the ENTRY, carried onto the exit row so the outcome
+        # and the conditions that preceded it land in the same record.
+        if getattr(entry_candidate, "entry_intel", None):
+            setattr(exit_candidate, "entry_intel", dict(getattr(entry_candidate, "entry_intel") or {}))
 
     def _get_current_session_day(self) -> str:
         now_ist = datetime.now(IST)
@@ -16444,6 +17254,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             setattr(candidate, "peak_pnl", float(payload.get("peak_pnl") or 0.0))
             setattr(candidate, "max_drawdown", float(payload.get("max_drawdown") or 0.0))
+            setattr(candidate, "pnl_path", [
+                (float(row[0]), float(row[1]))
+                for row in (payload.get("pnl_path") or [])
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ])
             setattr(candidate, "trade_id", str(payload.get("id") or payload.get("trade_id") or ""))
             setattr(candidate, "runner_mode", bool(payload.get("runner_mode") or False))
             setattr(candidate, "initial_stop", float(payload.get("initial_stop") or 0.0))
@@ -17440,12 +18255,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         min_age = max(0.0, float(getattr(settings, "missed_signal_reentry_min_age_seconds", 20.0) or 20.0))
         max_age = max(min_age, float(getattr(settings, "missed_signal_reentry_max_age_minutes", 6.0) or 6.0) * 60.0)
         if age < min_age:
+            self._diag_inc("missed_reentry_fail", "age_too_new")
             return False, "too new for re-entry", {"age_seconds": age}
         if age > max_age:
+            self._diag_inc("missed_reentry_fail", "age_expired")
             return False, "missed signal expired", {"age_seconds": age}
         confidence = float(getattr(seed, "confidence", 0.0) or 0.0)
         min_conf = float(getattr(settings, "missed_signal_reentry_min_confidence", 0.55) or 0.55)
-        if confidence < min_conf:
+        if confidence < min_conf and not self._setting_enabled(
+            getattr(settings, "missed_signal_reentry_scored_mode_enabled", False), False
+        ):
+            # In scored mode confidence is one of the six counted conditions rather than
+            # a hard gate, so it must not short-circuit before the score is computed.
+            self._diag_inc("missed_reentry_fail", "confidence")
             return False, f"confidence below re-entry floor {min_conf:.0%}", {"confidence": confidence}
         try:
             force_exit = self._configured_session_time("ut_force_exit_time", "15:25")
@@ -17455,6 +18277,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ).total_seconds() / 60.0
             min_remaining = float(getattr(settings, "missed_signal_reentry_min_remaining_minutes", 8.0) or 8.0)
             if remaining < min_remaining:
+                self._diag_inc("missed_reentry_fail", "no_runway")
                 return False, "not enough runway for missed re-entry", {"remaining_minutes": remaining}
         except Exception:
             pass
@@ -17482,15 +18305,57 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             min_adx = float(getattr(settings, "missed_signal_reentry_min_trend_adx", 24.0) or 24.0)
             min_intel = float(getattr(settings, "missed_signal_reentry_min_intel_score", 0.20) or 0.20)
             intel_ok = intel >= min_intel if signal_type == "BUY" else intel <= -min_intel
-            if allow_trend and is_trending_regime(regime) and regime_aligns(regime, signal_type) and adx >= min_adx and intel_ok:
+            # Every condition is counted, not short-circuited, so the diagnostics can say
+            # WHICH one kills a seed rather than only that something did. Three trades
+            # came through this path in 19 sessions against 60,425 rejections, and with a
+            # short-circuit chain there was no way to see where they died.
+            checks = {
+                "confidence": confidence >= min_conf,
+                "trending_regime": bool(is_trending_regime(regime)),
+                "regime_aligns": bool(regime_aligns(regime, signal_type)),
+                "adx": adx >= min_adx,
+                "intel": bool(intel_ok),
+                "cascade": bool(cascade),
+            }
+            for name, ok in checks.items():
+                if not ok:
+                    self._diag_inc("missed_reentry_fail", name)
+            met = sum(1 for ok in checks.values() if ok)
+            strict_ok = bool(
+                allow_trend and checks["trending_regime"] and checks["regime_aligns"]
+                and checks["adx"] and checks["intel"]
+            )
+            scored_mode = self._setting_enabled(
+                getattr(settings, "missed_signal_reentry_scored_mode_enabled", False), False
+            )
+            try:
+                need = int(getattr(settings, "missed_signal_reentry_min_conditions", 5) or 5)
+            except (TypeError, ValueError):
+                need = 5
+            need = max(1, min(len(checks), need))
+            if strict_ok:
                 support_type = "trend_regime_intel"
                 support_reason = f"{regime} aligns, ADX {adx:.1f}, intel {intel:+.2f}"
+            elif scored_mode and met >= need:
+                # A/B lever. The strict path demands FOUR conditions simultaneously on a
+                # signal already rejected once, and is_trending_regime alone fails on the
+                # ~62% of labels that read RANGING — so the other three are rarely even
+                # reached. Scored mode asks for N of 6 instead of all of one branch.
+                support_type = "scored_reentry"
+                support_reason = (
+                    f"{met}/{len(checks)} re-entry conditions met "
+                    f"({', '.join(k for k, ok in checks.items() if ok)})"
+                )
+                self._diag_inc("missed_reentry_fail", f"admitted_scored_{met}of{len(checks)}")
             else:
                 return False, "no fresh cascade/trend-intel support", {
                     "regime": regime,
                     "adx": adx,
                     "intel": intel,
                     "cascade": bool(cascade),
+                    "conditions_met": met,
+                    "conditions_needed": need if scored_mode else len(checks),
+                    "failed": [k for k, ok in checks.items() if not ok],
                 }
 
         chase_ok, chase_reason, chase = self._missed_reentry_chase_check(
@@ -17498,6 +18363,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             cascade_confirmed=(support_type == "one_way_cascade"),
         )
         if not chase_ok:
+            self._diag_inc("missed_reentry_fail", "chase")
             return False, chase_reason, chase
         return True, support_reason, {
             "type": support_type,
@@ -19884,8 +20750,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     reversal_reason = self._intel_reversal_reason(
                         previous.direction,
                         intel_result,
-                        is_losing=session_pnl < 0.0,
+                        is_losing=self._position_is_underwater(previous, session_pnl),
                     )
+                    if reversal_reason:
+                        fresh, stale_text = self._intel_reversal_is_new_evidence(
+                            previous, previous.direction, intel_result
+                        )
+                        if not fresh:
+                            marker = f"{latest_time:%H:%M}:noflip"
+                            if getattr(previous, "_last_stale_intel_exit", "") != marker:
+                                setattr(previous, "_last_stale_intel_exit", marker)
+                                self.log_event(
+                                    f"Held {previous.instrument} {previous.timeframe} through OI/PCR flip; "
+                                    f"not a reversal ({stale_text}).",
+                                    "info",
+                                )
+                            reversal_reason = None
                     if reversal_reason and self._intel_exit_blocked_by_trend(previous, regime):
                         marker = f"{latest_time:%H:%M}:trendskip"
                         if getattr(previous, "_last_trend_skip_intel_exit", "") != marker:
@@ -20145,6 +21025,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if abs(previous_peak - float(getattr(previous, "peak_pnl", 0.0) or 0.0)) > 1e-9:
                 setattr(previous, "peak_pnl", previous_peak)
                 changed = True
+            # Ordered samples behind peak_pnl/max_drawdown. Those are maxima and cannot
+            # say whether the trough came before or after the peak, which is exactly what
+            # decides whether a tighter trail would have kept more. Sampled on the
+            # CANDIDATE because that is the object rtracker records. Gross, matching
+            # peak_pnl above rather than the net previous.pnl, so the path and the peak
+            # it explains are on one basis.
+            sample_pnl_path(
+                previous,
+                pnl=current_pnl_rs,
+                entry_time=getattr(previous, "entry_timestamp", None),
+            )
             self._ensure_trade_like_initial_stop(previous)
             qty = int(previous.lots or 1) * int(previous.lot_size or 1)
             c_mult = getattr(previous, "multiplier", 1.0) if getattr(previous, "inst_type", "FUT") != "OPT" else 1.0
@@ -20398,14 +21289,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 latest_time,
                 trade_like=previous,
             )
-            smart_ratio = 0.70 if scalp_mode else 0.65
+            smart_ratio = self._smart_lock_backstop_ratio(lock_ratio, scalp_mode)
             abs_floor_rs = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
-            if smart_min_peak <= previous_peak and ladder_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or current_pnl_rs < abs_floor_rs):
+            floor_collapse = self._smart_lock_floor_collapse(previous_peak, current_pnl_rs)
+            if smart_min_peak <= previous_peak and ladder_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or floor_collapse):
                 exit_floor = float(lock_stop or 0.0)
                 if exit_floor > 0 and self._candidate_net_pnl(previous, exit_floor) > 0:
                     create_exit(previous, exit_floor, "SMART_PROFIT_LOCK", f"Smart profit lock peak Rs.{previous_peak:.0f}, current Rs.{current_pnl_rs:.0f}")
                     continue
-                if current_pnl_rs <= abs_floor_rs:
+                if floor_collapse:
                     if current_pnl_rs < 0.0 and handle_recovery_watch("SMART_PROFIT_LOCK"):
                         continue
                     create_exit(
@@ -24332,6 +25224,36 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 logger.success(f"✅ [STABILIZATION] Signal for {key} matured after {elapsed:.1f}s. Proceeding to execute.")
                 self._apply_stabilization_preflight(key, c)
                 self._diag_inc("stabilization", "matured")
+                # Record the SURVIVING side too. Rejections were already written here,
+                # so rtracker held only the deaths and no survival rate was computable
+                # from it — on 2026-08-11 the log showed 48 maturations against 9
+                # ACCEPTED rows, because most matured signals are refused further down
+                # and never reach an acceptance record. STABILIZED is its own decision
+                # so it cannot be mistaken for an entry in the funnel arithmetic.
+                if self._setting_enabled(
+                    getattr(get_settings(), "stabilization_rtracker_logging_enabled", True), True
+                ):
+                    self._rtracker_record_candidate(
+                        c,
+                        decision="STABILIZED",
+                        reason=(
+                            f"Survived the {stable_seconds:.0f}s stabilization window "
+                            f"in {elapsed:.1f}s"
+                        ),
+                        source="stabilization_gate",
+                        extra={
+                            "stabilization": {
+                                "window_seconds": round(float(stable_seconds or 0.0), 1),
+                                "elapsed_seconds": round(float(elapsed or 0.0), 1),
+                                "momentum_override": bool(
+                                    getattr(c, "stabilization_momentum_override", False)
+                                ),
+                                "cascade_latched": bool(
+                                    getattr(c, "_stabilization_cascade_latch", None)
+                                ),
+                            }
+                        },
+                    )
                 self.log_event(
                     f"UT1 {c.direction} {c.instrument} {c.timeframe} stayed valid for {elapsed:.1f}s. Running filters.",
                     "trade",
@@ -24697,6 +25619,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self._ensure_trade_like_initial_stop(sig)
                     # â”€â”€â”€ Manual Signal Gate â”€â”€â”€
                     if not self.auto_mode and not is_warmup:
+                        # The auto path reaches open_trade, which reprices via
+                        # _execution_levels and validates the mark. This one does not, so
+                        # the same question is asked here: is the price we are about to
+                        # record still real? See _candidate_entry_mark_refusal.
+                        stale_mark = self._candidate_entry_mark_refusal(sig)
+                        if stale_mark:
+                            sig.status = "NO ENTRY - Stale entry mark"
+                            self.log_signal_decision_once(
+                                f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{ts_key}|stale-mark",
+                                f"Signal rejected: {sig.instrument} {sig.direction} "
+                                f"{sig.timeframe} - {stale_mark}",
+                                "trade",
+                            )
+                            self._rtracker_record_candidate(
+                                sig,
+                                decision="REJECTED",
+                                reason=f"Stale entry mark: {stale_mark}",
+                                source="entry_mark_gate",
+                            )
+                            self._remember_trade_candidates([sig])
+                            continue
                         self._close_superseded_session_entries([sig])
                         self._latest_trade_candidates[sig.instrument] = [sig]
                         setattr(sig, "accepted_by_gate", True)
@@ -25949,11 +26892,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         intel_result = None
                 if intel_result:
                     # is_losing uses live unrealized for 2-vote OI/PCR (gap2).
+                    # unrealized_pnl is NET of estimated charges, so it opens at
+                    # minus the round trip — see _position_is_underwater.
                     reversal_reason = self._intel_reversal_reason(
                         trade.direction,
                         intel_result,
-                        is_losing=live_unreal < 0.0,
+                        is_losing=self._position_is_underwater(trade, live_unreal),
                     )
+                    if reversal_reason:
+                        fresh, stale_text = self._intel_reversal_is_new_evidence(
+                            trade, trade.direction, intel_result
+                        )
+                        if not fresh:
+                            marker = f"{latest_time:%H:%M}:noflip"
+                            if getattr(trade, "_last_stale_intel_exit", "") != marker:
+                                setattr(trade, "_last_stale_intel_exit", marker)
+                                self.log_event(
+                                    f"Held {trade.instrument} {trade.timeframe} through OI/PCR flip; "
+                                    f"not a reversal ({stale_text}).",
+                                    "info",
+                                )
+                            reversal_reason = None
                     if reversal_reason and self._intel_exit_blocked_by_trend(trade, regime):
                         marker = f"{latest_time:%H:%M}:trendskip"
                         if getattr(trade, "_last_trend_skip_intel_exit", "") != marker:
@@ -26483,8 +27442,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             ladder_peak_live = Scanner._profit_ladder_pnl(self, trade, trade.peak_pnl, qty)
             if smart_min_peak_live <= trade.peak_pnl and ladder_peak_live < 3000.0:
-                # If profit drops below 45% of peak OR falls below Rs.450 minimum floor
-                if current_pnl_rs < (trade.peak_pnl * 0.45) or current_pnl_rs < 450.0:
+                # Profit fell below the ladder's own retention, OR the trade earned more
+                # than the keep-floor and gave it back. The floor is collapse protection,
+                # never a cap on a trade still climbing through it — see
+                # _smart_lock_floor_collapse (2026-08-12: auto mode carried the same
+                # arm-below-floor defect that cut four signal-mode winners at their peak).
+                # The retention comes from _smart_lock_backstop_ratio so auto and signal
+                # mode cannot disagree about when a fading winner is done.
+                backstop_ratio_live = self._smart_lock_backstop_ratio(
+                    lock_ratio, bool(getattr(trade, "scalp_lock_mode", False))
+                )
+                if current_pnl_rs < (
+                    trade.peak_pnl * backstop_ratio_live
+                ) or self._smart_lock_floor_collapse(trade.peak_pnl, current_pnl_rs):
                     if current_pnl_rs < 0.0:
                         recovery_action = handle_live_recovery_watch("SMART_PROFIT_LOCK")
                         if recovery_action in {"HOLD", "EXIT"}:

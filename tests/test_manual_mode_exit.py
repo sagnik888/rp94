@@ -121,7 +121,12 @@ def test_smart_profit_lock_tier_boundaries():
     # premium points, and a 20-25% leash closed trades on ordinary bid/ask breathing.
     #   <= Rs.1,000  50%      Rs.1,000-2,000  35%->30%
     #   Rs.2,000-3,000  25%->20%            Rs.3,000+  15%->10%
-    assert ratio(400.0) == 0.0            # below Rs.500 min -> not armed, no lock
+    # The arm moved to Rs.250 on the non-scalp path (2026-08-11: over 12 live sessions
+    # the median trade peaked at Rs.274 while the median non-scalp arm computed to
+    # Rs.868, so only 4 of 59 rows ever reached their own lock). These calls pass no
+    # initial risk, so the base is the whole arm.
+    assert ratio(200.0) == 0.0            # below the Rs.250 arm -> not armed, no lock
+    assert ratio(400.0) == 0.50           # armed, and inside the first rung
     assert ratio(500.0) == 0.50           # 50% breathing
     assert ratio(999.0) == 0.50
     assert ratio(1000.0) == 0.50          # 'up to Rs.1,000' is inclusive -> 50%
@@ -1615,6 +1620,247 @@ def test_session_smart_lock_falls_back_to_giveback_exit_when_floor_unavailable()
     assert any("Smart lock floor unavailable after peak Rs.1554" in reason for reason in exit_candidate.reasons)
 
 
+def test_session_smart_lock_keep_floor_does_not_cut_a_winner_at_its_peak():
+    """The Rs.450 keep-floor is COLLAPSE protection, not a profit cap.
+
+    2026-08-12 live: the non-scalp lock arms at Rs.250
+    (profit_lock_nonscalp_min_peak_rs) while the keep-floor is Rs.450, so
+    `current < floor` was true the instant the lock armed. NIFTY 24400PE was
+    market-exited 18s after entry AT ITS PEAK (peak Rs.250 == current Rs.250)
+    for Rs.170 net; the same signal in restore_point_51 ran to Rs.3,124. Every
+    large win has to cross the Rs.250-450 band, so nothing may cut inside it.
+    """
+    candidate = _repaint_override_candidate()
+    candidate.instrument = "NIFTY"
+    candidate.option_type = "PE"
+    candidate.timeframe = "5min"
+    candidate.lots = 1
+    candidate.lot_size = 75
+    candidate.price = 121.80
+    candidate.current_price = 125.65
+    candidate.initial_stop = 112.06
+    candidate.stop = 112.06
+    candidate.peak_pnl = 250.0
+    candidate.scalp_lock_mode = False
+    candidate._next_repaint_check = None
+
+    scanner = _scanner_for_repaint_override_test(candidate, None)
+    scanner._repaint_signal_status = lambda *_args, **_kwargs: "INTACT"
+    # At the peak: current == peak, no give-back whatsoever.
+    scanner._candidate_gross_pnl = lambda _c, _price: 250.0
+    scanner._candidate_net_pnl = lambda _c, _price: 170.0
+    scanner._trade_like_initial_risk_rs = lambda *_args, **_kwargs: 730.5
+    scanner._profit_lock_min_peak = lambda *_args, **_kwargs: 250.0
+    # Lock floor below the round trip cost -> "Smart lock floor unavailable".
+    scanner._profit_lock_floor = lambda *_args, **_kwargs: (0.0, "", 0.0)
+
+    scanner._check_session_candidates_breaches_locked("NIFTY")
+
+    assert scanner._captured_exits == []
+
+
+def test_smart_lock_floor_collapse_requires_a_peak_above_the_floor():
+    scanner = Scanner.__new__(Scanner)
+
+    # Armed at Rs.250 and sitting at its peak: never a collapse.
+    assert scanner._smart_lock_floor_collapse(250.0, 250.0) is False
+    # Peak never cleared the floor, so the floor cannot have been given back.
+    assert scanner._smart_lock_floor_collapse(449.0, 10.0) is False
+    # Earned above the floor and gave it back: this is what the floor is for.
+    assert scanner._smart_lock_floor_collapse(1554.0, -213.5) is True
+    assert scanner._smart_lock_floor_collapse(900.0, 449.0) is True
+    # Above the floor and holding it: still protected by the retention ladder.
+    assert scanner._smart_lock_floor_collapse(900.0, 451.0) is False
+
+
+def test_smart_lock_backstop_never_fires_before_the_ladder_it_backs_up():
+    scanner = Scanner.__new__(Scanner)
+
+    # Whatever retention the ladder chose IS the backstop level, in both modes.
+    for scalp in (False, True):
+        assert scanner._smart_lock_backstop_ratio(0.50, scalp) == pytest.approx(0.50)
+        assert scanner._smart_lock_backstop_ratio(0.38, scalp) == pytest.approx(0.38)
+        assert scanner._smart_lock_backstop_ratio(0.90, scalp) == pytest.approx(0.90)
+    # No ladder floor -> the constant, and only floor-collapse can exit there anyway.
+    assert scanner._smart_lock_backstop_ratio(0.0, False) == pytest.approx(0.65)
+    assert scanner._smart_lock_backstop_ratio(0.0, True) == pytest.approx(0.70)
+
+
+def _faded_winner_scanner(current_gross):
+    """Peak Rs.1000, ladder retaining 50% (floor Rs.500 = premium 128.47)."""
+    candidate = _repaint_override_candidate()
+    candidate.instrument = "NIFTY"
+    candidate.option_type = "PE"
+    candidate.timeframe = "5min"
+    candidate.lots = 1
+    candidate.lot_size = 75
+    candidate.price = 121.80
+    candidate.current_price = 121.80 + (current_gross / 75.0)
+    candidate.initial_stop = 112.06
+    candidate.stop = 112.06
+    candidate.peak_pnl = 1000.0
+    candidate.scalp_lock_mode = False
+    candidate._next_repaint_check = None
+
+    scanner = _scanner_for_repaint_override_test(candidate, None)
+    scanner._repaint_signal_status = lambda *_args, **_kwargs: "INTACT"
+    scanner._candidate_gross_pnl = lambda _c, _price: float(current_gross)
+    scanner._candidate_net_pnl = lambda _c, _price: 400.0
+    scanner._trade_like_initial_risk_rs = lambda *_args, **_kwargs: 730.5
+    scanner._profit_lock_min_peak = lambda *_args, **_kwargs: 250.0
+    scanner._profit_lock_floor = lambda *_args, **_kwargs: (128.47, "SMART_PROFIT_LOCK", 0.50)
+    return scanner
+
+
+def test_faded_winner_above_the_ladder_floor_is_not_cut_at_the_ladder_floor():
+    """Peak Rs.1000, now Rs.600, ladder trailing at Rs.500.
+
+    The flat 0.65 gate opened at Rs.650 and booked the exit at the ladder's Rs.500
+    floor — a price the trade had not reached — while auto mode's 0.45 gate held
+    the same trade. The backstop may not pre-empt the trail it backs up.
+    """
+    scanner = _faded_winner_scanner(600.0)
+
+    scanner._check_session_candidates_breaches_locked("NIFTY")
+
+    assert scanner._captured_exits == []
+
+
+def test_faded_winner_below_the_ladder_floor_still_exits_on_the_lock():
+    scanner = _faded_winner_scanner(400.0)
+
+    scanner._check_session_candidates_breaches_locked("NIFTY")
+
+    assert len(scanner._captured_exits) == 1
+    assert scanner._captured_exits[0].exit_reason == "SMART_PROFIT_LOCK"
+
+
+def test_a_flat_trade_is_not_losing_just_because_it_owes_its_own_costs():
+    scanner = Scanner.__new__(Scanner)
+    trade = _option_candidate(inst_type="OPT")  # opt_cost 80 round trip
+
+    # Sitting exactly at entry: net is -80 purely because of brokerage and taxes.
+    assert scanner._position_is_underwater(trade, -80.0) is False
+    assert scanner._position_is_underwater(trade, 0.0) is False
+    assert scanner._position_is_underwater(trade, 250.0) is False
+    # Actually moved against the position.
+    assert scanner._position_is_underwater(trade, -81.0) is True
+    assert scanner._position_is_underwater(trade, -400.0) is True
+
+
+def _midcpnifty_intel_scanner(net_pnl):
+    """MIDCPNIFTY 14975CE, seconds after entry, first option chain of the day.
+
+    PCR contrarian BEARISH + order flow 0.17 = exactly 2 bearish votes, which is
+    the relaxed loss-guard bar and one short of the 3-vote winner bar.
+    """
+    candidate = _repaint_override_candidate()
+    candidate.instrument = "MIDCPNIFTY"
+    candidate.option_type = "CE"
+    candidate.direction = "LONG"
+    candidate.timeframe = "15min"
+    candidate.lots = 1
+    candidate.lot_size = 120
+    candidate.price = 161.45
+    candidate.current_price = 161.45
+    candidate.initial_stop = 148.53
+    candidate.stop = 148.53
+    candidate.peak_pnl = 0.0
+    candidate._next_repaint_check = None
+
+    scanner = _scanner_for_repaint_override_test(candidate, None)
+    scanner._repaint_signal_status = lambda *_args, **_kwargs: "INTACT"
+    scanner._candidate_gross_pnl = lambda _c, _price: float(net_pnl) + 80.0
+    scanner._candidate_net_pnl = lambda _c, _price: float(net_pnl)
+    scanner._get_trade_intel = lambda _c: {
+        "pcr": {"contrarian_signal": "BEARISH", "primary_pcr": 0.89},
+        "oi": {"signal": "NEUTRAL"},
+        "order_flow": {"ratio": 0.17},
+        "aggregate": {"score": 0.0},
+    }
+    scanner._intel_exit_blocked_by_trend = lambda *_args, **_kwargs: False
+    scanner._should_defer_option_intel_exit = lambda *_args, **_kwargs: (False, "")
+    return scanner
+
+
+def test_two_vote_intel_reversal_cannot_cut_a_trade_that_is_only_down_its_costs():
+    """2026-08-12 09:15:27: MIDCPNIFTY 14975CE entered 09:15:03 with no option
+    chain yet (PCR=0 at 09:15:10). The session's first chain fetch 23s later voted
+    2/2 bearish and closed it flat for -Rs.80. It only got the 2-vote bar because
+    net P&L at entry is minus the round trip cost, which every trade owes."""
+    scanner = _midcpnifty_intel_scanner(-80.0)
+
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+
+    assert scanner._captured_exits == []
+
+
+def test_two_vote_intel_reversal_still_cuts_a_genuinely_losing_trade():
+    scanner = _midcpnifty_intel_scanner(-600.0)
+    # Entered with a clean book, so the 2 votes now are a genuine turn — this
+    # isolates the vote bar from the entry-vs-now comparison tested below.
+    scanner._active_session_entry_candidates("MIDCPNIFTY")[0].entry_intel = {
+        "adverse_votes": 0
+    }
+
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+
+    assert len(scanner._captured_exits) == 1
+    assert scanner._captured_exits[0].exit_reason == "OI_PCR_REVERSAL"
+
+
+def _three_vote_bearish_scanner(entry_intel=None, net_pnl=-600.0):
+    """Genuinely losing, so the 2-vote bar applies and 3 votes clear it outright.
+
+    Only the entry-vs-now comparison can hold this trade.
+    """
+    scanner = _midcpnifty_intel_scanner(net_pnl)
+    candidate = scanner._active_session_entry_candidates("MIDCPNIFTY")[0]
+    if entry_intel is not None:
+        candidate.entry_intel = entry_intel
+    scanner._get_trade_intel = lambda _c: {
+        "pcr": {"contrarian_signal": "BEARISH", "primary_pcr": 0.89},
+        "oi": {"signal": "BEARISH"},
+        "order_flow": {"ratio": 0.17},
+        "aggregate": {"score": 0.0},
+    }
+    return scanner, candidate
+
+
+def test_intel_exit_cannot_fire_on_the_first_reading_an_intel_less_entry_ever_saw():
+    """MIDCPNIFTY entered 09:15:03 with no option chain. There is nothing for the
+    09:15:26 reading to have reversed FROM, so it becomes the reference instead of
+    the trigger — and the reference is latched so the next tick cannot re-fire it."""
+    scanner, candidate = _three_vote_bearish_scanner()
+
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+    assert scanner._captured_exits == []
+    assert getattr(candidate, "_intel_reversal_baseline", None) == 3
+
+    # The very next pass sees the same reading: still not a reversal.
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+    assert scanner._captured_exits == []
+
+
+def test_intel_that_was_already_adverse_at_entry_is_not_a_reversal():
+    """Entered with the book already leaning against it. The entry gate had its
+    chance; the same reading later is the accepted condition, not a turn."""
+    scanner, _candidate = _three_vote_bearish_scanner(entry_intel={"adverse_votes": 3})
+
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+
+    assert scanner._captured_exits == []
+
+
+def test_intel_that_actually_turned_against_the_entry_still_exits():
+    scanner, _candidate = _three_vote_bearish_scanner(entry_intel={"adverse_votes": 1})
+
+    scanner._check_session_candidates_breaches_locked("MIDCPNIFTY")
+
+    assert len(scanner._captured_exits) == 1
+    assert scanner._captured_exits[0].exit_reason == "OI_PCR_REVERSAL"
+
+
 def test_option_stop_hit_exit_uses_observed_premium_not_stop_line():
     scanner = Scanner.__new__(Scanner)
     candidate = _option_candidate(direction="SHORT", price=806.85, stop=758.44)
@@ -1706,7 +1952,12 @@ def test_sub_1r_giveback_guard_protects_special_dead_zone_winner():
     is closed at the current still-positive price so it cannot round-trip to a loss."""
     sc = Scanner.__new__(Scanner)
     sc.latest_regimes = {}
-    smp = sc._profit_lock_min_peak(False, _MIDCAP_RISK, "5min")  # ~2189, dead-zone ceiling
+    # scalp_mode=True, matching production: scanner.py computes this as
+    # `scalp_mode = bool(getattr(previous, "scalp_lock_mode", False))` before passing it
+    # in. Passing the non-scalp arm for a scalp trade was harmless while both branches
+    # shared a Rs.500 base; once the non-scalp base dropped to Rs.250 it silently moved
+    # this scenario out of the dead zone it is meant to exercise.
+    smp = sc._profit_lock_min_peak(True, _MIDCAP_RISK, "5min")  # ~1094, dead-zone ceiling
 
     # SPECIAL context (scalp-lock / late entry): peak ₹900 fades to ₹400 (<=50%) -> cut.
     scalp_trade = SimpleNamespace(instrument="MIDCPNIFTY 14525CE", scalp_lock_mode=True)
@@ -1738,37 +1989,57 @@ def test_sub_1r_giveback_guard_protects_special_dead_zone_winner():
     assert hold is False
 
 
-def test_giveback_guard_leaves_normal_trade_running_on_trend_days():
-    """Let-winners-run is preserved on CONFIRMED trend days: a normal trade that
-    fades a sub-1R peak is NOT cut there. On non-trend days (2026-07-03: four
-    sub-0.5R peaks round-tripped to full stops) the guard now covers every trade."""
+def test_normal_sub_1r_fade_is_now_owned_by_the_profit_lock():
+    """A normal trade fading a sub-1R peak used to be left running on trend days, and
+    caught by the give-back guard only on chop days.
+
+    2026-08-11 measured what that cost: across 12 live sessions the book reached
+    Rs.42,444 of peak profit and banked -Rs.992, with 45 trades going green then closing
+    red. So the non-scalp lock now arms at 0.20R (see profit_lock_min_r_multiple) and
+    this fade is protected on EVERY day type.
+
+    The protection did not disappear from the give-back guard, it MOVED: with the arm at
+    Rs.437.8 a Rs.900 peak is above it, so SMART_PROFIT_LOCK owns the trade and the
+    give-back guard correctly declines a position that is no longer in its dead zone.
+    Asserted both ways below, because "the guard says False" alone would also describe
+    an unprotected trade.
+    """
     sc = Scanner.__new__(Scanner)
     sc.latest_regimes = {}
-    sc._cached_timeframe_intel = lambda *a, **k: {"session_context": {"day_type": "TREND_DAY_UP", "confidence": 0.8}}
-    smp = sc._profit_lock_min_peak(False, _MIDCAP_RISK, "5min")
     normal = SimpleNamespace(instrument="MIDCPNIFTY 14525CE")  # no scalp flag, mid-day
-    should, _, _ = sc._peak_giveback_or_reversal_exit(
-        normal, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,
-        smart_min_peak=smp, latest_time=None, regime="RANGING",
-        inst_type="OPT", option_type="CE", direction="LONG",
-    )
-    assert should is False
 
-    # Same fade on an UNDECIDED/chop day IS protected (books while still green).
-    sc._cached_timeframe_intel = lambda *a, **k: {"session_context": {"day_type": "UNDECIDED", "confidence": 0.4}}
-    should2, reason2, _ = sc._peak_giveback_or_reversal_exit(
-        normal, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,
-        smart_min_peak=smp, latest_time=None, regime="RANGING",
-        inst_type="OPT", option_type="CE", direction="LONG",
-    )
-    assert should2 is True
-    assert reason2 == "PROFIT_GIVEBACK_GUARD"
+    for day_type, confidence in (("TREND_DAY_UP", 0.8), ("UNDECIDED", 0.4)):
+        sc._cached_timeframe_intel = lambda *a, _d=day_type, _c=confidence, **k: {
+            "session_context": {"day_type": _d, "confidence": _c}
+        }
+        smp = sc._profit_lock_min_peak(False, _MIDCAP_RISK, "5min")
+        assert smp == pytest.approx(437.76), "the non-scalp arm moved unexpectedly"
+
+        # Out of the give-back guard's dead zone, because the lock now covers it.
+        should, _, _ = sc._peak_giveback_or_reversal_exit(
+            normal, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,
+            smart_min_peak=smp, latest_time=None, regime="RANGING",
+            inst_type="OPT", option_type="CE", direction="LONG",
+        )
+        assert should is False, f"{day_type}: give-back guard fired inside the lock's range"
+
+        # ...and the lock genuinely fires: Rs.900 peak, 50% rung, floor Rs.450 > Rs.400.
+        _floor, _label, ratio = sc._profit_lock_floor(
+            304.0, "LONG", 120, 900.0, scalp_mode=False,
+            initial_risk_rs=_MIDCAP_RISK, timeframe="5min", trade_like=normal,
+        )
+        assert ratio == 0.50, f"{day_type}: lock did not arm on a Rs.900 peak"
+        assert 400.0 < ratio * 900.0, f"{day_type}: trade left unprotected by both layers"
 
 
-def test_repaint_window_giveback_guard_protects_unconfirmed_winner():
+def test_unconfirmed_repaint_window_winner_is_still_protected():
     """2026-07-02: an intracandle entry whose repaint check had not yet passed peaked
     Rs.990 and faded negative before the repaint abort fired. During that structurally
-    unconfirmed window the give-back guard arms even without scalp/EOD context."""
+    unconfirmed window the give-back guard armed even without scalp/EOD context.
+
+    Since 2026-08-11 the non-scalp profit lock arms at 0.20R/Rs.250, below the give-back
+    family's 0.40R/Rs.500, so the LOCK reaches this trade first. The protection asserted
+    here is the same protection; only the layer providing it changed."""
     sc = Scanner.__new__(Scanner)
     sc.latest_regimes = {}
     sc._cached_timeframe_intel = lambda *a, **k: {"session_context": {"day_type": "TREND_DAY_UP", "confidence": 0.8}}
@@ -1778,16 +2049,31 @@ def test_repaint_window_giveback_guard_protects_unconfirmed_winner():
         instrument="MIDCPNIFTY 14525CE",
         entered_intracandle=True,  # repaint check pending (no repaint_guard_checked)
     )
+    # 2026-08-11: on the NON-SCALP path the give-back family no longer has a band to
+    # cover here. Its arm is max(Rs.500, 0.40R) = Rs.875.5 while the lock now arms at
+    # max(Rs.250, 0.20R) = Rs.437.8, so the lock is always first and the dead zone these
+    # guards were written to patch is empty. That is a tightening, not a hole: the lock's
+    # first rung retains 50%, the same fraction profit_giveback_exit_ratio exits at, and
+    # every rung above it retains more.
+    gb_arm = sc._profit_giveback_arm(_MIDCAP_RISK)
+    assert smp < gb_arm, (
+        "the give-back guard arms before the lock again — the dead zone is back"
+    )
+
     should, reason, _ = sc._peak_giveback_or_reversal_exit(
         unconfirmed, current_pnl_rs=400.0, peak_pnl=900.0, initial_risk_rs=_MIDCAP_RISK,
         smart_min_peak=smp, latest_time=None, regime="RANGING",
         inst_type="OPT", option_type="CE", direction="LONG",
     )
-    assert should is True
-    assert reason == "REPAINT_GIVEBACK_GUARD"
+    assert should is False, "give-back guard fired inside the profit lock's range"
+    _f, _l, ratio = sc._profit_lock_floor(
+        304.0, "LONG", 120, 900.0, scalp_mode=False,
+        initial_risk_rs=_MIDCAP_RISK, timeframe="5min", trade_like=unconfirmed,
+    )
+    assert ratio == 0.50 and 400.0 < ratio * 900.0, "unconfirmed winner left unprotected"
 
-    # Once the repaint guard confirms the candle, the trade is a normal tracked
-    # position again — let-winners-run resumes and the fade is NOT cut.
+    # Once the repaint guard confirms the candle the trade is a normal tracked position
+    # again, and the give-back family stays out of the lock's range either way.
     confirmed = SimpleNamespace(
         instrument="MIDCPNIFTY 14525CE",
         entered_intracandle=True,
@@ -1864,13 +2150,22 @@ def test_cross_index_reversal_takes_profit_post_entry():
 
 
 def test_eod_proximity_collapses_profit_lock_arm():
-    """Fix 2: within the square-off window the 1R arm collapses so protection
-    engages on any positive peak instead of waiting for a run that can't happen."""
+    """Fix 2: within the square-off window the 1R arm collapses so protection engages on
+    a modest peak instead of waiting for a run that can't happen.
+
+    It collapses to the ROUND-TRIP COST, not to eod_protect_min_peak_rs (Rs.1), since
+    2026-08-11: at Rs.1 any blip armed a protective exit, and PROFIT_GIVEBACK_GUARD duly
+    banked a Rs.36 peak on BANKNIFTY 57400PE for a net -Rs.44 against Rs.80 of charges.
+    Below the round trip a protective exit cannot come out ahead, so that is the floor.
+    """
+    from config.settings import get_settings
+
     sc = Scanner.__new__(Scanner)
     normal = sc._profit_lock_min_peak(False, _MIDCAP_RISK, "5min")
     near_eod = sc._profit_lock_min_peak(False, _MIDCAP_RISK, "5min", datetime(2026, 7, 1, 15, 10))
-    assert normal > near_eod
-    assert near_eod == pytest.approx(1.0)
+    assert normal > near_eod, "the EOD window no longer collapses the arm"
+    assert near_eod == pytest.approx(float(getattr(get_settings(), "opt_cost", 80.0)))
+    assert near_eod > 36.0, "a peak smaller than the spread still arms a protective exit"
 
 
 def test_loss_recovery_watch_holds_former_winner_inside_breathing_with_support():

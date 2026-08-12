@@ -404,6 +404,35 @@ class Settings(BaseSettings):
     option_touch_limit_extra_ticks: int = 1
     option_touch_quote_max_spread_pct: float = 1.0
     option_touch_quote_max_spread_ticks: int = 40
+    # 2026-08-11 (rtracker, 28 Jul - 11 Aug): one entry cost Rs.10,402 -- ten times the
+    # entire 106-trade book. A signal timestamped 09:10:00, before the 09:15 open, was
+    # executed at 09:15:34.516 on an entry mark of 131.70 and exited 40 MILLISECONDS
+    # later at 52.30. An option cannot round-trip -60% in 40ms of real fills: the mark
+    # was the previous close, which is what an option's LTP still reads until its first
+    # trade of the day prints. _option_premium_quote_plausible could not catch it -- it
+    # only bounds premiums from ABOVE (to spot*0.12 ~ Rs.2,880 on NIFTY), because its
+    # job is catching an index price leaking into premium space, not a stale-but-
+    # in-range mark. Two independent nets, because the touch quote is not always usable:
+    #
+    #   (a) refuse an entry whose SIGNAL predates the session open. Across the two-week
+    #       window this blocks exactly 2 trades, both losers, together -Rs.10,866.
+    #   (b) refuse an entry whose MARK is inconsistent with the live bid/ask. The bad
+    #       mark sat 2.5x above the real offer; normal spread noise is far inside 1.5x.
+    entry_preopen_signal_guard_enabled: bool = True
+    entry_mark_touch_validation_enabled: bool = True
+    entry_mark_max_ask_multiple: float = 1.50
+    entry_mark_min_bid_multiple: float = 0.50
+    # The two guards above live in TradeManager.open_trade, which the MANUAL signal path
+    # never calls — it stamps accepted_by_gate on the candidate as-is, and every P&L
+    # figure downstream is computed from that recorded price. 2026-08-11 15:09:36: NIFTY
+    # 24500PE was accepted at 133.00 with spot at 24453.65, i.e. Rs.87 of time value on a
+    # same-day-expiry option 20 minutes from expiry, against a true price of 40.65. The
+    # mark was ~2.5 hours stale and the book took -Rs.6,083 the market never charged.
+    # Both conditions must hold: a large FRACTIONAL divergence and a material RUPEE gap,
+    # so a cheap contract ticking a few paise is never mistaken for a stale mark.
+    candidate_entry_mark_validation_enabled: bool = True
+    candidate_entry_mark_max_divergence_pct: float = 25.0
+    candidate_entry_mark_min_gap_rs: float = 500.0
     # Futures entries were plain MARKET (uncapped in a freak spike). ON places a
     # marketable LIMIT at signal price +/- fut_limit_buffer_bps instead: same
     # immediate fill in normal books, but worst-case entry slippage is hard-capped.
@@ -414,6 +443,13 @@ class Settings(BaseSettings):
     # enough samples exist. Bounded to sane ranges so one bad fill can't distort it.
     slippage_auto_calibration_enabled: bool = True
     slippage_calibration_min_samples: int = 5
+    # A sample count is not evidence of currency. On 2026-08-11 slippage_stats.json held
+    # 12,051 FUT samples at ewma_frac exactly 0.0, every row stamped last_leg "ENTRY",
+    # from an integration that has since been retired — and because the measured value
+    # REPLACES the static assumption rather than blending with it, that fossil pinned
+    # modelled futures slippage to the 0.2bp floor of _FUT_CALIBRATION_BOUNDS. Rows
+    # older than this fall back to the static model. 0 disables the age test.
+    slippage_calibration_max_age_days: float = 30.0
     broker_fill_confirmation_timeout_seconds: float = 12.0
     broker_cancel_replace_enabled: bool = True
     # Final broker-side affordability preflight.  The requested order value is
@@ -456,6 +492,41 @@ class Settings(BaseSettings):
     inst_pref: Literal["FUT", "OPT", "AUTO"] = "AUTO"
     sl_mode: Literal["NATURAL", "HARDCODED"] = "NATURAL"
     signal_grade_preference: Literal["auto", "B", "B+", "A", "A+"] = "A"
+    # ── Grade-gate A/B levers (2026-08-11) ───────────────────────────────────
+    # Both default OFF: nothing here changes live behaviour until switched on.
+    #
+    # Across 12 live sessions / 106 trades the grade the engine computes did not rank
+    # outcomes: corr(grade rank, pnl) = +0.096, i.e. no information, and what ordering
+    # there was ran the WRONG way — A+ Rs.49/trade and A Rs.48 against B+ Rs.260 and
+    # B Rs.407. Meanwhile grade drove 2,468 "C grade blocked" and 424 "Grade rank below
+    # required 2" rejections in that window, the second and fifth largest reject reasons.
+    #
+    # Note what that sample is: .env pins SIGNAL_GRADE_PREFERENCE='B', so options run at
+    # min_rank 2 and every B row in the book arrived through the fifteen_min_bplus_ok or
+    # power_move exemption. The best-performing grades are therefore precisely the ones
+    # the main gate refused and an OR-branch let past — suggestive, but n=15 across B and
+    # B+ combined, which is far too thin to justify moving a gate that touches every
+    # signal. So these ship off, to be A/B'd once pnl_path data has accumulated.
+    #
+    # -1 keeps signal_grade_preference in charge; 0-4 forces the floor
+    # (C=0, B=1, B+=2, A=3, A+=4).
+    # ── Late-trend entry ceiling (2026-08-11) ────────────────────────────────
+    # A high ADX on a WITH-trend entry says the leg is MATURE, not that it is strong.
+    # Across 47 stored sessions, same direction and same instruments:
+    #   TRENDING_DOWN shorts   median ADX 34.4   win rate  7.1%   (1 win in 14)
+    #   BREAKOUT_DOWN  shorts  median ADX 21.4   win rate 71.4%
+    # and independently the whole ADX>=30 cell runs 32.4%/Rs.41 against 45.8%/Rs.248
+    # for ADX<20. Blocking with-trend entries above the ceiling drops 43 of 240
+    # historical trades worth -Rs.4,033 and moves the book from 40.0%/Rs.197 to
+    # 46.2%/Rs.260. AGAINST-trend entries are deliberately untouched — they are the
+    # mean-reversion side of the same reading and measured positive.
+    late_trend_entry_guard_enabled: bool = True
+    late_trend_entry_adx_ceiling: float = 30.0
+    grade_gate_min_rank_override: int = -1
+    # Lets a C grade continue to the confidence, choppy and quality gates instead of
+    # being refused on grade alone. It does NOT admit the signal — everything downstream
+    # still applies.
+    grade_gate_allow_c_enabled: bool = False
     ut_timeframe_entry_policy: Literal["PRIMARY_15", "INCLUDE_5MIN"] = "INCLUDE_5MIN"
     ut_5min_option_min_confidence: float = 0.60
     ut_5min_loss_cooldown_minutes: int = 45
@@ -609,6 +680,27 @@ class Settings(BaseSettings):
     # candle closes. If a live trade is exited by a repaint abort while the same
     # candle is still forming, re-check that same candle once per minute so a
     # fresh reappearing signal can go through the normal buffer/filter pipeline.
+    # ── Stabilization: the system's largest filter (2026-08-11) ──────────────
+    # 252 signals entered the 30s buffer that session and 48 matured — 19%. Every
+    # rejection read "UT1 arrow vanished", 63 of them inside two seconds. All four
+    # indices produced the correct SELL/PE signal within 22 seconds of the open, on the
+    # only hour of the day that moved, and the buffer killed them.
+    #
+    # The latch: a one-way cascade is evidence about a move that ALREADY happened, so
+    # re-proving it every scan asks the wrong question and goes false the moment volume
+    # ticks under its ratio. Once confirmed it holds for the rest of the window. A
+    # FLIPPED arrow still vetoes — that check runs first and is untouched.
+    stabilization_cascade_latch_enabled: bool = True
+    # Thrust scaling: a flat 30s on a 5-minute candle is 10% of its life, and the arrow
+    # is least stable when price moves fastest. A thrusting bar drops to the floor.
+    stabilization_thrust_scaling_enabled: bool = True
+    stabilization_thrust_min_seconds: float = 10.0
+    stabilization_thrust_range_atr: float = 1.50
+    stabilization_thrust_volume_ratio: float = 1.50
+    # Every buffered signal's outcome is recorded, not just the repaint rejections.
+    # rtracker held 887 stabilization rejections across 47 sessions while a single
+    # session's log held 203 — the largest gate in the system was effectively unmeasured.
+    stabilization_rtracker_logging_enabled: bool = True
     live_repaint_candle_lockout: bool = True
     live_repaint_post_exit_recheck_seconds: float = 60.0
 
@@ -621,11 +713,56 @@ class Settings(BaseSettings):
     # flat give-back floor is also made tunable. Runner mode unlocks earlier so
     # winners flip to trail-and-ride sooner.
     let_winners_run: bool = True
-    profit_lock_min_r_multiple: float = 1.0
+    # 2026-08-11 (rtracker, 12 sessions / 106 trades): 1.0 measured as the reason the
+    # non-scalp book gave everything back. The system reached Rs.42,444 of peak profit
+    # and banked -Rs.992; 45 trades went green then closed red, 42 of them peaking below
+    # every arming floor. Median trade peaks at Rs.274 while the median non-scalp arm
+    # computed to Rs.868 -- only 4 of 59 non-scalp trades ever reached their own lock.
+    #
+    # The Rs.500 base was NOT what bound: it beat risk*1.0 on just 5 of those 59 rows.
+    # This R-multiple bound the other 54, so lowering the base alone would have been
+    # very nearly a no-op (2 of the 45 give-backs would have armed, against 20 for the
+    # pair below).
+    #
+    # 0.20 mirrors fifteen_min_choppy_scalp_profit_lock_r_multiple, whose cohort is the
+    # live control group: scalp_lock trades ran that arm and captured +42.6% of peak
+    # against -4.5% for the rest, at a 48.9% vs 20.3% win rate (z=3.11, p=0.002), and
+    # the effect holds inside RANGING and outside it. The "let winners run" worry -- that
+    # arming early truncates the fat tail -- did not appear in that cohort: it carried
+    # the SAME eight peak>=Rs.750 winners as the loose cohort and a HIGHER best peak
+    # (Rs.3,582 vs Rs.2,603). Arming is not exiting; the ladder still trails.
+    profit_lock_min_r_multiple: float = 0.20
     # True scalp rows still need an R-aware arm; otherwise a Rs.500 blip can cap
     # winners while the configured stop risk is several thousand rupees.
     scalp_profit_lock_min_r_multiple: float = 0.50
+    # Absolute arming floors, previously a bare 500.0 literal inside
+    # Scanner._profit_lock_min_peak with no way to reach it from the dashboard. Split in
+    # two because the branches want different answers: scalp keeps its historical base,
+    # while the non-scalp base drops to the same Rs.250 the choppy-scalp path already
+    # uses in production (and which .env has pinned at 250.0 since before this change).
+    profit_lock_min_peak_rs: float = 500.0
+    profit_lock_nonscalp_min_peak_rs: float = 250.0
     profit_lock_abs_floor_rs: float = 450.0
+    # The sub-Rs.1,000 rung retains 50% of peak, i.e. it stops a trade that gives back
+    # half. Measured heat as a fraction of peak across every winner in 47 sessions:
+    # TRENDING_UP 8%, TRENDING_DOWN 28%, RANGING 35%, BREAKOUT_DOWN 43%, BREAKOUT_UP
+    # 47%, VOLATILE 49%. In the fast regimes that floor sits ON the pullback those
+    # winners routinely make and survive. 0.38 = 62% breathing, clear of the measured
+    # median. Applied through a min(), so it can only loosen; TRENDING_UP and RANGING
+    # are untouched because their heat is nowhere near the floor.
+    first_rung_regime_retention_enabled: bool = True
+    first_rung_fast_regime_retention: float = 0.38
+    # A closed trade has only ever recorded peak_pnl and max_drawdown, and those cannot
+    # answer "would a tighter trail have kept more?" -- a trail exits at f x peak only if
+    # P&L reached that level AFTER the peak, and a max carries no ordering. Asked of the
+    # 2026-08-11 book the honest answer was "between -Rs.18,114 and +Rs.10,988", which is
+    # no answer at all. Sampling the path makes the next such question measurable rather
+    # than arguable. Bounded three ways in _sample_pnl_path; at a 1.2-minute median hold
+    # a typical trade stores ~36 samples.
+    pnl_path_logging_enabled: bool = True
+    pnl_path_min_interval_seconds: float = 2.0
+    pnl_path_min_move_rs: float = 50.0
+    pnl_path_max_samples: int = 400
     # ── Sub-1R give-back guard (Fix 1) ──────────────────────────────
     # Below the full 1R profit-lock arm, a modest peak used to be unprotected and
     # could round-trip into a loss (e.g. a +0.4R peak fading past breakeven). Once
@@ -636,6 +773,66 @@ class Settings(BaseSettings):
     profit_giveback_arm_r_multiple: float = 0.40
     profit_giveback_min_peak_rs: float = 500.0
     profit_giveback_exit_ratio: float = 0.50
+    # No protective exit may arm below what a round trip costs. 2026-08-11 15:11:
+    # PROFIT_GIVEBACK_GUARD closed BANKNIFTY 57400PE to protect a Rs.36 peak and booked
+    # -Rs.44, because opening and closing cost Rs.80. Inside the EOD window the arm
+    # collapses to eod_protect_min_peak_rs (Rs.1), so any blip armed an exit that could
+    # not come out ahead. The LOSS side of peak-threat has refused on this reasoning
+    # since it was written (peak_threat_exit_loss_min_cost_multiple); the profit side
+    # never had the equivalent. Raises an arm only — it can never lower one.
+    profit_protect_cost_floor_enabled: bool = True
+    profit_protect_min_cost_multiple: float = 1.0
+    # ── Volatility + regime scaling of the profit-side floors (2026-08-11) ────
+    # Every profit-side threshold is fixed rupees (Rs.750 peak-threat, Rs.500/250 lock,
+    # Rs.500 give-back, ladder at 1k/2k/3k) while the moves they catch scale with
+    # volatility. As the median daily range fell 0.97% -> 0.64% across W30-W33, the share
+    # of trades ever reaching a Rs.750 peak fell 43% -> 4%; PEAK_THREAT_EXIT, which banks
+    # 87% of peak, fired ONCE in a week, and LOSS_THREAT_EXIT went from 30% to 50% of all
+    # exits. Win rate followed, 47.8% -> 12.5%.
+    #
+    # Only the ABSOLUTE floors are scaled — each arm is max(floor, risk x r_multiple) and
+    # the r_multiple half already scales, since initial_risk_rs is an ATR-derived stop
+    # times quantity. The max() is exactly what lets the blind floor dominate when risk
+    # is small, i.e. in the quiet markets where it does the damage.
+    #
+    # Volatility term: the trade's own risk against this reference (median observed risk
+    # is Rs.937). Regime term: measured peak potential, so a trend develops before the
+    # lock arms and chop banks sooner. Bounded hard both ways.
+    # ── Entry-time intel snapshot (2026-08-12) ───────────────────────────────
+    # OBSERVATION ONLY. Nothing reads this to make a decision.
+    #
+    # The engine computes volume ratio, PCR, cumulative OI, order flow, breadth, VWAP
+    # position, the full greeks and a VIX percentile — and the trade record kept almost
+    # none of it: volume_ratio survived on 2% of 239 accepted rows, the grading pillars
+    # on 33%, PCR/OI/order_flow on none. intelligence_history.json does hold the series
+    # per minute, but as a rolling 5,000-point window only 76 of 240 trades were still
+    # joinable to it: the evidence expires before anyone can use it.
+    #
+    # A composite ENTRY GATE built on these features was measured and REJECTED. It looked
+    # excellent in-sample (55.6% win rate / Rs.752 at K>=3) and inverted out-of-sample
+    # (16.7% / -Rs.336 against a 32.5% baseline), and the adaptive rolling-median variant
+    # beat its own baseline win rate in no configuration. This snapshot exists so that
+    # question can be re-asked later against complete, permanent data instead of a
+    # 6-feature shadow of what the engine actually knows.
+    entry_intel_snapshot_enabled: bool = True
+    profit_threshold_scaling_enabled: bool = True
+    profit_threshold_regime_scaling_enabled: bool = True
+    profit_threshold_reference_risk_rs: float = 1000.0
+    profit_threshold_scale_min: float = 0.35
+    # Capped at 1.0 deliberately: the scale exists to RESTORE PEAK_THREAT_EXIT where the
+    # fixed floor has gone unreachable, and letting it exceed 1.0 in trending regimes
+    # suppressed the very exit it was meant to rescue — measured as an exact wash, 17
+    # trades reaching the arm before and after. Regime still differentiates below 1.0
+    # (RANGING 0.85 vs TRENDING_UP 1.00), it just cannot push the arm further away.
+    profit_threshold_scale_max: float = 1.00
+    # ── Entry budget scaled to the day's measured range ──────────────────────
+    # Trades per 1% of median daily range across the stored weeks: 15.5, 13.8, 16.9,
+    # 18.8 — activity rose against opportunity as the market quietened, and the median
+    # peak fell Rs.533 -> Rs.78 over the same stretch. 0.90% is the reference day;
+    # quieter days scale the per-index budget down, never up, and never below the floor.
+    range_scaled_budget_enabled: bool = True
+    range_scaled_budget_reference_pct: float = 0.90
+    range_scaled_budget_min_trades: int = 3
     # Confirmed-live-trend "let winners run" (2026-07-24 audit): a with-trend PROVEN
     # winner (peak >= min_peak_r_multiple x initial risk) in a strong-trend regime
     # rides the runner lock (10% give-back) instead of the tighter give-back guard,
@@ -767,8 +964,16 @@ class Settings(BaseSettings):
     # 1R, so collapse the profit-lock arm toward a small peak so protection engages
     # early instead of letting a winner round-trip until the forced EOD kill.
     eod_protect_enabled: bool = True
-    eod_protect_window_minutes: float = 30.0
+    # 14 minutes, set FROM the session schedule rather than independently of it:
+    # ut_force_exit_time (15:15) minus this is 15:01, which is exactly
+    # ut_5min_no_entry_after. Protection therefore begins the moment the last entry is
+    # allowed, so no position can ever be opened inside the window that closes it. At
+    # the previous 30 it began at 14:45 and overlapped the entry gate by 20 minutes.
+    # Changing either time without the other re-opens that overlap.
+    eod_protect_window_minutes: float = 14.0
     eod_protect_arm_r_multiple: float = 0.0
+    # Floored at the round-trip cost by _profit_protect_cost_floor_rs — on its own this
+    # Rs.1 armed protective exits that banked less than they paid to close.
     eod_protect_min_peak_rs: float = 1.0
     # ── EOD-proximity loss minimizer ───────────────────────────────
     # During the last 15-20 minutes, a losing trade should not casually drift into
@@ -909,6 +1114,23 @@ class Settings(BaseSettings):
     # Retrack window: 20s → 360s (6.0 min) after soft reject so 1min + 5min
     # (and 15min) can re-enter if the setup strengthens post-rejection.
     missed_signal_reentry_enabled: bool = True
+    # ── Scored re-entry (A/B, 2026-08-12) ────────────────────────────────────
+    # The strict path demands FOUR conditions at once — trending regime AND regime
+    # aligned AND ADX>=24 AND intel confirmed — on a signal that was already rejected
+    # once, with confidence and cascade gating separately. is_trending_regime alone
+    # fails on the ~62% of labels that read RANGING, so the other three are rarely even
+    # evaluated. Result: 3 re-entries in 19 sessions against 60,425 rejections.
+    #
+    # Scored mode asks for N of these SIX instead of all of one branch:
+    #   confidence, trending_regime, regime_aligns, adx, intel, cascade
+    #
+    # What it does NOT relax, because these are safety rather than quality: the signal
+    # must still be 20s-6min old (a stale seed is a different trade), there must be
+    # runway before square-off, the price must not have run past the chase limit, and
+    # every repaint rejection still stands. Ships OFF — the strict path is unchanged
+    # until this is switched on, which is what makes it an A/B.
+    missed_signal_reentry_scored_mode_enabled: bool = False
+    missed_signal_reentry_min_conditions: int = 5
     missed_signal_reentry_max_age_minutes: float = 6.0
     missed_signal_reentry_min_age_seconds: float = 20.0
     # 1min + 5min primary retrack; 15min kept for structure flips.
@@ -1217,10 +1439,12 @@ class Settings(BaseSettings):
     # flattens everything by force-exit", and that was literally all that stood between a
     # late-window position and settlement: the 13:30 gamma exit is already past when this
     # window opens, and its entry-time filter drops everything entered after the 13:00
-    # cutoff. Defaults ahead of ut_force_exit_time (15:25) so an expiring contract is
+    # cutoff. Defaults ahead of ut_force_exit_time (15:15) so an expiring contract is
     # closed on its own schedule rather than in the final-minutes liquidity crunch,
-    # alongside every other force-exited position.
-    expiry_day_late_window_time_exit: str = "15:20"
+    # alongside every other force-exited position. Moved 15:20 -> 15:10 with the
+    # 2026-08-11 schedule change; at 15:20 it sat AFTER the new force-exit, which
+    # inverts the ordering this setting exists to guarantee.
+    expiry_day_late_window_time_exit: str = "15:10"
 
     # ─── UT Bot Core Settings ────────────────────────────────
     ut_preset: str = "AGGRESSIVE"
@@ -1242,15 +1466,34 @@ class Settings(BaseSettings):
     ut_fractal_confluence: bool = True # Allow 1m entries if 5m trend aligns
     ut_session_filter: bool = True   # Enable session filtering in the engine
     ut_intel_early_exit: bool = True # Enable intelligence-based early exits
+    # OI_PCR_REVERSAL must prove the book turned SINCE entry, not merely that it
+    # leans against the trade now. Off = any qualifying reading exits, including the
+    # first one an entry made before the day's option chain existed ever saw.
+    intel_reversal_requires_new_evidence: bool = True
     ut_dynamic_confidence: bool = True # Enable dynamic confidence threshold
     ut_backtest_more_results: bool = True # Loosen historical-only gates for exploratory backtests
     futures_shadow_enabled: bool = False # Research-only FUT comparison rows for historical AUTO/Hybrid; never places live orders
     ut_session_start: str = "09:18"
     ut_early_session_cutoff: str = "09:20" # Stricter 5min-quality window applies only until this time (aligned to session start, not a trading-start delay)
     ut_session_end: str = "15:25"
-    ut_no_entry_after: str = "15:01" # Block fresh 15min entries at/after this IST time
-    ut_5min_no_entry_after: str = "15:14" # Qualified 5min/1min entries have a later cutoff
-    ut_force_exit_time: str = "15:22"
+    # ─── Operator session schedule (2026-08-11) ──────────────────────────────
+    #   14:55  last 15min entry
+    #   15:01  last 5min/1min entry, and the moment EOD protection engages
+    #   15:15  full exit
+    # The three are deliberately consistent: eod_protect_window_minutes is set so that
+    # protection begins exactly when the last entry is allowed, rather than 30 minutes
+    # before force-exit. Until 2026-08-11 the 5min cutoff (15:15) sat 20 minutes INSIDE
+    # the protection window, so fresh positions were opened into a regime whose own EOD
+    # logic closed them on the next tick — four such entries on 11 Aug round-tripped in
+    # 0.06-0.19s, each paying ~Rs.80 of round-trip charges for a fraction of a second of
+    # exposure, and across the stored book that window cost -Rs.8,864 over 13 trades.
+    ut_no_entry_after: str = "14:55" # Block fresh 15min entries at/after this IST time
+    ut_5min_no_entry_after: str = "15:01" # Qualified 5min/1min entries have a later cutoff
+    # Enforces the invariant above: whatever the two cutoffs say, no entry is admitted
+    # once EOD protection is active. Off restores the previous behaviour of letting the
+    # entry gate and the EOD exit logic contradict each other.
+    block_entries_during_eod_protect: bool = True
+    ut_force_exit_time: str = "15:15"
     trade_product_type: Literal["CARRYFORWARD"] = "CARRYFORWARD"
     live_filter_leniency_pct: float = 0.0 # Keep live gates strict; loosen only during deliberate diagnostics
     intelligence_cache_ttl_seconds: float = 90.0 # Option-chain cache TTL for live intelligence
@@ -1421,7 +1664,12 @@ class Settings(BaseSettings):
     power_move_adx_threshold: float = 20.0   # momentum: ADX >= this (lower than general 25; ADX lags spikes)
     power_move_momentum_volume_mult: float = 3.5 # momentum substitute: volume >= this x avg counts as momentum
     power_move_volume_lookback: int = 20     # candles for the volume average
-    power_move_late_hard_cutoff: str = "15:15" # no power-move entry after this (leaves time before 15:25 square-off)
+    # A power move is the one lane that BYPASSES ut_no_entry_after entirely (see
+    # power_move_cutoff_ok in signal_processor), so this is its only cutoff. Held at the
+    # 5min entry time: at 15:15 it would have admitted a fresh entry at the very moment
+    # of force-exit, which is the instant round-trip the 2026-08-11 schedule change
+    # exists to stop — the bypass has to respect the schedule or it re-opens the hole.
+    power_move_late_hard_cutoff: str = "15:01" # no power-move entry after this (= the 5min cutoff)
     # Fast 1min/5min volume-spike entry. 1min scalp entries can be disabled
     # separately without disabling 1min tracking/trailing/emergency context.
     # When 1min scalping is OFF, post-exit reversion can still admit 1min rows

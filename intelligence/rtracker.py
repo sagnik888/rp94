@@ -320,6 +320,17 @@ class RegimeTracker:
             "pnl": _safe_float(_candidate_value(candidate, "pnl", 0.0)),
             "peak_pnl": _safe_float(_candidate_value(candidate, "peak_pnl", 0.0)),
             "max_drawdown": _safe_float(_candidate_value(candidate, "max_drawdown", 0.0)),
+            # (seconds_since_entry, pnl) samples. peak_pnl and max_drawdown are maxima,
+            # so they cannot say whether the trough came before or after the peak — and
+            # that ordering is the whole question when sizing a trail. Empty for trades
+            # opened before 2026-08-11 and whenever pnl_path_logging_enabled is off.
+            "pnl_path": _pnl_path_rows(_candidate_value(candidate, "pnl_path", None)),
+            # The intel state at the moment of acceptance: volume ratio, PCR, cumulative
+            # OI, order flow, breadth, VWAP position, greeks and VIX percentile. The
+            # engine computed all of it and the record kept almost none — volume_ratio
+            # survived on 2% of accepted rows and PCR/OI on none — so "does the intel
+            # predict which trades travel?" was unanswerable from this file.
+            "entry_intel": _entry_intel_block(_candidate_value(candidate, "entry_intel", None)),
             "exit_price": _safe_float(_candidate_value(candidate, "exit_price", 0.0)),
             "exit_reason": str(_candidate_value(candidate, "exit_reason", "") or ""),
             "signal_timestamp": _iso_or_empty(signal_ts),
@@ -683,6 +694,50 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _entry_intel_block(value: Any) -> dict:
+    """Normalise the entry-time intel snapshot into JSON-safe scalars.
+
+    Tolerant like everything else in this writer: a malformed field costs that field,
+    never the record. Bounded so a runaway payload cannot bloat the event log.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict = {}
+    for key, raw in value.items():
+        if len(out) >= 40:
+            break
+        name = str(key)[:48]
+        if isinstance(raw, bool):
+            out[name] = raw
+        elif isinstance(raw, (int, float)):
+            try:
+                f = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if f == f and abs(f) != float("inf"):
+                out[name] = round(f, 6)
+        elif isinstance(raw, str):
+            out[name] = raw[:32]
+    return out
+
+
+def _pnl_path_rows(value: Any) -> list:
+    """Normalise a trade's pnl_path into JSON-safe [seconds, pnl] pairs.
+
+    Tolerant by design: this runs inside the event writer, and a malformed sample must
+    cost that sample rather than the whole record.
+    """
+    rows = []
+    for row in (value or []):
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        try:
+            rows.append([round(float(row[0]), 2), round(float(row[1]), 2)])
+        except (TypeError, ValueError):
+            continue
+    return rows
 
 
 def _safe_int(value: Any) -> int:

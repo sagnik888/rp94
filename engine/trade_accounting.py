@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from loguru import logger
+
 
 # Sanity bounds for calibrated per-leg slippage fractions. The realized EWMA is
 # clamped into these so a run of lucky (or catastrophic) fills can't push the
@@ -20,8 +22,11 @@ def _calibrated_leg_fraction(settings: Any, inst_type: str, instrument: str) -> 
         from engine.slippage_tracker import get_slippage_tracker
 
         min_samples = int(getattr(settings, "slippage_calibration_min_samples", 5) or 5)
+        max_age_days = float(
+            getattr(settings, "slippage_calibration_max_age_days", 30.0) or 30.0
+        )
         measured = get_slippage_tracker().calibrated_fraction(
-            inst_type, instrument, min_samples=min_samples
+            inst_type, instrument, min_samples=min_samples, max_age_days=max_age_days
         )
         if measured is None:
             return None
@@ -31,7 +36,12 @@ def _calibrated_leg_fraction(settings: Any, inst_type: str, instrument: str) -> 
             else _FUT_CALIBRATION_BOUNDS
         )
         return min(max(float(measured), lo), hi)
-    except Exception:
+    except Exception as exc:
+        # Falling back to the static assumption is the safe answer, but doing it in
+        # silence hides the difference between "no fills measured yet" and "this call is
+        # broken" — a stub whose signature drifted was masked here for exactly that
+        # reason, surfacing only as a quietly wrong charge.
+        logger.debug(f"Slippage calibration unavailable, using static assumption: {exc}")
         return None
 
 

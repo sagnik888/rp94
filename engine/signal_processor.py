@@ -274,13 +274,61 @@ def price_action_context(scanner, instrument: str, timeframe: str, sig, settings
         return None
 
 
+def _parse_clock(label: str, default: str):
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(label).strip(), fmt).time()
+        except ValueError:
+            continue
+    return datetime.strptime(default, "%H:%M").time()
+
+
+def _eod_protect_entry_cutoff(settings):
+    """When EOD profit-protection engages, or None if it is off/unknowable.
+
+    Entries taken after this point are opened into a regime whose own EOD logic closes
+    them immediately, so this is a hard ceiling on any entry cutoff.
+    """
+    if not _setting_enabled(
+        getattr(settings, "block_entries_during_eod_protect", True), True
+    ):
+        return None
+    if not _setting_enabled(getattr(settings, "eod_protect_enabled", True), True):
+        return None
+    try:
+        window = float(getattr(settings, "eod_protect_window_minutes", 30.0) or 0.0)
+        if window <= 0:
+            return None
+        force_exit = _parse_clock(
+            getattr(settings, "ut_force_exit_time", "15:22") or "15:22", "15:22"
+        )
+        start = datetime.combine(date.min, force_exit) - timedelta(minutes=window)
+        return start.time()
+    except Exception:
+        return None
+
+
 def _entry_cutoff(settings, timeframe: str):
-    """Return the configured no-entry label and time for a timeframe."""
+    """Return the effective no-entry label and time for a timeframe.
+
+    2026-08-11: ut_5min_no_entry_after ("15:14") sat 22 minutes AFTER EOD protection
+    engaged (ut_force_exit_time 15:22 minus a 30-minute window = 14:52), so for 22
+    minutes the system opened fresh 5min positions into a regime whose EOD logic closed
+    them on the next tick. Four entries at 15:09-15:11 round-tripped in 0.06-0.19s and
+    paid ~Rs.80 of round-trip charges each for holds of a fraction of a second.
+
+    The two settings are now reconciled rather than left to contradict each other: the
+    effective cutoff is whichever comes first.
+    """
     if str(timeframe) in {"1min", "5min"}:
         label = str(getattr(settings, "ut_5min_no_entry_after", "15:15") or "15:15")
     else:
         label = str(getattr(settings, "ut_no_entry_after", "15:00") or "15:00")
-    return label, datetime.strptime(label, "%H:%M").time()
+    cutoff = _parse_clock(label, "15:15")
+    eod_start = _eod_protect_entry_cutoff(settings)
+    if eod_start is not None and eod_start < cutoff:
+        return f"{eod_start.strftime('%H:%M')} (EOD protect)", eod_start
+    return label, cutoff
 
 
 #: Grading telemetry lives on the graded UTBotSignal, but TradeCandidate is built fresh
@@ -2727,7 +2775,13 @@ class SignalProcessor:
                             and scanner.mode == "HISTORICAL"
                         )
 
-                        if hist_grade == "C" and not (more_results and hist_conf >= self._relaxed_threshold(0.62, settings) and not self._is_choppy_regime(hist_regime)):
+                        # grade_gate_allow_c_enabled (default OFF) lets a C continue to the
+                        # confidence/choppy/quality gates rather than being refused on
+                        # grade alone. It admits nothing by itself — see config/settings.py.
+                        allow_c_grade = _setting_enabled(
+                            getattr(settings, "grade_gate_allow_c_enabled", False), False
+                        )
+                        if hist_grade == "C" and not allow_c_grade and not (more_results and hist_conf >= self._relaxed_threshold(0.62, settings) and not self._is_choppy_regime(hist_regime)):
                             record_reject("C grade blocked")
                             self._historical_audit_log(f"â­ï¸ [AUDIT] Skipping C grade signal at {s1.timestamp}")
                             continue
@@ -2901,12 +2955,61 @@ class SignalProcessor:
                             min_rank = 3
                         else: # auto
                             min_rank = 3 if is_choppy else 2
-                            
+
+                        # A/B override (default -1 = follow signal_grade_preference above).
+                        # Read AFTER the preference ladder so it wins, and bounded to the
+                        # hierarchy so a stray value cannot open or close the gate entirely.
+                        try:
+                            rank_override = int(getattr(settings, "grade_gate_min_rank_override", -1))
+                        except (TypeError, ValueError):
+                            rank_override = -1
+                        if rank_override >= 0:
+                            min_rank = max(0, min(4, rank_override))
+
                         if sig_rank < min_rank and not fifteen_min_bplus_ok and not power_move_hist:
                             record_reject(f"Grade rank below required {min_rank}", sim_inst)
                             self._historical_audit_log(f"🚫 Skipping grade-preference-blocked signal {s1.signal_type} {base_grade} (rank {sig_rank} < min {min_rank}) at {s1.timestamp}")
                             continue
-                            
+
+                        # ── Late-trend entry ceiling ──────────────────────────
+                        # A high ADX on a WITH-trend entry means the leg is mature, not
+                        # that it is strong. Measured over 47 stored sessions:
+                        #   TRENDING_DOWN shorts   median ADX 34.4   win rate  7.1%
+                        #   BREAKOUT_DOWN  shorts  median ADX 21.4   win rate 71.4%
+                        # Same direction, same instruments — the difference is WHEN.
+                        # Independently, the whole ADX>=30 cell runs 32.4% / Rs.41 against
+                        # 45.8% / Rs.248 for ADX<20. Blocking with-trend entries above the
+                        # ceiling removes 43 of 240 historical trades worth -Rs.4,033 and
+                        # lifts the book from 40.0%/Rs.197 to 46.2%/Rs.260.
+                        # AGAINST-trend entries are untouched: they are the mean-reversion
+                        # side of the same reading and measured positive.
+                        late_ceiling = float(
+                            getattr(settings, "late_trend_entry_adx_ceiling", 30.0) or 0.0
+                        )
+                        if (
+                            late_ceiling > 0
+                            and _setting_enabled(
+                                getattr(settings, "late_trend_entry_guard_enabled", True), True
+                            )
+                            and not power_move_hist
+                            and float(adx_val or 0.0) > late_ceiling
+                            and (
+                                (str(hist_regime).upper() == "TRENDING_DOWN" and direction == "SHORT")
+                                or (str(hist_regime).upper() == "TRENDING_UP" and direction == "LONG")
+                            )
+                        ):
+                            record_reject(
+                                f"Late-trend entry: ADX {float(adx_val or 0.0):.0f} > {late_ceiling:.0f} "
+                                f"with {hist_regime}",
+                                sim_inst,
+                            )
+                            self._historical_audit_log(
+                                f"🚫 Late-trend entry blocked {s1.signal_type} {hist_regime} "
+                                f"ADX={adx_val} at {s1.timestamp}"
+                            )
+                            continue
+
+
                         # Aligned Quality Gates (mirror _passes_live_trade_ready_gate)
                         if not power_move_hist and not self._passes_quality_gate(
                             tf,
