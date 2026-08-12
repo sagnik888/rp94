@@ -69,6 +69,13 @@ class RegimeTracker:
         self.retention_days = max(0, int(retention_days or 0))
         self._seen: set[str] = set()
         self._seen_order: deque[str] = deque(maxlen=max(128, int(dedupe_size or 4096)))
+        # Ids already on disk, per day-file, recovered before the first write to
+        # that day. _seen alone is per-instance and starts empty, so every process
+        # start reopened the day for rewriting: the 2026-08-12 archive holds 482
+        # rows over 307 distinct ids — 59 ids written more than once, one of them
+        # seven times — across six process starts. Counts drawn from that file feed
+        # tuning decisions, so the duplication is not a reporting cosmetic.
+        self._day_ids: Dict[str, set[str]] = {}
 
     @classmethod
     def from_settings(cls, settings: Any) -> "RegimeTracker":
@@ -145,12 +152,18 @@ class RegimeTracker:
             event.setdefault("schema", "rtracker.v1")
             event_id = str(event.get("id") or self._event_id(event))
             event["id"] = event_id
+            # Identity of the SIGNAL, independent of which gate spoke about it, so a
+            # day's funnel can be counted per signal rather than per row without
+            # re-deriving the key from every consumer.
+            event.setdefault("signal_id", self._signal_id(event))
             with _RTRACKER_FILE_LOCK:
-                if event_id in self._seen:
-                    return False
-                self._remember(event_id)
                 self.events_dir.mkdir(parents=True, exist_ok=True)
                 path = self.events_dir / f"{event['date']}.jsonl"
+                day_ids = self._day_ids_for(str(event["date"]), path)
+                if event_id in self._seen or event_id in day_ids:
+                    return False
+                self._remember(event_id)
+                day_ids.add(event_id)
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(_json_safe(event), separators=(",", ":"), sort_keys=True) + "\n")
             return True
@@ -438,6 +451,61 @@ class RegimeTracker:
             self._seen.discard(old)
         self._seen.add(event_id)
         self._seen_order.append(event_id)
+
+    def _day_ids_for(self, day: str, path: Path) -> set[str]:
+        """Ids already recorded for a day, recovered from its file exactly once.
+
+        Best effort: a damaged archive must never silence the tracker, so an
+        unreadable line or file yields an empty set and recording continues.
+        """
+        known = self._day_ids.get(day)
+        if known is not None:
+            return known
+        known = set()
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row_id = json.loads(line).get("id")
+                        except Exception:
+                            continue
+                        if row_id:
+                            known.add(str(row_id))
+        except Exception as exc:
+            logger.debug(f"rtracker day-id recovery skipped for {day}: {exc}")
+        # Only the current and previous day stay resident; older files are never
+        # appended to again.
+        if len(self._day_ids) >= 2:
+            self._day_ids.pop(sorted(self._day_ids)[0], None)
+        self._day_ids[day] = known
+        return known
+
+    @staticmethod
+    def _signal_id(event: Dict[str, Any]) -> str:
+        """Stable identity for the SIGNAL a row is about.
+
+        Keyed on the signal's own clock, not the row's, so every gate that speaks
+        about one signal shares an id. Falls back to the row timestamp when a
+        signal clock is absent: identity is then unknowable, and recording twice is
+        the safe error where merging two real signals is not.
+        """
+        key = "|".join(
+            str(event.get(name, "") or "")
+            for name in (
+                "date",
+                "instrument",
+                "timeframe",
+                "direction",
+                "signal_timestamp",
+            )
+        )
+        if not str(event.get("signal_timestamp") or ""):
+            key = f"{key}|{event.get('timestamp', '')}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
 
     def _event_id(self, event: Dict[str, Any]) -> str:
         key = "|".join(
