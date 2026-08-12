@@ -546,6 +546,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._losses_today = {} # {instrument: count}
         self._last_exit_time = {} # {instrument: timestamp}
         self._last_exit_direction = {} # {index: LONG|SHORT of the last exit}
+        self._loss_streaks_by_lane = {} # {(index, timeframe): consecutive losses}
         self._counted_entry_keys = set()
         self._counted_outcome_signatures = set()
         self._last_loss_outcome_instrument = ""
@@ -701,7 +702,44 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         lane = str(getattr(row, "source_lane", "") or "").upper()
         return instrument, timeframe, direction, str(source_time or ""), symbol, lane
 
-    def _record_consecutive_loss_outcome(self, instrument: str, pnl: float) -> int:
+    @staticmethod
+    def _loss_lane_key(instrument: str, timeframe: str = "") -> Tuple[str, str]:
+        """(index, timeframe) — the unit a consecutive-loss run belongs to."""
+        base = str(instrument or "").split()[0].upper()
+        tf = str(timeframe or "").strip().lower() or "unknown"
+        return base, tf
+
+    def _refresh_loss_streak_aggregate(self, instrument: str) -> int:
+        """This index's streak = its WORST lane, not the sum of its lanes."""
+        base = str(instrument or "").split()[0].upper()
+        lanes = getattr(self, "_loss_streaks_by_lane", None)
+        if not isinstance(lanes, dict):
+            self._loss_streaks_by_lane = {}
+            lanes = self._loss_streaks_by_lane
+        current = max(
+            [int(value or 0) for (idx, _tf), value in lanes.items() if idx == base] or [0]
+        )
+        if not isinstance(getattr(self, "_losses_today", None), dict):
+            self._losses_today = {}
+        self._losses_today[base] = current
+        return current
+
+    def _clear_loss_streak_lanes(self, instrument: str) -> None:
+        """Drop every lane for an index once its suspension has been consumed.
+
+        _can_trade_instrument consumes the streak at index level, so the lanes the
+        aggregate was computed from must go with it — otherwise the next recorded
+        outcome recomputes the aggregate straight back to where it was.
+        """
+        base = str(instrument or "").split()[0].upper()
+        lanes = getattr(self, "_loss_streaks_by_lane", None)
+        if isinstance(lanes, dict):
+            for lane in [key for key in lanes if key[0] == base]:
+                lanes[lane] = 0
+
+    def _record_consecutive_loss_outcome(
+        self, instrument: str, pnl: float, timeframe: str = ""
+    ) -> int:
         """Track this index's own uninterrupted loss run.
 
         This used to be measured on the GLOBAL exit tape: any completed trade for another
@@ -714,6 +752,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         A NIFTY run is now broken only by a NIFTY outcome that is not a loss, which is
         what "3 consecutive NIFTY losses" means to an operator watching one chart. Set
         consecutive_loss_streak_per_index=False to restore the global-tape behaviour.
+
+        Runs are kept per (index, TIMEFRAME) lane and the index's streak is its worst
+        lane — restore_point_51's model, ported 2026-08-12. Pooling every timeframe
+        into one counter meant two losses on NIFTY 5min and two on NIFTY 15min read
+        as a run of four and armed the suspension, though neither chart lost four in
+        a row. "A win resets only its own lane. Other indices/timeframes neither
+        extend nor erase this lane's streak."
         """
         # split() on an empty string yields [], so [0] raised IndexError and the guard
         # below was unreachable — on the exit-recording path, where a blank instrument
@@ -733,18 +778,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             previous_instrument = str(
                 getattr(self, "_last_loss_outcome_instrument", "") or ""
             ).upper()
+            # Lanes are the source of truth the aggregate is recomputed from, so a
+            # global-tape reset has to clear them too or the next recorded outcome
+            # rebuilds the streak this branch just erased.
             for other in list(streaks):
                 if str(other).upper() != instrument:
                     streaks[other] = 0
+                    self._clear_loss_streak_lanes(str(other))
             if previous_instrument and previous_instrument != instrument:
                 streaks[instrument] = 0
+                self._clear_loss_streak_lanes(instrument)
 
+        lanes = getattr(self, "_loss_streaks_by_lane", None)
+        if not isinstance(lanes, dict):
+            self._loss_streaks_by_lane = {}
+            lanes = self._loss_streaks_by_lane
+        lane = Scanner._loss_lane_key(instrument, timeframe)
         if float(pnl or 0.0) < 0.0:
-            streaks[instrument] = int(streaks.get(instrument, 0) or 0) + 1
+            lanes[lane] = int(lanes.get(lane, 0) or 0) + 1
         else:
-            streaks[instrument] = 0
+            lanes[lane] = 0
         self._last_loss_outcome_instrument = instrument
-        return int(streaks[instrument])
+        # Global-tape mode already zeroed the other indices above; recomputing the
+        # aggregate from this index's own lanes preserves that.
+        return int(self._refresh_loss_streak_aggregate(instrument))
 
     def _reset_daily_counters(self):
         """Resets daily trading counters at 09:15 AM IST (live-book only)."""
@@ -765,6 +822,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._losses_today = {}
             self._last_exit_time = {}
             self._last_exit_direction = {}
+            self._loss_streaks_by_lane = {}
             self._counted_entry_keys = set()
             self._counted_outcome_signatures = set()
             # _stop_out_reentries was never cleared here, so the "once per index per
@@ -868,6 +926,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 self._record_consecutive_loss_outcome(
                     instrument,
                     float(getattr(outcome, "pnl", 0.0) or 0.0),
+                    str(getattr(outcome, "timeframe", "") or ""),
                 )
                 exit_time = self._closed_outcome_time(outcome)
                 if exit_time != datetime.min:
@@ -2413,6 +2472,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         losses = self._losses_today.get(instrument, 0)
         if losses >= self.max_consecutive_losses:
             self._losses_today[instrument] = 0
+            self._clear_loss_streak_lanes(instrument)
             return False, (
                 f"Same-index loss suspension: skipped one {instrument} candidate "
                 f"after {self.max_consecutive_losses} consecutive losses"
@@ -17904,6 +17964,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             streak = self._record_consecutive_loss_outcome(
                 instrument,
                 float(getattr(outcome, "pnl", 0.0) or 0.0),
+                str(getattr(outcome, "timeframe", "") or ""),
             )
             exit_time = self._closed_outcome_time(outcome)
             if exit_time != datetime.min:
@@ -22013,6 +22074,85 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             return 0.0
 
+    def _entry_intelligence_reading(
+        self, candidate: TradeCandidate, timeframe: Optional[str] = None
+    ) -> Tuple[bool, float, float, str]:
+        """(available, signed score, adx, source) for an entry-policy decision.
+
+        Availability is reported SEPARATELY from the score because 0.0 is a
+        legitimate measurement — a balanced book — and also what every failure path
+        returns. _candidate_signed_intelligence collapses the two, so a guard
+        reading it cannot tell "the book is neutral" from "there is no book".
+
+        2026-08-12 14:36 and 14:55, mid-reversal, the 15-minute guard refused
+        MIDCPNIFTY with "signed intelligence -0.00 not aligned for BUY" and again at
+        -0.01. Those are not bearish readings; they are the absence of one, and the
+        entry died for it. Same defect as the order-flow pillar reading an absent
+        ratio as a real 0.0 (see _first_present_number).
+
+        Contract and semantics follow restore_point_51's
+        _fresh_entry_intelligence_metrics: read the EXACT timeframe with no
+        fallback — a 5-minute reading is not evidence about a 15-minute entry —
+        and bound it by the age this codebase already calls stale for entry
+        acceleration. Built on this build's own primitives rather than porting that
+        build's cache readers, which this one does not have.
+
+        A scanner with no intelligence cache at all is a bare test double, not a
+        starved production scanner; it keeps the candidate's own snapshot, exactly
+        as the ported build does.
+        """
+        instrument = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+        tf = str(timeframe or getattr(candidate, "timeframe", "5min") or "5min").lower()
+
+        exact = None
+        try:
+            exact = self._cached_timeframe_intel(instrument, tf, allow_fallback=False)
+        except Exception:
+            exact = None
+
+        if isinstance(exact, dict) and exact:
+            try:
+                age = self._intel_age_seconds(exact, instrument)
+            except Exception:
+                age = None
+            max_age = float(
+                getattr(get_settings(), "loss_guard_intel_max_age_seconds", 90.0) or 90.0
+            )
+            # None means the age could not be established — missing evidence about
+            # freshness, not evidence of staleness.
+            if age is not None and max_age > 0 and float(age) > max_age:
+                return False, 0.0, 0.0, (
+                    f"exact {tf} intelligence stale ({float(age):.0f}s > {max_age:.0f}s)"
+                )
+            aggregate = exact.get("aggregate") if isinstance(exact.get("aggregate"), dict) else {}
+            regime_payload = exact.get("regime") if isinstance(exact.get("regime"), dict) else {}
+            # aggregate_intelligence_score knows the aggregate's unit;
+            # normalize_intelligence_score infers scale from magnitude and must
+            # never be pointed at an aggregate payload (test_intel_score_unit_is_explicit).
+            try:
+                signed = aggregate_intelligence_score(aggregate)
+            except Exception:
+                signed = 0.0
+            adx = Scanner._first_present_number(regime_payload, "adx")
+            if adx is None:
+                adx = Scanner._first_present_number(aggregate, "adx")
+            return True, float(signed), float(adx or 0.0), "fresh_exact_intelligence"
+
+        if hasattr(self, "_intel_cache"):
+            return False, 0.0, 0.0, f"exact {tf} intelligence unavailable"
+
+        try:
+            signed = normalize_intelligence_score(
+                float(getattr(candidate, "intelligence_score", 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            signed = 0.0
+        try:
+            adx = float(getattr(candidate, "adx_value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        return True, float(signed), float(adx), "candidate_snapshot"
+
     @staticmethod
     def _candidate_signal_type(candidate: TradeCandidate) -> str:
         source = str(getattr(candidate, "source_signal_type", "") or "").upper()
@@ -22114,6 +22254,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return True, ""
         if bool(getattr(candidate, "late_session_reclaim_entry", False)):
             return True, ""
+        # A synchronised multi-index reversal is the same class of exemption as the
+        # power-move and volume-spike lanes above: the move itself is the evidence.
+        # These are fast-tracked through a 5-10s stabilization buffer precisely
+        # because the whole market turned, and were then vetoed here for lacking a
+        # single instrument's intel alignment — 2026-08-12 14:36, three MIDCPNIFTY
+        # 15min LONGs refused mid-reversal on a -0.00 reading. A market-wide entry
+        # has already cleared B+ grade, 60% confidence and an independently
+        # confirmed peer (_market_wide_candidate_quality), which is more evidence
+        # than this guard asks of anything else it lets through.
+        if (
+            bool(getattr(candidate, "market_wide_reversal_entry", False))
+            or bool(getattr(candidate, "market_ltp_shock_entry", False))
+            or bool(getattr(candidate, "one_way_cascade_entry", False))
+        ):
+            return True, ""
         if bool(getattr(candidate, "quad_union_entry", False) or getattr(candidate, "raw_union_entry", False)):
             try:
                 trend_15m_agrees = bool(self._candidate_15m_trend_agrees(candidate))
@@ -22135,7 +22290,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 return True, ""
 
         signal_type = self._candidate_signal_type(candidate)
-        signed_intel = self._candidate_signed_intelligence(candidate)
+        # Availability first: a missing reading is not a bearish one.
+        intel_available, signed_intel, fresh_adx, intel_reason = (
+            self._entry_intelligence_reading(candidate, "15min")
+        )
+        if not intel_available:
+            return False, f"15min choppy scalp guard: {intel_reason}"
+        try:
+            setattr(candidate, "intelligence_score", float(signed_intel))
+            if float(fresh_adx or 0.0) > 0.0:
+                setattr(candidate, "adx_value", float(fresh_adx))
+        except Exception:
+            pass
         min_intel = float(getattr(settings, "fifteen_min_choppy_scalp_min_intel_score", 0.20) or 0.20)
         intel_ok = signed_intel >= min_intel if signal_type == "BUY" else signed_intel <= -min_intel
         if not intel_ok:
@@ -26830,6 +26996,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 self._record_consecutive_loss_outcome(
                     instrument,
                     float(getattr(closed_trade, "pnl", 0.0) or 0.0),
+                    str(getattr(closed_trade, "timeframe", "") or ""),
                 )
 
             # Record exit time and direction for cooldown
@@ -27835,6 +28002,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._record_consecutive_loss_outcome(
                             trade.instrument,
                             float(getattr(closed_trade, "pnl", 0.0) or 0.0),
+                            str(getattr(trade, "timeframe", "") or ""),
                         )
                     self._last_exit_time[trade.instrument] = latest_time if latest_time else datetime.now(IST).replace(tzinfo=None)
                     self._note_index_exit_direction(trade.instrument, trade)

@@ -281,11 +281,16 @@ def test_the_only_consumer_is_the_reversal_reference():
     out-of-sample evidence has to be revisited before it is allowed.
     """
     import inspect
+    import re
 
     src = inspect.getsource(Scanner)
+    # \b so this matches the entry_intel FIELD and not longer identifiers that
+    # merely start with it (e.g. _entry_intelligence_reading, which reads the live
+    # intel cache and never touches the snapshot).
+    field = re.compile(r"\bentry_intel\b")
     reads = [
         ln for ln in src.splitlines()
-        if "entry_intel" in ln
+        if field.search(ln)
         and "_entry_intel_snapshot" not in ln
         and not ln.strip().startswith("#")
     ]
