@@ -380,14 +380,14 @@ class RegimeTracker:
                 "guarded_regime": str(regime_ctx.get("guarded_regime") or ""),
                 "smoothed_regime": str(regime_ctx.get("smoothed_regime") or regime_ctx.get("regime") or _candidate_value(candidate, "market_regime", "") or ""),
                 "hard_label": str(regime_ctx.get("regime") or _candidate_value(candidate, "market_regime", "") or ""),
-                "confidence": _safe_float(regime_ctx.get("confidence", 0.0)),
+                "confidence": _measured_float(regime_ctx, "confidence"),
                 "conviction_label": str(regime_ctx.get("conviction_label") or ""),
                 "conviction_summary": str(regime_ctx.get("conviction_summary") or ""),
                 "conviction_vector": {key: _safe_float(vector.get(key, 0.0)) for key in VECTOR_KEYS},
                 "adx": _safe_float(regime_ctx.get("adx", _candidate_value(candidate, "adx_value", 0.0))),
-                "kaufman_er": _safe_float(regime_ctx.get("kaufman_er", 0.0)),
-                "atr_pct": _safe_float(regime_ctx.get("atr_pct", 0.0)),
-                "bb_width": _safe_float(regime_ctx.get("bb_width", 0.0)),
+                "kaufman_er": _measured_float(regime_ctx, "kaufman_er"),
+                "atr_pct": _measured_float(regime_ctx, "atr_pct"),
+                "bb_width": _measured_float(regime_ctx, "bb_width"),
                 "range_day_trend_guard": bool(regime_ctx.get("range_day_trend_guard", False)),
                 "range_day_trend_guard_reason": str(regime_ctx.get("range_day_trend_guard_reason") or ""),
             },
@@ -762,6 +762,31 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _measured_float(mapping: Any, key: str) -> Optional[float]:
+    """A metric's value, or None when it was never measured.
+
+    Absent is not zero. `_safe_float(ctx.get(key, 0.0))` writes a 0.0 nobody
+    measured, and every threshold in this system is argued from this archive: on
+    2026-08-12 the four worst trades recorded `TRENDING_UP, adx 47-54,
+    confidence 0.0`, which reads as "traded on no conviction" — but
+    RegimeDetector's floor is 40 and a trending label computes min(95, adx+30),
+    so the real values were 77-84. The zero was invented here, because
+    `hard_label` has a candidate fallback and `confidence` does not.
+
+    A genuinely measured 0.0 still records as 0.0; only the missing key is absent.
+    """
+    if not isinstance(mapping, dict) or key not in mapping:
+        return None
+    value = mapping.get(key)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
 
 
 def _entry_intel_block(value: Any) -> dict:

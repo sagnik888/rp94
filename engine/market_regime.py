@@ -98,9 +98,27 @@ def is_risky_regime(value) -> bool:
 
 
 def uses_tight_trailing(value) -> bool:
+    """Regimes whose stop trails the PREVIOUS 1-MINUTE candle's extreme.
+
+    VOLATILE is deliberately absent. Scanner._first_rung_regime_retention carries
+    a table measured over 47 stored sessions — heat as a fraction of peak, across
+    every winner:
+
+        TRENDING_UP 8%  TRENDING_DOWN 28%  RANGING 35%
+        BREAKOUT_DOWN 43%  BREAKOUT_UP 47%  VOLATILE 49%
+
+    and loosens the profit-lock floor to 0.38 for the three highest-heat regimes
+    because "the MEDIAN winner gives back 49%" in VOLATILE. Pinning that same
+    trade to a 1-minute candle extreme contradicted it outright, and the tighter
+    of two stops always binds — so the measured loosening never reached the
+    regime it was measured for. VOLATILE keeps every other risky-regime
+    treatment (is_risky_regime still returns True); only the trail changes.
+
+    RANGING (35%) and UNKNOWN stay: mid-range heat and no reading at all are both
+    cases where the tighter trail is the defensible default.
+    """
     return normalize_regime(value) in {
         MarketRegime.RANGING,
-        MarketRegime.VOLATILE,
         MarketRegime.UNKNOWN,
     }
 
