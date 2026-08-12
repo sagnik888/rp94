@@ -541,8 +541,17 @@ class Settings(BaseSettings):
     # past the raw quality floor. Ported back from restore_point_51, where the bypass
     # read `market_wide and market_wide_ok`; this build had lost the guard and the
     # bare flag admitted anything (2026-08-12: grade C at 12% and 13%).
-    market_wide_reversal_min_grade: Literal["B", "B+", "A", "A+"] = "B+"
-    market_wide_reversal_min_confidence: float = 0.60
+    # restore_point_51 sets B+/60% here, but its raw-entry `allowed` expression
+    # carries an admission route this build does not have — `or bool(census_ctx)`,
+    # from _census_range_scalp_context. Porting the restriction without its
+    # compensator made this build strictly TIGHTER than the one being matched.
+    # 2026-08-12 14:30 BANKNIFTY sat exactly in the gap: grade B, 54%, market-wide
+    # core 3/3 total 4, and the session's largest winner at +Rs.1,300. The junk this
+    # guard exists to stop was C grade at 12-13%. The floor every other bypass in
+    # that expression already uses separates the two with room to spare, so the bar
+    # is set there until the census path exists to justify a higher one.
+    market_wide_reversal_min_grade: Literal["B", "B+", "A", "A+"] = "B"
+    market_wide_reversal_min_confidence: float = 0.50
     live_b_grade_min_confidence: float = 0.50  # Top-of-band floor for dedicated B-grade entries (trending + 15m align + ADX>=25)
 
     # ─── Confidence calibration (de-saturation) ──────────────
