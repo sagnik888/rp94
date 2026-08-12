@@ -169,10 +169,15 @@ def test_daily_trade_budget_is_never_bypassed(monkeypatch):
     assert allowed is False and "Max daily trades" in why
 
 
-def test_consecutive_loss_halt_is_never_bypassed(monkeypatch):
+def test_consecutive_loss_suspension_is_never_bypassed_by_stop_out_reentry(monkeypatch):
+    """The loss rule still outranks the stop-out re-entry bypass — it just costs one
+    candidate now instead of the rest of the session (see
+    test_loss_halt_is_a_skip_not_a_lockout_2026_08_12)."""
     sc = _budget_scanner(monkeypatch, trades_today={"NIFTY": 1}, losses_today={"NIFTY": 3})
     allowed, why = sc._can_trade_instrument("NIFTY", NOW, direction="LONG", adx_value=32.0)
-    assert allowed is False and "HALTED" in why
+    assert allowed is False and "loss suspension" in why
+    # The suspension consumed the streak rather than latching the index off.
+    assert sc._losses_today["NIFTY"] == 0
 
 
 def test_dashboard_toggle_is_fully_wired():

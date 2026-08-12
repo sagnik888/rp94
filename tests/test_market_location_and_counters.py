@@ -1937,10 +1937,24 @@ def test_index_halt_message_matches_uninterrupted_same_index_semantics():
     scanner._dynamic_trade_budget = lambda _instrument: (10, "base")
     scanner.max_consecutive_losses = 3
     scanner.index_cooldown_minutes = 0.0
+    scanner._last_exit_time = {}
+    scanner._index_cooldown_applies = lambda *_a: (False, "")
+    scanner._post_loss_cooldown_block = lambda *_a, **_k: (False, "")
 
     allowed, reason = scanner._can_trade_instrument(
         "NIFTY", datetime.now(IST).replace(tzinfo=None)
     )
 
     assert allowed is False
-    assert reason == "Index HALTED: 3 uninterrupted same-index losses"
+    assert reason == (
+        "Same-index loss suspension: skipped one NIFTY candidate "
+        "after 3 consecutive losses"
+    )
+    # It is a cooling-off, not a lockout: the streak is consumed by the skip so the
+    # next signal is judged on its own merits. A halt that only a win could clear,
+    # on an index refused every entry, could never clear at all — on 2026-08-12 that
+    # sat NIFTY and SENSEX out of the 14:15 reversal.
+    assert scanner._losses_today["NIFTY"] == 0
+    assert scanner._can_trade_instrument(
+        "NIFTY", datetime.now(IST).replace(tzinfo=None)
+    )[0] is True

@@ -2394,12 +2394,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if count >= budget:
             return False, f"Max daily trades ({budget}, {budget_basis}) reached"
 
-        # Rule 2: Max Consecutive Losses (Prevent death spirals)
+        # Rule 2: Max Consecutive Losses — a cooling-off, NOT a lockout.
+        #
+        # The streak is cleared only by a non-losing outcome on this same index
+        # (_record_consecutive_loss_outcome), and a refused index cannot produce
+        # one — so refusing every entry at the threshold was self-perpetuating and
+        # ran to the closing bell. 2026-08-12: NIFTY and SENSEX each reached four
+        # losses between 12:42 and 13:39 on entries the market-wide bypass should
+        # never have admitted; at 14:15 the tape reversed and both sat out the
+        # largest move of the day, rtracker logging "Index HALTED" against every
+        # signal. The streak was evidence about a regime that no longer existed.
+        #
+        # restore_point_51 skips ONE candidate in the lane and clears the streak
+        # (see its _loss_skip_pending_by_lane / consume_loss_skip path). Same
+        # semantic here: refuse this signal, reset, let the next one be judged on
+        # its own merits. It re-arms on a fresh streak, so a genuinely broken index
+        # still pays a skip per run rather than trading straight through.
         losses = self._losses_today.get(instrument, 0)
         if losses >= self.max_consecutive_losses:
+            self._losses_today[instrument] = 0
             return False, (
-                f"Index HALTED: {self.max_consecutive_losses} uninterrupted "
-                "same-index losses"
+                f"Same-index loss suspension: skipped one {instrument} candidate "
+                f"after {self.max_consecutive_losses} consecutive losses"
             )
 
         # Rule 3: Cooldown Period — regime-scoped (chop/range only by default);
