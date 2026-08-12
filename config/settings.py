@@ -1051,6 +1051,14 @@ class Settings(BaseSettings):
     # 4s, 33s and 60s after a fill, on signals that had just spent 31s in stabilization —
     # the position was cut before its own thesis had a chance to print a bar.
     peak_threat_exit_min_hold_seconds: float = 60.0
+    # Winner side of the same guard, ported back from restore_point_51. That build:
+    # "gap/synthetic marks at the open can manufacture an instant peak that arms
+    # this exit on a seconds-old position (2026-07-15; ledger rows exited 1-22s
+    # after entry)". This build kept the loss-side hold above and lost this one.
+    peak_threat_exit_min_age_enabled: bool = True
+    peak_threat_exit_min_age_seconds: float = 45.0
+    peak_threat_exit_open_window_end: str = "09:30"
+    peak_threat_exit_open_window_min_age_seconds: float = 120.0
     # Whether a NEUTRAL/HOLD/MIXED intelligence read counts toward the adverse score.
     # It used to add +1 each for the aggregate and order-flow pillars, so an unclear tape
     # contributed 2 of the 6 points needed to exit — absence of evidence scored as

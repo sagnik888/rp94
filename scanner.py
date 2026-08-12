@@ -13612,6 +13612,55 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not loss_mode:
             # Back above water: any half-built loss confirmation is void.
             self._clear_loss_threat_confirmation(trade_like)
+            # Winner-side minimum age, ported from restore_point_51: "gap/synthetic
+            # marks at the open can manufacture an instant peak that arms this exit
+            # on a seconds-old position (2026-07-15; ledger rows exited 1-22s after
+            # entry)". This build kept the loss-side hold below and lost this one, so
+            # the profit branch could fire before any post-entry tape existed. The
+            # opening window is escalated because that is where a synthetic mark is
+            # most likely to invent the peak in the first place.
+            #
+            # An age of None means "cannot tell" and must not block — the same
+            # never-conclude-from-absence rule _trade_like_age_seconds states, and
+            # what the old build meant by "only enforceable when an actual entry
+            # clock exists; legacy rows keep the old behavior".
+            if self._setting_enabled(
+                getattr(settings, "peak_threat_exit_min_age_enabled", True), True
+            ):
+                age_seconds = Scanner._trade_like_age_seconds(trade_like, latest_time)
+                if age_seconds is not None:
+                    min_age = max(
+                        0.0,
+                        float(getattr(settings, "peak_threat_exit_min_age_seconds", 45.0) or 45.0),
+                    )
+                    try:
+                        latest_ref = (
+                            latest_time.astimezone(IST).replace(tzinfo=None)
+                            if getattr(latest_time, "tzinfo", None) is not None
+                            else latest_time
+                        )
+                        parts = str(
+                            getattr(settings, "peak_threat_exit_open_window_end", "09:30") or "09:30"
+                        ).split(":")
+                        if dtime(9, 15) <= latest_ref.time() <= dtime(int(parts[0]), int(parts[1])):
+                            min_age = max(
+                                min_age,
+                                float(
+                                    getattr(
+                                        settings,
+                                        "peak_threat_exit_open_window_min_age_seconds",
+                                        120.0,
+                                    )
+                                    or 120.0
+                                ),
+                            )
+                    except Exception:
+                        pass
+                    if age_seconds < min_age:
+                        return False, "", (
+                            f"near-peak threat observing post-entry tape "
+                            f"{age_seconds:.1f}s/{min_age:.1f}s"
+                        )
             if peak < min_peak:
                 return False, "", f"peak Rs.{peak:.0f} below near-peak arm Rs.{min_peak:.0f}"
             if retention < min_retention:
