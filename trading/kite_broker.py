@@ -588,6 +588,32 @@ class KiteBroker(Broker):
             # Kite returns an id on success, so an empty one is unexplained. Ask the
             # order book whether anything actually reached the exchange; only a
             # completed scan that finds nothing may be called a clean failure.
+            # Ask the TAG first — this call wrote it a few lines above, and it is the
+            # only exact identity available. inspect_recent_entry_order matches on
+            # contract, side and quantity, so on a strike several trades share it can
+            # hand back a DIFFERENT trade's order and this entry then adopts it.
+            # inspect_order_by_tag exists for precisely this case ("after a lost
+            # acknowledgement, ask the order book whether the tag exists") and is
+            # already used for the protective leg and for exits — the entry path was
+            # the one that still guessed.
+            #
+            # Additive: only a definite FOUND short-circuits. ABSENT and UNKNOWN fall
+            # through to the contract scan exactly as before, so a tag the broker did
+            # not echo cannot make a placed order look unplaced.
+            if tag:
+                try:
+                    tagged = self.inspect_order_by_tag(tag)
+                except Exception as exc:
+                    logger.debug(f"Tag lookup failed for {symbol} ({tag}): {exc}")
+                    tagged = {}
+                if str(tagged.get("state") or "").upper() == "FOUND":
+                    by_tag = str(tagged.get("order_id") or "")
+                    if by_tag:
+                        logger.warning(
+                            f"Recovered entry order id {by_tag} for {symbol} by exact tag {tag}."
+                        )
+                        return by_tag
+
             resting = self.inspect_recent_entry_order(symbol, token, side, qty)
             state = str(resting.get("state") or "UNKNOWN").upper()
             if state == "ABSENT":
