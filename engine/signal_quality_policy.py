@@ -416,6 +416,44 @@ def option_index_stop_distance(
     return min(natural, percentage_distance) if natural > 0 else percentage_distance
 
 
+#: Separation the code defaults express between the two power-move range tiers
+#: (2.5 / 2.0). The spike tier is DERIVED from this so the two can never be
+#: configured into each other.
+_POWER_MOVE_SPIKE_MARGIN = 1.25
+
+
+def power_move_spike_threshold(settings) -> float:
+    """Explosive-spike range multiple, guaranteed ABOVE the ordinary range gate.
+
+    power_move_confirmed uses two multiples: `power_move_range_atr_mult` gates
+    entry on range expansion, and `power_move_spike_range_atr_mult` decides
+    whether the move is explosive enough to WAIVE 15-minute alignment. That
+    waiver is justified because a genuine spike LEADS the 15m bar — reasoning
+    that only holds while "explosive" is a higher bar than "expanded".
+
+    Code ships 2.0 and 2.5. On 2026-08-13 the operator's .env set the spike
+    multiple to 2.0, equal to the range gate, so every candidate clearing
+    range_ok also counted as explosive, align_ok was always satisfied through
+    the bypass, and the 15-minute requirement became unreachable for power
+    moves. Two independent numbers with nothing enforcing the ordering.
+
+    So the tier is derived rather than assumed: whatever the range gate is set
+    to, the spike tier keeps the separation the defaults express. Raising the
+    gate carries the spike tier with it. A deliberately HIGHER spike setting is
+    honoured untouched; only the collapse is corrected.
+    """
+    try:
+        gate = float(getattr(settings, "power_move_range_atr_mult", 2.0) or 2.0)
+    except (TypeError, ValueError):
+        gate = 2.0
+    floor = max(0.0, gate) * _POWER_MOVE_SPIKE_MARGIN
+    try:
+        configured = float(getattr(settings, "power_move_spike_range_atr_mult", 2.5) or 2.5)
+    except (TypeError, ValueError):
+        configured = 0.0
+    return max(floor, configured) if configured > 0 else floor
+
+
 def power_move_confirmed(
     *,
     volume_ratio: float,
@@ -458,9 +496,7 @@ def power_move_confirmed(
     # genuinely explosive (big range expansion + a hard directional close +
     # momentum), that confluence IS the confirmation, so 15m agreement is waived.
     spike_bypass = setting_enabled(getattr(settings, "power_move_spike_bypass_15m", True), True)
-    strong_spike = float(range_atr_ratio or 0.0) >= float(
-        getattr(settings, "power_move_spike_range_atr_mult", 2.5) or 2.5
-    )
+    strong_spike = float(range_atr_ratio or 0.0) >= power_move_spike_threshold(settings)
     align_ok = bool(trend_15m_agrees) or (spike_bypass and strong_spike and dir_ok and mom_ok)
     return bool(vol_ok and range_ok and dir_ok and mom_ok and align_ok)
 
