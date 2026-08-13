@@ -25275,6 +25275,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     # mirror while the real position was market-exited immediately.
                     mark = Scanner._repaint_abort_exit_price(self, trade, candidate)
                     hold_reason = ""
+                    # Repaint is an INTRABAR verdict. _repaint_close_check_in_window is
+                    # the policy that says so — source candle still forming, plus a
+                    # grace at the close for the final check — and its docstring is
+                    # explicit that afterwards a still-open trade is a NORMAL tracked
+                    # position that "must never be repaint-aborted".
+                    #
+                    # It was consulted at 16338 and 21921, both session-mirror paths, and
+                    # not here — the tracker that closes the REAL position. So a tracker
+                    # spawned or resumed late could take its first absence reading long
+                    # after the bar had confirmed and market-exit on it; a 15m signal was
+                    # aborted eight minutes past confirmation. The loop ordering itself is
+                    # right (the tick at/after candle close IS the authoritative final
+                    # check) — what was missing is any bound on how far past it may go.
+                    try:
+                        within_repaint_window = Scanner._repaint_close_check_in_window(
+                            self, sig_timestamp,
+                            getattr(candidate, "timeframe", "5min"), now,
+                        )
+                    except Exception as exc:
+                        logger.debug(f"Repaint window check unavailable for {trade.id}: {exc}")
+                        # Unlike the mitigations below, this is a VALIDITY bound, not a
+                        # reason to spare a genuine repaint. Not knowing whether the bar
+                        # has confirmed makes exiting the dangerous move, not the safe
+                        # one: a missed abort leaves the trade to its stop and target.
+                        within_repaint_window = False
                     # Fail SAFE, not open: if a mitigation cannot be evaluated the abort
                     # proceeds, which is the behaviour that existed before they were
                     # wired. Partial scanner stubs are a real pattern here and this whole
@@ -25308,6 +25333,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     except Exception as exc:
                         logger.debug(f"Repaint mitigation check unavailable for {trade.id}: {exc}")
                         hold_reason = ""
+                    # After the mitigation block on purpose: its `except` resets
+                    # hold_reason, and the window bound must not be cleared by a failure
+                    # in an unrelated mitigation.
+                    if not within_repaint_window:
+                        hold_reason = (
+                            "source candle already confirmed and the repaint grace window has passed"
+                        )
                     if hold_reason:
                         # Fall through to the candle-close check rather than continue, so
                         # the tracker still finishes at the close instead of looping on.
