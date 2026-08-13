@@ -19641,10 +19641,29 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             adx_value=adx_val,
             settings=settings,
         )
+        # The intelligence leg has to point the SAME WAY as the trade. It read
+        # `intel_abs >= 0.70` -- abs() of a SIGNED score -- so intelligence of -0.80,
+        # i.e. strongly bearish, satisfied the bar for a LONG. It sits in an OR beside
+        # adx and trend_15m_agrees, so it could carry the whole leg on its own, and
+        # exceptional_spike has no grade floor: a C-grade at the 50% minimum with a
+        # volume spike and intelligence arguing the opposite way was admitted.
+        #
+        # The sibling site at 20417 uses the same abs() safely because it is AND-ed
+        # with trend_agrees, which already establishes direction. This one had nothing.
+        # Signed comparison per the convention at 22511 and 22583.
+        spike_min_intel = float(
+            getattr(settings, "quad_prime_raw_spike_min_intel_score", 0.70) or 0.70
+        )
+        signed_intel = self._candidate_signed_intelligence(candidate)
+        intel_aligned = (
+            signed_intel >= spike_min_intel
+            if self._candidate_signal_type(candidate) == "BUY"
+            else signed_intel <= -spike_min_intel
+        )
         exceptional_spike = bool(
             (power_move or volume_spike or momentum_override)
             and confidence >= min_conf
-            and (adx_val >= 25.0 or intel_abs >= 0.70 or trend_15m_agrees)
+            and (adx_val >= 25.0 or intel_aligned or trend_15m_agrees)
         )
         # A market-wide reversal / one-way cascade is CONTEXT: it answers "may we be
         # positioned this way right now", which is why it was introduced — to relax
@@ -19671,7 +19690,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not allowed:
             context = (
                 f"solo_sources={source_count}, grade={grade}, conf={confidence:.0%}, "
-                f"adx={adx_val:.1f}, trend15={trend_15m_agrees}, risky={risky_regime}"
+                f"adx={adx_val:.1f}, intel={signed_intel:+.2f}, "
+                f"trend15={trend_15m_agrees}, risky={risky_regime}"
             )
             return False, True, f"quad-prime raw quality floor failed ({context})"
 

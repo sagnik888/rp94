@@ -1356,6 +1356,10 @@ class Settings(BaseSettings):
     quad_prime_raw_min_confidence: float = 0.50
     quad_prime_raw_multi_source_min_confidence: float = 0.55
     quad_prime_raw_runner_min_confidence: float = 0.70
+    # The intelligence bar the exceptional-spike leg must clear, ALIGNED with the
+    # trade's own side. Matches rare_burst_min_intel_score, which uses the same 0.70
+    # with the same signed comparison.
+    quad_prime_raw_spike_min_intel_score: float = 0.70
     # ── Engine 10 v2: regime-switched delegation to the proven engines ──
     # v1 re-invented selection from raw arrows and lost 10x to the engines it
     # routed (three 30d backtests Rs.17-21k vs Rs.190k). v2 emits ONLY the two
