@@ -7,8 +7,7 @@ does read one shared row for all three. A 2026-08-13 external audit read that as
 sharing that contract… two trades can each believe they own the full position,
 corrupting stops, P&L and exits."
 
-Traced against this build, that is not what happens. Three separate mechanisms
-keep the trades apart, and this pins all three so the isolation cannot regress:
+These mechanisms keep the trades apart on the READ side, and this pins them:
 
   ORDERS     tagged per trade — _broker_order_tag -> tagger(trade.id, leg, attempt)
   QUANTITY   per trade — _confirmed_broker_quantity reads trade.broker_quantity,
@@ -16,10 +15,21 @@ keep the trades apart, and this pins all three so the isolation cannot regress:
   EXITS      per trade — _request_broker_exit sends trade.broker_quantity (its own
              fill), falling back to trade.quantity; never the aggregate
 
-The shared row is used for ONE thing: orphan detection, and only in conjunction
-with the trade's own confirmed quantity — broker flat AND this trade unfunded.
-A funded trade is not closed because a different trade on the same strike went
-flat.
+CORRECTION (2026-08-13): this file originally concluded from the above that the
+audit was wrong and "the shared row is used for ONE thing: orphan detection".
+That was a bad inference. Every check here is on the READ path; none of them
+asked what WRITES trade.broker_quantity. reconcile_broker_positions did:
+
+    trade.broker_quantity = abs(net_qty)   # the aggregate, for every trade
+
+so the readers pinned above were faithfully returning a corrupted value and these
+tests still passed. The audit's P0 was real. The write is now split per trade by
+_allocate_broker_quantity — see
+test_shared_contract_quantity_allocation_2026_08_13.py, which covers the write
+path this file does not.
+
+The lesson worth keeping: proving a reader reads the right FIELD says nothing
+about whether the field holds the right VALUE.
 
 What remains true from the audit: with ut_concurrency_guard off (it is off in the
 operator's .env) the timeframe/lane reasoning that would normally limit

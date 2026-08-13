@@ -130,9 +130,11 @@ def _run_tracker(status, monkeypatch, entry=100.0, mark=99.0):
         _close_and_record=lambda *a, **k: closed.append(a),
         log_event=lambda *_a: None,
     )
-    asyncio.get_event_loop().run_until_complete(
-        Scanner._track_repaint_until_candle_close(dummy, trade, candidate)
-    )
+    # asyncio.run, not get_event_loop().run_until_complete: the latter adopts whatever
+    # loop the previously-run test left behind. Once any earlier test calls asyncio.run
+    # the policy's loop is closed, so this became order-dependent -- green in file order,
+    # a RuntimeError under a shuffled suite. asyncio.run makes and disposes its own loop.
+    asyncio.run(Scanner._track_repaint_until_candle_close(dummy, trade, candidate))
     return trade, closed
 
 

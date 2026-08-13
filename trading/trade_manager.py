@@ -770,6 +770,75 @@ class TradeManager:
             return 0
 
     @staticmethod
+    def _allocate_broker_quantity(trades_on_symbol, net_qty) -> Dict[str, int]:
+        """Split ONE broker position row across the local trades that share the contract.
+
+        Kite reports POSITIONS per tradingsymbol, not per order, so three trades on the
+        same strike read one row. reconcile_broker_positions assigned that row's net
+        quantity to every one of them:
+
+            trade.broker_quantity = abs(net_qty)
+
+        Three 75-lot trades against a broker net of 225 each became broker_quantity=225.
+        That field is authoritative for order SIZING -- ensure_broker_protection, the
+        flatten path and _request_broker_exit all size from it -- so each trade then
+        armed a 225 stop against the 75 it actually held. On options an oversized SL-M
+        sells more than the account owns: a naked written option, which this file
+        already documents as the outcome that must never happen.
+
+        Allocation rules, in order:
+          1. One trade on the contract -> the row is unambiguously its own. Return the
+             net verbatim, so every existing single-trade path (including an excess that
+             callers detect by comparing against trade.quantity) is unchanged.
+          2. A trade whose own ENTRY FILL was already confirmed keeps that quantity.
+             Per-order fills come from the order itself and are real evidence; a
+             positions-derived split is a guess and must not overwrite them.
+          3. Whatever is left is handed out oldest-trade-first, each capped at the
+             quantity that trade actually intended.
+
+        Under-allocation is the safe direction: a stop sized short of the true position
+        leaves part of it unprotected, while an oversized one sells stock the account
+        does not hold. Positions alone genuinely cannot say which trade owns which lot
+        when fills are ambiguous -- only the per-order fill path can, which is why an
+        already-confirmed fill wins over this split.
+        """
+        try:
+            total = abs(int(net_qty or 0))
+        except (TypeError, ValueError):
+            total = 0
+
+        if len(trades_on_symbol) <= 1:
+            return {str(tid): total for tid, _ in trades_on_symbol}
+
+        def _order_key(item):
+            tid, trade = item
+            return (str(getattr(trade, "entry_time", "") or ""), str(tid))
+
+        ordered = sorted(trades_on_symbol, key=_order_key)
+        allocation: Dict[str, int] = {}
+        remaining = total
+
+        for tid, trade in ordered:
+            own = TradeManager._confirmed_broker_quantity(trade)
+            if own > 0:
+                take = min(remaining, own)
+                allocation[str(tid)] = take
+                remaining -= take
+
+        for tid, trade in ordered:
+            if str(tid) in allocation:
+                continue
+            try:
+                want = max(0, int(getattr(trade, "quantity", 0) or 0))
+            except (TypeError, ValueError):
+                want = 0
+            take = min(remaining, want)
+            allocation[str(tid)] = take
+            remaining -= take
+
+        return allocation
+
+    @staticmethod
     def _entry_still_confirming(trade: Trade) -> bool:
         status = str(getattr(trade, "execution_status", "") or "").upper()
         return bool(getattr(trade, "pending_execution", False)) or status in {
@@ -3204,6 +3273,24 @@ class TradeManager:
         changed = False
         with self._lock:
             local_snapshot = list(self.open_trades.items())
+
+        # One position row can back several local trades on the same contract, so the
+        # row's net quantity is split ONCE here rather than handed to each of them.
+        # See _allocate_broker_quantity: with a single trade on the symbol this is the
+        # net verbatim and nothing downstream changes.
+        symbol_groups: Dict[str, list] = {}
+        for _tid, _trade in local_snapshot:
+            _symbol = str(_trade.trading_symbol or _trade.instrument)
+            symbol_groups.setdefault(_symbol, []).append((_tid, _trade))
+        broker_allocation: Dict[str, int] = {}
+        for _symbol, _group in symbol_groups.items():
+            _row = broker_pos.get(_symbol)
+            if _row is None:
+                continue
+            broker_allocation.update(
+                self._allocate_broker_quantity(_group, self._position_quantity(_row))
+            )
+
         local_symbols = set()
         for trade_id, trade in local_snapshot:
             symbol = str(trade.trading_symbol or trade.instrument)
@@ -3413,9 +3500,11 @@ class TradeManager:
                         changed = True
                 continue
             net_qty = self._position_quantity(position)
+            # This trade's SHARE of the contract's position, not the whole row.
+            allocated_qty = broker_allocation.get(str(trade_id), abs(net_qty))
             expected_sign = self._expected_position_sign(trade)
             if net_qty and (1 if net_qty > 0 else -1) != expected_sign:
-                trade.broker_quantity = abs(net_qty)
+                trade.broker_quantity = allocated_qty
                 trade.pending_execution = True
                 self._mark_recovery(
                     trade,
@@ -3429,7 +3518,7 @@ class TradeManager:
             latched = getattr(self, "_flatten_ambiguous_latched", None)
             if latched:
                 latched.discard(trade_id)
-            trade.broker_quantity = abs(net_qty)
+            trade.broker_quantity = allocated_qty
             expected_qty = max(1, trade.quantity)
             if net_qty == 0:
                 if trade.protective_order_id:
