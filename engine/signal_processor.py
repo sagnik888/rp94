@@ -594,6 +594,46 @@ class SignalProcessor:
         return result if isinstance(result, dict) else fallback_result, score, str(context_regime or "UNKNOWN")
 
     @staticmethod
+    def _graded_candidate_context(
+        best_sig,
+        fallback_regime: str,
+        fallback_intel_norm: float,
+    ) -> Tuple[str, float]:
+        """Return the (regime, normalised intel) a candidate should be STAMPED with.
+
+        _candidate_timeframe_context grades a 15-minute candidate on 15-minute
+        intelligence, but the candidate was then stamped with the 5-minute
+        `regime`/`intel_norm` that happened to be in scope. Every downstream gate and
+        exit reads candidate.market_regime / .intelligence_score, so enabling
+        per-timeframe grading changed the grade and nothing else.
+
+        The values recorded on the signal by the grading loop are the ones that
+        actually graded it. With per_timeframe_grading_enabled off they resolve to the
+        caller's 5-minute values, so this returns the previous pair unchanged.
+
+        Presence, not truthiness: a genuine 0.0 intelligence score is a real reading
+        and must not fall back to the 5-minute score.
+        """
+        regime = str(getattr(best_sig, "graded_regime", "") or "").strip()
+        if not regime:
+            regime = str(fallback_regime or "UNKNOWN")
+
+        attr = getattr(best_sig, "graded_intel_score", None)
+        if isinstance(attr, bool) or not isinstance(attr, (int, float)):
+            return regime, float(fallback_intel_norm or 0.0)
+        try:
+            graded_raw = float(attr)
+        except (TypeError, ValueError):
+            return regime, float(fallback_intel_norm or 0.0)
+        if graded_raw != graded_raw or graded_raw in (float("inf"), float("-inf")):
+            return regime, float(fallback_intel_norm or 0.0)
+        # Same unit as the caller's intel_score, which process_best_signal converts
+        # with normalize_intelligence_score. This is a scalar already extracted by
+        # _candidate_timeframe_context, not an aggregate payload -- reading score_norm
+        # off a payload belongs there, at the extraction, not here.
+        return regime, float(normalize_intelligence_score(graded_raw))
+
+    @staticmethod
     def _build_timeframe_contexts(scanner, instrument: str, settings) -> Optional[Dict[str, Dict]]:
         """Collect each timeframe's own cached intelligence snapshot.
 
@@ -6318,7 +6358,12 @@ class SignalProcessor:
                 if one_way_cascade_entry and isinstance(_reversal_relief_context, dict):
                     setattr(candidate, "one_way_cascade_context", dict(_reversal_relief_context))
                 setattr(candidate, "trend_15m_agrees", bool(trend_15m_agrees))
-                setattr(candidate, "intelligence_score", float(intel_norm))
+                # Stamp the intelligence that GRADED this candidate, not the 5-minute
+                # snapshot in scope. No-op while per-timeframe grading is off.
+                _stamp_regime, _stamp_intel_norm = self._graded_candidate_context(
+                    best_sig, regime, intel_norm
+                )
+                setattr(candidate, "intelligence_score", float(_stamp_intel_norm))
                 if isinstance(intel_result, dict):
                     setattr(
                         candidate,
@@ -6344,7 +6389,7 @@ class SignalProcessor:
                     setattr(candidate, "iv_percentile", float(iv_percentile))
                 setattr(candidate, "option_premium_ok", bool(option_premium_ok))
                 setattr(candidate, "chain_quality", dict(chain_quality or {}))
-                setattr(candidate, "market_regime", str(regime or "UNKNOWN"))
+                setattr(candidate, "market_regime", _stamp_regime)
                 # Tag with the structural price-action verdict (advisory telemetry).
                 _pa = getattr(scanner, "_last_price_action_ctx", None)
                 if isinstance(_pa, dict):
