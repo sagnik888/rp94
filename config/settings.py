@@ -625,7 +625,18 @@ class Settings(BaseSettings):
     # with big range expansion + hard directional close may enter WITHOUT 15m
     # agreement (otherwise spikes are structurally un-catchable near close).
     power_move_spike_bypass_15m: bool = True
+    # Measured 5-min range/ATR(14) over 7,068 bars, four indices:
+    #   median 0.88   p90 1.50   p95 1.78   p99 3.03
+    # so 1.8x is the p95 "unusual bar" and admits ~4.8% of bars to the power-move
+    # gate. The spike tier that WAIVES 15-minute alignment is derived from it
+    # (power_move_spike_threshold) rather than set beside it: 1.8 x 1.25 = 2.25,
+    # around p97-98 at ~2.1% of bars, so the waiver stays meaningfully rarer than
+    # the gate. Set the two equal — as .env did — and the waiver applies to every
+    # power move.
     power_move_spike_range_atr_mult: float = 2.5
+    #: Separation between the range gate and the spike tier. Adjustable, but
+    #: clamped above 1.0 in code: the tiers meeting is the one thing it may not say.
+    power_move_spike_range_margin: float = 1.25
     # 5min trend-CONTINUATION entry path: admit a high-grade, 15m-aligned 5min
     # signal in a confirmed trending regime with strong ADX, even if it isn't an
     # impulse reversal and option-premium data is incomplete. Fixes "system misses
@@ -1687,7 +1698,7 @@ class Settings(BaseSettings):
     # 15:00 no-entry cutoff (after 15:00, up to the hard cutoff), with tight scalp-lock risk.
     power_move_override_enabled: bool = True
     power_move_volume_mult: float = 2.5      # candle volume >= this x recent average
-    power_move_range_atr_mult: float = 2.0   # candle true range >= this x ATR
+    power_move_range_atr_mult: float = 1.8   # candle true range >= this x ATR (p95 of measured 5-min range/ATR)
     power_move_close_location: float = 0.70  # directional close >= this fraction of candle range
     power_move_adx_threshold: float = 20.0   # momentum: ADX >= this (lower than general 25; ADX lags spikes)
     power_move_momentum_volume_mult: float = 3.5 # momentum substitute: volume >= this x avg counts as momentum

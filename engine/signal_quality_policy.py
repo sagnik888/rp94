@@ -416,10 +416,11 @@ def option_index_stop_distance(
     return min(natural, percentage_distance) if natural > 0 else percentage_distance
 
 
-#: Separation the code defaults express between the two power-move range tiers
-#: (2.5 / 2.0). The spike tier is DERIVED from this so the two can never be
-#: configured into each other.
-_POWER_MOVE_SPIKE_MARGIN = 1.25
+#: Smallest separation that still means anything. The margin itself is a setting
+#: (power_move_spike_range_margin) because a parameter should be adjustable — but
+#: it is clamped ABOVE this, because the one thing the knob may not express is the
+#: two tiers meeting. That is the relationship, not a parameter.
+_POWER_MOVE_SPIKE_MARGIN_FLOOR = 1.01
 
 
 def power_move_spike_threshold(settings) -> float:
@@ -446,7 +447,11 @@ def power_move_spike_threshold(settings) -> float:
         gate = float(getattr(settings, "power_move_range_atr_mult", 2.0) or 2.0)
     except (TypeError, ValueError):
         gate = 2.0
-    floor = max(0.0, gate) * _POWER_MOVE_SPIKE_MARGIN
+    try:
+        margin = float(getattr(settings, "power_move_spike_range_margin", 1.25) or 1.25)
+    except (TypeError, ValueError):
+        margin = 1.25
+    floor = max(0.0, gate) * max(_POWER_MOVE_SPIKE_MARGIN_FLOOR, margin)
     try:
         configured = float(getattr(settings, "power_move_spike_range_atr_mult", 2.5) or 2.5)
     except (TypeError, ValueError):

@@ -110,3 +110,51 @@ def test_15m_agreement_still_admits_a_sub_spike():
     settings = _S(power_move_range_atr_mult=2.0, power_move_spike_range_atr_mult=2.0)
 
     assert _pm(settings, trend_15m_agrees=True, range_atr_ratio=2.2) is True
+
+
+# ── the separation itself is a setting, not a constant ───────────────────────
+# "All settings should be adjustable" is right for PARAMETERS. It is wrong for
+# the RELATIONSHIP between two of them — independently adjustable tiers are what
+# let the spike tier be configured down onto the range gate in the first place.
+# So the margin is exposed as a knob, and the invariant it protects (spike above
+# gate) is derived rather than trusted.
+
+def test_the_margin_is_configurable():
+    settings = _S(power_move_range_atr_mult=1.8, power_move_spike_range_atr_mult=1.8,
+                  power_move_spike_range_margin=1.10)
+
+    assert power_move_spike_threshold(settings) == pytest.approx(1.98)
+
+
+def test_a_narrower_margin_is_honoured():
+    """An operator may deliberately run the tiers closer together."""
+    wide = power_move_spike_threshold(_S(power_move_range_atr_mult=2.0,
+                                         power_move_spike_range_atr_mult=2.0,
+                                         power_move_spike_range_margin=1.25))
+    narrow = power_move_spike_threshold(_S(power_move_range_atr_mult=2.0,
+                                           power_move_spike_range_atr_mult=2.0,
+                                           power_move_spike_range_margin=1.05))
+
+    assert narrow < wide
+
+
+@pytest.mark.parametrize("margin", [1.0, 0.9, 0.0, -1.0, None, "junk"])
+def test_the_margin_can_never_be_configured_into_a_collapse(margin):
+    """Below 1.0 the tiers would meet or invert. That is the one thing the knob
+    may not express, whatever it is set to."""
+    settings = _S(power_move_range_atr_mult=2.0, power_move_spike_range_atr_mult=2.0,
+                  power_move_spike_range_margin=margin)
+
+    assert power_move_spike_threshold(settings) > 2.0
+
+
+def test_the_shipped_tiers_keep_a_real_separation():
+    """1.8x is p95 of measured 5-min range/ATR and 2.25x is near p97-98, so the
+    gate admits ~4.8% of bars and the waiver ~2.1% — the distinction survives."""
+    from config.settings import Settings
+
+    gate = Settings.model_fields["power_move_range_atr_mult"].default
+    margin = Settings.model_fields["power_move_spike_range_margin"].default
+
+    assert gate == pytest.approx(1.8)
+    assert gate * margin >= 2.0, "the spike tier must still land at 2.0x or above"
