@@ -4103,7 +4103,8 @@ class TradeManager:
 
         # ⚡ REAL BROKER ENTRY (Background Thread) ⚡ 
         is_warmup = getattr(self, "is_warmup", False)
-        if self.broker and trading_symbol and symbol_token and not is_warmup and not is_ghost:
+        if (self._live_orders_permitted() and self.broker and trading_symbol
+                and symbol_token and not is_warmup and not is_ghost):
             order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
             
             def _place_bg_body():
@@ -4769,6 +4770,25 @@ class TradeManager:
             if on_exit_result:
                 on_exit_result(trade, False)
 
+    def _live_orders_permitted(self) -> bool:
+        """Whether this manager may send an order to a broker at all.
+
+        Defense in depth, not the primary control. The factory does not attach a
+        broker outside REAL mode, so this is a second lock on the same door —
+        sited where the order is actually sent rather than where it is wired.
+
+        Both broker-order paths previously guarded only on wiring (`self.broker`
+        present, symbol/token resolved, not warmup, not ghost) and never asked
+        what mode they were in, while the surrounding lifecycle checks at lines
+        802, 1412, 3778 and 4692 all do. A broker injected by a test, a hot-swap,
+        or a future wiring change would have reached the order path with nothing
+        mode-aware in the way.
+
+        trading_mode is Literal["HISTORICAL", "REAL"], so no legitimate mode is
+        denied a fill by this: there is no third mode that trades a broker.
+        """
+        return str(getattr(self, "mode", "") or "").upper() == "REAL"
+
     def close_trade(
         self,
         trade_id: str,
@@ -4849,7 +4869,8 @@ class TradeManager:
             trade.execution_error = ""
         self.save_state()
 
-        if self.broker and trade.symbol_token and not getattr(trade, 'is_ghost', False):
+        if (self._live_orders_permitted() and self.broker and trade.symbol_token
+                and not getattr(trade, 'is_ghost', False)):
             self._request_broker_exit(trade, on_exit_result=on_exit_result)
         else:
             self._finalize_closed_trade(
