@@ -261,7 +261,10 @@ def test_settings_declare_shock_and_mood_knobs():
 
     fields = Settings.model_fields
     assert fields["market_ltp_shock_enabled"].default is True
-    assert fields["market_ltp_shock_min_move_pct"].default == 0.20
+    # Recalibrated 2026-08-13: 0.20% sat above the p99 of the measured 3-minute
+    # move distribution and the lane fired zero times on a +0.32% session. 0.12%
+    # is its p97-98. See test_shock_floor_calibration_2026_08_13.
+    assert fields["market_ltp_shock_min_move_pct"].default == 0.12
     assert fields["market_ltp_shock_strong_move_pct"].default == 0.35
     # Full-sensitivity window per operator spec 2026-07-10: 14:00–15:10 IST,
     # strong tier (0.35%) required outside the window.

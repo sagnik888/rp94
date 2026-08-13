@@ -1927,7 +1927,18 @@ class Settings(BaseSettings):
     # after session_override_start the sticky TREND_DAY_* label yields so the
     # regime panel is not stuck on the full-day open classification.
     market_ltp_shock_enabled: bool = True
-    market_ltp_shock_min_move_pct: float = 0.20
+    # Measured on 19,984 three-minute windows, four indices, 13 sessions:
+    #   median 0.022%   p90 0.065%   p99 0.161%   max 0.978%
+    # The old 0.20% floor sat ABOVE the 99th percentile, so this lane fired zero
+    # times on 2026-08-13 — a session in which NIFTY moved +0.32% and SENSEX
+    # +0.35%. A detector that never fires is an absence, not protection. 0.12% is
+    # the p97-98 of that distribution: still unusual, not noise.
+    #
+    # Safe only because the multi-index requirement below bounds it — >=2 core
+    # indices moving the same way inside the same window:
+    #   >=0.20%  ~2.3 openings/day     >=0.12%  ~6.3 openings/day
+    # and each still faces the quality floor, volume ratio and grade gates.
+    market_ltp_shock_min_move_pct: float = 0.12
     market_ltp_shock_strong_move_pct: float = 0.35
     market_ltp_shock_lookback_minutes: int = 5
     market_ltp_shock_min_lookback_minutes: int = 3
