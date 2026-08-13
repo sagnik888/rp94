@@ -7,7 +7,11 @@ from typing import Dict, List, Tuple, Optional
 from loguru import logger
 from dataclasses import dataclass, field
 from config.settings import get_settings
-from engine.intelligence_score import normalize_intelligence_score
+from engine.intelligence_score import (
+    LEGACY_SCORE_SCALE,
+    aggregate_intelligence_score,
+    normalize_intelligence_score,
+)
 from engine.option_history_store import get_option_history_store
 from engine.signal_quality_policy import (
     b_grade_entry_allowed,
@@ -659,6 +663,23 @@ class SignalProcessor:
             regime_block = intel.get("regime") if isinstance(intel.get("regime"), dict) else {}
             contexts[tf] = {
                 "intel_result": intel,
+                # UNIT HAZARD, deliberately left as-is -- see
+                # tests/test_per_timeframe_intel_unit_2026_08_14.py before changing it.
+                # aggregate["score"] is always legacy-scaled (-100..100) and is read raw
+                # here, then handed to normalize_intelligence_score, which infers the
+                # scale from MAGNITUDE (`if abs(score) > 1.0`). A legacy 0.9 is under
+                # that threshold, so it is never divided and reads as canonical 0.9 --
+                # a near-neutral signal promoted to near-maximum conviction.
+                #
+                # It is NOT fixable here alone. Storing the corrected legacy value
+                # round-trips straight back through the same magnitude test. Storing the
+                # canonical value diverges from the flag-off path, which supplies the
+                # caller's legacy intel_score to the same consumers -- _grade_signal
+                # would then see ~100x less conviction than it does today.
+                #
+                # Latent: per_timeframe_grading_enabled is False, so these contexts are
+                # never consulted. Making the whole per-timeframe route canonical --
+                # fallback included -- is the prerequisite for enabling that flag.
                 "intel_score": aggregate.get("score", aggregate.get("intel_score", 0.0)),
                 "regime": regime_block.get("regime") or regime_block.get("hard_label") or "",
             }
