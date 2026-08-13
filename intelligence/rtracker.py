@@ -344,6 +344,9 @@ class RegimeTracker:
             # survived on 2% of accepted rows and PCR/OI on none — so "does the intel
             # predict which trades travel?" was unanswerable from this file.
             "entry_intel": _entry_intel_block(_candidate_value(candidate, "entry_intel", None)),
+            # The readings the gate judged THIS row on, for every decision — not
+            # only accepted ones. Bounded and truncated by the same block helper.
+            "decision_intel": _entry_intel_block(_candidate_value(candidate, "decision_intel", None)),
             "exit_price": _safe_float(_candidate_value(candidate, "exit_price", 0.0)),
             "exit_reason": str(_candidate_value(candidate, "exit_reason", "") or ""),
             "signal_timestamp": _iso_or_empty(signal_ts),

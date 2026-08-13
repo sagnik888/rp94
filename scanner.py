@@ -18164,6 +18164,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tracker = getattr(self, "rtracker", None)
         if tracker is None:
             return
+        # Record what the gate actually judged. Measured over the 66,027-row
+        # archive: volume.volume_ratio populated on 19 rows (0.0%), regime.adx
+        # 5.1%, aggregate.score_norm 1.0%, and entry_intel on 0 of 65,423 REJECTED
+        # rows. Every volume/ADX/intel/PCR threshold in this system is argued from
+        # that archive, and the rejected population — "what did the gate turn away,
+        # and was it right" — is exactly the one gate tuning needs.
+        #
+        # Deliberately NOT entry_intel: that field means "the intel that existed
+        # when this entry was ACCEPTED" and is taken once (see
+        # test_the_snapshot_is_taken_once). Stamping it at rejection time would
+        # rewrite that meaning. Observation only, and it must never be able to cost
+        # a record — a failed snapshot leaves the row to be written without it.
+        try:
+            if not getattr(candidate, "decision_intel", None) and self._setting_enabled(
+                getattr(get_settings(), "entry_intel_snapshot_enabled", True), True
+            ):
+                setattr(candidate, "decision_intel", self._entry_intel_snapshot(candidate))
+        except Exception as exc:
+            logger.debug(f"Decision intel snapshot skipped: {exc}")
         try:
             tracker.record_candidate(
                 candidate,
