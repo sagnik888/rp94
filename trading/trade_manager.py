@@ -3619,7 +3619,12 @@ class TradeManager:
                 }
                 and not trade.pending_exit
             ):
-                filled_qty = abs(net_qty)
+                # THIS trade's share of the row, not the contract's total. The aggregate
+                # here did more than mis-size the stop below: filled_qty also decides
+                # pending_execution and whether the row is OPEN or PARTIAL, so three
+                # fully-filled trades on one strike each saw 195 against an expected 65
+                # and were all marked PARTIAL.
+                filled_qty = allocated_qty
                 trade.pending_execution = filled_qty != expected_qty
                 trade.execution_status = "OPEN" if filled_qty == expected_qty else "PARTIAL"
                 
@@ -3672,12 +3677,12 @@ class TradeManager:
                     self._withdraw_stale_entry_remainder(trade, filled_qty, expected_qty)
             elif (
                 trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
-                and abs(net_qty) < expected_qty
+                and allocated_qty < expected_qty
             ):
                 trade.pending_exit = True
                 trade.execution_status = "PARTIAL_EXIT"
                 trade.execution_error = (
-                    f"Broker exit partially filled; {abs(net_qty)} of "
+                    f"Broker exit partially filled; {allocated_qty} of "
                     f"{expected_qty} quantity remains; awaiting broker completion"
                 )
                 changed = True
@@ -3695,7 +3700,7 @@ class TradeManager:
                 # fact the broker can state rather than something to guess at.
                 verdict = self._abandoned_exit_verdict(trade)
                 if verdict == "DEAD":
-                    self._resume_abandoned_partial_exit(trade, abs(net_qty))
+                    self._resume_abandoned_partial_exit(trade, allocated_qty)
                 elif verdict == "UNKNOWN":
                     if not hasattr(self, "_partial_exit_unknown_logged"):
                         self._partial_exit_unknown_logged = set()
@@ -3704,15 +3709,15 @@ class TradeManager:
                         logger.warning(
                             f"Cannot determine whether the exit order for "
                             f"{trade.trading_symbol} is still working; leaving "
-                            f"{abs(net_qty)} quantity in place rather than risking a "
+                            f"{allocated_qty} quantity in place rather than risking a "
                             "double exit. The force-exit remains the backstop."
                         )
             elif (
-                abs(net_qty) != expected_qty
+                allocated_qty != expected_qty
                 and trade.execution_status not in {"EXIT_PENDING", "PARTIAL_EXIT"}
             ):
                 trade.execution_status = "PARTIAL"
-                self.ensure_broker_protection(trade, abs(net_qty))
+                self.ensure_broker_protection(trade, allocated_qty)
                 changed = True
 
         orphans = {}
