@@ -93,3 +93,42 @@ def test_entry_orders_are_still_tagged():
     src = inspect.getsource(KiteBroker._submit_entry)
 
     assert 'params["tag"] = tag' in src
+
+
+# ── every order leg carries an identity ──────────────────────────────────────
+
+def test_the_reconcile_replacement_order_is_tagged():
+    """The one send that went out untagged.
+
+    A replacement exists BECAUSE the first acknowledgement was unreliable, so it is
+    the leg most likely to need recovery by tag. Untagged, a lost ack on it can only
+    be resolved by contract shape, which cannot tell two trades on one strike apart.
+    """
+    from trading.trade_manager import TradeManager
+
+    src = inspect.getsource(TradeManager.reconcile_broker_positions)
+    i = src.index("replacement = self.broker.place_order(")
+    call = src[i: src.index(")", src.index("**self._tag_kwargs", i))]
+
+    assert "_tag_kwargs(" in call, "the stale-entry replacement is still untagged"
+    assert '"ENTRY"' in call
+
+
+def test_the_replacement_tag_differs_from_the_original_entry():
+    """Same trade, same leg — only `attempt` keeps the two orders distinguishable."""
+    from trading.trade_manager import TradeManager
+
+    src = inspect.getsource(TradeManager.reconcile_broker_positions)
+    i = src.index("replacement = self.broker.place_order(")
+    call = src[i: src.index(")", src.index("**self._tag_kwargs", i))]
+
+    assert "attempt=" in call
+    assert "entry_replace_count" in call
+
+
+def test_tagging_degrades_rather_than_breaking_untagged_brokers():
+    """_tag_kwargs returns {} unless the broker really accepts a tag kwarg."""
+    from trading.trade_manager import TradeManager
+
+    doc = inspect.getdoc(TradeManager._tag_kwargs) or ""
+    assert "only when the broker actually accepts it" in doc

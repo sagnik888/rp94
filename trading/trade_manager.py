@@ -3479,6 +3479,22 @@ class TradeManager:
                                     entry_side,
                                     self.product_type,
                                     price=0.0,
+                                    # The one order path that went out untagged. Every
+                                    # other leg carries one -- protective, ADD, EXIT --
+                                    # and the entry tag is written inside the broker.
+                                    # A replacement is the leg MOST likely to need it:
+                                    # it exists because the first acknowledgement was
+                                    # already unreliable, and without a tag a lost ack
+                                    # on the replacement can only be resolved by
+                                    # contract shape, which cannot tell two trades on
+                                    # one strike apart. attempt distinguishes it from
+                                    # the original entry's tag.
+                                    **self._tag_kwargs(
+                                        self.broker.place_order,
+                                        trade,
+                                        "ENTRY",
+                                        attempt=int(getattr(trade, "entry_replace_count", 0) or 0) + 1,
+                                    ),
                                 )
                             except (BrokerOrderAmbiguous, BrokerOrderRejected, PermissionError) as exc:
                                 # Unguarded, this unwound out of reconcile and abandoned
