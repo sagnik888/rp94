@@ -1218,7 +1218,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         now = now or datetime.now(IST)
         if getattr(now, "tzinfo", None) is not None:
             now = now.astimezone(IST).replace(tzinfo=None)
-        for timeframe, attr in (("5min", "results_5min"), ("15min", "results_15min")):
+        # 1min is a live entry lane -- candidate_timeframes inserts it whenever
+        # volume-spike and one-minute scalping are on, which is the default. It was
+        # the one timeframe this guard did not look at, so a signal on a forming
+        # 1-minute candle left the decision cache marked safe and a decision graded
+        # on partial data was reused for up to 15 seconds. It is also the lane where
+        # that matters most: the fastest chart and the likeliest to repaint.
+        for timeframe, attr in (
+            ("1min", "results_1min"),
+            ("5min", "results_5min"),
+            ("15min", "results_15min"),
+        ):
             result = getattr(mtf_result, attr, None) or {}
             signals = result.get("signals", []) or []
             if not signals:
@@ -1228,7 +1238,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 continue
             if getattr(signal_ts, "tzinfo", None) is not None:
                 signal_ts = signal_ts.astimezone(IST).replace(tzinfo=None)
-            minutes = 5 if timeframe == "5min" else 15
+            # Was `5 if timeframe == "5min" else 15`, a two-way branch that would have
+            # given a 1-minute candle a 15-minute forming window.
+            minutes = {"1min": 1, "5min": 5, "15min": 15}.get(timeframe, 5)
             if now < signal_ts + timedelta(minutes=minutes):
                 return True
         return False
@@ -10391,7 +10403,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         # â• â• â•  BEST SIGNAL SELECTION across timeframes â• â• â•
         signal_parts = []
-        for tf_name, tf_result in (("5min", mtf_result.results_5min), ("15min", mtf_result.results_15min)):
+        # The key is the cache's identity. 1min was absent from it, so a brand-new
+        # 1-minute signal did not change the key and the 15-second REAL-mode cache
+        # kept serving a candidate list computed before that signal existed.
+        for tf_name, tf_result in (
+            ("1min", getattr(mtf_result, "results_1min", None)),
+            ("5min", mtf_result.results_5min),
+            ("15min", mtf_result.results_15min),
+        ):
             sigs = tf_result.get("signals", []) if tf_result else []
             last_sig = sigs[-1] if sigs else None
             if last_sig:
