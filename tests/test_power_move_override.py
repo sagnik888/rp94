@@ -30,6 +30,12 @@ def settings():
     s.power_move_override_enabled = True
     s.power_move_volume_mult = 2.5
     s.power_move_range_atr_mult = 2.0
+    # Pinned like the rest: this fixture reads the live singleton, so without it
+    # the operator's .env leaks in and the test measures their config rather than
+    # this code. POWER_MOVE_SPIKE_RANGE_ATR_MULT='2.0' in .env against a 2.5 code
+    # default made a 2.2x range count as an explosive spike and waive the 15m
+    # alignment the sub-spike case exists to require.
+    s.power_move_spike_range_atr_mult = 2.5
     s.power_move_close_location = 0.70
     s.power_move_volume_lookback = 20
     s.momentum_override_threshold = 25.0

@@ -132,3 +132,70 @@ def test_the_trail_lane_now_agrees_with_the_measured_heat_table():
             f"{regime} is loosened by _first_rung_regime_retention but pinned to the "
             "1-minute candle by uses_tight_trailing"
         )
+
+
+# ── the same fabricated zero, in three more blocks ───────────────────────────
+# Measured live on 2026-08-13 at the same moment, for the same quantity:
+#
+#   volume profiler (log):        NIFTY 0.108x  BANKNIFTY 0.198x  SENSEX 0.043x
+#   rtracker volume.volume_ratio: 0.0   on all 158 rows that session
+#   decision_intel.volume_ratio:  1.0
+#
+# Volume was being measured the whole time. The archive recorded neither the
+# value nor its absence, and 0.0 is a legitimate reading for buy/sell ratio and
+# aggregate score — so nothing downstream can tell a real zero from a missing one.
+# This is the block the next 20 sessions of tuning data lands in.
+
+def test_an_unmeasured_volume_ratio_is_absent_not_zero(tmp_path):
+    regime_free = SimpleNamespace(
+        instrument="NIFTY", timeframe="5min", direction="LONG",
+        signal_timestamp="2026-08-13T13:00:00",
+    )
+    rt = RegimeTracker(root_dir=tmp_path, enabled=True)
+    rt.record_candidate(regime_free, decision="REJECTED", reason="x")
+    row = json.loads(next((tmp_path / "events").glob("*.jsonl")).read_text(encoding="utf-8").strip())
+
+    assert row["volume"].get("volume_ratio") is None
+    assert row["volume"].get("buy_sell_ratio") is None
+    assert row["volume"].get("current_volume") is None
+
+
+def test_a_measured_volume_ratio_survives(tmp_path):
+    cand = SimpleNamespace(
+        instrument="NIFTY", timeframe="5min", direction="LONG",
+        signal_timestamp="2026-08-13T13:00:00",
+        market_intelligence_context={"volume": {"volume_ratio": 0.108, "buy_sell_ratio": 1.23}},
+    )
+    rt = RegimeTracker(root_dir=tmp_path, enabled=True)
+    rt.record_candidate(cand, decision="REJECTED", reason="x")
+    row = json.loads(next((tmp_path / "events").glob("*.jsonl")).read_text(encoding="utf-8").strip())
+
+    assert row["volume"]["volume_ratio"] == pytest.approx(0.108)
+    assert row["volume"]["buy_sell_ratio"] == pytest.approx(1.23)
+
+
+def test_a_genuinely_zero_reading_still_records(tmp_path):
+    """0.0 is a real buy/sell ratio. Only the UNMEASURED case becomes absent."""
+    cand = SimpleNamespace(
+        instrument="NIFTY", timeframe="5min", direction="LONG",
+        signal_timestamp="2026-08-13T13:00:00",
+        market_intelligence_context={"volume": {"buy_sell_ratio": 0.0}},
+    )
+    rt = RegimeTracker(root_dir=tmp_path, enabled=True)
+    rt.record_candidate(cand, decision="REJECTED", reason="x")
+    row = json.loads(next((tmp_path / "events").glob("*.jsonl")).read_text(encoding="utf-8").strip())
+
+    assert row["volume"]["buy_sell_ratio"] == pytest.approx(0.0)
+
+
+def test_an_unmeasured_aggregate_and_breadth_are_absent(tmp_path):
+    cand = SimpleNamespace(
+        instrument="NIFTY", timeframe="5min", direction="LONG",
+        signal_timestamp="2026-08-13T13:00:00",
+    )
+    rt = RegimeTracker(root_dir=tmp_path, enabled=True)
+    rt.record_candidate(cand, decision="REJECTED", reason="x")
+    row = json.loads(next((tmp_path / "events").glob("*.jsonl")).read_text(encoding="utf-8").strip())
+
+    assert row["aggregate"].get("score_norm") is None
+    assert row["breadth"].get("aligned_count") is None

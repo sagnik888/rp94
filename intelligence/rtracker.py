@@ -403,13 +403,13 @@ class RegimeTracker:
             },
             "volume": {
                 "signal": str(volume_ctx.get("signal") or ""),
-                "volume_ratio": _safe_float(_candidate_value(candidate, "volume_ratio", volume_ctx.get("volume_ratio", 0.0))),
-                "current_volume": _safe_float(volume_ctx.get("current_volume", 0.0)),
-                "buy_sell_ratio": _safe_float(volume_ctx.get("buy_sell_ratio", 0.0)),
+                "volume_ratio": _measured_float(volume_ctx, "volume_ratio", _candidate_value(candidate, "volume_ratio", None)),
+                "current_volume": _measured_float(volume_ctx, "current_volume"),
+                "buy_sell_ratio": _measured_float(volume_ctx, "buy_sell_ratio"),
             },
             "breadth": {
                 "bias": str(breadth_ctx.get("bias") or ""),
-                "aligned_count": _safe_int(breadth_ctx.get("aligned_count", 0)),
+                "aligned_count": _measured_int(breadth_ctx, "aligned_count"),
             },
             "market_wide_reversal": {
                 "entry": bool(_candidate_value(candidate, "market_wide_reversal_entry", False)),
@@ -423,17 +423,21 @@ class RegimeTracker:
                 # the archive was not comparable across rows. Record the canonical
                 # value under its own key; `score` keeps its shape for old readers.
                 "score": _safe_float(aggregate_ctx.get("score", _candidate_value(candidate, "intelligence_score", 0.0))),
-                "score_norm": _safe_float(
-                    aggregate_ctx.get("score_norm")
+                # Absent stays absent: 0.0 is a legitimate aggregate score, so a
+                # fabricated one is indistinguishable from a genuinely neutral book.
+                "score_norm": (
+                    _measured_float(aggregate_ctx, "score_norm")
                     if aggregate_ctx.get("score_norm") is not None
                     else (
                         _safe_float(aggregate_ctx.get("score")) / 100.0
                         if aggregate_ctx.get("score") is not None
-                        else _candidate_value(candidate, "intelligence_score", 0.0)
+                        else _measured_float(
+                            {}, "", _candidate_value(candidate, "intelligence_score", None)
+                        )
                     )
                 ),
                 "signal": str(aggregate_ctx.get("signal") or ""),
-                "regime_score_multiplier": _safe_float(aggregate_ctx.get("regime_score_multiplier", 0.0)),
+                "regime_score_multiplier": _measured_float(aggregate_ctx, "regime_score_multiplier"),
             },
             "flags": {
                 "accepted_by_gate": bool(_candidate_value(candidate, "accepted_by_gate", False)),
@@ -767,7 +771,13 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
-def _measured_float(mapping: Any, key: str) -> Optional[float]:
+def _measured_int(mapping: Any, key: str) -> Optional[int]:
+    """Integer counterpart of _measured_float. Absent stays absent."""
+    value = _measured_float(mapping, key)
+    return None if value is None else int(value)
+
+
+def _measured_float(mapping: Any, key: str, fallback: Any = None) -> Optional[float]:
     """A metric's value, or None when it was never measured.
 
     Absent is not zero. `_safe_float(ctx.get(key, 0.0))` writes a 0.0 nobody
@@ -780,9 +790,12 @@ def _measured_float(mapping: Any, key: str) -> Optional[float]:
 
     A genuinely measured 0.0 still records as 0.0; only the missing key is absent.
     """
-    if not isinstance(mapping, dict) or key not in mapping:
-        return None
-    value = mapping.get(key)
+    value = mapping.get(key) if isinstance(mapping, dict) and key in mapping else None
+    if value is None:
+        # A caller-supplied fallback is a MEASUREMENT from elsewhere (the candidate
+        # carries its own reading), not a default standing in for one. None still
+        # means nobody measured it.
+        value = fallback
     if value is None:
         return None
     try:
