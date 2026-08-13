@@ -2947,6 +2947,14 @@ class TradeManager:
 
     def emergency_flatten_trade(self, trade: Trade, reason: str) -> bool:
         """Flatten a confirmed recovery position after safely cancelling its SL-M."""
+        if self._live_account_send_blocked():
+            # Reached mode-blind from check_session_end, risk_manager.halt_trading and
+            # close_segment_trades; only _maybe_auto_flatten_unprotected checked mode.
+            logger.error(
+                f"Emergency flatten refused for {trade.trading_symbol}: mode is "
+                f"{getattr(self, 'mode', '')!r} but the live account broker is still attached."
+            )
+            return False
         if not self.broker or not trade.symbol_token or not trade.trading_symbol:
             # There is no contract to submit against, so re-entering here every cycle
             # cannot ever succeed. check_session_end() calls this on every pass for as
@@ -3407,6 +3415,11 @@ class TradeManager:
                         and age_seconds >= timeout
                         and trade.entry_replace_count < 1
                         and _setting_enabled(getattr(settings, "broker_cancel_replace_enabled", True), True)
+                        # Reconcile runs from the PositionSync daemon every ~5s in EVERY
+                        # mode; this branch cancels a resting entry and MARKET-replaces
+                        # it. The read half above must keep running, so the gate is here
+                        # rather than at the top of the pass.
+                        and not self._live_account_send_blocked()
                     ):
                         # PROVE the cancel, do not just acknowledge it. cancel_order
                         # returns True on the API acknowledgement alone, and this order is
@@ -3540,7 +3553,10 @@ class TradeManager:
                     stop_id = str(trade.protective_order_id)
                     cleared = False
                     try:
-                        cleared = bool(self.broker.cancel_order(stop_id, "STOPLOSS"))
+                        cleared = bool(
+                            not self._live_account_send_blocked()
+                            and self.broker.cancel_order(stop_id, "STOPLOSS")
+                        )
                     except (BrokerOrderRejected, PermissionError) as exc:
                         logger.error(
                             f"Protective stop {stop_id} cancel refused while closing "
@@ -4878,6 +4894,34 @@ class TradeManager:
         """
         return str(getattr(self, "mode", "") or "").upper() == "REAL"
 
+    def _live_account_send_blocked(self) -> bool:
+        """True when a send would reach the REAL ACCOUNT broker outside REAL mode.
+
+        _live_orders_permitted covers the two dispatch paths that ask it. Several
+        broker-mutating paths never did: emergency_flatten_trade (and the flatten
+        helpers below it), the three mutating branches of reconcile_broker_positions
+        (cancel a resting entry, MARKET-replace it, cancel a protective stop) and the
+        session-end orphan close. Their only gate is wiring — `if not self.broker`.
+
+        In ordinary HISTORICAL running that costs nothing, because the factory attaches
+        a SignalSimBroker whose order methods are stubs. The hole is the REAL ->
+        HISTORICAL hot swap: scanner.configure sets self.trades.mode = "HISTORICAL"
+        (scanner.py:4194) about a hundred lines before it swaps the broker back to the
+        mock (scanner.py:4305), and the PositionSync daemon calls reconcile every ~5s
+        throughout. In that window mode says HISTORICAL while self.broker is still the
+        live KiteBroker.
+
+        So the invariant this enforces is narrower and truer than "not REAL mode":
+        never transact against the REAL ACCOUNT broker outside REAL mode. Gating those
+        paths on mode alone would refuse the fake brokers that 53 test files inject in
+        HISTORICAL on purpose; real_broker is wired only in main.py production startup
+        (main.py:898), so it is absent under test and this predicate stays False there.
+        """
+        if self._live_orders_permitted():
+            return False
+        real = getattr(self, "real_broker", None)
+        return real is not None and getattr(self, "broker", None) is real
+
     def close_trade(
         self,
         trade_id: str,
@@ -5122,7 +5166,7 @@ class TradeManager:
         settings = get_settings()
         flatten = _setting_enabled(
             getattr(settings, "force_exit_flattens_orphans", False), False
-        )
+        ) and not self._live_account_send_blocked()
         for symbol, position in orphans.items():
             quantity = self._position_quantity(position)
             if not quantity:
