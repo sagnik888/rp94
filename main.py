@@ -819,7 +819,14 @@ def create_system():
                 f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/kite_login "
                 f"({kite_auth.status().get('reason')})"
             )
-        if settings.trading_mode == "REAL" and not real_broker.acquire_execution_lease():
+        # A blank account id builds no lease, and the lease accessors answer True
+        # when there is none — so this gate could never fire in exactly the case
+        # where single-instance ownership is least establishable. Refuse REAL
+        # unless the lease is both establishable and actually held.
+        if settings.trading_mode == "REAL" and not (
+            real_broker.execution_lease_established()
+            and real_broker.acquire_execution_lease()
+        ):
             logger.critical(
                 "REAL startup refused: " + real_broker.execution_lease_block_reason()
             )

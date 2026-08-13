@@ -175,6 +175,22 @@ class KiteBroker(Broker):
         lease = self._execution_lease
         return True if lease is None else bool(lease.acquire())
 
+    def execution_lease_established(self) -> bool:
+        """Whether an account lease could be built at all.
+
+        A lease is only constructed when an account id is configured, and the
+        accessors above answer True when there is none — so the control that
+        stops two instances trading one Kite account is absent AND reports
+        success. That is deliberate for non-REAL use, where there is no account
+        to collide on and every test fixture builds a broker without one.
+
+        REAL startup is the case where it matters, and it is the caller that can
+        tell: main.py refuses REAL unless this is True. Kept as a separate
+        predicate rather than folded into acquire_execution_lease so the
+        non-REAL path is unaffected.
+        """
+        return self._execution_lease is not None
+
     def release_execution_lease(self) -> None:
         lease = self._execution_lease
         if lease is not None:
