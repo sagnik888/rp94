@@ -148,3 +148,48 @@ def test_the_reconcile_read_half_is_not_gated():
     assert "_live_account_send_blocked()" not in head, (
         "the read half of reconcile must not be gated"
     )
+
+
+# ── queued work re-asks authority at dispatch, not just at enqueue ───────────
+
+def test_the_predicate_can_be_asked_about_a_captured_broker():
+    """Queued tasks capture the broker at enqueue and send later.
+
+    By dispatch time self.broker may already be the mock while the closure still
+    holds the live account, so asking about self.broker would wave it through.
+    """
+    live, sim = _Broker(), _Broker()
+    mgr = _mgr("HISTORICAL", broker=sim, real_broker=live)
+
+    assert mgr._live_account_send_blocked() is False        # self.broker is the mock
+    assert mgr._live_account_send_blocked(live) is True     # the captured one is not
+
+
+def test_asking_about_a_mock_broker_is_never_blocked():
+    live, sim = _Broker(), _Broker()
+    mgr = _mgr("HISTORICAL", broker=live, real_broker=live)
+
+    assert mgr._live_account_send_blocked(sim) is False
+
+
+def test_real_mode_is_unblocked_for_a_captured_broker_too():
+    live = _Broker()
+
+    assert _mgr("REAL", broker=live, real_broker=live)._live_account_send_blocked(live) is False
+
+
+def test_the_queued_exit_reasks_authority_at_dispatch():
+    src = inspect.getsource(TradeManager._request_broker_exit)
+
+    assert "_live_account_send_blocked(broker)" in src, (
+        "the queued exit still relies on the enqueue-time gate alone"
+    )
+
+
+def test_the_dispatch_check_runs_before_any_send():
+    src = inspect.getsource(TradeManager._request_broker_exit)
+    i = src.index("_live_account_send_blocked(broker)")
+
+    for call in ("broker.close_order", "broker.cancel_order"):
+        if call in src:
+            assert i < src.index(call), f"{call} is reachable before the dispatch check"

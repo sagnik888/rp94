@@ -4719,6 +4719,20 @@ class TradeManager:
                         on_exit_result(trade, False)
                     return
 
+            # The mode gate ran at ENQUEUE. This body runs later on the execution queue,
+            # and the staleness check above only asks about the TRADE. If REAL was left
+            # in between, the captured `broker` is still the live account — so authority
+            # is re-asked here, against the broker this closure will actually use.
+            if self._live_account_send_blocked(broker):
+                logger.error(
+                    f"Queued exit for {trade.id} refused at dispatch: mode is "
+                    f"{getattr(self, 'mode', '')!r} and this task still holds the live "
+                    "account broker."
+                )
+                if on_exit_result:
+                    on_exit_result(trade, False)
+                return
+
             exit_side = "SELL" if trade.direction == "LONG" or trade.inst_type == "OPT" else "BUY"
             exit_quantity = (
                 int(trade.broker_quantity)
@@ -4894,8 +4908,15 @@ class TradeManager:
         """
         return str(getattr(self, "mode", "") or "").upper() == "REAL"
 
-    def _live_account_send_blocked(self) -> bool:
+    def _live_account_send_blocked(self, broker=None) -> bool:
         """True when a send would reach the REAL ACCOUNT broker outside REAL mode.
+
+        `broker` names the object the caller is actually about to send through.
+        Queued work captures `broker = self.broker` at ENQUEUE time and dispatches
+        later, so by then self.broker may already be the mock while the closure still
+        holds the live one — checking self.broker would clear a send that is about to
+        go to the real account anyway. Callers sending through self.broker pass
+        nothing and are unaffected.
 
         _live_orders_permitted covers the two dispatch paths that ask it. Several
         broker-mutating paths never did: emergency_flatten_trade (and the flatten
@@ -4920,7 +4941,8 @@ class TradeManager:
         if self._live_orders_permitted():
             return False
         real = getattr(self, "real_broker", None)
-        return real is not None and getattr(self, "broker", None) is real
+        target = broker if broker is not None else getattr(self, "broker", None)
+        return real is not None and target is real
 
     def close_trade(
         self,
