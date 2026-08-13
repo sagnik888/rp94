@@ -12538,7 +12538,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Rs.1, and a lock armed below the round-trip cost banks less than it pays.
         return max(min_peak, Scanner._profit_protect_cost_floor_rs(self, trade_like))
 
-    def _smart_lock_floor_collapse(self, peak_pnl: float, current_pnl_rs: float) -> bool:
+    def _smart_lock_floor_collapse(
+        self, peak_pnl: float, current_pnl_rs: float, retention_ratio: float = 0.0
+    ) -> bool:
         """Whether the absolute keep-floor may cut this trade.
 
         The keep-floor is COLLAPSE protection, not a profit cap: it may only fire
@@ -12555,7 +12557,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ladder, the round-trip cost floor and the trend-runner exemption.
         """
         floor = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
-        return float(peak_pnl or 0.0) > floor and float(current_pnl_rs or 0.0) < floor
+        peak = float(peak_pnl or 0.0)
+        current = float(current_pnl_rs or 0.0)
+        if not (peak > floor and current < floor):
+            return False
+        # Crossing an absolute rupee line is not a collapse. 2026-08-13, after the
+        # peak>floor gate above was in place, three winners were still cut because
+        # each had peaked just ABOVE Rs.450, so an ordinary pullback carried it back
+        # across: SENSEX peak Rs.458 -> Rs.399 is a 13% giveback, cut three seconds
+        # after entry; NIFTY Rs.572 -> Rs.413 is 28%. Any trade whose peak lands near
+        # the floor sits in a band where noise reads as collapse.
+        #
+        # The retention ladder already knows what a real giveback is for THIS trade
+        # and this regime, so the floor may only fire on one the ladder itself calls
+        # a breach. A ratio of 0 means the ladder had no reading, and absent is not a
+        # reason to invent one — the peak>floor gate stands alone there.
+        ratio = float(retention_ratio or 0.0)
+        if ratio > 0.0 and current >= peak * ratio:
+            return False
+        return True
 
     def _smart_lock_backstop_ratio(self, lock_ratio: float, scalp_mode: bool) -> float:
         """Peak retention at which the P&L-space backstop may fire.
@@ -21654,7 +21674,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
             smart_ratio = self._smart_lock_backstop_ratio(lock_ratio, scalp_mode)
             abs_floor_rs = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
-            floor_collapse = self._smart_lock_floor_collapse(previous_peak, current_pnl_rs)
+            floor_collapse = self._smart_lock_floor_collapse(
+                previous_peak, current_pnl_rs, smart_ratio
+            )
             if smart_min_peak <= previous_peak and ladder_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or floor_collapse):
                 exit_floor = float(lock_stop or 0.0)
                 if exit_floor > 0 and self._candidate_net_pnl(previous, exit_floor) > 0:
@@ -27924,7 +27946,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 )
                 if current_pnl_rs < (
                     trade.peak_pnl * backstop_ratio_live
-                ) or self._smart_lock_floor_collapse(trade.peak_pnl, current_pnl_rs):
+                ) or self._smart_lock_floor_collapse(
+                    trade.peak_pnl, current_pnl_rs, backstop_ratio_live
+                ):
                     if current_pnl_rs < 0.0:
                         recovery_action = handle_live_recovery_watch("SMART_PROFIT_LOCK")
                         if recovery_action in {"HOLD", "EXIT"}:

@@ -3057,3 +3057,48 @@ def test_opposite_signal_exits_broker_backed_open_trade_once():
             {"exit_time": signal_ts},
         )
     ]
+
+
+# ── the keep-floor is not a line to be crossed; it is a collapse ─────────────
+# 2026-08-13, three winners cut by the floor-collapse path AFTER the peak>floor
+# gate was added. Every one had peaked just above the Rs.450 line, so an ordinary
+# pullback carried it back across:
+#
+#   09:23 MIDCPNIFTY peak Rs.474 -> Rs.240   (49% giveback)
+#   11:58 SENSEX     peak Rs.458 -> Rs.399   (13% giveback)  cut 3s after entry
+#   11:58 NIFTY      peak Rs.572 -> Rs.413   (28% giveback)
+#
+# Crossing an absolute rupee line says nothing about whether the trade collapsed.
+# The retention ladder already knows what a real giveback is for this trade, so
+# the floor may only fire on a giveback the ladder itself calls a breach.
+
+@pytest.mark.parametrize("name,peak,current", [
+    ("MIDCPNIFTY", 474.0, 240.0),
+    ("SENSEX", 458.0, 399.0),
+    ("NIFTY", 572.0, 413.0),
+])
+def test_todays_three_cut_winners_are_held(name, peak, current):
+    scanner = Scanner.__new__(Scanner)
+    # The ladder's own retention for these peaks.
+    assert scanner._smart_lock_floor_collapse(peak, current, 0.50) is False, name
+
+
+def test_a_real_collapse_below_the_floor_still_exits():
+    """peak 1554 -> -213: the case the fallback exists for."""
+    scanner = Scanner.__new__(Scanner)
+
+    assert scanner._smart_lock_floor_collapse(1554.0, -213.5, 0.50) is True
+
+
+def test_a_giveback_past_the_ladder_still_exits():
+    scanner = Scanner.__new__(Scanner)
+
+    assert scanner._smart_lock_floor_collapse(900.0, 200.0, 0.50) is True
+
+
+def test_without_a_ladder_ratio_the_floor_behaves_as_before():
+    """No ladder reading is no reason to invent one; the peak>floor gate still holds."""
+    scanner = Scanner.__new__(Scanner)
+
+    assert scanner._smart_lock_floor_collapse(900.0, 449.0, 0.0) is True
+    assert scanner._smart_lock_floor_collapse(449.0, 100.0, 0.0) is False
