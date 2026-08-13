@@ -9121,7 +9121,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 getattr(get_settings(), "profit_lock_per_lot_basis", False), False
             ):
                 return peak
-            lots = self._profit_lock_lot_count(trade_like, qty)
+            counter = getattr(self, "_profit_lock_lot_count", None)
+            lots = (
+                counter(trade_like, qty)
+                if callable(counter)
+                else Scanner._profit_lock_lot_count(trade_like, qty)
+            )
             return peak / float(lots) if lots > 1 else peak
         except Exception:
             return peak
@@ -12766,7 +12771,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if self._setting_enabled(
             getattr(settings, "profit_lock_per_lot_basis", False), False
         ):
-            lots = self._profit_lock_lot_count(trade_like, qty)
+            # Resolved defensively, exactly as _profit_lock_arm_cap_rs does. Partial
+            # scanners are a real pattern here, and while the switch was OFF by default
+            # this line never ran for them; turning it on made an unbound lookup reachable
+            # on every profit-lock evaluation.
+            counter = getattr(self, "_profit_lock_lot_count", None)
+            lots = (
+                counter(trade_like, qty)
+                if callable(counter)
+                else Scanner._profit_lock_lot_count(trade_like, qty)
+            )
             if lots > 1:
                 ladder_pnl = peak_pnl / float(lots)
         # ladder_pnl selects the TIER. peak_pnl stays the real figure, because the price

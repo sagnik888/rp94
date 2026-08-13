@@ -1781,10 +1781,24 @@ class Settings(BaseSettings):
     # (500 / 1000 / 2000 / 3000) were tuned on single-lot trades, so on 3 lots a Rs.3000
     # peak — Rs.1000 per lot, a modest win — lands on the Rs.3000 MAJOR_WIN_GUARD rung and
     # locks 90%, scalping a position that has barely developed.
-    # Default OFF because per-lot is LOOSER, not safer: a multi-lot winner lands on a lower
-    # rung and is allowed to give back more before the lock fires. More principled, but a
-    # real risk increase on live money, so it stays the operator's decision.
-    profit_lock_per_lot_basis: bool = False
+    # Per-lot is LOOSER, not safer: a multi-lot winner lands on a lower rung and is
+    # allowed to give back more before the lock fires. That is a real risk increase on
+    # live money, which is why it sat OFF and was left to the operator.
+    #
+    # Turned ON 2026-08-14, by the operator, because the pairing it was waiting for is
+    # already live and the mismatch was costing the exact trades it was meant to protect:
+    # cascade_lot_scale_enabled defaults True with cascade_lot_multiplier_opt 3.0 (floor
+    # 2.0), so cascade OPTION signals size 2-3 lots today. With the ladder reading
+    # absolute rupees against rungs tuned on single-lot trades, a 3-lot position peaking
+    # at Rs.3,000 -- Rs.1,000 per lot, a modest win -- landed on the Rs.3,000
+    # MAJOR_WIN_GUARD rung and locked 90%, scalping the high-conviction multi-lot
+    # entries. The scale-in note at line 1623 already said to run adds with this on.
+    #
+    # Coherent by construction: _profit_ladder_pnl divides the peak by lots and
+    # _profit_lock_arm_cap_rs multiplies the arm ceiling by lots, both under this one
+    # switch, so the tier and the threshold feeding it stay on the same scale. Setting
+    # it False restores the previous behaviour exactly.
+    profit_lock_per_lot_basis: bool = True
     # Refuse an entry that would push the book past its stop-risk budget. The daily
     # circuit breaker measures a book that already exists and halts after the fact; this
     # refuses the entry that would create the breach, using the SAME segment and global

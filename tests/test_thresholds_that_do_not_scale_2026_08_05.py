@@ -175,9 +175,27 @@ def _trade(lots=1, lot_size=75):
     return SimpleNamespace(lots=lots, lot_size=lot_size, quantity=lots * lot_size)
 
 
-def test_the_arming_cap_is_flat_by_default():
-    """Default off, like the ladder switch it rides on."""
+def test_the_arming_cap_scales_by_default():
+    """Default ON since 2026-08-14, like the ladder switch it rides on.
+
+    It was flat by default while profit_lock_per_lot_basis was off. That pairing was
+    wrong once cascade_lot_scale_enabled (default True, opt multiplier 3.0) started
+    sizing 2-3 lots: a 3-lot position peaking at Rs.3,000 is Rs.1,000 per lot, and the
+    flat cap armed it as if it were a single-lot major win.
+    """
     s = Scanner.__new__(Scanner)
+    assert s._profit_lock_arm_cap_rs(_trade(1)) == 3000.0
+    assert s._profit_lock_arm_cap_rs(_trade(10)) == 30_000.0
+
+
+def test_the_arming_cap_goes_flat_again_when_the_switch_is_off(monkeypatch):
+    """Setting the flag False must restore the previous behaviour exactly."""
+    s = Scanner.__new__(Scanner)
+    base = scanner_module.get_settings()
+    monkeypatch.setattr(
+        scanner_module, "get_settings",
+        lambda: SimpleNamespace(**{**vars(base), "profit_lock_per_lot_basis": False}),
+    )
     assert s._profit_lock_arm_cap_rs(_trade(1)) == 3000.0
     assert s._profit_lock_arm_cap_rs(_trade(10)) == 3000.0
 
@@ -430,3 +448,27 @@ def test_the_median_range_fallback_is_on_the_index_basis_too():
     # index fallback 24500*0.0002 = 4.90 -> body = max(4.90*1.20, 6.125) = 6.125
     # premium fallback 217.50*0.0002 = 0.0435 -> body would be max(0.052, 0.054) = 0.054
     assert body > 1.0, f"fallback range came from the premium: body floor {body:.4f}"
+
+
+def test_the_ladder_basis_survives_a_partial_scanner():
+    """The per-lot switch made an unbound lookup reachable on every evaluation.
+
+    While profit_lock_per_lot_basis was OFF by default the lot-count line never ran,
+    so a scanner stub without _profit_lock_lot_count was fine. Turning the switch on
+    put that lookup on the hot path for every profit-lock evaluation, and partial
+    scanners are a real pattern here -- the file already carries the same guard for
+    the arming cap, for the same reason.
+    """
+    stub = SimpleNamespace()
+    stub._setting_enabled = Scanner._setting_enabled
+    stub._profit_ladder_pnl = Scanner._profit_ladder_pnl.__get__(stub, Scanner)
+
+    # 3 lots peaking at Rs.3,000 is Rs.1,000 per lot: a modest win, not a major one.
+    assert stub._profit_ladder_pnl(_trade(3), 3000.0) == pytest.approx(1000.0)
+
+
+def test_a_single_lot_reads_the_ladder_unchanged():
+    """The per-lot basis must be a no-op on the one-lot trades that tuned the rungs."""
+    s = Scanner.__new__(Scanner)
+
+    assert s._profit_ladder_pnl(_trade(1), 3000.0) == pytest.approx(3000.0)
