@@ -311,3 +311,33 @@ def test_recording_never_raises_into_an_order_path():
     src = inspect.getsource(TradeManager._record_fill)
 
     assert "except Exception" in src
+
+
+def test_a_protective_stop_firing_is_recorded():
+    """An exchange-side stop is the commonest real exit on a shared contract.
+
+    It arrives through no other ledger path: ensure_broker_protection sees the SL-M
+    report complete/filled, marks recovery and returns. Unrecorded, the ledger keeps
+    reporting a holding the stop already closed, and the next arm sizes from it.
+    """
+    import inspect
+
+    src = inspect.getsource(TradeManager.ensure_broker_protection)
+    i = src.index('stop_status in {"complete", "filled"}')
+    window = src[i: i + 700]
+
+    assert "_record_leg_fill_from_order(" in window, (
+        "a filled protective stop leaves the ledger overstating the holding"
+    )
+    assert "PROTECTIVE" in window
+
+
+def test_the_stop_fill_is_recorded_before_recovery_returns():
+    """_mark_recovery is followed by `return False`, so ordering decides it runs."""
+    import inspect
+
+    src = inspect.getsource(TradeManager.ensure_broker_protection)
+    i = src.index('stop_status in {"complete", "filled"}')
+    window = src[i: i + 700]
+
+    assert window.index("_record_leg_fill_from_order(") < window.index("_mark_recovery(")

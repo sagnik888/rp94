@@ -1694,6 +1694,13 @@ class TradeManager:
                     trade.protective_order_id = ""
                     existing = ""
                 elif stop_status in {"complete", "filled"}:
+                    # The SL-M sold this trade's quantity, so the ledger has to hear
+                    # about it. An exchange-side stop firing is the commonest real exit
+                    # on a shared contract and it arrives through no other path here:
+                    # unrecorded, the ledger keeps reporting a holding the stop already
+                    # closed, and the next arm sizes protection from that stale number.
+                    # Read from the stop ORDER, like every other leg.
+                    self._record_leg_fill_from_order(trade, existing, "PROTECTIVE", -1)
                     self._mark_recovery(
                         trade,
                         "Protective stop reports filled while broker position is still open",
