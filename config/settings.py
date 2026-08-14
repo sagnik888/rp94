@@ -489,6 +489,24 @@ class Settings(BaseSettings):
     shared_host_mode: bool = False
     allow_plaintext_broker_secrets: bool = True
     option_strike_selection: Literal["ATM", "ITM", "BOTH"] = "BOTH"
+    # With "BOTH", the ATM and ITM candidates are scored and the higher score wins.
+    # Nothing in that score describes how TRADEABLE the contract is, so two setups of
+    # near-identical quality were separated by whatever the score rounded to, and the
+    # thinner strike won as often as not. Delta is already per-strike, so the pricing
+    # was right; only the choice between the two was unranked.
+    #
+    # The chain this system already fetches carries call_oi / call_volume / put_oi /
+    # put_volume PER STRIKE, so this needs no extra broker call and adds no latency --
+    # it reads the cached chain (allow_fetch=False) or does nothing.
+    option_strike_liquidity_ranking_enabled: bool = True
+    # Only ever a TIE-BREAK. A materially better setup must still win, so liquidity may
+    # decide only when the two scores are within this band.
+    option_strike_liquidity_score_band: float = 0.05
+    # And only when the alternative is better on BOTH open interest and traded volume by
+    # at least this ratio. Requiring both, rather than a weighted blend, keeps the test
+    # scale-free: OI is standing interest and volume is today's activity, and inventing
+    # a weight between them would be the arbitrary part.
+    option_strike_liquidity_min_advantage: float = 1.25
     inst_pref: Literal["FUT", "OPT", "AUTO"] = "AUTO"
     sl_mode: Literal["NATURAL", "HARDCODED"] = "NATURAL"
     signal_grade_preference: Literal["auto", "B", "B+", "A", "A+"] = "A"

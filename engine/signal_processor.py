@@ -598,6 +598,85 @@ class SignalProcessor:
         return result if isinstance(result, dict) else fallback_result, score, str(context_regime or "UNKNOWN")
 
     @staticmethod
+    def _strike_liquidity(chain, strike, option_type) -> Tuple[float, float]:
+        """(open interest, traded volume) at ONE strike, from the already-cached chain.
+
+        The chain carries these per strike -- call_oi / call_volume / put_oi /
+        put_volume -- so nothing here costs a broker call. Returns (0.0, 0.0) whenever
+        the answer is not knowable, which the caller treats as "no opinion" rather than
+        as "illiquid": an unreadable chain must never move the selection.
+        """
+        if chain is None or not len(chain) or "strike" not in getattr(chain, "columns", []):
+            return 0.0, 0.0
+        side = "call" if str(option_type or "").upper() == "CE" else "put"
+        oi_col, vol_col = f"{side}_oi", f"{side}_volume"
+        if oi_col not in chain.columns or vol_col not in chain.columns:
+            return 0.0, 0.0
+        try:
+            target = float(strike or 0.0)
+            # Strikes arrive as floats from the broker; match on proximity, not equality.
+            row = chain[(chain["strike"] - target).abs() < 0.5]
+            if not len(row):
+                return 0.0, 0.0
+            oi = float(row.iloc[0][oi_col] or 0.0)
+            vol = float(row.iloc[0][vol_col] or 0.0)
+        except (TypeError, ValueError, KeyError, IndexError):
+            return 0.0, 0.0
+        if oi != oi or vol != vol:  # NaN
+            return 0.0, 0.0
+        return max(0.0, oi), max(0.0, vol)
+
+    @staticmethod
+    def _prefer_liquid_strike(ranked, settings):
+        """Break a near-tie between strike candidates on tradeability.
+
+        `ranked` is already sorted by score, so ranked[0] is the incumbent and only a
+        candidate within the configured band may displace it -- a materially better
+        setup always wins regardless of liquidity.
+
+        The challenger must be better on BOTH open interest and traded volume. A
+        weighted blend of the two would need a weight nobody can justify; requiring both
+        is scale-free and means "more standing interest AND more activity today".
+        """
+        if not ranked:
+            return None
+        leader = ranked[0]
+        if len(ranked) < 2:
+            return leader
+        if not _setting_enabled(
+            getattr(settings, "option_strike_liquidity_ranking_enabled", True), True
+        ):
+            return leader
+        try:
+            band = float(getattr(settings, "option_strike_liquidity_score_band", 0.05) or 0.0)
+            edge = float(getattr(settings, "option_strike_liquidity_min_advantage", 1.25) or 1.25)
+        except (TypeError, ValueError):
+            return leader
+        if band <= 0 or edge <= 1.0:
+            return leader
+
+        lead_oi, lead_vol = (
+            getattr(leader, "strike_oi", 0.0) or 0.0,
+            getattr(leader, "strike_volume", 0.0) or 0.0,
+        )
+        for challenger in ranked[1:]:
+            try:
+                gap = float(leader.score) - float(challenger.score)
+            except (TypeError, ValueError):
+                continue
+            if gap > band:
+                break  # sorted by score: everything after this is further away
+            oi = float(getattr(challenger, "strike_oi", 0.0) or 0.0)
+            vol = float(getattr(challenger, "strike_volume", 0.0) or 0.0)
+            # Absent liquidity is no opinion, not a verdict. Only a strike the chain
+            # actually described may displace the incumbent.
+            if oi <= 0 or vol <= 0 or lead_oi <= 0 or lead_vol <= 0:
+                continue
+            if oi >= lead_oi * edge and vol >= lead_vol * edge:
+                return challenger
+        return leader
+
+    @staticmethod
     def _graded_candidate_context(
         best_sig,
         fallback_regime: str,
@@ -5821,6 +5900,21 @@ class SignalProcessor:
             elif strike_selection == "ITM": target_strikes = [itm_strike_val]
             else: target_strikes = [atm_strike_val, itm_strike_val]
 
+        # Read ONCE, and only when there is actually a choice to make. allow_fetch=False
+        # means this uses the chain already in cache or nothing at all -- no broker call,
+        # no latency added to an entry.
+        _liquidity_chain = None
+        if len(target_strikes) > 1 and _setting_enabled(
+            getattr(settings, "option_strike_liquidity_ranking_enabled", True), True
+        ):
+            try:
+                _liquidity_chain, _ = scanner._get_option_chain_cached(
+                    instrument, cfg, allow_fetch=False
+                )
+            except Exception as exc:
+                logger.debug(f"Strike liquidity chain unavailable for {instrument}: {exc}")
+                _liquidity_chain = None
+
         results_list = []
         for strike in target_strikes:
             if inst_type == "FUT":
@@ -6492,6 +6586,12 @@ class SignalProcessor:
                     candidate.reasons = list(candidate.reasons or []) + [
                         f"Confirmed impulse bypass ADX={adx_value:.1f}, intel={normalize_intelligence_score(intel_score):.2f}"
                     ]
+                # Tradeability of THIS strike, for the near-tie break below.
+                _strike_oi, _strike_vol = self._strike_liquidity(
+                    _liquidity_chain, strike_local, option_type_local
+                )
+                setattr(candidate, "strike_oi", _strike_oi)
+                setattr(candidate, "strike_volume", _strike_vol)
                 results_list.append(candidate)
                 logger.info(
                     f"Resolved candidate: {instrument} {best_tf} {best_sig.signal_type} -> "
@@ -6508,7 +6608,18 @@ class SignalProcessor:
             return []
 
         results_list.sort(key=lambda x: x.score, reverse=True)
-        winner = results_list[0]
+        # Score decides. Liquidity only separates candidates the score cannot.
+        winner = self._prefer_liquid_strike(results_list, settings) or results_list[0]
+        if winner is not results_list[0]:
+            logger.info(
+                f"Strike liquidity tie-break for {instrument}: "
+                f"{getattr(winner, 'trading_symbol', '')} "
+                f"(OI {getattr(winner, 'strike_oi', 0.0):,.0f} / "
+                f"vol {getattr(winner, 'strike_volume', 0.0):,.0f}) preferred over "
+                f"{getattr(results_list[0], 'trading_symbol', '')} "
+                f"(OI {getattr(results_list[0], 'strike_oi', 0.0):,.0f} / "
+                f"vol {getattr(results_list[0], 'strike_volume', 0.0):,.0f})"
+            )
         getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
             f"{instrument}_{best_tf}",
             None,
