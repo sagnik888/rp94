@@ -248,3 +248,32 @@ def test_the_harness_catches_the_original_defect(monkeypatch):
     assert [t.broker_quantity for t in trades] == [225, 225, 225], (
         "the harness no longer reproduces the defect, so the tests above prove nothing"
     )
+
+
+def test_the_allocation_fallback_is_never_the_aggregate():
+    """A trade missing from the map must not silently inherit the whole row.
+
+    The lookup default is unreachable as written, but it was abs(net_qty) — the exact
+    defect the split removes. A silent default that restores a fixed bug is how the bug
+    comes back, so the fallback is this trade's own size capped by the row.
+    """
+    trades = [
+        _trade("a", 1, datetime(2026, 8, 14, 9, 20)),
+        _trade("b", 1, datetime(2026, 8, 14, 9, 35)),
+        _trade("c", 1, datetime(2026, 8, 14, 9, 50)),
+    ]
+    mgr = _manager(trades)
+
+    # Force the fallback: an allocator that maps nothing at all.
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(TradeManager, "_allocate_broker_quantity", staticmethod(lambda group, net: {}))
+        mgr.reconcile_broker_positions(_positions(225))
+    finally:
+        mp.undo()
+
+    for t in trades:
+        assert t.broker_quantity <= 75, (
+            f"{t.id} fell back to the aggregate: {t.broker_quantity}"
+        )

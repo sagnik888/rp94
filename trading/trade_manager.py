@@ -3530,7 +3530,18 @@ class TradeManager:
                 continue
             net_qty = self._position_quantity(position)
             # This trade's SHARE of the contract's position, not the whole row.
-            allocated_qty = broker_allocation.get(str(trade_id), abs(net_qty))
+            allocated_qty = broker_allocation.get(str(trade_id))
+            if allocated_qty is None:
+                # Unreachable as written -- reaching here means broker_pos held this
+                # symbol, so its group was allocated and this id is in the map. But the
+                # fallback must not be abs(net_qty): that is precisely the defect this
+                # split exists to remove, and a silent default that restores it is how
+                # it would come back. This trade's own intended size, capped by what the
+                # row actually holds, is the safe answer; 0 is safer still, because
+                # every unfunded path in this class defers rather than acting.
+                allocated_qty = min(
+                    abs(net_qty), max(0, int(getattr(trade, "quantity", 0) or 0))
+                )
             expected_sign = self._expected_position_sign(trade)
             if net_qty and (1 if net_qty > 0 else -1) != expected_sign:
                 trade.broker_quantity = allocated_qty
