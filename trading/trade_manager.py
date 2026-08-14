@@ -847,6 +847,60 @@ class TradeManager:
         except Exception as exc:
             logger.debug(f"Fill ledger write skipped for {getattr(trade, 'id', '?')}: {exc}")
 
+    def _order_filled_quantity(self, order_id: str) -> Optional[int]:
+        """What ONE order actually executed, from the order's own trades.
+
+        get_fill asks Kite for that order's executions, so the answer is per-ORDER. The
+        positions-derived helpers next to it (_confirmed_reduced_quantity,
+        _confirmed_scaled_quantity) read the per-tradingsymbol AGGREGATE, which is the
+        guess the ledger exists to remove -- on a shared contract they cannot tell this
+        trade's reduction from a sibling's.
+
+        Three answers, kept distinct: a number when the broker states the fill, 0 when
+        it states there were no executions, and None when it cannot say. None must never
+        become 0 here; an unknown fill that recorded as zero would leave the ledger
+        confidently wrong, which is worse than leaving it silent.
+        """
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        getter = getattr(getattr(self, "broker", None), "get_fill", None)
+        if not callable(getter):
+            return None
+        try:
+            detail = getter(oid) or {}
+        except Exception as exc:
+            logger.debug(f"Order fill lookup failed for {oid}: {exc}")
+            return None
+        state = str(detail.get("state") or "").upper()
+        if state == "FILLED":
+            try:
+                return max(0, int(float(detail.get("quantity") or 0)))
+            except (TypeError, ValueError):
+                return None
+        if state == "NO_FILL":
+            return 0
+        return None
+
+    def _record_leg_fill_from_order(self, trade, order_id: str, leg: str, sign: int) -> bool:
+        """Record a leg into the ledger from the ORDER, or record nothing at all.
+
+        Silence is the safe failure: a missing row makes _allocate_broker_quantity fall
+        back to the older splitting rule, which is worse than the ledger but honest. A
+        row derived from the aggregate would instead put the guess INSIDE the ledger and
+        make it look authoritative.
+        """
+        qty = self._order_filled_quantity(order_id)
+        if not qty:
+            if qty is None:
+                logger.debug(
+                    f"Ledger left silent for {getattr(trade, 'id', '?')} {leg}: "
+                    f"order {order_id} fill unknown"
+                )
+            return False
+        self._record_fill(trade, order_id, sign * int(qty), leg)
+        return True
+
     @staticmethod
     def _ledger_owned_quantity(trade_id: str) -> Optional[int]:
         """This trade's holding per the ledger, or None when the ledger is silent.
@@ -2233,17 +2287,18 @@ class TradeManager:
 
         with self._lock:
             self._book_partial_child(trade, close_lots, exit_price, reason, exit_time)
-            # Recorded from the CONFIRMED reduction, not from the request: `confirmed`
-            # is the broker's post-reduce quantity, so the difference is what actually
-            # left. Negative, because the ledger sums to a holding.
-            _reduced = max(0, int(trade.broker_quantity or 0) - int(confirmed or 0))
             trade.broker_quantity = confirmed or trade.broker_quantity
             trade.partial_derisk_done = True
-            if _reduced:
-                self._record_fill(
-                    trade, getattr(trade, "partial_reduce_order_id", ""),
-                    -_reduced, "PARTIAL_EXIT",
-                )
+            # From the REDUCE ORDER's own executions. `confirmed` is positions-derived
+            # (_confirmed_reduced_quantity reads the per-tradingsymbol aggregate), so on
+            # a shared contract broker_quantity - confirmed cannot tell this trade's
+            # reduction from a sibling's -- with two 75s on one strike and this trade
+            # reducing 75, the aggregate falls 150 -> 75 and the difference computes as
+            # zero. That is precisely the guess the ledger exists to remove, so it must
+            # not be the thing written INTO it.
+            self._record_leg_fill_from_order(
+                trade, getattr(trade, "partial_reduce_order_id", ""), "PARTIAL_EXIT", -1
+            )
         self.save_state()
         logger.success(
             f"Partial de-risk booked for {trade.trading_symbol}: {close_lots} lot(s) "
@@ -2440,8 +2495,9 @@ class TradeManager:
         trade.scale_in_lots = int(getattr(trade, "scale_in_lots", 0) or 0) + int(add_lots)
         trade.scale_in_count = int(getattr(trade, "scale_in_count", 0) or 0) + 1
         trade.broker_quantity = total_qty
-        self._record_fill(
-            trade, getattr(trade, "scale_in_order_id", ""), int(add_qty), "ADD"
+        # add_qty is what was INTENDED; the ledger records what the add order executed.
+        self._record_leg_fill_from_order(
+            trade, getattr(trade, "scale_in_order_id", ""), "ADD", 1
         )
         logger.success(
             f"Scale-in booked for {trade.trading_symbol}: +{add_lots} lot(s) @ "

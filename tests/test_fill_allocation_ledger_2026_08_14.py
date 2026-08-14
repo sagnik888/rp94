@@ -263,8 +263,45 @@ def test_every_leg_that_changes_a_holding_records_a_fill(method, leg):
         pytest.skip(f"{method} not present under that name")
     src = inspect.getsource(fn)
 
-    assert "_record_fill(" in src, f"{method} changes a holding without recording it"
+    recorded = "_record_fill(" in src or "_record_leg_fill_from_order(" in src
+    assert recorded, f"{method} changes a holding without recording it"
     assert leg in src
+
+
+def test_exit_and_add_legs_are_recorded_from_the_ORDER_not_the_aggregate():
+    """The guess must not be written INTO the ledger.
+
+    _confirmed_reduced_quantity and _confirmed_scaled_quantity read the
+    per-tradingsymbol AGGREGATE. With two 75s on one strike and this trade reducing 75,
+    the aggregate falls 150 -> 75 and `broker_quantity - confirmed` computes as zero --
+    the exact ambiguity the ledger exists to remove. These legs must read the order's
+    own executions instead.
+    """
+    import inspect
+
+    for method in ("_run_partial_reduce", "_book_scale_in"):
+        src = inspect.getsource(getattr(TradeManager, method))
+        assert "_record_leg_fill_from_order(" in src, (
+            f"{method} still records from a positions-derived number"
+        )
+
+
+def test_an_unknown_order_fill_records_nothing_rather_than_zero():
+    """Silence falls back to the older rule; a wrong row looks authoritative."""
+    import inspect
+
+    src = inspect.getsource(TradeManager._record_leg_fill_from_order)
+
+    assert "if not qty:" in src and "return False" in src
+
+
+def test_the_order_fill_lookup_keeps_unknown_distinct_from_no_fill():
+    import inspect
+
+    src = inspect.getsource(TradeManager._order_filled_quantity)
+
+    assert '"NO_FILL"' in src and "return 0" in src
+    assert "return None" in src
 
 
 def test_recording_never_raises_into_an_order_path():
