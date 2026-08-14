@@ -1220,8 +1220,30 @@ class TradeManager:
 
         Two necessary conditions for a real fill, and both are plain dataclass fields:
         the trade is not a ghost, and the leg has a broker order id.
+
+        2026-08-15: those two conditions were not enough. The store had grown to 14,244
+        FUT samples -- 2,193 of them added AFTER the guard above -- still at ewma_frac
+        exactly 0.0, still refreshing (00:55, market closed, no order in the log), while
+        every one of the 103 persisted trades was an OPTION. Nothing that trades options
+        can measure futures execution, so the samples come from a simulated futures path
+        that satisfies both conditions: not flagged a ghost, and carrying an order id.
+
+        Refreshing is what makes it dangerous rather than merely wrong. The age bound
+        added alongside the guard exists to stop stale rows outranking the static model,
+        and rows that keep updating defeat it: calibrated_fraction("FUT") returns 0.0
+        today, clamped to the 0.2bp floor of _FUT_CALIBRATION_BOUNDS, in place of the
+        2.0bp static assumption. Futures are modelled ten times cheaper than configured.
+
+        So the sample must also come from a LIVE entry -- HISTORICAL and RECOVERY
+        reconstruct a fill rather than observe one -- and must not be a futures shadow
+        companion, which is synthetic by construction.
         """
         if bool(getattr(trade, "is_ghost", False)):
+            return False
+        if str(getattr(trade, "trading_symbol", "") or "").upper() == "FUT_SHADOW":
+            return False
+        # Absent provenance is not evidence of a live fill.
+        if str(getattr(trade, "data_provenance", "") or "").upper() != "LIVE":
             return False
         order_id = (
             getattr(trade, "exit_order_id", "")
@@ -1252,6 +1274,12 @@ class TradeManager:
             else:
                 adverse = reference - fill
             trade.entry_slippage = round(adverse, 4)
+            # A genuine zero from a real fill is deliberately KEPT: it is a measurement,
+            # and discarding it would bias the EWMA toward adverse fills. The 14,244
+            # poisoned samples were all exact zeros, but zero was their symptom, not the
+            # defect — they were simulated. _slippage_sample_is_a_real_fill excludes them
+            # at the source, which is the precise fix; filtering zeros here would be the
+            # blunt one, and would throw away real execution data with it.
             if not record_to_ewma:
                 return
             from engine.slippage_tracker import get_slippage_tracker

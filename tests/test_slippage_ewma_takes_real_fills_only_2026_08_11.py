@@ -32,6 +32,11 @@ def _trade(**kw):
         entry_price=100.0, trailing_stop=90.0, current_stop=90.0,
         lots=1, lot_size=65, grade="A", inst_type="OPT",
         entry_time=datetime.now(),
+        # 2026-08-15: a real fill now also has to be a LIVE one. These cases mean "a
+        # genuine broker fill", so they carry the provenance a genuine fill carries;
+        # the provenance condition itself is covered in
+        # test_slippage_samples_are_real_fills_2026_08_15.py.
+        data_provenance="LIVE",
     )
     base.update(kw)
     return Trade(**base)

@@ -69,6 +69,14 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # restart is how a duplicate GTT goes unreconciled until both it and the SL-M
     # fire, double-exiting the position into a naked reversed leg.
     "gtt_arm_uncertain",
+    # Measured execution quality. Trade computes both on every fill and to_dict()/
+    # from_dict() have always carried them, but they were not in this list, so the
+    # only durable record of how an option actually filled was discarded at save.
+    # This system trades options first, and the options leg has never had a single
+    # calibrated slippage sample -- estimate_trade_charges falls back to the static
+    # slippage_opt_pct for every option it prices. Nothing can tune that number
+    # without a stored history of real fills to tune it against.
+    "entry_slippage", "exit_slippage",
     # Scale-out state. An in-flight reduce that did not survive a restart would be
     # re-submitted against lots that are already gone.
     "partial_derisk_done", "partial_reduce_order_id",
@@ -426,6 +434,8 @@ class DatabaseManager:
                     "reversal_watch_required": "INTEGER",
                     "is_reversion_scalp": "INTEGER",
                     "repaint_guard_checked": "INTEGER",
+                    "entry_slippage": "REAL",
+                    "exit_slippage": "REAL",
                     "gtt_arm_uncertain": "INTEGER",
                     "partial_derisk_done": "INTEGER",
                     "partial_reduce_order_id": "TEXT",

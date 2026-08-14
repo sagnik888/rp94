@@ -216,6 +216,10 @@ def _trade(**overrides):
         # 12,051 simulated entries pinned measured futures slippage to zero. These tests
         # assert the SIGN convention, which is unchanged, so they describe real fills.
         broker_order_id="251108000123", exit_order_id="251108000999",
+        # LIVE provenance since 2026-08-15: an order id was not enough on its own —
+        # the count had reached 14,244, still at exactly zero, while every stored trade
+        # was HISTORICAL, BACKTEST or blank. A real fill is a live one.
+        data_provenance="LIVE",
     )
     base.update(overrides)
     return Trade(**base)
