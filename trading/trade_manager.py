@@ -769,6 +769,56 @@ class TradeManager:
         except (TypeError, ValueError):
             return 0
 
+    def _same_contract_entry_blocked(
+        self, trading_symbol: str, *, is_recovery: bool = False, is_ghost: bool = False
+    ) -> Tuple[bool, str]:
+        """Refuse a second REAL position on a contract that already holds one.
+
+        INTERIM MEASURE, and deliberately blunt. Kite reports POSITIONS per
+        tradingsymbol, so when several trades share a contract the broker cannot tell us
+        who owns what -- _allocate_broker_quantity splits the row by a rule (confirmed
+        fills first, then oldest-first by intended size) and that rule is a GUESS the
+        moment one sibling exits and the remainder has to be re-attributed.
+
+        The real answer is a persisted per-order fill ledger, which is being built. Until
+        it exists, the safe state is one REAL trade per contract: the guess never has to
+        be made, so it can never be wrong about the quantity that sizes a stop.
+
+        What this costs: cascade multi-timeframe stacking on a SINGLE strike. Stacking
+        across different strikes or instruments is untouched, and so is every non-REAL
+        mode -- backtests and replays keep exercising the multi-trade paths, including
+        the allocator's own tests.
+
+        Lifts by setting forbid_concurrent_same_contract_real=False, which is how the
+        ledger work will be validated before this is retired.
+        """
+        if not self._live_orders_permitted():
+            return False, ""
+        if is_recovery or is_ghost:
+            # Recovery re-establishes a position that ALREADY exists; refusing it would
+            # strand a live position instead of preventing a second one.
+            return False, ""
+        symbol = str(trading_symbol or "").strip()
+        if not symbol:
+            return False, ""
+        from config.settings import get_settings
+
+        if not _setting_enabled(
+            getattr(get_settings(), "forbid_concurrent_same_contract_real", True), True
+        ):
+            return False, ""
+        for existing in list(getattr(self, "open_trades", {}).values()):
+            if getattr(existing, "is_ghost", False):
+                continue
+            if str(getattr(existing, "trading_symbol", "") or "").strip() != symbol:
+                continue
+            return True, (
+                f"{symbol} already held by trade {getattr(existing, 'id', '?')} "
+                f"({getattr(existing, 'timeframe', '?')}); one REAL position per contract "
+                "until the fill-allocation ledger lands"
+            )
+        return False, ""
+
     @staticmethod
     def _allocate_broker_quantity(trades_on_symbol, net_qty) -> Dict[str, int]:
         """Split ONE broker position row across the local trades that share the contract.
@@ -4117,6 +4167,13 @@ class TradeManager:
             can, reason = self.can_open_trade(is_recovery)
             if not can:
                 logger.warning(f"Cannot open trade: {reason}")
+                return None
+            same, same_reason = self._same_contract_entry_blocked(
+                trading_symbol, is_recovery=is_recovery, is_ghost=is_ghost
+            )
+            if same:
+                logger.warning(f"Cannot open trade: {same_reason}")
+                self._log_ui(f"Entry refused: {same_reason}", "warning")
                 return None
             # Is the price we are about to trade on real? Checked before anything sizes,
             # logs or reaches the broker, because a stale mark poisons the stop, the

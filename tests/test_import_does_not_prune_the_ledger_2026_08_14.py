@@ -172,8 +172,14 @@ def test_a_prune_that_deletes_nothing_writes_no_snapshot():
     assert set(_P(path).parent.glob(f"{stem}.pre_prune_*")) == before
 
 
-def test_a_failed_snapshot_does_not_block_the_prune(monkeypatch):
-    """Best effort: retention is the caller's decision, not the backup's."""
+def test_a_failed_snapshot_aborts_the_prune(monkeypatch):
+    """A backup allowed to fail silently is not a backup.
+
+    The first version was "best effort", which protects nothing: if the snapshot failed
+    while rows were eligible, the delete proceeded and destroyed exactly the data the
+    snapshot existed to preserve. Retention is a scheduling preference and can wait for
+    the next run; the rows cannot be recovered.
+    """
     handle, path = _fresh_handle()
     _seed(path, days_old=400)
     monkeypatch.setattr(
@@ -181,4 +187,31 @@ def test_a_failed_snapshot_does_not_block_the_prune(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
     )
 
-    assert handle.cleanup_old_records(days=30) is False or _counts(path) == (0, 0)
+    assert handle.cleanup_old_records(days=30) is False, "a failed backup must abort"
+    assert _counts(path) == (1, 1), "rows were deleted with no usable snapshot"
+
+
+def test_the_snapshot_opens_and_passes_an_integrity_check():
+    """A copy that cannot be opened is not evidence of anything."""
+    handle, path = _fresh_handle()
+    _seed(path, days_old=400)
+    from pathlib import Path as _P
+
+    written = handle._snapshot_before_prune(2, "2099-01-01")
+
+    try:
+        conn = sqlite3.connect(written)
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        # and it actually holds the rows the prune was about to remove
+        assert conn.execute("SELECT COUNT(*) FROM session_signals").fetchone()[0] == 1
+        conn.close()
+    finally:
+        _P(written).unlink(missing_ok=True)
+
+
+def test_a_snapshot_missing_the_doomed_rows_is_rejected(monkeypatch):
+    """Verification must be of the CONTENT, not merely that a file appeared."""
+    handle, path = _fresh_handle()   # no old rows seeded
+    with pytest.raises(Exception):
+        # claims 5 rows are doomed while the ledger holds none that old
+        handle._snapshot_before_prune(5, "1999-01-01")

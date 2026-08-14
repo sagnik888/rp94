@@ -489,6 +489,20 @@ class Settings(BaseSettings):
     shared_host_mode: bool = False
     allow_plaintext_broker_secrets: bool = True
     option_strike_selection: Literal["ATM", "ITM", "BOTH"] = "BOTH"
+    # INTERIM P0 CONTAINMENT. Kite reports POSITIONS per tradingsymbol, so when several
+    # REAL trades share one contract the broker cannot say who owns what:
+    # _allocate_broker_quantity splits the row by a rule, and that rule is a GUESS as
+    # soon as one sibling exits and the remainder must be re-attributed. broker_quantity
+    # SIZES the protective stop, so a wrong guess arms the wrong quantity.
+    #
+    # One REAL position per contract removes the need to guess at all. It costs cascade
+    # multi-timeframe stacking on a SINGLE strike; stacking across different strikes or
+    # instruments is unaffected, as is every non-REAL mode.
+    #
+    # Retire this by setting it False once the persisted per-order fill ledger is in
+    # place and certified against sibling exits, restarts and missing acknowledgements.
+    forbid_concurrent_same_contract_real: bool = True
+
     # With "BOTH", the ATM and ITM candidates are scored and the higher score wins.
     # Nothing in that score describes how TRADEABLE the contract is, so two setups of
     # near-identical quality were separated by whatever the score rounded to, and the

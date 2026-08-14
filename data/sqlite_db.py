@@ -129,40 +129,89 @@ class DatabaseManager:
 
 
     def _snapshot_before_prune(self, doomed: int, cutoff_date: str) -> str:
-        """Copy the ledger next to itself before a prune removes anything.
+        """A VERIFIED copy of the ledger, written before a prune removes anything.
 
-        Best effort by design: a snapshot that cannot be written must not stop the
-        prune, because the caller has already decided the retention window. But it is
-        attempted every time rows are actually at risk, so "what did that delete?" has
-        an answer that does not depend on someone having thought to back up first.
+        Raises on any failure, and the caller aborts the prune. The first version of
+        this was "best effort", which protects nothing: if the snapshot failed while
+        rows were eligible, the delete went ahead anyway and destroyed exactly the data
+        the snapshot existed to preserve. A backup that is allowed to fail silently is
+        not a backup. Retention is a scheduling preference; the rows are not
+        recoverable, so the rows win.
 
-        VACUUM INTO is used where available -- it is atomic and consistent against a
-        live connection -- with a plain file copy as the fallback.
+        Uses sqlite3's online backup API, which is consistent against a live connection
+        and correct under WAL. The earlier shutil.copy2 fallback was not: copying the
+        main database file while a connection is open can capture a torn page set and
+        leaves the -wal/-shm sidecars behind, so the "backup" may not open.
+
+        Verified before it is trusted: PRAGMA integrity_check, plus a confirmation that
+        the rows about to be deleted are actually present in the copy.
         """
-        try:
-            source = Path(self.db_path)
-            if not source.exists():
-                return ""
-            # Microseconds, not seconds: two prunes inside one second are rare but real,
-            # and a name collision made the second one silently reuse the first's
-            # snapshot — which would describe the wrong pre-state.
-            stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S_%f")
-            target = source.with_name(f"{source.stem}.pre_prune_{stamp}{source.suffix}")
-            if target.exists():
-                return str(target)
-            try:
-                self.conn.execute("VACUUM INTO ?", (str(target),))
-            except Exception:
-                shutil.copy2(source, target)
-            logger.info(
-                f"Pre-prune snapshot written: {target.name} "
-                f"({doomed} rows older than {cutoff_date} about to be removed)"
-            )
-            return str(target)
-        except Exception as exc:
-            # Reported, never raised: the prune itself is the caller's decision.
-            logger.warning(f"Could not snapshot before prune: {exc}")
+        raw = str(getattr(self, "db_path", "") or "")
+        if not raw or raw == ":memory:":
+            # No durable file, so nothing a snapshot could preserve. The hazard this
+            # guards is irreversible loss from the production ledger; an in-memory
+            # database is ephemeral by construction and its rows do not outlive the
+            # process either way. Returning rather than raising keeps the cleanup
+            # contract testable against an isolated in-memory db, which is how
+            # tests/test_sqlite_cleanup.py exercises it.
             return ""
+        source = Path(raw)
+        if not source.exists():
+            raise FileNotFoundError(f"ledger missing at {source}")
+        # Microseconds, not seconds: two prunes inside one second are rare but real, and
+        # a name collision made the second silently reuse the first's snapshot, which
+        # would describe the wrong pre-state.
+        stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S_%f")
+        target = source.with_name(f"{source.stem}.pre_prune_{stamp}{source.suffix}")
+
+        dest = sqlite3.connect(str(target))
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+
+        check = sqlite3.connect(str(target))
+        try:
+            status = check.execute("PRAGMA integrity_check").fetchone()[0]
+            if str(status).lower() != "ok":
+                raise sqlite3.DatabaseError(f"snapshot integrity_check said {status!r}")
+            preserved = 0
+            for table, column in (
+                ("session_signals", "date"),
+                ("signal_decisions", "date"),
+            ):
+                try:
+                    preserved += int(
+                        check.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE {column} < ?",
+                            (cutoff_date,),
+                        ).fetchone()[0]
+                    )
+                except sqlite3.Error:
+                    pass
+            try:
+                preserved += int(
+                    check.execute(
+                        "SELECT COUNT(*) FROM trades "
+                        "WHERE COALESCE(exit_timestamp, exit_time) < ? "
+                        "AND status = 'CLOSED'",
+                        (cutoff_date,),
+                    ).fetchone()[0]
+                )
+            except sqlite3.Error:
+                pass
+            if preserved <= 0 < doomed:
+                raise sqlite3.DatabaseError(
+                    "snapshot does not contain the rows about to be deleted"
+                )
+        finally:
+            check.close()
+
+        logger.info(
+            f"Pre-prune snapshot verified: {target.name} "
+            f"({doomed} rows older than {cutoff_date} about to be removed)"
+        )
+        return str(target)
 
     def cleanup_old_records(self, days=30):
         # Automatic cleanup is suppressed by _init_db during pytest imports.
@@ -213,7 +262,18 @@ class DatabaseManager:
                 except Exception:
                     pass
                 if doomed > 0:
-                    self._snapshot_before_prune(doomed, cutoff_date)
+                    # ABORT rather than delete unbacked. Retention is a scheduling
+                    # preference and can wait for the next run; the rows cannot be
+                    # recovered once they are gone.
+                    try:
+                        self._snapshot_before_prune(doomed, cutoff_date)
+                    except Exception as exc:
+                        logger.critical(
+                            f"RETENTION ABORTED: {doomed} rows older than {cutoff_date} "
+                            f"were eligible for deletion but the pre-prune snapshot "
+                            f"failed ({exc}). Nothing was deleted."
+                        )
+                        return False
 
                 cursor.execute(
                     "DELETE FROM session_signals WHERE date < ?",
