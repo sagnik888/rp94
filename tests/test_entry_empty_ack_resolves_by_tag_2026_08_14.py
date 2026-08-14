@@ -132,3 +132,57 @@ def test_tagging_degrades_rather_than_breaking_untagged_brokers():
 
     doc = inspect.getdoc(TradeManager._tag_kwargs) or ""
     assert "only when the broker actually accepts it" in doc
+
+
+# ── the tag must actually reach the real broker ──────────────────────────────
+
+def test_kite_place_order_accepts_an_explicit_tag():
+    """_tag_kwargs only passes a tag when the callee accepts one.
+
+    close_order and place_protective_stop both took `tag`; place_order did not, so
+    every _tag_kwargs(self.broker.place_order, ...) call resolved to {} against the
+    real broker. The stale-entry REPLACEMENT and the scale-in ADD were both silently
+    untagged in production while their tests -- which inspect trade_manager source --
+    passed.
+    """
+    import inspect as _i
+    from trading.kite_broker import KiteBroker
+
+    assert "tag" in _i.signature(KiteBroker.place_order).parameters
+
+
+def test_every_kite_mutation_takes_a_tag_consistently():
+    import inspect as _i
+    from trading.kite_broker import KiteBroker
+
+    for name in ("place_order", "close_order", "place_protective_stop"):
+        assert "tag" in _i.signature(getattr(KiteBroker, name)).parameters, (
+            f"{name} cannot carry an order identity"
+        )
+
+
+def test_an_explicit_tag_wins_over_the_trade_id_default():
+    """trade_id alone can only ever produce ENTRY|0."""
+    import inspect as _i
+    from trading.kite_broker import KiteBroker
+
+    # place_order takes the parameter; _submit_entry is where it is applied.
+    assert 'tag = str(tag or "") or self.order_tag(trade_id)' in _i.getsource(
+        KiteBroker._submit_entry
+    )
+    assert "momentum_urgency, tag," in _i.getsource(KiteBroker.place_order), (
+        "place_order accepts a tag but never passes it on"
+    )
+
+
+def test_the_leg_and_attempt_reach_the_tag():
+    """Distinct legs must produce distinct identities on one contract."""
+    from trading.kite_broker import KiteBroker
+
+    entry = KiteBroker.order_tag("T1", "ENTRY", 0)
+    replacement = KiteBroker.order_tag("T1", "ENTRY", 1)
+    add = KiteBroker.order_tag("T1", "ADD", 0)
+
+    assert len({entry, replacement, add}) == 3, (
+        f"legs collide: {entry!r} {replacement!r} {add!r}"
+    )

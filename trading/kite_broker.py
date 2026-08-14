@@ -340,7 +340,14 @@ class KiteBroker(Broker):
         if not raw:
             return ""
         leg_code = {
+            # ENTRY/EXIT/PROTECTIVE/STOP are the original four. The rest were rejected
+            # outright, and _broker_order_tag swallows the ValueError into "" -- so a
+            # scale-in ADD went to the exchange untagged while the code read as if it
+            # were tagging it. Distinct exit legs matter for the same reason an exit and
+            # its entry must not collide: a partial, a full and a recovery exit on one
+            # contract are different orders and an exact lookup has to tell them apart.
             "ENTRY": "E", "EXIT": "X", "PROTECTIVE": "S", "STOP": "S",
+            "ADD": "A", "PARTIAL_EXIT": "P", "FULL_EXIT": "F", "RECOVERY_EXIT": "R",
         }.get(str(leg or "").strip().upper())
         if not leg_code:
             raise ValueError(f"unsupported order-tag leg: {leg!r}")
@@ -497,6 +504,14 @@ class KiteBroker(Broker):
         trade_id: str = "",
         confidence: float = 0.0,
         momentum_urgency: float = 0.0,
+        # close_order and place_protective_stop both take an explicit tag; this one did
+        # not, so _tag_kwargs -- which only passes a tag when the callee accepts one --
+        # silently sent nothing here. Every place_order therefore went out tagged
+        # ENTRY|0 from trade_id alone, whatever leg it actually was: the stale-entry
+        # REPLACEMENT and the scale-in ADD both collided with the original entry's tag,
+        # and the fixes that thought they were tagging them were no-ops against the real
+        # broker. Left optional so existing callers are unchanged.
+        tag: str = "",
     ) -> Optional[str]:
         try:
             self._require_account_execution_lease("entry order")
@@ -511,7 +526,7 @@ class KiteBroker(Broker):
         try:
             return self._submit_entry(
                 api, symbol, token, qty, side, product_type, price, trade_id, confidence,
-                momentum_urgency,
+                momentum_urgency, tag,
             )
         except (BrokerOrderRejected, BrokerOrderAmbiguous):
             raise
@@ -525,7 +540,7 @@ class KiteBroker(Broker):
     def _submit_entry(
         self, api, symbol: str, token: str, qty: int, side: str, product_type: str,
         price: float, trade_id: str, confidence: float,
-        momentum_urgency: float = 0.0,
+        momentum_urgency: float = 0.0, tag: str = "",
     ) -> Optional[str]:
         exchange = self._exchange_for_symbol(symbol)
         # Take the market unless the signal is strong enough to justify waiting for a
@@ -566,7 +581,10 @@ class KiteBroker(Broker):
             if ttl > 0:
                 params["validity"] = "TTL"
                 params["validity_ttl"] = ttl
-        tag = self.order_tag(trade_id)
+        # An explicit tag names the LEG and attempt; trade_id alone can only ever
+        # produce ENTRY|0, which is right for a first entry and wrong for everything
+        # else that reaches this method.
+        tag = str(tag or "") or self.order_tag(trade_id)
         if tag:
             params["tag"] = tag
 
