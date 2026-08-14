@@ -2139,26 +2139,64 @@ class TradeManager:
                 return row, True
         return None, True
 
+    def _sole_trade_on_contract(self, trade) -> bool:
+        """True when no OTHER open trade shares this contract.
+
+        The per-tradingsymbol position is only evidence about one trade when one trade
+        is all there is. With a sibling on the same strike the aggregate answers a
+        different question than the caller is asking, and answering it anyway is how a
+        sibling's quantity confirms an order that never filled.
+        """
+        symbol = str(getattr(trade, "trading_symbol", "") or "").strip()
+        if not symbol:
+            return True
+        mine = getattr(trade, "id", None)
+        for other in list(getattr(self, "open_trades", {}).values()):
+            if other is trade or getattr(other, "id", None) == mine:
+                continue
+            if getattr(other, "is_ghost", False):
+                continue
+            if str(getattr(other, "trading_symbol", "") or "").strip() == symbol:
+                return False
+        return True
+
     def _confirmed_reduced_quantity(
         self, trade: Trade, expected_quantity: int, timeout: float = 2.0
     ) -> Optional[int]:
-        """Wait briefly for POSITIONS — not an order ack — to prove the reduce landed.
+        """Prove the reduce landed, and prove it about THIS trade.
 
         An acknowledgement says the order was accepted, not that it filled. Booking a
         realised child off an ack is how a phantom P&L row gets written for lots that
-        never left. None means unproven.
+        never left. None means unproven, never "it did not fill".
+
+        The proof used to be the per-tradingsymbol POSITION, which describes the whole
+        contract. With a sibling on the same strike that never falls to this trade's
+        expected remainder, so a genuine reduce could never be confirmed and the
+        protective stop was never re-armed on the remainder.
+
+        The reduce ORDER answers the question directly, so it is asked first. The
+        aggregate is still consulted, but only when this trade is alone on the contract
+        -- where it is unambiguous and remains the better evidence, because it reflects
+        the exchange rather than one order's view of itself.
         """
+        prior = self._confirmed_broker_quantity(trade)
+        order_id = str(getattr(trade, "partial_reduce_order_id", "") or "")
+        sole = self._sole_trade_on_contract(trade)
         deadline = time.monotonic() + max(0.5, float(timeout or 0.5))
         while time.monotonic() < deadline:
-            position, readable = self._live_position_for_trade(trade)
-            if readable:
-                if position is None:
-                    return 0
-                signed = self._position_quantity(position)
-                if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
-                    return None          # direction flipped: not our reduce
-                if abs(signed) <= expected_quantity:
-                    return abs(signed)
+            filled = self._order_filled_quantity(order_id) if order_id else None
+            if filled:
+                return max(0, prior - int(filled))
+            if sole:
+                position, readable = self._live_position_for_trade(trade)
+                if readable:
+                    if position is None:
+                        return 0
+                    signed = self._position_quantity(position)
+                    if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
+                        return None          # direction flipped: not our reduce
+                    if abs(signed) <= expected_quantity:
+                        return abs(signed)
             time.sleep(0.2)
         return None
 
@@ -2707,15 +2745,22 @@ class TradeManager:
         would move the average entry price for lots that may never have arrived, and every
         R and P&L figure downstream is computed from that price.
         """
+        prior = self._confirmed_broker_quantity(trade)
+        order_id = str(getattr(trade, "scale_in_order_id", "") or "")
+        sole = self._sole_trade_on_contract(trade)
         deadline = time.monotonic() + max(0.5, float(timeout or 0.5))
         while time.monotonic() < deadline:
-            position, readable = self._live_position_for_trade(trade)
-            if readable and position is not None:
-                signed = self._position_quantity(position)
-                if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
-                    return None          # direction flipped: not our add
-                if abs(signed) >= int(expected_total):
-                    return abs(signed)
+            filled = self._order_filled_quantity(order_id) if order_id else None
+            if filled:
+                return prior + int(filled)
+            if sole:
+                position, readable = self._live_position_for_trade(trade)
+                if readable and position is not None:
+                    signed = self._position_quantity(position)
+                    if signed and (1 if signed > 0 else -1) != self._expected_position_sign(trade):
+                        return None          # direction flipped: not our add
+                    if abs(signed) >= int(expected_total):
+                        return abs(signed)
             time.sleep(0.2)
         return None
 
