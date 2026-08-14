@@ -160,6 +160,78 @@ def _fyers_sdk_log_path() -> str:
     # FyersDataSocket concatenates log_path + filename, so keep the trailing slash.
     return _fyers_log_dir().as_posix().rstrip("/") + "/"
 
+def drop_forming_tail_candle(
+    df: "pd.DataFrame",
+    interval_minutes: int,
+    label: str = "",
+    *,
+    now: Optional[datetime] = None,
+) -> "pd.DataFrame":
+    """Drop trailing candles whose interval has not finished yet.
+
+    An intraday history REST call returns the CURRENT bar too, holding only the volume
+    traded so far. Merged into the candle store it becomes indistinguishable from a
+    completed bar the moment the clock rolls past its minute: the profiler's forming-bar
+    check only excuses a bar whose interval has yet to elapse, and its stub walk-back only
+    rejects bars under 5% of their neighbours' median. A bar captured eight seconds into a
+    minute holds ~13% — comfortably above that floor — so it is measured as a complete
+    observation of a quiet market.
+
+    Captured live on 2026-08-14, one fetch per index, all four caught mid-bar:
+      BANKNIFTY  36,075 against a 349,417 average -> 0.103x
+      MIDCPNIFTY 83,942 against a 539,076 average -> 0.156x
+      SENSEX      5,774 against a  17,068 median  -> 0.34x
+    and the reading persists until the next fetch, which the same session's log shows can
+    be 4m47s later. 665 VOLUME RATIO LOW diagnostics were emitted in that one session.
+    Every volume gate (2.5x power move, 1.6x thrust, 1.40x cascade, 1.05x scalp) refuses
+    on those numbers, and the volume pillar scores a phantom "no participation" into the
+    confidence of every candidate instead of abstaining.
+
+    The forming bar is not ours to store: the live tick builder owns the right edge, and
+    the next fetch returns this bar complete. Trimming only the tail, and never the whole
+    frame, keeps an empty result from cascading into the volume-less Yahoo fallback.
+    """
+    if df is None or len(df) == 0 or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    try:
+        minutes = int(interval_minutes)
+    except (TypeError, ValueError):
+        return df
+    if minutes <= 0:
+        return df
+    try:
+        reference = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz=df.index.tz)
+        if df.index.tz is None and reference.tzinfo is not None:
+            reference = reference.tz_localize(None)
+        elif df.index.tz is not None and reference.tzinfo is None:
+            reference = reference.tz_localize(df.index.tz)
+        cutoff = reference - pd.Timedelta(minutes=minutes)
+    except (TypeError, ValueError, AttributeError) as exc:
+        logger.debug(f"Forming-bar trim skipped for {label or 'frame'}: {exc}")
+        return df
+
+    # Count back from the end only. A hole punched mid-frame by a clock skew would be far
+    # worse than the partial bar this exists to remove.
+    keep = len(df)
+    while keep > 0 and df.index[keep - 1] > cutoff:
+        keep -= 1
+    if keep == len(df):
+        return df
+    if keep == 0:
+        # Everything looks unfinished — a stopped clock or a one-bar frame. Handing back
+        # an empty frame sends the caller down the AngelOne/Yahoo path, and Yahoo reports
+        # zero volume for every Indian index ticker, so that trade is never worth making.
+        logger.debug(
+            f"Forming-bar trim would empty {label or 'frame'} ({len(df)} bars); keeping it."
+        )
+        return df
+    logger.debug(
+        f"Dropped {len(df) - keep} still-forming {minutes}m bar(s) from {label or 'history'} "
+        f"(newest complete {df.index[keep - 1]})."
+    )
+    return df.iloc[:keep]
+
+
 import functools
 
 def retry_on_exception(retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
@@ -222,6 +294,12 @@ class MarketDataProvider:
         # the candle builder must rebase across rather than subtract.
         self._index_cum_volume_source: Dict[str, str] = {}
         self._index_cum_volume_at: Dict[str, float] = {}
+        # Near-month futures volume/OI while the cash feed is quiet. Deliberately kept
+        # OUT of the cumulative total above: that total is ticked into the index candle
+        # series, whose volume column is Fyers cash SHARES backfilled from history, and
+        # contracts are a different quantity by ~1000x rather than a scale of it. This
+        # is telemetry and an OI read — reported, never ticked.
+        self._index_futures_fallback: Dict[str, Dict[str, float]] = {}
         self._index_futures_volume_at: Dict[str, float] = {}
         # One in-flight volume refresh at a time; the tick thread never waits on it.
         # Per-index in-flight set, guarded by a short-lived mutex. A single global lock
@@ -1248,7 +1326,29 @@ class MarketDataProvider:
     # This started at 0.75%, which is far too loose for an index system: a 0.5% error
     # is ~120 NIFTY points and would sail through silently while every stop, target and
     # position size derived from it was wrong.
-    QUOTE_DIVERGENCE_ALERT_PCT = 0.05
+    # Two feeds disagreeing about one index by this much (percent of LTP) is a fault in
+    # one of them, not market microstructure. Both quote the SAME computed index, so any
+    # real gap is staleness or a bad tick — there is no spread to explain it away.
+    #
+    # Tightened from 0.05% on 2026-08-15. At 0.05% a NIFTY at 24,000 could carry a 12
+    # point disagreement before anything was said, which is a large move on an index that
+    # gates entries; 0.015% puts that at ~3.6 points. The default is the fallback here —
+    # quote_divergence_alert_pct is the live knob.
+    QUOTE_DIVERGENCE_ALERT_PCT = 0.015
+
+    def _quote_divergence_alert_pct(self) -> float:
+        """The configured divergence tolerance, with the class default as fallback."""
+        try:
+            from config.settings import get_settings
+
+            value = float(
+                getattr(get_settings(), "quote_divergence_alert_pct", 0.0) or 0.0
+            )
+        except Exception:
+            return float(MarketDataProvider.QUOTE_DIVERGENCE_ALERT_PCT)
+        if value <= 0:
+            return float(MarketDataProvider.QUOTE_DIVERGENCE_ALERT_PCT)
+        return value
 
     def _flag_quote_divergence(
         self, symbol: str, primary: str, primary_ltp: float,
@@ -1262,7 +1362,7 @@ class MarketDataProvider:
         if not isinstance(getattr(self, "_quote_divergence", None), dict):
             self._quote_divergence = {}
         deviation = abs(primary_ltp - secondary_ltp) / primary_ltp * 100.0
-        if deviation < self.QUOTE_DIVERGENCE_ALERT_PCT:
+        if deviation < self._quote_divergence_alert_pct():
             self._quote_divergence.pop(symbol, None)
             return deviation
 
@@ -1706,7 +1806,7 @@ class MarketDataProvider:
             deviation = self._flag_quote_divergence(
                 symbol, "kite", broker_ltp, "fyers", fyers_ltp
             )
-            if deviation >= self.QUOTE_DIVERGENCE_ALERT_PCT:
+            if deviation >= self._quote_divergence_alert_pct():
                 # Disagreement this large is a fault in one of them. Trust the venue
                 # that fills the orders and quarantine the other for this symbol.
                 return broker[1], broker[0]
@@ -1777,9 +1877,22 @@ class MarketDataProvider:
         """(cumulative_volume, source) to carry on a Kite index tick.
 
         Kite sends no volume for an index, so a Kite tick would otherwise reset the
-        candle's delta to zero. Prefer the last Fyers cash total; when Fyers has gone
-        quiet, fall back to near-month FUTURES volume via get_index_activity — the
-        decided policy, and previously implemented but never called from anywhere.
+        candle's delta to zero. Carry the last Fyers cash total instead.
+
+        Only ever the CASH total. The near-month futures fallback is still resolved by
+        get_index_activity — for the health endpoint and the OI read — but it is not
+        returned here, because this value is ticked straight into the index candle
+        series whose volume column is Fyers cash shares from the history backfill.
+        Contracts are a different quantity from constituent shares, not a scale of it
+        (measured 0.006 for NIFTY, 0.001 for SENSEX), and nothing downstream can
+        separate them once they share a column: backfilled rows carry no volume_basis,
+        so the homogeneity guard reads an unlabelled row as "unknown, not a unit" and
+        passes a cash window with contract bars at its right edge as homogeneous.
+
+        When Fyers is quiet the carried total simply stops growing, so the delta is 0
+        and the bar reads empty until the history backfill fills it. An undercount that
+        the profiler already skips is the safe failure; a bar of contracts measured
+        against a mean of shares is the one that fabricates a surge.
         """
         carried = float(self._index_cum_volume.get(index_name, 0.0) or 0.0)
         source = str(self._index_cum_volume_source.get(index_name, "") or "")
@@ -1839,10 +1952,28 @@ class MarketDataProvider:
             activity = self.get_index_activity(index_name) or {}
             source = str(activity.get("source") or "")
             volume = float(activity.get("volume") or 0.0)
-            if source in {"kite_index_futures", "fyers_index"} and volume > 0:
+            if volume <= 0:
+                return
+            if source == "fyers_index":
                 self._index_cum_volume[index_name] = volume
                 self._index_cum_volume_source[index_name] = source
                 self._index_cum_volume_at[index_name] = time.time()
+                self._index_futures_fallback.pop(index_name, None)
+            elif source == "kite_index_futures":
+                # Recorded for the health endpoint and the OI read, NOT carried onto a
+                # tick. An index candle's volume column is Fyers cash shares (the
+                # `Prioritizing Fyers history ... to get volume` backfill); ticking
+                # near-month CONTRACTS into it puts two quantities ~1000x apart in one
+                # column. The homogeneity guard cannot catch that, because backfilled
+                # rows carry no volume_basis and it reads an unlabelled row as "unknown,
+                # not a unit" — so a window of cash bars with contract bars at its right
+                # edge passes as homogeneous. Measured live on 2026-08-14: forming bars
+                # of 30-780 contracts against 1m cash bars of 17k-1M shares.
+                self._index_futures_fallback[index_name] = {
+                    "volume": volume,
+                    "oi": float(activity.get("oi") or 0.0),
+                    "at": time.time(),
+                }
         except Exception as exc:
             logger.debug(f"Index activity fallback failed for {index_name}: {exc}")
         finally:
@@ -2945,6 +3076,13 @@ class MarketDataProvider:
                             fyers_df['timestamp'] = pd.to_datetime(fyers_df['timestamp'], unit='s')
                             fyers_df['timestamp'] = fyers_df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
                             fyers_df.set_index('timestamp', inplace=True)
+                            # The newest candle is the minute currently being traded. It
+                            # carries a fraction of its eventual volume, and once its
+                            # minute closes nothing downstream can tell that fraction from
+                            # a genuinely quiet bar.
+                            fyers_df = drop_forming_tail_candle(
+                                fyers_df, int(res), f"{fyers_symbol} {res}m"
+                            )
 
                             if not fyers_df.empty:
                                 nonzero = int((fyers_df['volume'] > 0).sum())
@@ -3003,7 +3141,10 @@ class MarketDataProvider:
                             fyers_df['timestamp'] = pd.to_datetime(fyers_df['timestamp'], unit='s')
                             fyers_df['timestamp'] = fyers_df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
                             fyers_df.set_index('timestamp', inplace=True)
-                            
+                            fyers_df = drop_forming_tail_candle(
+                                fyers_df, int(res), f"{fyers_symbol} {res}m"
+                            )
+
                             if not fyers_df.empty:
                                 df = fyers_df
                                 df = self._save_and_merge_candles(df, cache_file)

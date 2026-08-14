@@ -542,6 +542,44 @@ def volume_spike_depth_ofr_aligned(
     return True
 
 
+def volume_spike_min_ratio(settings, instrument: str = "") -> float:
+    """The volume-ratio floor for THIS index, not one number for all four.
+
+    A flat 2.5x is not one filter, it is four different filters. Measured over 24
+    sessions (2026-07-14..08-14, 1,650 five-minute bars per index) against the
+    profiler's own time-of-day baseline, 2.5x sits at a completely different place in
+    each index's distribution:
+
+        NIFTY       p95 1.63   ->  flat 2.0x fires on   1.3% of bars
+        BANKNIFTY   p95 2.14   ->  flat 2.0x fires on   6.2% of bars
+        MIDCPNIFTY  p95 2.13   ->  flat 2.0x fires on   6.3% of bars
+        SENSEX      p95 3.71   ->  flat 2.0x fires on  12.4% of bars
+
+    Nearly ten times more often on SENSEX than on NIFTY, from one setting. SENSEX is the
+    thinnest of the four by absolute volume (median 137k a bar against NIFTY's 3.5m),
+    and thin books produce lumpy prints, so its ratios scatter far wider.
+
+    The defaults below are each index's own 95th percentile, which puts the spike lane
+    on the top 5.0% of bars on every index instead of 1.3% on one and 12.4% on another.
+
+    Selectivity is all this equalises. It does not manufacture signal: over the same 24
+    sessions the forward-move lift at >=2.5x was 1.64x on BANKNIFTY but 1.07x on SENSEX
+    and 1.05x on MIDCPNIFTY, so on those two a volume spike says little about what
+    happens next regardless of where the bar is set. Empty entries mean nothing is
+    per-index and the flat setting applies, which is the pre-2026-08-15 behaviour.
+    """
+    base = float(getattr(settings, "volume_spike_entry_min_volume_ratio", 2.5) or 2.5)
+    name = str(instrument or "").strip().upper()
+    if not name:
+        return base
+    try:
+        per_index = getattr(settings, "volume_spike_min_ratio_by_index", None) or {}
+        value = float(per_index.get(name, 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return base
+    return value if value > 0 else base
+
+
 def volume_spike_entry_confirmed(
     *,
     timeframe: str,
@@ -557,6 +595,7 @@ def volume_spike_entry_confirmed(
     ofr: float = 0.0,
     volume_basis: str = "TRADED",
     surge_percentile: float = -1.0,
+    instrument: str = "",
 ) -> bool:
     """Confirm a fast 1min/5min directional volume-spike entry.
 
@@ -570,7 +609,7 @@ def volume_spike_entry_confirmed(
     tf = str(timeframe or "").lower()
     if tf not in {"1min", "5min"}:
         return False
-    volume_floor = float(getattr(settings, "volume_spike_entry_min_volume_ratio", 2.5) or 2.5)
+    volume_floor = volume_spike_min_ratio(settings, instrument)
     if tf == "1min":
         strong_1min_context = bool(
             power_move

@@ -966,6 +966,7 @@ class SignalProcessor:
         ofr: float = 0.0,
         volume_basis: str = "TRADED",
         surge_percentile: float = -1.0,
+        instrument: str = "",
     ) -> bool:
         return volume_spike_entry_confirmed(
             timeframe=timeframe,
@@ -981,6 +982,7 @@ class SignalProcessor:
             ofr=ofr,
             volume_basis=volume_basis,
             surge_percentile=surge_percentile,
+            instrument=instrument,
         )
 
     @staticmethod

@@ -12496,6 +12496,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 ofr=ofr,
                 volume_basis=str(metrics.get("volume_basis", "TRADED")),
                 surge_percentile=float(metrics.get("surge_percentile", -1.0)),
+                instrument=str(instrument or ""),
             )
             if not confirmed:
                 return None

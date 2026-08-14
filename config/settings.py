@@ -486,6 +486,16 @@ class Settings(BaseSettings):
     entry_order_rate_window_seconds: float = 60.0
     entry_order_kill_latch_seconds: float = 300.0
     clock_skew_max_seconds: float = 180.0
+    # Two feeds disagreeing about one INDEX by more than this (percent of LTP) is a fault
+    # in one of them: both quote the same computed number, so there is no spread to
+    # explain a gap away. Past it the system keeps the venue that fills the orders and
+    # quarantines the other for that symbol; inside it, the fresher quote wins.
+    #
+    # 0.05% was too loose to catch a stale feed on an index this system gates entries on:
+    # NIFTY at 24,000 could carry a 12-point disagreement silently. At 0.015% that is
+    # ~3.6 points on NIFTY, ~7 on BANKNIFTY and ~12 on SENSEX — tight enough that a
+    # lagging feed is caught while a normal tick-timing difference is not.
+    quote_divergence_alert_pct: float = 0.015
     shared_host_mode: bool = False
     allow_plaintext_broker_secrets: bool = True
     option_strike_selection: Literal["ATM", "ITM", "BOTH"] = "BOTH"
@@ -1832,6 +1842,44 @@ class Settings(BaseSettings):
     # form that survives the change of measurement basis.
     surge_tick_percentile_floor: float = 97.0
     volume_spike_entry_min_volume_ratio: float = 2.5
+    # Per-index volume-ratio floors, because a flat 2.5x is not one filter but four.
+    # Measured over 24 sessions (2026-07-14..08-14, 1,650 five-minute bars per index)
+    # against the profiler's own time-of-day baseline, 2.5x sits somewhere completely
+    # different in each index's distribution:
+    #
+    #     index        median   p90    p95    p99  | flat 2.0x fires on
+    #     NIFTY          0.94   1.42   1.63   2.03 |   1.3% of bars
+    #     BANKNIFTY      0.83   1.70   2.14   3.76 |   6.2% of bars
+    #     MIDCPNIFTY     0.88   1.70   2.13   4.07 |   6.3% of bars
+    #     SENSEX         0.74   2.35   3.71   9.85 |  12.4% of bars
+    #
+    # (2.0x is the live .env value; the 2.5 default above is the shipped one. The shape
+    # is the same either way — at 2.5x it is 0.5% against 9.3%.)
+    #
+    # Nine to eighteen times more often on SENSEX than on NIFTY, from one number. SENSEX is the
+    # thinnest of the four by absolute volume (median 137k a bar against NIFTY's 3.5m)
+    # and thin books print lumpily, so its ratios scatter far wider.
+    #
+    # These defaults are each index's own 95th percentile, putting the spike lane on the
+    # top 5.0% of bars on every index rather than 1.3% on one and 12.4% on another.
+    #
+    # This equalises SELECTIVITY only. It does not create signal: over the same 24
+    # sessions the forward-move lift at >=2.5x was 1.64x on BANKNIFTY but 1.07x on
+    # SENSEX and 1.05x on MIDCPNIFTY, so on those two a volume spike says little about
+    # what comes next wherever the bar is set. NIFTY produced only 8 qualifying bars in
+    # 24 sessions, too few to measure at all. Treat volume as a strong filter on
+    # BANKNIFTY and a weak one elsewhere until live data says otherwise.
+    #
+    # Empty dict = nothing is per-index and the flat setting applies everywhere, which
+    # is the pre-2026-08-15 behaviour.
+    volume_spike_min_ratio_by_index: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "NIFTY": 1.63,
+            "BANKNIFTY": 2.14,
+            "MIDCPNIFTY": 2.13,
+            "SENSEX": 3.71,
+        }
+    )
     volume_spike_entry_strong_1min_min_volume_ratio: float = 2.5
     volume_spike_entry_strong_1min_adx_threshold: float = 25.0
     volume_spike_entry_strong_1min_intel_threshold: float = 0.70
