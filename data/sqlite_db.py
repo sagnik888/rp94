@@ -77,6 +77,14 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # slippage_opt_pct for every option it prices. Nothing can tune that number
     # without a stored history of real fills to tune it against.
     "entry_slippage", "exit_slippage",
+    # The six columns below already existed in the trades table and NOTHING wrote them:
+    # schema with no producer, so every stored row read 0/NULL. They are the raw evidence
+    # of how an order filled — what was asked for, what came back, and how long it took —
+    # and without the requested price stored beside the filled one, realised slippage
+    # cannot be recomputed from history at all.
+    "requested_entry_price", "requested_exit_price",
+    "entry_filled_at", "exit_filled_at",
+    "fill_latency_ms", "exit_fill_latency_ms",
     # Scale-out state. An in-flight reduce that did not survive a restart would be
     # re-submitted against lots that are already gone.
     "partial_derisk_done", "partial_reduce_order_id",
@@ -436,6 +444,14 @@ class DatabaseManager:
                     "repaint_guard_checked": "INTEGER",
                     "entry_slippage": "REAL",
                     "exit_slippage": "REAL",
+                    # Present in long-lived databases from an earlier schema, absent from
+                    # a freshly created one — so they need migrating like anything else.
+                    "requested_entry_price": "REAL",
+                    "requested_exit_price": "REAL",
+                    "entry_filled_at": "TEXT",
+                    "exit_filled_at": "TEXT",
+                    "fill_latency_ms": "REAL",
+                    "exit_fill_latency_ms": "REAL",
                     "gtt_arm_uncertain": "INTEGER",
                     "partial_derisk_done": "INTEGER",
                     "partial_reduce_order_id": "TEXT",

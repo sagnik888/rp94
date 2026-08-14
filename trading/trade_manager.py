@@ -242,6 +242,25 @@ class Trade:
     signal_entry_price: float = 0.0  # pre-fill signal/decision price (slippage reference)
     entry_slippage: float = 0.0      # adverse ₹/unit paid vs signal at entry fill
     exit_slippage: float = 0.0       # adverse ₹/unit vs exit decision price at exit fill
+    # ── How the order filled, not merely that it did ──
+    # The trades table has carried these six columns for some time and NOTHING wrote
+    # them: no code anywhere referenced requested_entry_price, requested_exit_price,
+    # fill_latency_ms, exit_fill_latency_ms, entry_filled_at or exit_filled_at. They
+    # were schema with no producer, so every row read 0/NULL.
+    #
+    # They matter because entry_price is OVERWRITTEN by the broker fill on
+    # confirmation, and signal_entry_price -- the reference slippage is measured
+    # against -- is not persisted at all. Once a row is saved, the price that was asked
+    # for is gone, so realised slippage cannot be recomputed from the stored history:
+    # only a live in-memory EWMA could ever see it, and one restart erased the evidence.
+    # Storing the requested price beside the filled one makes each row self-sufficient:
+    # entry_price - requested_entry_price IS the entry slippage, re-derivable forever.
+    requested_entry_price: float = 0.0   # price the entry order was sent at
+    requested_exit_price: float = 0.0    # decision price the exit was sent at
+    entry_filled_at: Optional[datetime] = None
+    exit_filled_at: Optional[datetime] = None
+    fill_latency_ms: float = 0.0         # entry submit -> fill confirmation
+    exit_fill_latency_ms: float = 0.0    # exit submit -> fill confirmation
     execution_bid_price: float = 0.0
     execution_ask_price: float = 0.0
     execution_touch_source: str = ""
@@ -419,6 +438,12 @@ class Trade:
             "signal_entry_price": self.signal_entry_price,
             "entry_slippage": self.entry_slippage,
             "exit_slippage": self.exit_slippage,
+            "requested_entry_price": self.requested_entry_price,
+            "requested_exit_price": self.requested_exit_price,
+            "entry_filled_at": self.entry_filled_at.isoformat() if self.entry_filled_at else "",
+            "exit_filled_at": self.exit_filled_at.isoformat() if self.exit_filled_at else "",
+            "fill_latency_ms": self.fill_latency_ms,
+            "exit_fill_latency_ms": self.exit_fill_latency_ms,
             "execution_bid_price": self.execution_bid_price,
             "execution_ask_price": self.execution_ask_price,
             "execution_touch_source": self.execution_touch_source,
@@ -580,6 +605,12 @@ class Trade:
             signal_entry_price=float(data.get("signal_entry_price") or 0.0),
             entry_slippage=float(data.get("entry_slippage") or 0.0),
             exit_slippage=float(data.get("exit_slippage") or 0.0),
+            requested_entry_price=float(data.get("requested_entry_price") or 0.0),
+            requested_exit_price=float(data.get("requested_exit_price") or 0.0),
+            entry_filled_at=parse_ist_datetime(data.get("entry_filled_at")),
+            exit_filled_at=parse_ist_datetime(data.get("exit_filled_at")),
+            fill_latency_ms=float(data.get("fill_latency_ms") or 0.0),
+            exit_fill_latency_ms=float(data.get("exit_fill_latency_ms") or 0.0),
             execution_bid_price=float(data.get("execution_bid_price") or 0.0),
             execution_ask_price=float(data.get("execution_ask_price") or 0.0),
             execution_touch_source=str(data.get("execution_touch_source") or ""),
@@ -1164,6 +1195,7 @@ class TradeManager:
             trade.exit_reason = reason
             if getattr(trade, "exit_order_id", ""):
                 self._record_exit_slippage(trade, exit_decision_price, trade.exit_price)
+                self._stamp_fill_quality(trade, leg="EXIT", requested=exit_decision_price)
             # Realised P&L on the size the broker actually filled, not the intended
             # size. A partial fill otherwise books a loss (or gain) proportionally
             # larger than the position ever was, and that figure is what the daily
@@ -1251,6 +1283,49 @@ class TradeManager:
             else getattr(trade, "broker_order_id", "")
         )
         return bool(str(order_id or "").strip())
+
+    @staticmethod
+    def _stamp_fill_quality(trade: Trade, *, leg: str, requested: float) -> None:
+        """Record HOW the order filled, durably, at the moment of confirmation.
+
+        Slippage is measured against a reference that lives only in memory:
+        signal_entry_price for the entry, the decision price stamped into exit_price
+        for the exit. entry_price is then OVERWRITTEN by the broker fill. So once the
+        row is saved the price that was asked for is gone, and realised slippage can
+        never be recomputed from stored history -- the in-memory EWMA was the only
+        consumer that ever saw it, and a restart erased the evidence behind it.
+
+        Writing the requested price beside the filled one makes the row self-sufficient:
+        entry_price - requested_entry_price IS the slippage, re-derivable at any time,
+        which is what a static assumption has to be tuned against.
+
+        Latency is measured only when a submit time exists. It is genuinely absent on a
+        recovered or reconstructed leg, and a fabricated zero there would read as an
+        instant fill.
+        """
+        try:
+            reference = float(requested or 0.0)
+            if reference <= 0:
+                return
+            now = datetime.now(IST)
+            if str(leg or "").upper() == "EXIT":
+                trade.requested_exit_price = round(reference, 4)
+                trade.exit_filled_at = now
+                submitted = getattr(trade, "exit_submitted_at", None)
+                if submitted is not None:
+                    trade.exit_fill_latency_ms = round(
+                        max(0.0, (now - submitted).total_seconds() * 1000.0), 1
+                    )
+                return
+            trade.requested_entry_price = round(reference, 4)
+            trade.entry_filled_at = now
+            submitted = getattr(trade, "entry_submitted_at", None)
+            if submitted is not None:
+                trade.fill_latency_ms = round(
+                    max(0.0, (now - submitted).total_seconds() * 1000.0), 1
+                )
+        except Exception as exc:
+            logger.debug(f"Fill-quality stamp skipped for {getattr(trade, 'id', '')}: {exc}")
 
     @staticmethod
     def _record_entry_slippage(trade: Trade, fill_price: float) -> None:
@@ -4060,6 +4135,15 @@ class TradeManager:
                         getattr(trade, "entry_spot", 0.0),
                     ):
                         self._record_entry_slippage(trade, fill_price)
+                        # Before the overwrite below: entry_price is about to become the
+                        # fill, and signal_entry_price is not persisted, so this is the
+                        # last moment the requested price exists anywhere.
+                        self._stamp_fill_quality(
+                            trade,
+                            leg="ENTRY",
+                            requested=float(getattr(trade, "signal_entry_price", 0.0) or 0.0)
+                            or float(trade.entry_price or 0.0),
+                        )
                         trade.entry_price = fill_price
                     else:
                         logger.warning(
