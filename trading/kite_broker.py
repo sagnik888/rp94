@@ -216,6 +216,58 @@ class KiteBroker(Broker):
             return
         raise PermissionError(f"{action} blocked: {self.execution_lease_block_reason()}")
 
+    def set_execution_authority(self, provider) -> None:
+        """Wire the SYSTEM-mode authority every mutation here must satisfy.
+
+        `provider` is a zero-argument callable returning True only while the system is
+        genuinely in REAL mode. It is read at the moment of the send, which is the whole
+        point: a job queued while REAL and dispatched after a switch to HISTORICAL asks
+        again and is refused, where a check taken at enqueue time could not help.
+        """
+        self._authority_provider = provider
+
+    def _authorize_mutation(self, action: str) -> None:
+        """The single gate every broker mutation passes: session, lease, mode.
+
+        These three used to be checked in different places, or not at all. The lease was
+        asked at seven separate call sites; the system MODE was never asked here, so the
+        adapter would happily transact for a caller that had stopped being allowed to
+        ask -- a queued exit, a hot-swap window, a background reconcile on a timer.
+
+        Strictness is keyed to the account lease rather than to a default, because the
+        default is where this keeps going wrong. A broker with an established lease is
+        by construction the production one (main.py builds it with the account id), and
+        it MUST have an authority wired -- an unwired one is refused, not waved through.
+        A broker without a lease is a fixture: 50-odd test files build them deliberately
+        and none can reach a real account, so the mode question does not arise.
+        """
+        self._require_api(action)
+        self._require_account_execution_lease(action)
+
+        if not self.execution_lease_established():
+            return
+
+        provider = getattr(self, "_authority_provider", None)
+        if not callable(provider):
+            raise BrokerOrderRejected(
+                f"{action} blocked: this broker holds a live account lease but no "
+                "execution authority is wired; refusing rather than assuming REAL.",
+                terminal=True,
+            )
+        try:
+            permitted = bool(provider())
+        except Exception as exc:
+            # Cannot tell is not permission.
+            raise BrokerOrderRejected(
+                f"{action} blocked: execution authority could not be read ({exc}).",
+                terminal=True,
+            ) from exc
+        if not permitted:
+            raise BrokerOrderRejected(
+                f"{action} blocked: the system is not in REAL mode.",
+                terminal=True,
+            )
+
     # ── runaway-entry kill switch ────────────────────────────────────────────
     def _entry_rate_allowed(self) -> bool:
         """Latch entries off once too many fire inside the configured window.
@@ -514,7 +566,7 @@ class KiteBroker(Broker):
         tag: str = "",
     ) -> Optional[str]:
         try:
-            self._require_account_execution_lease("entry order")
+            self._authorize_mutation("entry order")
         except PermissionError as exc:
             raise BrokerOrderRejected(str(exc), terminal=True) from exc
         api = self._require_api("entry order")
@@ -662,7 +714,7 @@ class KiteBroker(Broker):
         # and wait for a human.
         tag: str = "",
     ) -> Optional[str]:
-        self._require_account_execution_lease("exit order")
+        self._authorize_mutation("exit order")
         api = self._require_api("exit order")
         try:
             order_id = self._api_call(
@@ -704,7 +756,7 @@ class KiteBroker(Broker):
         self, symbol: str, token: str, qty: int, side: str, trigger_price: float,
         product_type: str = "CARRYFORWARD", tag: str = "",
     ) -> Optional[str]:
-        self._require_account_execution_lease("protective stop")
+        self._authorize_mutation("protective stop")
         api = self._require_api("protective stop")
         trigger = self._tick_price(trigger_price)
         try:
@@ -764,7 +816,7 @@ class KiteBroker(Broker):
         # A GTT is a real resting order on the account, so it needs the same lease as
         # every other write. Without this a process that does NOT own the account could
         # arm a trigger on top of the stop the true holder is managing, and both fire.
-        self._require_account_execution_lease("GTT stop")
+        self._authorize_mutation("GTT stop")
         api = self._require_api("GTT stop")
         trigger = self._tick_price(trigger_price)
         exchange = self._exchange_for_symbol(symbol)
@@ -828,7 +880,7 @@ class KiteBroker(Broker):
         # The last account write without the lease, and the worst polarity of the set:
         # this STRIPS protection rather than adding or rewriting it.
         try:
-            self._require_account_execution_lease("GTT cancellation")
+            self._authorize_mutation("GTT cancellation")
         except PermissionError as exc:
             logger.error(f"GTT cancellation refused for {trigger_id}: {exc}")
             return False
@@ -878,7 +930,7 @@ class KiteBroker(Broker):
         # rewrite the trigger and quantity of the stop the true holder was managing —
         # and the holder's local protective_trigger would keep its own stale value, so
         # it would never notice or correct the divergence.
-        self._require_account_execution_lease("protective stop modification")
+        self._authorize_mutation("protective stop modification")
         api = self._require_api("protective stop modify")
         try:
             self._api_call(
@@ -903,7 +955,7 @@ class KiteBroker(Broker):
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
         if not order_id:
             return True
-        self._require_account_execution_lease("order cancellation")
+        self._authorize_mutation("order cancellation")
         api = self._require_api("order cancellation")
         try:
             self._api_call(

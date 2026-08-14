@@ -897,6 +897,15 @@ def create_system():
     trade_manager.mock_broker = sim_broker
     trade_manager.real_broker = real_broker
 
+    # The live adapter asks this at the moment of every mutation, not when the caller
+    # was queued. That is what closes the hot-swap window: a job enqueued while REAL and
+    # dispatched after a switch to HISTORICAL asks again here and is refused, and so is
+    # anything on a timer (reconcile runs every ~5s in every mode) that reaches the
+    # broker after the mode changed underneath it. Bound to the manager rather than to a
+    # captured value so it reads the CURRENT mode every time.
+    if hasattr(real_broker, "set_execution_authority"):
+        real_broker.set_execution_authority(trade_manager._live_orders_permitted)
+
     # 7. Performance Tracker
     performance = PerformanceTracker()
     logger.info("✅ Performance Tracker")
