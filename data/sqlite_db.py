@@ -449,8 +449,131 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_signal_decisions_date "
                 "ON signal_decisions(date, timestamp)"
             )
-            
+
+            # 4. Order fill ledger — who owns what, per ORDER rather than per contract.
+            #
+            # Kite reports POSITIONS per tradingsymbol, so when several trades sit on one
+            # contract the broker cannot say which trade owns which quantity. Splitting
+            # that aggregate by a rule works until a sibling exits, after which the
+            # remainder has to be re-attributed and the rule is a guess. broker_quantity
+            # SIZES protective stops, so a wrong guess arms the wrong size.
+            #
+            # An order, by contrast, belongs to exactly one trade and its fill is a fact
+            # the broker states. Recording those facts makes ownership derivable instead
+            # of inferred, and persisting them makes it survive the restart that would
+            # otherwise lose the attribution entirely.
+            #
+            # order_id is the PRIMARY KEY, which is what makes recording idempotent:
+            # retries, reconcile re-reads and restart replay all write the same row.
+            # quantity_delta is SIGNED — an entry or add is positive, an exit negative —
+            # so a trade's holding is just the sum, and a fully exited trade sums to zero
+            # without needing a separate status.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS order_fills (
+                    order_id TEXT PRIMARY KEY,
+                    trade_id TEXT NOT NULL,
+                    tradingsymbol TEXT,
+                    leg TEXT,
+                    quantity_delta INTEGER NOT NULL,
+                    tag TEXT,
+                    recorded_at TEXT
+                )
+            ''')
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_fills_trade ON order_fills(trade_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_fills_symbol ON order_fills(tradingsymbol)"
+            )
+
             self.conn.commit()
+
+    # ── order fill ledger ────────────────────────────────────────────────────
+
+    def record_order_fill(
+        self,
+        order_id: str,
+        trade_id: str,
+        quantity_delta: int,
+        *,
+        tradingsymbol: str = "",
+        leg: str = "",
+        tag: str = "",
+    ) -> bool:
+        """Record what ONE order filled, for ONE trade. Idempotent on order_id.
+
+        `quantity_delta` is signed: positive for an entry or add, negative for an exit.
+        Recording the same order twice replaces the row rather than double-counting,
+        which is what makes this safe to call from a retry, a reconcile re-read, or a
+        restart replay.
+        """
+        oid = str(order_id or "").strip()
+        tid = str(trade_id or "").strip()
+        if not oid or not tid:
+            # Without both, the row cannot be attributed and would poison the sum.
+            return False
+        try:
+            delta = int(quantity_delta)
+        except (TypeError, ValueError):
+            return False
+        with self.write_lock:
+            try:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO order_fills "
+                    "(order_id, trade_id, tradingsymbol, leg, quantity_delta, tag, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        oid, tid, str(tradingsymbol or ""), str(leg or ""), delta,
+                        str(tag or ""), datetime.now(IST).isoformat(),
+                    ),
+                )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error(f"Failed to record order fill {oid} for {tid}: {exc}")
+                return False
+
+    def owned_quantity(self, trade_id: str) -> Optional[int]:
+        """This trade's holding from its OWN fills, or None when the ledger is silent.
+
+        None and 0 are different answers and callers must treat them differently:
+        0 means "its own orders net to nothing", which is a fact; None means "no rows",
+        which is no information at all. Collapsing the two is how an unrecorded trade
+        would be read as flat and have its protection sized to nothing — or, worse in
+        the other direction, fall back to intended size and be armed for quantity the
+        account does not hold.
+        """
+        tid = str(trade_id or "").strip()
+        if not tid:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(quantity_delta), 0) FROM order_fills "
+                "WHERE trade_id = ?",
+                (tid,),
+            ).fetchone()
+        except Exception as exc:
+            logger.error(f"Failed to read owned quantity for {tid}: {exc}")
+            return None
+        if not row or not int(row[0] or 0):
+            return None
+        return max(0, int(row[1] or 0))
+
+    def owned_quantities_for_symbol(self, tradingsymbol: str) -> Dict[str, int]:
+        """{trade_id: holding} for every trade the ledger describes on one contract."""
+        symbol = str(tradingsymbol or "").strip()
+        if not symbol:
+            return {}
+        try:
+            rows = self.conn.execute(
+                "SELECT trade_id, COALESCE(SUM(quantity_delta), 0) FROM order_fills "
+                "WHERE tradingsymbol = ? GROUP BY trade_id",
+                (symbol,),
+            ).fetchall()
+        except Exception as exc:
+            logger.error(f"Failed to read owned quantities for {symbol}: {exc}")
+            return {}
+        return {str(r[0]): max(0, int(r[1] or 0)) for r in rows}
 
     def _ensure_columns(self, cursor: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
         """Add missing columns for DBs created by older restore points."""

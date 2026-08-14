@@ -224,7 +224,7 @@ def test_the_lifecycle_reproduces_the_oversized_stop(monkeypatch):
     monkeypatch.setattr(
         TradeManager,
         "_allocate_broker_quantity",
-        staticmethod(lambda group, net: {str(tid): abs(int(net or 0)) for tid, _ in group}),
+        staticmethod(lambda group, net, ledger=None: {str(tid): abs(int(net or 0)) for tid, _ in group}),
     )
 
     mgr.reconcile_broker_positions(_positions(LOT * 3))

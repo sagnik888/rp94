@@ -819,8 +819,48 @@ class TradeManager:
             )
         return False, ""
 
+    def _record_fill(
+        self, trade, order_id: str, quantity_delta: int, leg: str
+    ) -> None:
+        """Record one ORDER's fill against one TRADE, durably.
+
+        An order belongs to exactly one trade and its fill is a fact the broker states,
+        so this is the only place ownership is ever KNOWN rather than inferred. Signed:
+        an entry or add is positive, an exit negative, so a trade's holding is the sum.
+
+        Never raises. The ledger improves attribution; it must not be able to take down
+        an order path that is otherwise working, and a missing row degrades to the older
+        splitting rule rather than to a wrong number.
+        """
+        try:
+            oid = str(order_id or "").strip()
+            if not oid or not int(quantity_delta or 0):
+                return
+            db.record_order_fill(
+                oid,
+                str(getattr(trade, "id", "") or ""),
+                int(quantity_delta),
+                tradingsymbol=str(getattr(trade, "trading_symbol", "") or ""),
+                leg=str(leg or ""),
+                tag=self._broker_order_tag(trade, leg) if leg else "",
+            )
+        except Exception as exc:
+            logger.debug(f"Fill ledger write skipped for {getattr(trade, 'id', '?')}: {exc}")
+
     @staticmethod
-    def _allocate_broker_quantity(trades_on_symbol, net_qty) -> Dict[str, int]:
+    def _ledger_owned_quantity(trade_id: str) -> Optional[int]:
+        """This trade's holding per the ledger, or None when the ledger is silent.
+
+        None and 0 mean different things and must never be collapsed: 0 is "its own
+        orders net to nothing", a fact; None is "no rows", no information.
+        """
+        try:
+            return db.owned_quantity(str(trade_id or ""))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _allocate_broker_quantity(trades_on_symbol, net_qty, ledger=None) -> Dict[str, int]:
         """Split ONE broker position row across the local trades that share the contract.
 
         Kite reports POSITIONS per tradingsymbol, not per order, so three trades on the
@@ -868,7 +908,26 @@ class TradeManager:
         allocation: Dict[str, int] = {}
         remaining = total
 
+        # THE LEDGER FIRST. A trade whose own orders are recorded does not need to be
+        # guessed at: its holding is the sum of its own fills, which stays correct after
+        # a sibling exits — the case the splitting rule below cannot get right, because
+        # once the aggregate shrinks it cannot say whose quantity left.
+        #
+        # Still capped by `remaining`: the broker is authoritative about TOTAL exposure
+        # even when the ledger is authoritative about attribution. If the two disagree
+        # the aggregate wins on size, so nothing is ever armed for more than the account
+        # actually holds.
+        for tid, _trade in ordered:
+            known = ledger(str(tid)) if callable(ledger) else None
+            if known is None:
+                continue  # silent ledger is no information, not a zero
+            take = min(remaining, max(0, int(known)))
+            allocation[str(tid)] = take
+            remaining -= take
+
         for tid, trade in ordered:
+            if str(tid) in allocation:
+                continue
             own = TradeManager._confirmed_broker_quantity(trade)
             if own > 0:
                 take = min(remaining, own)
@@ -950,6 +1009,18 @@ class TradeManager:
         exit_time: Optional[datetime] = None,
         realised_pnl: Optional[float] = None,
     ) -> bool:
+        # The trade is finished, so whatever it still held has left the book. Booked
+        # here rather than at the exit ACK because an acknowledgement is not a fill, and
+        # a ledger that decrements early would under-state a position that is still on.
+        _held = self._confirmed_broker_quantity(trade)
+        if _held:
+            self._record_fill(
+                trade,
+                str(getattr(trade, "exit_order_id", "") or "")
+                or f"{getattr(trade, 'id', '')}|CLOSE",
+                -_held,
+                "FULL_EXIT",
+            )
         from config.settings import get_settings
         from engine.trade_accounting import estimate_trade_charges
 
@@ -1268,6 +1339,8 @@ class TradeManager:
                 filled, average = 0, 0.0
             if filled > 0:
                 trade.broker_quantity = filled
+                # The entry order's OWN fill: the first and most important ledger fact.
+                self._record_fill(trade, getattr(trade, "broker_order_id", ""), filled, "ENTRY")
             if average > 0:
                 trade.execution_error = ""
             logger.info(
@@ -2160,8 +2233,17 @@ class TradeManager:
 
         with self._lock:
             self._book_partial_child(trade, close_lots, exit_price, reason, exit_time)
+            # Recorded from the CONFIRMED reduction, not from the request: `confirmed`
+            # is the broker's post-reduce quantity, so the difference is what actually
+            # left. Negative, because the ledger sums to a holding.
+            _reduced = max(0, int(trade.broker_quantity or 0) - int(confirmed or 0))
             trade.broker_quantity = confirmed or trade.broker_quantity
             trade.partial_derisk_done = True
+            if _reduced:
+                self._record_fill(
+                    trade, getattr(trade, "partial_reduce_order_id", ""),
+                    -_reduced, "PARTIAL_EXIT",
+                )
         self.save_state()
         logger.success(
             f"Partial de-risk booked for {trade.trading_symbol}: {close_lots} lot(s) "
@@ -2358,6 +2440,9 @@ class TradeManager:
         trade.scale_in_lots = int(getattr(trade, "scale_in_lots", 0) or 0) + int(add_lots)
         trade.scale_in_count = int(getattr(trade, "scale_in_count", 0) or 0) + 1
         trade.broker_quantity = total_qty
+        self._record_fill(
+            trade, getattr(trade, "scale_in_order_id", ""), int(add_qty), "ADD"
+        )
         logger.success(
             f"Scale-in booked for {trade.trading_symbol}: +{add_lots} lot(s) @ "
             f"{fill_price:.2f} ({reason}); {trade.lots} lots now, average entry "
@@ -3346,7 +3431,9 @@ class TradeManager:
             if _row is None:
                 continue
             broker_allocation.update(
-                self._allocate_broker_quantity(_group, self._position_quantity(_row))
+                self._allocate_broker_quantity(
+                    _group, self._position_quantity(_row), self._ledger_owned_quantity
+                )
             )
 
         local_symbols = set()
@@ -3411,6 +3498,13 @@ class TradeManager:
                         filled_qty = order_filled_quantity(order_status)
                         if filled_qty > 0:
                             trade.broker_quantity = int(filled_qty)
+                            # The second way an entry fill becomes known: the postback
+                            # was missed and the order book states it instead. Same
+                            # order id, so recording here is the same idempotent row.
+                            self._record_fill(
+                                trade, getattr(trade, "broker_order_id", ""),
+                                int(filled_qty), "ENTRY",
+                            )
                             trade.execution_status = "PARTIAL"
                             trade.pending_execution = True
                             trade.execution_error = (

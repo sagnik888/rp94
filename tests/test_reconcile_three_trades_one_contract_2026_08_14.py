@@ -240,7 +240,7 @@ def test_the_harness_catches_the_original_defect(monkeypatch):
     monkeypatch.setattr(
         TradeManager,
         "_allocate_broker_quantity",
-        staticmethod(lambda group, net: {str(tid): abs(int(net or 0)) for tid, _ in group}),
+        staticmethod(lambda group, net, ledger=None: {str(tid): abs(int(net or 0)) for tid, _ in group}),
     )
 
     mgr.reconcile_broker_positions(_positions(225))
@@ -268,7 +268,7 @@ def test_the_allocation_fallback_is_never_the_aggregate():
     import pytest as _pytest
     mp = _pytest.MonkeyPatch()
     try:
-        mp.setattr(TradeManager, "_allocate_broker_quantity", staticmethod(lambda group, net: {}))
+        mp.setattr(TradeManager, "_allocate_broker_quantity", staticmethod(lambda group, net, ledger=None: {}))
         mgr.reconcile_broker_positions(_positions(225))
     finally:
         mp.undo()
