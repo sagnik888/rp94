@@ -505,7 +505,25 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
     )
 
 
-def start_session_archiver_scheduler():
+def _contract_token_for(data_provider, symbol: str) -> str:
+    """Resolve an option contract's broker token, or "" when it cannot be found."""
+    for attr in ("get_token_for_symbol", "resolve_token", "symbol_token"):
+        fn = getattr(data_provider, attr, None)
+        if callable(fn):
+            try:
+                token = str(fn(symbol) or "").strip()
+                if token:
+                    return token
+            except Exception:
+                continue
+    lookup = getattr(data_provider, "contract_master", None)
+    if isinstance(lookup, dict):
+        row = lookup.get(symbol) or {}
+        return str(row.get("token") or row.get("symboltoken") or "").strip()
+    return ""
+
+
+def start_session_archiver_scheduler(data_provider=None):
     """Archive each session's trades + real option-premium candles after the close.
 
     Builds the multi-day validation set the offline exit backtester replays. The live
@@ -537,6 +555,41 @@ def start_session_archiver_scheduler():
                 )
                 time.sleep(max(30.0, (target - now).total_seconds()))
                 continue
+            # BACK-FILL FIRST, in this process, because this is where the broker
+            # session lives. The archiver runs as a child with no auth, so it can only
+            # copy what the live cache already holds -- and for OPTION contracts the
+            # cache held nothing: as of 2026-08-14 it had no CE/PE file newer than
+            # 2026-07-31, so every session after that archived index candles and no
+            # premium, and became permanently unreplayable. The snapshot existed; the
+            # thing it was meant to snapshot did not.
+            if data_provider is not None:
+                try:
+                    from scripts.archive_session_data import backfill_contract_history
+
+                    def _fetch(symbol: str) -> bool:
+                        token = _contract_token_for(data_provider, symbol)
+                        if not token:
+                            return False
+                        df = data_provider.get_historical_candles(
+                            token,
+                            "BFO" if symbol.upper().startswith("SENSEX") else "NFO",
+                            "1min",
+                            days_back=1,
+                            instrument_name=symbol,
+                        )
+                        return df is not None and len(df) > 0
+
+                    filled = backfill_contract_history(session_day, _fetch, quiet=True)
+                    if filled:
+                        logger.info(
+                            f"Back-filled {len(filled)} contract histories before "
+                            f"archiving {session_day}: {', '.join(filled[:6])}"
+                            + (" ..." if len(filled) > 6 else "")
+                        )
+                except Exception as exc:
+                    # Never block the archive: a session that cannot be back-filled must
+                    # still archive whatever it does have.
+                    logger.warning(f"Contract back-fill skipped for {session_day}: {exc}")
             try:
                 subprocess.run(
                     [sys.executable, str(script), session_day, "--quiet"],
@@ -1035,7 +1088,7 @@ def main():
     # Start the log cleaner thread
     start_angelone_log_cleaner()
     start_live_session_tracker_scheduler()
-    start_session_archiver_scheduler()
+    start_session_archiver_scheduler(data_provider=data_provider)
 
     logger.info(f"Starting dashboard server on {settings.dashboard_host}:{settings.dashboard_port}")
     uvicorn.run(

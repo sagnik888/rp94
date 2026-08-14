@@ -138,6 +138,8 @@ def test_archive_writes_trades_and_manifest(monkeypatch, tmp_path):
 
 def test_main_py_wires_the_archiver_scheduler():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert "def start_session_archiver_scheduler()" in src
-    assert "start_session_archiver_scheduler()" in src.split("def main()")[-1]
+    # Takes the authenticated data provider since 2026-08-14: the archiver child has no
+    # broker session, so contract premium is back-filled in the parent before it runs.
+    assert "def start_session_archiver_scheduler(data_provider=None)" in src
+    assert "start_session_archiver_scheduler(data_provider=" in src.split("def main()")[-1]
     assert "SESSION_ARCHIVE_ENABLED" in src

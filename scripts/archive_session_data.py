@@ -74,6 +74,52 @@ def traded_symbols(events: list[dict]) -> set[str]:
     return syms
 
 
+def missing_contract_symbols(day: str, events: list[dict]) -> list[str]:
+    """Traded contracts whose 1-minute premium is NOT in the live candle cache.
+
+    The archiver can only ever copy what the cache already holds, and the cache holds
+    only what the live session happened to fetch. For OPTION contracts that turned out
+    to be nothing at all: as of 2026-08-14 the cache had no CE/PE file newer than
+    2026-07-31, so every session after that archived index candles and no premium, and
+    became permanently unreplayable.
+
+    This lists what is missing so an authenticated caller can fetch it BEFORE the
+    archive snapshot runs. The archiver itself is a child process with no broker
+    session, which is why it cannot do the fetching.
+    """
+    missing: list[str] = []
+    for sym in sorted(traded_symbols(events)):
+        if not sym.upper().endswith(("CE", "PE")):
+            continue
+        path = CANDLES / f"{sym}_1min.csv"
+        if day_slice(path, day) is None:
+            missing.append(sym)
+    return missing
+
+
+def backfill_contract_history(day: str, fetcher, events: list[dict] | None = None,
+                              *, quiet: bool = False) -> list[str]:
+    """Fetch each traded contract's 1-minute premium into the live candle cache.
+
+    `fetcher(symbol) -> bool` is supplied by the caller, which owns the authenticated
+    data provider. Returns the symbols that landed. Never raises: a session that cannot
+    be back-filled must still archive whatever it does have.
+    """
+    events = events if events is not None else load_events(day)
+    wanted = missing_contract_symbols(day, events)
+    if not wanted:
+        return []
+    filled: list[str] = []
+    for sym in wanted:
+        try:
+            if fetcher(sym):
+                filled.append(sym)
+        except Exception as exc:
+            _log(f"[backfill] {sym} failed: {exc}", quiet)
+    _log(f"[backfill] {len(filled)}/{len(wanted)} contract histories fetched for {day}", quiet)
+    return filled
+
+
 def day_slice(csv_path: Path, day: str) -> pd.DataFrame | None:
     try:
         if csv_path.stat().st_size < 120:
