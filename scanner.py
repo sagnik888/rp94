@@ -19290,10 +19290,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         trigger_time = self._configured_session_time("ut_force_exit_time", "15:25")
         exit_time = trigger_time
-        if now.time() < trigger_time:
-            return 0
 
-        exit_ts = IST.localize(datetime.combine(now.date(), exit_time))
+        # Each row is closed at ITS OWN session's square-off, not at today's.
+        #
+        # This used to return early unless now.time() >= trigger_time, and then skip any
+        # row whose date was not today's. Together those confined the sweep to one window:
+        # square-off until midnight, on the day the row was created. Miss that window and
+        # the row could never be closed again -- after midnight the early return fires on
+        # every cycle (00:05 < 15:15) and the date filter rejects yesterday's rows anyway.
+        #
+        # Missing the window is not exotic; it is what a crash does. On 2026-08-14 the
+        # process was down from before 15:15 until after midnight, so a 12:37 BANKNIFTY
+        # entry whose exit had been recorded under a different lifecycle key was still
+        # being rendered as a live intraday signal the next day, marking P&L against a
+        # dead position.
+        #
+        # Per-row keeps the intraday guarantee exactly as it was -- a row from today is
+        # untouched until today's square-off passes -- and adds the one this lacked: a
+        # row from any earlier session is closed at the first scan after restart, whenever
+        # that happens to be.
         exits: List[TradeCandidate] = []
         for instrument in list((getattr(self, "_session_trade_candidates", {}) or {}).keys()):
             for previous in self._active_session_entry_candidates(instrument):
@@ -19301,7 +19316,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if not prev_ts:
                     continue
                 prev_ist = IST.localize(prev_ts) if prev_ts.tzinfo is None else prev_ts.astimezone(IST)
-                if prev_ist.date() != now.date() or prev_ist >= exit_ts:
+                # The square-off belonging to the row's own session day.
+                exit_ts = IST.localize(datetime.combine(prev_ist.date(), exit_time))
+                if prev_ist >= exit_ts or now < exit_ts:
                     continue
 
                 dedupe_key = f"EOD_{instrument}_{previous.timeframe}_{previous.direction}_{prev_ist.isoformat()}"
