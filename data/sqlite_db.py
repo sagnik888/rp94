@@ -112,10 +112,18 @@ class DatabaseManager:
         self.write_lock = threading.Lock()
         
         self._create_tables()
-        # Never VACUUM/delete against the production ledger during pytest imports.
-        if not _running_under_pytest():
-            self.cleanup_old_records()
-        else:
+        # CONSTRUCTION DOES NOT PRUNE. This used to call cleanup_old_records() on every
+        # instantiation, suppressed only under pytest — so merely importing a module that
+        # builds a db handle DELETED 30-day-old session_signals, signal_decisions and
+        # closed trades from the production ledger, then VACUUMed it. Any script, any
+        # ad-hoc `python -c` import, any tooling: a read-shaped action with a destructive
+        # side effect, and nothing in the call looked like a delete.
+        #
+        # Retention is not lost. main.py:149 already runs the prune deliberately, once a
+        # month, gated on a marker it only writes when the prune actually succeeds — and
+        # that marker was meaningless while startup had already pruned on construction.
+        # Explicit callers still work, which is what the cleanup tests exercise.
+        if _running_under_pytest():
             logger.debug(f"SQLite test isolation active: {self.db_path}")
 
 
