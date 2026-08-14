@@ -844,6 +844,43 @@ class TradeManager:
                 )
         return False, ""
 
+    def _transactable_quantity(self, trade, requested: Optional[int] = None) -> int:
+        """How many contracts this trade may transact. ZERO IS AN ANSWER, not a gap.
+
+        The sizing sites all read `quantity or trade.broker_quantity or trade.quantity`,
+        which treats an explicit 0 as absent and falls through to the intended size. So
+        a trade that owns nothing asked the broker for a full lot: an SL-M for 75 with
+        nothing behind it, or an exit for 75 that sells a SIBLING's position on the same
+        contract. On options that writes a naked reverse leg.
+
+        That shape was harmless while 0 only ever meant "not filled yet". The fill
+        ledger changed it: 0 is now a real, evidenced answer -- this trade's own orders
+        net to nothing -- and it arrives on exactly the contracts where over-sizing does
+        the damage.
+
+        Precedence, most authoritative first:
+          1. an explicitly REQUESTED quantity, including 0
+          2. the ledger, which distinguishes a known 0 from no information at all
+          3. a confirmed broker fill
+          4. intent -- and only here, where nothing is known and the entry may simply
+             not have been confirmed yet, which is the case the old fallback was for
+        """
+        if requested is not None:
+            try:
+                return max(0, int(requested))
+            except (TypeError, ValueError):
+                return 0
+        owned = self._ledger_owned_quantity(str(getattr(trade, "id", "") or ""))
+        if owned is not None:
+            return max(0, int(owned))
+        confirmed = self._confirmed_broker_quantity(trade)
+        if confirmed > 0:
+            return confirmed
+        try:
+            return max(0, int(getattr(trade, "quantity", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def _record_fill(
         self, trade, order_id: str, quantity_delta: int, leg: str
     ) -> None:
@@ -1692,7 +1729,7 @@ class TradeManager:
         if not self.broker or not trade.symbol_token or not trade.trading_symbol:
             self._mark_recovery(trade, "Cannot establish broker protection without broker contract details")
             return False
-        qty = int(quantity or trade.broker_quantity or trade.quantity)
+        qty = self._transactable_quantity(trade, quantity)
         if qty <= 0:
             return False
         trigger = self._protective_trigger_for(trade)
@@ -2291,7 +2328,7 @@ class TradeManager:
             order_id = self.broker.close_order(
                 trade.trading_symbol, trade.symbol_token, quantity, side,
                 self.product_type,
-                **self._tag_kwargs(self.broker.close_order, trade, "EXIT"),
+                **self._tag_kwargs(self.broker.close_order, trade, "PARTIAL_EXIT"),
             )
         except (BrokerOrderRejected, PermissionError) as exc:
             logger.error(f"Partial exit refused for {trade.trading_symbol}: {exc}")
@@ -2476,7 +2513,7 @@ class TradeManager:
                     or str(trade.direction).upper() == "LONG")
                 else (entry - mark)
             )
-            qty = int(getattr(trade, "broker_quantity", 0) or trade.quantity or 0)
+            qty = self._transactable_quantity(trade)
             mult = 1.0 if str(trade.inst_type or "").upper() == "OPT" else float(
                 getattr(trade, "instrument_multiplier", 1.0) or 1.0
             )
@@ -2510,7 +2547,7 @@ class TradeManager:
         stop = float(getattr(trade, "initial_stop", 0.0) or trade.trailing_stop or 0.0)
         if entry <= 0 or stop <= 0:
             return 0.0
-        qty = int(getattr(trade, "broker_quantity", 0) or trade.quantity or 0)
+        qty = self._transactable_quantity(trade)
         mult = 1.0 if str(trade.inst_type or "").upper() == "OPT" else float(
             getattr(trade, "instrument_multiplier", 1.0) or 1.0
         )
@@ -3068,6 +3105,20 @@ class TradeManager:
         except Exception:
             return ""
 
+    # Exits used to share one leg identity, "EXIT". Splitting them into
+    # PARTIAL_EXIT / FULL_EXIT / RECOVERY_EXIT is what lets two orders on one trade be
+    # told apart -- but an order placed by the PREVIOUS build is resting at the exchange
+    # under the old tag, and a lookup for the new leg would not find it. That trade
+    # would fall through to shape matching, which cannot tell two trades on one strike
+    # apart: the exact ambiguity the tag exists to remove, reintroduced by the upgrade
+    # that was meant to remove it. So each new exit leg names the legacy tag it replaces
+    # and the lookup tries both.
+    _LEGACY_TAG_LEGS = {
+        "PARTIAL_EXIT": ("EXIT",),
+        "FULL_EXIT": ("EXIT",),
+        "RECOVERY_EXIT": ("EXIT",),
+    }
+
     def _recover_order_id_from_tag(self, trade: Trade, leg: str) -> str:
         """Ask the broker whether this leg's tagged order actually reached the exchange.
 
@@ -3091,15 +3142,31 @@ class TradeManager:
         tag = self._broker_order_tag(trade, leg, attempt)
         if not tag:
             return ""
-        try:
-            result = inspector(tag) or {}
-        except Exception as exc:
-            logger.warning(f"Tagged {leg.lower()} recovery failed for {trade.id}: {exc}")
-            return ""
+        legacy = [
+            self._broker_order_tag(trade, alt, attempt)
+            for alt in self._LEGACY_TAG_LEGS.get(str(leg).upper(), ())
+        ]
+        result, matched_tag = {}, tag
+        for candidate_tag in [tag] + [t for t in legacy if t]:
+            try:
+                result = inspector(candidate_tag) or {}
+            except Exception as exc:
+                logger.warning(f"Tagged {leg.lower()} recovery failed for {trade.id}: {exc}")
+                return ""
+            state = str(result.get("state") or "UNKNOWN").upper()
+            if state in {"FOUND", "AMBIGUOUS"}:
+                matched_tag = candidate_tag
+                if candidate_tag != tag:
+                    logger.info(
+                        f"Recovered {trade.id} {leg.lower()} under the legacy tag "
+                        f"{candidate_tag}; placed before exit legs were split."
+                    )
+                break
         state = str(result.get("state") or "UNKNOWN").upper()
         if state == "AMBIGUOUS":
             self._mark_recovery(
-                trade, f"Multiple broker orders share the exact {leg.lower()} tag {tag}"
+                trade,
+                f"Multiple broker orders share the exact {leg.lower()} tag {matched_tag}",
             )
             return ""
         if state != "FOUND":
@@ -3107,7 +3174,7 @@ class TradeManager:
         order_id = str(result.get("order_id") or "")
         if not order_id:
             self._mark_recovery(
-                trade, f"Exact {leg.lower()} tag {tag} was found without an order id"
+                trade, f"Exact {leg.lower()} tag {matched_tag} was found without an order id"
             )
         return order_id
 
@@ -3312,7 +3379,7 @@ class TradeManager:
         try:
             order_id = self.broker.close_order(
                 trade.trading_symbol, trade.symbol_token, qty, side, self.product_type,
-                **self._tag_kwargs(self.broker.close_order, trade, "EXIT"),
+                **self._tag_kwargs(self.broker.close_order, trade, "RECOVERY_EXIT"),
             )
         except (BrokerOrderRejected, PermissionError) as exc:
             # close_order takes the account lease and needs a session, so it raises just
@@ -3339,7 +3406,12 @@ class TradeManager:
             #             not latched — latching here is what strands a live position.
             # Only UNKNOWN (unreadable book) and AMBIGUOUS fall through to the latch,
             # which is the honest outcome when the question genuinely cannot be answered.
-            recovered_exit = self._recover_order_id_from_tag(trade, "EXIT")
+            # Must match the leg this method SENDS. emergency_flatten_trade now tags
+            # its order RECOVERY_EXIT, so looking up "EXIT" would search for a tag that
+            # is never written and silently fall through to shape matching -- which
+            # cannot tell two trades on one strike apart, the exact ambiguity the tag
+            # exists to remove.
+            recovered_exit = self._recover_order_id_from_tag(trade, "RECOVERY_EXIT")
             if recovered_exit:
                 trade.exit_order_id = recovered_exit
                 trade.pending_exit = True
@@ -5025,11 +5097,18 @@ class TradeManager:
                 return
 
             exit_side = "SELL" if trade.direction == "LONG" or trade.inst_type == "OPT" else "BUY"
-            exit_quantity = (
-                int(trade.broker_quantity)
-                if int(getattr(trade, "broker_quantity", 0) or 0) > 0
-                else trade.quantity
-            )
+            exit_quantity = self._transactable_quantity(trade)
+            if exit_quantity <= 0:
+                # Nothing to exit. Sending the intended size here would sell a SIBLING's
+                # quantity on the same contract, which on options opens a naked reverse
+                # leg -- the opposite of what an exit is for.
+                logger.error(
+                    f"Exit for {trade.id} refused: this trade owns no quantity "
+                    f"({trade.trading_symbol}). Nothing was sent."
+                )
+                if on_exit_result:
+                    on_exit_result(trade, False)
+                return
 
             if trade.protective_order_id:
                 # PROVE the cancel; do not just acknowledge it. cancel_order returns True
@@ -5070,7 +5149,7 @@ class TradeManager:
                 trade.protective_order_id = ""
                 self.save_state()
 
-            exit_tag_kwargs = self._tag_kwargs(broker.close_order, trade, "EXIT")
+            exit_tag_kwargs = self._tag_kwargs(broker.close_order, trade, "FULL_EXIT")
 
             def close_order():
                 return broker.close_order(

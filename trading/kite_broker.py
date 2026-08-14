@@ -244,10 +244,31 @@ class KiteBroker(Broker):
         self._require_api(action)
         self._require_account_execution_lease(action)
 
+        provider = getattr(self, "_authority_provider", None)
+
+        # An explicitly wired authority is honoured ALWAYS, lease or no lease. The
+        # lease-established test below decides only whether an authority is REQUIRED,
+        # never whether a supplied one may be ignored -- skipping it for a blank
+        # account id meant an adapter whose authority said False was still authorised,
+        # which is a fail-open path in the one place built to fail closed.
+        if callable(provider):
+            try:
+                permitted = bool(provider())
+            except Exception as exc:
+                raise BrokerOrderRejected(
+                    f"{action} blocked: execution authority could not be read ({exc}).",
+                    terminal=True,
+                ) from exc
+            if not permitted:
+                raise BrokerOrderRejected(
+                    f"{action} blocked: the system is not in REAL mode.",
+                    terminal=True,
+                )
+            return
+
         if not self.execution_lease_established():
             return
 
-        provider = getattr(self, "_authority_provider", None)
         if not callable(provider):
             raise BrokerOrderRejected(
                 f"{action} blocked: this broker holds a live account lease but no "

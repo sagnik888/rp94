@@ -80,9 +80,18 @@ def test_an_unusable_quantity_reads_as_zero(bad):
 def test_the_exit_quantity_comes_from_the_trades_own_fill():
     src = inspect.getsource(TradeManager._request_broker_exit)
 
-    assert "trade.broker_quantity" in src, "exit must size on this trade's own fill"
+    assert "_transactable_quantity(trade)" in src, (
+        "exit must size on this trade's own holding"
+    )
     assert "position" not in src.split("exit_quantity")[1][:400], (
         "exit quantity must not be read from the shared per-symbol position row"
+    )
+    # Stronger than the original assertion it replaces: _transactable_quantity asks the
+    # fill LEDGER first, so a trade the ledger says owns nothing sizes to zero instead of
+    # falling through to its intended quantity and selling a sibling's position.
+    i = src.index("exit_quantity = ")
+    assert "exit_quantity <= 0" in src[i: i + 400], (
+        "a trade owning nothing must not send an exit at all"
     )
 
 

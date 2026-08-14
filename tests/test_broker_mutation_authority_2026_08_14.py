@@ -98,9 +98,21 @@ def test_a_lease_less_broker_does_not_need_an_authority():
     _broker(leased=False)._authorize_mutation("entry order")
 
 
-def test_a_lease_less_broker_is_not_refused_by_a_false_authority():
-    """Without a live account there is nothing for the mode question to protect."""
-    _broker(leased=False, authority=lambda: False)._authorize_mutation("entry order")
+def test_a_lease_less_broker_IS_refused_by_a_false_authority():
+    """Corrected 2026-08-14: this originally asserted the opposite, and was wrong.
+
+    The reasoning was "without a live account there is nothing to protect", which
+    confused two questions. Whether an authority is REQUIRED may depend on the lease;
+    whether a SUPPLIED one may be ignored must not. An external audit built a fake
+    authenticated adapter with a blank account id and an authority explicitly returning
+    False, and it was authorised anyway -- a fail-open path in the one place built to
+    fail closed.
+
+    An explicitly wired authority is now honoured always. The lease test below decides
+    only whether one is mandatory.
+    """
+    with pytest.raises(BrokerOrderRejected, match="not in REAL mode"):
+        _broker(leased=False, authority=lambda: False)._authorize_mutation("entry order")
 
 
 # ── session is part of the same gate ─────────────────────────────────────────

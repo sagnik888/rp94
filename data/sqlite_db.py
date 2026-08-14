@@ -236,7 +236,13 @@ class DatabaseManager:
                 # only to observe that the oldest surviving row sat one day inside the
                 # cutoff. Skipping the snapshot when nothing matches keeps the common
                 # case free: no copy, no VACUUM, no churn.
+                # A COUNT that cannot be taken is not a count of zero. Swallowing the
+                # failure left doomed at 0, which skipped the snapshot and let the
+                # DELETE run anyway -- the backup bypassed by the one condition that
+                # should have made it mandatory. Unknown now means "assume rows are at
+                # risk", so the snapshot is taken and, if it fails, the prune aborts.
                 doomed = 0
+                countable = True
                 for table, column in (
                     ("session_signals", "date"),
                     ("signal_decisions", "date"),
@@ -248,8 +254,9 @@ class DatabaseManager:
                                 (cutoff_date,),
                             ).fetchone()[0]
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(f"Pre-prune count failed for {table}: {exc}")
+                        countable = False
                 try:
                     doomed += int(
                         cursor.execute(
@@ -259,21 +266,30 @@ class DatabaseManager:
                             (cutoff_ts,),
                         ).fetchone()[0]
                     )
-                except Exception:
-                    pass
-                if doomed > 0:
-                    # ABORT rather than delete unbacked. Retention is a scheduling
-                    # preference and can wait for the next run; the rows cannot be
-                    # recovered once they are gone.
-                    try:
-                        self._snapshot_before_prune(doomed, cutoff_date)
-                    except Exception as exc:
-                        logger.critical(
-                            f"RETENTION ABORTED: {doomed} rows older than {cutoff_date} "
-                            f"were eligible for deletion but the pre-prune snapshot "
-                            f"failed ({exc}). Nothing was deleted."
-                        )
-                        return False
+                except Exception as exc:
+                    logger.warning(f"Pre-prune count failed for trades: {exc}")
+                    countable = False
+
+                if not countable and doomed <= 0:
+                    doomed = -1  # unknown, and therefore treated as "something to lose"
+
+                if doomed == 0:
+                    # Genuinely nothing to delete: no snapshot, no DELETE, and no VACUUM.
+                    # The previous version still VACUUMed on a no-op prune.
+                    logger.debug(
+                        f"Retention: nothing older than {cutoff_date}; nothing to do."
+                    )
+                    return True
+
+                try:
+                    self._snapshot_before_prune(doomed, cutoff_date)
+                except Exception as exc:
+                    logger.critical(
+                        f"RETENTION ABORTED: rows older than {cutoff_date} were eligible "
+                        f"for deletion but the pre-prune snapshot failed ({exc}). "
+                        "Nothing was deleted."
+                    )
+                    return False
 
                 cursor.execute(
                     "DELETE FROM session_signals WHERE date < ?",
@@ -294,6 +310,15 @@ class DatabaseManager:
                 logger.info("Database cleanup completed and vacuumed.")
                 return True
             except Exception as e:
+                # Roll back before reporting. The DELETEs run as one transaction and a
+                # failure part-way through would otherwise leave some tables pruned and
+                # others not, with no commit to mark where it stopped -- and the next
+                # run's snapshot would then describe that half-pruned state as the
+                # "before".
+                try:
+                    self.conn.rollback()
+                except Exception as rollback_exc:
+                    logger.error(f"Rollback after failed cleanup also failed: {rollback_exc}")
                 logger.error(f"Error during DB cleanup: {e}")
                 # Reported, not raised — but the caller needs to know, because the
                 # monthly prune in main.py writes its "already done this month" marker
