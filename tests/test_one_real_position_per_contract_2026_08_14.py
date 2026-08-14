@@ -110,17 +110,78 @@ def test_a_blank_symbol_is_not_matched():
 
 # ── the switch ───────────────────────────────────────────────────────────────
 
-def test_it_can_be_lifted_for_ledger_validation(monkeypatch):
-    """The guard resolves get_settings at call time from config.settings."""
+def _settings_with(monkeypatch, **over):
     import config.settings as cs
-    mgr = _mgr(trades=[_t("t-5min")])
     base = cs.get_settings()
     monkeypatch.setattr(
         cs, "get_settings",
-        lambda: SimpleNamespace(**{**vars(base), "forbid_concurrent_same_contract_real": False}),
+        lambda: SimpleNamespace(**{**vars(base), **over}),
     )
 
+
+def test_lifting_the_master_switch_does_not_mean_unrestricted(monkeypatch):
+    """The second lock. Off does not mean open.
+
+    Stacking is only safe while the ledger can say who owns what on THIS contract, so
+    it must prove that per contract rather than once, globally, by operator judgement.
+    """
+    mgr = _mgr(trades=[_t("t-5min")])
+    _settings_with(monkeypatch, forbid_concurrent_same_contract_real=False)
+    monkeypatch.setattr(TradeManager, "_ledger_owned_quantity", staticmethod(lambda _t: None))
+
+    blocked, reason = mgr._same_contract_entry_blocked(SYMBOL)
+
+    assert blocked is True
+    assert "ledger cannot account" in reason
+
+
+def test_a_ledger_accounted_contract_may_be_stacked(monkeypatch):
+    """What step 5 unlocks: the ledger knows the existing trade, so adding is safe."""
+    mgr = _mgr(trades=[_t("t-5min")])
+    _settings_with(monkeypatch, forbid_concurrent_same_contract_real=False)
+    monkeypatch.setattr(TradeManager, "_ledger_owned_quantity", staticmethod(lambda _t: 75))
+
     assert mgr._same_contract_entry_blocked(SYMBOL)[0] is False
+
+
+def test_a_ledger_known_zero_still_counts_as_accounted(monkeypatch):
+    """0 is a real answer -- the trade's own orders net to nothing. None is not."""
+    mgr = _mgr(trades=[_t("t-5min")])
+    _settings_with(monkeypatch, forbid_concurrent_same_contract_real=False)
+    monkeypatch.setattr(TradeManager, "_ledger_owned_quantity", staticmethod(lambda _t: 0))
+
+    assert mgr._same_contract_entry_blocked(SYMBOL)[0] is False
+
+
+def test_one_unaccounted_sibling_blocks_the_whole_contract(monkeypatch):
+    """Ownership is only knowable if EVERY trade on the contract is attributable."""
+    mgr = _mgr(trades=[_t("known"), _t("unknown")])
+    _settings_with(monkeypatch, forbid_concurrent_same_contract_real=False)
+    monkeypatch.setattr(
+        TradeManager, "_ledger_owned_quantity",
+        staticmethod(lambda tid: 75 if tid == "known" else None),
+    )
+
+    assert mgr._same_contract_entry_blocked(SYMBOL)[0] is True
+
+
+def test_both_locks_off_is_fully_unrestricted(monkeypatch):
+    """A deliberate two-step escape hatch for a backtest or an emergency."""
+    mgr = _mgr(trades=[_t("t-5min")])
+    _settings_with(
+        monkeypatch,
+        forbid_concurrent_same_contract_real=False,
+        same_contract_requires_ledger_evidence=False,
+    )
+    monkeypatch.setattr(TradeManager, "_ledger_owned_quantity", staticmethod(lambda _t: None))
+
+    assert mgr._same_contract_entry_blocked(SYMBOL)[0] is False
+
+
+def test_the_ledger_gate_defaults_on():
+    from config.settings import Settings
+
+    assert Settings.model_fields["same_contract_requires_ledger_evidence"].default is True
 
 
 def test_the_setting_exists_and_defaults_on():

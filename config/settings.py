@@ -502,6 +502,22 @@ class Settings(BaseSettings):
     # Retire this by setting it False once the persisted per-order fill ledger is in
     # place and certified against sibling exits, restarts and missing acknowledgements.
     forbid_concurrent_same_contract_real: bool = True
+    # The second lock, and the one that makes lifting the first survivable. Turning
+    # forbid_concurrent_same_contract_real off does NOT return to unrestricted stacking:
+    # a second REAL trade on a contract is still refused unless the fill ledger can
+    # account for every trade already on it.
+    #
+    # That is the difference between "an operator decided the ledger works" and "the
+    # ledger demonstrates it works, per contract, at the moment of the entry". A trade
+    # the ledger cannot attribute is the entire hazard -- reconciliation falls back to
+    # splitting the aggregate, and that split becomes a guess the moment a sibling exits
+    # -- so refusing to stack onto it confines the guess to one position, where it
+    # cannot mis-size anything.
+    #
+    # Set False only for a deliberate unrestricted run (a backtest, or an emergency
+    # where stacking matters more than attribution).
+    same_contract_requires_ledger_evidence: bool = True
+
 
     # With "BOTH", the ATM and ITM candidates are scored and the higher score wins.
     # Nothing in that score describes how TRADEABLE the contract is, so two setups of

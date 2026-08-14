@@ -803,20 +803,45 @@ class TradeManager:
             return False, ""
         from config.settings import get_settings
 
+        settings = get_settings()
+        siblings = [
+            t for t in list(getattr(self, "open_trades", {}).values())
+            if not getattr(t, "is_ghost", False)
+            and str(getattr(t, "trading_symbol", "") or "").strip() == symbol
+        ]
+        if not siblings:
+            return False, ""
+
+        if _setting_enabled(
+            getattr(settings, "forbid_concurrent_same_contract_real", True), True
+        ):
+            first = siblings[0]
+            return True, (
+                f"{symbol} already held by trade {getattr(first, 'id', '?')} "
+                f"({getattr(first, 'timeframe', '?')}); one REAL position per contract "
+                "while same-contract stacking is disabled"
+            )
+
+        # The master switch is off, which does NOT mean unrestricted. Stacking is only
+        # safe while the ledger can say who owns what on THIS contract, so it has to
+        # prove that per contract rather than once, globally, by operator judgement.
+        #
+        # A trade the ledger cannot account for is the whole hazard: reconciliation
+        # falls back to splitting the aggregate, and that split is a guess the moment a
+        # sibling exits. Refusing to ADD to such a contract keeps the guess confined to
+        # a single position, where it cannot mis-size anything.
         if not _setting_enabled(
-            getattr(get_settings(), "forbid_concurrent_same_contract_real", True), True
+            getattr(settings, "same_contract_requires_ledger_evidence", True), True
         ):
             return False, ""
-        for existing in list(getattr(self, "open_trades", {}).values()):
-            if getattr(existing, "is_ghost", False):
-                continue
-            if str(getattr(existing, "trading_symbol", "") or "").strip() != symbol:
-                continue
-            return True, (
-                f"{symbol} already held by trade {getattr(existing, 'id', '?')} "
-                f"({getattr(existing, 'timeframe', '?')}); one REAL position per contract "
-                "until the fill-allocation ledger lands"
-            )
+        for existing in siblings:
+            tid = str(getattr(existing, "id", "") or "")
+            if self._ledger_owned_quantity(tid) is None:
+                return True, (
+                    f"{symbol} already held by trade {tid or '?'}, and the fill ledger "
+                    "cannot account for it; refusing to stack onto a contract whose "
+                    "ownership would have to be guessed"
+                )
         return False, ""
 
     def _record_fill(
