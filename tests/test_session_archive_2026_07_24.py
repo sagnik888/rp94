@@ -140,6 +140,19 @@ def test_main_py_wires_the_archiver_scheduler():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     # Takes the authenticated data provider since 2026-08-14: the archiver child has no
     # broker session, so contract premium is back-filled in the parent before it runs.
+    #
+    # As a GETTER, not the object. create_system() builds the provider on the dashboard
+    # bootstrap task, which runs after this scheduler is wired, so there is nothing to
+    # pass at wiring time -- naming the object here crashed startup with NameError.
+    #
+    # This assertion was previously a substring match on the exact call text, which
+    # matched the crashing line perfectly: it proved main.py CONTAINED the wiring, never
+    # that the name resolved. test_main_startup_has_no_unbound_names_2026_08_14.py now
+    # carries that half by walking main()'s bytecode.
     assert "def start_session_archiver_scheduler(data_provider=None)" in src
-    assert "start_session_archiver_scheduler(data_provider=" in src.split("def main()")[-1]
+    main_src = src.split("def main()")[-1]
+    i = main_src.index("start_session_archiver_scheduler(")
+    call = main_src[i: i + 200]
+    assert "data_provider=" in call
+    assert "lambda" in call, "the provider must be resolved at fire time, not wiring time"
     assert "SESSION_ARCHIVE_ENABLED" in src

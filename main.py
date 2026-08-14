@@ -562,15 +562,31 @@ def start_session_archiver_scheduler(data_provider=None):
             # 2026-07-31, so every session after that archived index candles and no
             # premium, and became permanently unreplayable. The snapshot existed; the
             # thing it was meant to snapshot did not.
-            if data_provider is not None:
+            # Resolved HERE, not at wiring time. The provider is built inside
+            # create_system(), which runs on the dashboard bootstrap task well after
+            # this scheduler is started, so at wiring time there is nothing to pass.
+            # A callable defers the lookup to the moment it is actually needed --
+            # after the close, by which point the scanner exists.
+            provider = data_provider
+            if (
+                provider is not None
+                and not hasattr(provider, "get_historical_candles")
+                and callable(provider)
+            ):
+                try:
+                    provider = provider()
+                except Exception as exc:
+                    logger.warning(f"Data provider unavailable for back-fill: {exc}")
+                    provider = None
+            if provider is not None:
                 try:
                     from scripts.archive_session_data import backfill_contract_history
 
                     def _fetch(symbol: str) -> bool:
-                        token = _contract_token_for(data_provider, symbol)
+                        token = _contract_token_for(provider, symbol)
                         if not token:
                             return False
-                        df = data_provider.get_historical_candles(
+                        df = provider.get_historical_candles(
                             token,
                             "BFO" if symbol.upper().startswith("SENSEX") else "NFO",
                             "1min",
@@ -1088,7 +1104,14 @@ def main():
     # Start the log cleaner thread
     start_angelone_log_cleaner()
     start_live_session_tracker_scheduler()
-    start_session_archiver_scheduler(data_provider=data_provider)
+    # The provider does not exist yet: it is built by create_system() on the bootstrap
+    # task that runs after the dashboard starts, and is reachable as scanner.data.
+    # Passing the object here referenced a name bound only inside create_system(), which
+    # crashed startup with NameError before uvicorn ever came up. The archiver sleeps
+    # until after the close, so a getter is resolved in time.
+    start_session_archiver_scheduler(
+        data_provider=lambda: getattr(runtime.get("scanner"), "data", None)
+    )
 
     logger.info(f"Starting dashboard server on {settings.dashboard_host}:{settings.dashboard_port}")
     uvicorn.run(
