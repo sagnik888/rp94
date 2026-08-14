@@ -1863,18 +1863,33 @@ class Settings(BaseSettings):
     # These defaults are each index's own 95th percentile, putting the spike lane on the
     # top 5.0% of bars on every index rather than 1.3% on one and 12.4% on another.
     #
-    # This equalises SELECTIVITY only. It does not create signal: over the same 24
-    # sessions the forward-move lift at >=2.5x was 1.64x on BANKNIFTY but 1.07x on
-    # SENSEX and 1.05x on MIDCPNIFTY, so on those two a volume spike says little about
-    # what comes next wherever the bar is set. NIFTY produced only 8 qualifying bars in
-    # 24 sessions, too few to measure at all. Treat volume as a strong filter on
-    # BANKNIFTY and a weak one elsewhere until live data says otherwise.
+    # NIFTY is held at the live 2.0 rather than its p95 of 1.63, because nothing here
+    # should make this lane MORE active. Tested in the other direction — starting from
+    # the moves rather than from the volume — a spike does not precede a big move on any
+    # of the four. Median ratio of the top 1% of forward moves:
+    #
+    #     NIFTY 1.01   BANKNIFTY 0.92   SENSEX 0.74   MIDCPNIFTY 0.73
+    #
+    # At or BELOW average volume. Sweeping every threshold from 0.8x to 2.5x, the share
+    # of big moves retained divided by the share of all bars retained sits at ~1.00
+    # throughout: no better than random. It degrades at the top — MIDCPNIFTY 0.19 at
+    # 2.0x and 0.00 at 2.5x, NIFTY 0.00 at 2.5x, SENSEX below 1.00 at every level.
+    #
+    # So this is not a filter that catches real moves, and loosening it would only add
+    # entries with no measured edge. It stays selective for that reason, not because
+    # volume is informative. Volume never blocks a normal entry in this system — the
+    # stabilization thrust only SHORTENS a wait and is OR'd with range expansion — so a
+    # tight bar here costs no setups.
+    #
+    # The one-directional read (volume -> move) gave BANKNIFTY 1.64x lift at >=2.5x, but
+    # the reverse read (move -> volume) gives it nothing, so treat even that as
+    # unconfirmed until live fills say otherwise.
     #
     # Empty dict = nothing is per-index and the flat setting applies everywhere, which
     # is the pre-2026-08-15 behaviour.
     volume_spike_min_ratio_by_index: Dict[str, float] = Field(
         default_factory=lambda: {
-            "NIFTY": 1.63,
+            "NIFTY": 2.00,
             "BANKNIFTY": 2.14,
             "MIDCPNIFTY": 2.13,
             "SENSEX": 3.71,

@@ -17,7 +17,9 @@ single setting. SENSEX is the thinnest of the four by absolute volume — median
 scatter far wider.
 
 The defaults are each index's own 95th percentile, which puts the lane on the top
-5.0% of bars everywhere.
+5.0% of bars — except NIFTY, held at the live 2.0 rather than its p95 of 1.63,
+because nothing here should make this lane MORE active. SENSEX tightens from 12.4%
+of bars to 5%; nothing is loosened.
 
 WHAT THIS DOES NOT DO
 Equalising selectivity does not manufacture signal. Over the same 24 sessions the
@@ -28,8 +30,17 @@ forward-move lift at >=2.5x, verified across 1, 3 and 6 bar horizons, was:
     SENSEX      1.02x / 1.03x / 1.07x  (153 samples)  - essentially none
     NIFTY       too few to measure       (8 samples)
 
-So a volume spike is worth something on BANKNIFTY and little on SENSEX no matter
-where the bar is set. This corrects an earlier audit note that read SENSEX's low
+Tested in the OTHER direction — starting from the moves rather than the volume —
+it is worth nothing anywhere. Median volume ratio of the top 1% of forward moves:
+NIFTY 1.01, BANKNIFTY 0.92, SENSEX 0.74, MIDCPNIFTY 0.73 — at or BELOW average.
+Sweeping 0.8x to 2.5x, big-move retention over all-bar retention sits at ~1.00
+throughout, and degrades at the top: MIDCPNIFTY 0.19 at 2.0x and 0.00 at 2.5x,
+NIFTY 0.00 at 2.5x, SENSEX under 1.00 everywhere.
+
+So this lane is kept selective because it has no measured edge, not because volume
+is informative. Volume never blocks a normal entry here — the stabilization thrust
+only SHORTENS a wait and is OR'd with range expansion — so a tight bar costs no
+setups. This corrects an earlier audit note that read SENSEX's low
 logged ratios as thin participation suppressing its entries: SENSEX in fact clears
 the spike bar more often than any other index, and on the weakest evidence.
 """
@@ -51,7 +62,7 @@ class _S:
 # ── per-index resolution ─────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("name,expected", [
-    ("NIFTY", 1.63),
+    ("NIFTY", 2.00),
     ("BANKNIFTY", 2.14),
     ("MIDCPNIFTY", 2.13),
     ("SENSEX", 3.71),
@@ -67,11 +78,18 @@ def test_sensex_is_the_highest_bar_because_its_ratios_scatter_widest():
     assert volume_spike_min_ratio(s, "SENSEX") > volume_spike_min_ratio(s, "NIFTY")
 
 
-def test_nifty_is_the_lowest_bar_because_its_ratios_cluster_tightest():
-    s = get_settings()
-    others = [volume_spike_min_ratio(s, n) for n in ("BANKNIFTY", "SENSEX", "MIDCPNIFTY")]
+def test_nifty_is_held_at_the_live_flat_value_not_its_own_p95():
+    """Its p95 is 1.63, which would take the lane from 1.3% of bars to 5%. With no
+    measured edge, nothing here may make this lane MORE active."""
+    assert volume_spike_min_ratio(get_settings(), "NIFTY") == pytest.approx(2.00)
 
-    assert volume_spike_min_ratio(s, "NIFTY") < min(others)
+
+def test_no_index_is_loosened_below_the_live_flat_floor():
+    """SENSEX tightens (12.4% -> 5% of bars); nothing goes the other way."""
+    s = get_settings()
+
+    for name in ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"):
+        assert volume_spike_min_ratio(s, name) >= 2.0 - 1e-9
 
 
 def test_the_case_of_the_name_does_not_matter():
@@ -130,7 +148,7 @@ def _confirm(instrument, volume_ratio):
 
 
 def test_a_ratio_between_the_two_floors_separates_the_indices():
-    """2.5x clears NIFTY's 1.63 bar and fails SENSEX's 3.71 — the whole point."""
+    """2.5x clears NIFTY's 2.00 bar and fails SENSEX's 3.71 — the whole point."""
     assert _confirm("NIFTY", 2.5) is True
     assert _confirm("SENSEX", 2.5) is False
 
@@ -140,4 +158,4 @@ def test_sensex_still_qualifies_above_its_own_bar():
 
 
 def test_nifty_below_its_own_bar_is_refused():
-    assert _confirm("NIFTY", 1.2) is False
+    assert _confirm("NIFTY", 1.9) is False
