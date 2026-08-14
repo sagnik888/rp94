@@ -1068,13 +1068,20 @@ class TradeManager:
         # a ledger that decrements early would under-state a position that is still on.
         _held = self._confirmed_broker_quantity(trade)
         if _held:
-            self._record_fill(
-                trade,
-                str(getattr(trade, "exit_order_id", "") or "")
-                or f"{getattr(trade, 'id', '')}|CLOSE",
-                -_held,
-                "FULL_EXIT",
-            )
+            # Prefer the exit ORDER's own executions, like every other leg. When the
+            # order cannot state them, close the ledger out EXACTLY: a finished trade
+            # holds nothing, so the closing delta is the negative of whatever the ledger
+            # currently believes -- not of trade.broker_quantity, which is the number the
+            # ledger exists to stop trusting.
+            if not self._record_leg_fill_from_order(
+                trade, str(getattr(trade, "exit_order_id", "") or ""), "FULL_EXIT", -1
+            ):
+                _sum = self._ledger_owned_quantity(getattr(trade, "id", ""))
+                _close = _held if _sum is None else _sum
+                if _close:
+                    self._record_fill(
+                        trade, f"{getattr(trade, 'id', '')}|CLOSE", -_close, "FULL_EXIT"
+                    )
         from config.settings import get_settings
         from engine.trade_accounting import estimate_trade_charges
 
@@ -3859,6 +3866,19 @@ class TradeManager:
                         detail = filler(str(trade.broker_order_id))
                         if str(detail.get("state") or "") == "FILLED":
                             fill_price = float(detail.get("average_price") or 0.0)
+                            # The same lookup states this ORDER's own filled quantity,
+                            # which was being fetched and thrown away. It is the
+                            # authoritative entry figure -- better than the position
+                            # aggregate and better than the allocation derived from it --
+                            # and it costs no extra call.
+                            try:
+                                _order_qty = max(0, int(float(detail.get("quantity") or 0)))
+                            except (TypeError, ValueError):
+                                _order_qty = 0
+                            if _order_qty:
+                                self._record_fill(
+                                    trade, str(trade.broker_order_id), _order_qty, "ENTRY"
+                                )
                     except Exception as exc:
                         logger.debug(f"Order-level fill lookup failed for {trade.id}: {exc}")
                 if fill_price <= 0.1:
