@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -127,6 +128,42 @@ class DatabaseManager:
             logger.debug(f"SQLite test isolation active: {self.db_path}")
 
 
+    def _snapshot_before_prune(self, doomed: int, cutoff_date: str) -> str:
+        """Copy the ledger next to itself before a prune removes anything.
+
+        Best effort by design: a snapshot that cannot be written must not stop the
+        prune, because the caller has already decided the retention window. But it is
+        attempted every time rows are actually at risk, so "what did that delete?" has
+        an answer that does not depend on someone having thought to back up first.
+
+        VACUUM INTO is used where available -- it is atomic and consistent against a
+        live connection -- with a plain file copy as the fallback.
+        """
+        try:
+            source = Path(self.db_path)
+            if not source.exists():
+                return ""
+            # Microseconds, not seconds: two prunes inside one second are rare but real,
+            # and a name collision made the second one silently reuse the first's
+            # snapshot — which would describe the wrong pre-state.
+            stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S_%f")
+            target = source.with_name(f"{source.stem}.pre_prune_{stamp}{source.suffix}")
+            if target.exists():
+                return str(target)
+            try:
+                self.conn.execute("VACUUM INTO ?", (str(target),))
+            except Exception:
+                shutil.copy2(source, target)
+            logger.info(
+                f"Pre-prune snapshot written: {target.name} "
+                f"({doomed} rows older than {cutoff_date} about to be removed)"
+            )
+            return str(target)
+        except Exception as exc:
+            # Reported, never raised: the prune itself is the caller's decision.
+            logger.warning(f"Could not snapshot before prune: {exc}")
+            return ""
+
     def cleanup_old_records(self, days=30):
         # Automatic cleanup is suppressed by _init_db during pytest imports.
         # Explicit calls remain executable so the cleanup contract can be tested
@@ -144,6 +181,40 @@ class DatabaseManager:
         with self.write_lock:
             try:
                 cursor = self.conn.cursor()
+                # Snapshot BEFORE deleting, and only when there is something to delete.
+                # The prune had no backup and no pre-counts, so when it fired
+                # unintentionally there was no way to answer "what did that remove?" --
+                # only to observe that the oldest surviving row sat one day inside the
+                # cutoff. Skipping the snapshot when nothing matches keeps the common
+                # case free: no copy, no VACUUM, no churn.
+                doomed = 0
+                for table, column in (
+                    ("session_signals", "date"),
+                    ("signal_decisions", "date"),
+                ):
+                    try:
+                        doomed += int(
+                            cursor.execute(
+                                f"SELECT COUNT(*) FROM {table} WHERE {column} < ?",
+                                (cutoff_date,),
+                            ).fetchone()[0]
+                        )
+                    except Exception:
+                        pass
+                try:
+                    doomed += int(
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM trades "
+                            "WHERE COALESCE(exit_timestamp, exit_time) < ? "
+                            "AND status = 'CLOSED'",
+                            (cutoff_ts,),
+                        ).fetchone()[0]
+                    )
+                except Exception:
+                    pass
+                if doomed > 0:
+                    self._snapshot_before_prune(doomed, cutoff_date)
+
                 cursor.execute(
                     "DELETE FROM session_signals WHERE date < ?",
                     (cutoff_date,),

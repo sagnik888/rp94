@@ -8,9 +8,17 @@ closed trades from the production ledger and then VACUUMed it.
 
 This was found the hard way. Roughly twenty diagnostic imports during the 2026-08-14
 session each logged "Database cleanup completed and vacuumed" against the live
-database. No rows were actually lost — the oldest signal_decisions row was
-2026-07-16 against a 2026-07-15 cutoff, one day inside the window — but that is luck,
-not safety. The next day's run would have taken real data.
+database.
+
+What was lost cannot be established after the fact, which is itself the point: there
+were no pre-counts and no backup. What is known is that the surviving SQLite rows
+start at 2026-07-16 against a 2026-07-15 cutoff — one day inside the window — while
+the append-only rtracker store still holds 40 session days back to 2026-06-08,
+including 26 days that predate the cutoff. So the analysis evidence survives in the
+store designed never to be pruned, and whether the missing SQLite rows went to these
+imports or to the scheduled monthly prune is no longer answerable.
+
+That ambiguity is what _snapshot_before_prune below exists to prevent.
 
 The shape of the bug is the point: a read-shaped action with a destructive side
 effect, where nothing at the call site looks like a delete.
@@ -128,3 +136,49 @@ def test_the_monthly_prune_remains_the_owner_of_retention():
     assert "cleanup_old_records(days=31)" in src, (
         "nothing prunes any more: retention was dropped rather than relocated"
     )
+
+
+# ── a prune that deletes must leave a snapshot ───────────────────────────────
+
+def test_a_prune_that_deletes_writes_a_snapshot_first():
+    """The incident had no backup and no pre-counts, so 'what did that remove?'
+    had no answer. A snapshot is attempted whenever rows are actually at risk."""
+    handle, path = _fresh_handle()
+    _seed(path, days_old=400)
+    from pathlib import Path as _P
+    stem = _P(path).stem
+    before = set(_P(path).parent.glob(f"{stem}.pre_prune_*"))
+
+    handle.cleanup_old_records(days=30)
+
+    after = set(_P(path).parent.glob(f"{stem}.pre_prune_*"))
+    new = after - before
+    assert new, "rows were deleted with no snapshot taken"
+    for f in new:
+        assert f.stat().st_size > 0
+        f.unlink()
+
+
+def test_a_prune_that_deletes_nothing_writes_no_snapshot():
+    """The common case stays free: no copy, no VACUUM, no churn."""
+    handle, path = _fresh_handle()
+    _seed(path, days_old=2)
+    from pathlib import Path as _P
+    stem = _P(path).stem
+    before = set(_P(path).parent.glob(f"{stem}.pre_prune_*"))
+
+    handle.cleanup_old_records(days=30)
+
+    assert set(_P(path).parent.glob(f"{stem}.pre_prune_*")) == before
+
+
+def test_a_failed_snapshot_does_not_block_the_prune(monkeypatch):
+    """Best effort: retention is the caller's decision, not the backup's."""
+    handle, path = _fresh_handle()
+    _seed(path, days_old=400)
+    monkeypatch.setattr(
+        db_module.DatabaseManager, "_snapshot_before_prune",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert handle.cleanup_old_records(days=30) is False or _counts(path) == (0, 0)
