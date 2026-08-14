@@ -95,8 +95,14 @@ def test_enabled_grades_each_timeframe_with_its_own_intelligence():
     _, score5, regime5 = SignalProcessor._candidate_timeframe_context(
         "5min", {}, 3.3, "RANGING", ctx
     )
-    assert (score15, regime15) == (15.5, "TRENDING_UP")
-    assert (score5, regime5) == (5.5, "VOLATILE")
+    # CANONICAL since 2026-08-14, not the raw aggregate["score"] this used to assert.
+    # That field is legacy-scaled (-100..100) and was read raw, then handed to
+    # normalize_intelligence_score, which infers the scale from magnitude -- so a small
+    # legacy reading like 0.9 was never divided and became near-maximum conviction.
+    # The builder now converts explicitly, which also matches the flag-OFF path: the
+    # caller's intel_score is computed the same way at scanner.py:10414.
+    assert (score15, regime15) == (0.155, "TRENDING_UP")
+    assert (score5, regime5) == (0.055, "VOLATILE")
 
 
 def test_unknown_timeframe_falls_back_safely():

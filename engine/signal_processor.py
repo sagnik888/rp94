@@ -761,24 +761,26 @@ class SignalProcessor:
             regime_block = intel.get("regime") if isinstance(intel.get("regime"), dict) else {}
             contexts[tf] = {
                 "intel_result": intel,
-                # UNIT HAZARD, deliberately left as-is -- see
-                # tests/test_per_timeframe_intel_unit_2026_08_14.py before changing it.
-                # aggregate["score"] is always legacy-scaled (-100..100) and is read raw
-                # here, then handed to normalize_intelligence_score, which infers the
-                # scale from MAGNITUDE (`if abs(score) > 1.0`). A legacy 0.9 is under
-                # that threshold, so it is never divided and reads as canonical 0.9 --
-                # a near-neutral signal promoted to near-maximum conviction.
+                # CANONICAL, like every other producer of this value.
                 #
-                # It is NOT fixable here alone. Storing the corrected legacy value
-                # round-trips straight back through the same magnitude test. Storing the
-                # canonical value diverges from the flag-off path, which supplies the
-                # caller's legacy intel_score to the same consumers -- _grade_signal
-                # would then see ~100x less conviction than it does today.
+                # This read `aggregate.get("score")` raw. That field is always
+                # legacy-scaled (-100..100) and was then handed to
+                # normalize_intelligence_score, which infers the scale from MAGNITUDE:
+                # a legacy 0.9 -- all but neutral -- is under the `abs(score) > 1.0`
+                # threshold, never divided, and reads as canonical 0.9, near-maximum
+                # conviction. Only SMALL readings were affected, which is what made it
+                # quiet; the loud cases (70 -> 0.70) looked perfectly correct.
                 #
-                # Latent: per_timeframe_grading_enabled is False, so these contexts are
-                # never consulted. Making the whole per-timeframe route canonical --
-                # fallback included -- is the prerequisite for enabling that flag.
-                "intel_score": aggregate.get("score", aggregate.get("intel_score", 0.0)),
+                # It was left unfixed on the reasoning that storing the canonical value
+                # would diverge from the flag-off path "which hands the caller's LEGACY
+                # intel_score to the same consumers". That premise was simply wrong.
+                # scanner.py:10414 computes the caller's value as
+                # `aggregate_intelligence_score(intel_result["aggregate"])`, so it is
+                # already canonical and is passed to process_best_signal unchanged.
+                # Storing canonical here CONVERGES the two paths rather than splitting
+                # them, and normalize_intelligence_score downstream becomes the no-op it
+                # is documented to be on values that are already canonical.
+                "intel_score": aggregate_intelligence_score(aggregate),
                 "regime": regime_block.get("regime") or regime_block.get("hard_label") or "",
             }
         return contexts or None

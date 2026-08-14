@@ -1,40 +1,34 @@
-"""A small legacy intelligence score reads as a huge canonical one. NOT YET FIXED.
-
-This file documents a real unit hazard and pins the two facts that keep it dormant.
-It deliberately does NOT assert a fix, because every one-line fix tried made things
-worse, and the guard here is what proved that.
+"""A small legacy intelligence score read as a huge canonical one. NOW FIXED.
 
 THE HAZARD
-_build_timeframe_contexts fills the per-timeframe intelligence that the
-per_timeframe_grading_enabled flag routes into grading:
+_build_timeframe_contexts filled the per-timeframe intelligence that the
+per_timeframe_grading_enabled flag routes into grading, and read it raw:
 
     "intel_score": aggregate.get("score", aggregate.get("intel_score", 0.0)),
 
-aggregate["score"] is ALWAYS legacy-scaled (-100..100). It reaches
+aggregate["score"] is ALWAYS legacy-scaled (-100..100). It reached
 normalize_intelligence_score, which infers the scale from MAGNITUDE:
 
     if abs(score) > 1.0:
         score /= LEGACY_SCORE_SCALE
 
-A legacy 0.9 -- all but neutral on -100..100 -- is under that threshold, so it is
-never divided and reads as canonical 0.9: near-maximum conviction, wrong by 100x.
-Only SMALL readings are affected, which is what makes it quiet. The loud cases
-(70 -> 0.70) look perfectly correct.
+A legacy 0.9 -- all but neutral on -100..100 -- is under that threshold, so it was
+never divided and read as canonical 0.9: near-maximum conviction, wrong by 100x. Only
+SMALL readings were affected, which is what made it quiet. The loud cases (70 -> 0.70)
+looked perfectly correct.
 
-WHY IT IS NOT A ONE-LINER
-  - Store the corrected LEGACY value (aggregate_intelligence_score * 100) and it
-    round-trips straight back into the same magnitude test: 0.009 * 100 = 0.9, and
-    normalize sees abs(0.9) <= 1.0 and returns 0.9 again. No improvement at all.
-  - Store the CANONICAL value and this path diverges from the flag-off path, which
-    hands the caller's legacy intel_score to the same consumers. _grade_signal would
-    receive ~100x less conviction than it does today.
+WHY THE EARLIER "NOT A ONE-LINER" VERDICT WAS WRONG
+This file previously refused to assert a fix, on the reasoning that storing the
+canonical value "diverges from the flag-off path, which hands the caller's LEGACY
+intel_score to the same consumers".
 
-The real fix is to make the whole per-timeframe route canonical -- fallback included
--- which is a prerequisite for ever enabling the flag, not a patch to this line.
+That premise was false, and checking it is all it took. scanner.py:10414 computes the
+caller's value as aggregate_intelligence_score(intel_result["aggregate"]) and passes it
+to process_best_signal unchanged -- so the flag-off path was ALREADY canonical. Storing
+canonical here CONVERGES the two paths instead of splitting them.
 
-WHY IT IS DORMANT
-per_timeframe_grading_enabled defaults False, so these contexts are never consulted.
-The last test below fails the moment that default flips, which is the point.
+The other bullet was correct: storing a corrected LEGACY value would round-trip back
+through the same magnitude test and improve nothing. Only the canonical form works.
 """
 import inspect
 
@@ -48,77 +42,91 @@ from engine.intelligence_score import (
 from engine.signal_processor import SignalProcessor
 
 
-# ── the hazard is real ───────────────────────────────────────────────────────
+# ── the conversion itself ────────────────────────────────────────────────────
 
-def test_a_near_neutral_legacy_score_reads_as_near_maximum():
-    """0.9 on a -100..100 scale is ~neutral. The magnitude guess calls it 0.9."""
+def test_a_near_neutral_legacy_score_stays_near_neutral():
+    """The whole bug in one line: 0.9 legacy is 0.9%, not 90%."""
+    assert aggregate_intelligence_score({"score": 0.9}) == pytest.approx(0.009)
+
+
+def test_the_magnitude_guess_would_have_got_that_wrong():
+    """Pins WHY the raw read was unsafe, so the reason cannot be forgotten."""
     assert normalize_intelligence_score(0.9) == pytest.approx(0.9)
-
-    correct = aggregate_intelligence_score({"score": 0.9})
-    assert correct == pytest.approx(0.009)
+    assert normalize_intelligence_score(0.9) != pytest.approx(0.009)
 
 
-@pytest.mark.parametrize("legacy", [0.1, 0.5, 0.9, -0.9])
-def test_the_magnitude_guess_is_lossy_below_one(legacy):
-    assert normalize_intelligence_score(legacy) == pytest.approx(legacy)
-    assert aggregate_intelligence_score({"score": legacy}) == pytest.approx(
-        legacy / LEGACY_SCORE_SCALE
-    )
+def test_a_loud_reading_is_unchanged():
+    """70 -> 0.70 both ways, which is why the bug was invisible in normal ranges."""
+    assert aggregate_intelligence_score({"score": 70.0}) == pytest.approx(0.70)
+    assert normalize_intelligence_score(70.0) == pytest.approx(0.70)
 
 
-def test_ordinary_scores_are_unaffected():
-    """Why this stayed hidden: everything above 1.0 behaves correctly."""
-    for legacy in (70.0, -70.0, 42.0, 100.0):
-        assert normalize_intelligence_score(legacy) == pytest.approx(
-            legacy / LEGACY_SCORE_SCALE
-        )
-
-
-# ── why the obvious fixes do not work ────────────────────────────────────────
-
-def test_rescaling_back_to_legacy_does_not_help():
-    """Pins the failed fix so it is not attempted again."""
-    stored = aggregate_intelligence_score({"score": 0.9}) * LEGACY_SCORE_SCALE
-
-    assert normalize_intelligence_score(stored) == pytest.approx(0.9), (
-        "the round trip lands back on the wrong value -- the heuristic is lossy "
-        "for any |legacy| <= 1, so the legacy unit cannot carry these readings"
-    )
-
-
-def test_the_canonical_value_is_a_hundred_times_smaller():
-    """Why storing canonical here would break grading on the flag-off path."""
-    legacy = 70.0
+@pytest.mark.parametrize("legacy", [0.9, -0.9, 70.0, -85.0, 0.0, 100.0, -100.0])
+def test_normalising_a_canonical_value_is_a_no_op(legacy):
+    """Downstream still calls normalize; on canonical input it must change nothing."""
     canonical = aggregate_intelligence_score({"score": legacy})
 
-    assert legacy / canonical == pytest.approx(LEGACY_SCORE_SCALE)
+    assert normalize_intelligence_score(canonical) == pytest.approx(canonical)
 
 
-# ── the guards that keep it dormant ──────────────────────────────────────────
+def test_score_norm_is_preferred_over_the_legacy_field():
+    """The aggregator publishes the explicit value; it must win."""
+    payload = {"score": 90.0, "score_norm": 0.12}
 
-def test_the_hazard_is_documented_at_the_site():
-    src = inspect.getsource(SignalProcessor)
-    i = src.index('"intel_score": aggregate.get("score"')
+    assert aggregate_intelligence_score(payload) == pytest.approx(0.12)
 
-    assert "UNIT HAZARD" in src[i - 1400: i], (
-        "the warning above this line is the only thing telling the next reader why "
-        "the obvious fix is wrong"
+
+# ── the context builder no longer guesses ────────────────────────────────────
+
+def test_the_builder_reads_the_aggregate_explicitly():
+    src = inspect.getsource(SignalProcessor._build_timeframe_contexts)
+    # The comment explains the old read by quoting it; only executable lines matter.
+    code = " ".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
     )
 
+    assert "aggregate_intelligence_score(aggregate)" in code, (
+        "the per-timeframe score is being inferred from magnitude again"
+    )
+    assert 'aggregate.get("score"' not in code, "the raw legacy field is being read again"
 
-def test_per_timeframe_grading_is_still_off():
-    """The hazard is unreachable only while this is False.
 
-    If this test fails because the default was flipped, the unit handling on the
-    per-timeframe route must be made canonical FIRST -- read this file's docstring.
+def test_both_routes_now_agree_on_the_scale():
+    """Flag on and flag off must hand grading the same units.
+
+    The flag-off path supplies the caller's intel_score, computed by scanner.py with
+    aggregate_intelligence_score. The flag-on path now computes it the same way, so
+    enabling the flag changes WHICH timeframe's intelligence is used and not what a
+    number means.
+    """
+    import scanner as scanner_module
+
+    scanner_src = inspect.getsource(scanner_module)
+    builder_src = inspect.getsource(SignalProcessor._build_timeframe_contexts)
+
+    assert "intel_score = aggregate_intelligence_score(" in scanner_src
+    assert "aggregate_intelligence_score(aggregate)" in builder_src
+
+
+def test_the_fallback_path_is_untouched_when_the_flag_is_off():
+    """Disabled still returns None, so grading stays byte-identical."""
+    src = inspect.getsource(SignalProcessor._build_timeframe_contexts)
+    i = src.index("per_timeframe_grading_enabled")
+
+    assert "return None" in src[i: i + 300]
+
+
+# ── the flag is still off, and that is a separate decision ───────────────────
+
+def test_per_timeframe_grading_is_still_disabled_by_default():
+    """The unit hazard is fixed; whether to ENABLE the route is its own question.
+
+    The remaining reason to leave it off is unrelated to units: the candidate's nested
+    intelligence context and several pre-entry gates still read the outer 5-minute
+    bundle, so enabling it would grade on one timeframe and gate on another.
     """
     from config.settings import Settings
 
     field = Settings.model_fields.get("per_timeframe_grading_enabled")
-    if field is None:
-        pytest.skip("flag not defined as a setting")
-
-    assert field.default is False, (
-        "per-timeframe grading was enabled while the intelligence unit on that route "
-        "is still legacy-scaled and read through a magnitude guess"
-    )
+    assert field is not None
+    assert field.default is False
