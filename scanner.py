@@ -12540,7 +12540,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     ) -> float:
         """Minimum peak P&L before SMART_PROFIT_LOCK can arm."""
         settings = get_settings()
-        base_peak = float(getattr(settings, "profit_lock_min_peak_rs", 500.0) or 500.0)
+        base_peak = Scanner._profit_lock_arm_base_rs(
+            self,
+            trade_like,
+            float(getattr(settings, "profit_lock_min_peak_rs", 500.0) or 500.0),
+            float(getattr(settings, "profit_lock_arm_scalp_cost_pct", 0.0) or 0.0),
+        )
         min_peak = base_peak
         risk = abs(float(initial_risk_rs or 0.0))
         normal_r_mult = float(getattr(settings, "profit_lock_min_r_multiple", 0.20) or 0.20)
@@ -12573,8 +12578,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Applied OUTSIDE the let_winners_run test on purpose: that flag adds the
             # R-multiple DELAY, so gating the base on it too would make switching
             # let-winners-run OFF arm later than leaving it on.
-            min_peak = float(
-                getattr(settings, "profit_lock_nonscalp_min_peak_rs", 250.0) or 250.0
+            min_peak = Scanner._profit_lock_arm_base_rs(
+                self,
+                trade_like,
+                float(getattr(settings, "profit_lock_nonscalp_min_peak_rs", 250.0) or 250.0),
+                float(getattr(settings, "profit_lock_arm_cost_pct", 0.0) or 0.0),
             )
             if self._setting_enabled(getattr(settings, "let_winners_run", True), True):
                 r_mult = normal_r_mult
@@ -12596,8 +12604,99 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Rs.1, and a lock armed below the round-trip cost banks less than it pays.
         return max(min_peak, Scanner._profit_protect_cost_floor_rs(self, trade_like))
 
+    @staticmethod
+    def _position_cost_rs(trade_like) -> float:
+        """What this contract actually put at risk: premium x quantity.
+
+        Every rupee threshold in the profit-lock stack is really a statement about
+        breathing room, and breathing room only means something relative to this. The
+        four indices span 6x on lot size alone (SENSEX 20, MIDCPNIFTY 120), so a flat
+        rupee line is a different instruction on each of them.
+        """
+        if trade_like is None:
+            return 0.0
+        try:
+            entry = float(getattr(trade_like, "entry_price", 0.0) or 0.0)
+            qty = int(getattr(trade_like, "quantity", 0) or 0)
+            if qty <= 0:
+                lots = int(getattr(trade_like, "lots", 0) or 0)
+                lot_size = int(getattr(trade_like, "lot_size", 0) or 0)
+                qty = lots * lot_size
+            cost = entry * float(qty)
+        except (TypeError, ValueError):
+            return 0.0
+        return cost if cost > 0 else 0.0
+
+    def _profit_lock_arm_base_rs(self, trade_like, base_rs: float, pct: float) -> float:
+        """A lock's arming rung, scaled to the contract it arms on.
+
+        This is the LOWEST lock, and the one where a flat rupee number bites hardest:
+        the non-scalp base of Rs.250 is 12.5 points of premium on a 20-lot SENSEX and
+        2.1 points on a 120-lot MIDCPNIFTY. Two points is inside the noise of an ATR
+        flip, so MIDCPNIFTY was arming a lock before its entry had room to prove
+        anything, while SENSEX got six times the room from the same setting.
+
+        The percentages are anchored on SENSEX, whose current behaviour the operator
+        reports as correct: Rs.250 of a Rs.10,000 position is 2.5%, Rs.500 is 5%. Every
+        index now arms at the same share of what it put at risk. Falls back to the flat
+        base when the row cannot be priced or sized.
+        """
+        base = float(base_rs or 0.0)
+        if pct <= 0:
+            return base
+        cost = Scanner._position_cost_rs(trade_like)
+        if cost <= 0:
+            return base
+        return cost * pct / 100.0
+
+    def _profit_lock_floor_rs(self, trade_like) -> float:
+        """The give-back floor for THIS contract, not a flat rupee line for all four.
+
+        A flat floor means six different things across these indices. SENSEX trades 20
+        to a lot and MIDCPNIFTY 120, so Rs.500 is 25 points of premium on the first and
+        barely 4 on the second -- the same instruction asking one index to sit through
+        six times the swing of another. Entries here come from an ATR flip, which needs
+        room to breathe, and the narrow end of that range gives it almost none.
+
+        Scaling on position cost fixes it with one number instead of four: 5% reproduces
+        the Rs.500/25-point SENSEX behaviour that works today and lifts MIDCPNIFTY to
+        ~Rs.1,020, while NIFTY and BANKNIFTY fall below profit_lock_abs_floor_rs, which
+        keeps doing its original job as a cost-coverage minimum.
+
+        max(absolute, proportional): at least enough to clear the round trip, and at
+        least this share of what was put at risk.
+        """
+        settings = get_settings()
+        abs_floor = float(getattr(settings, "profit_lock_abs_floor_rs", 450.0) or 450.0)
+        pct = float(getattr(settings, "profit_lock_cost_pct", 0.0) or 0.0)
+        if pct <= 0 or trade_like is None:
+            return abs_floor
+        cost = self._position_cost_rs(trade_like)
+        if cost <= 0:
+            # An unpriced or unsized row cannot be scaled; the flat floor is the safe
+            # answer, never a floor of zero that would let anything cut anything.
+            return abs_floor
+
+        proportional = cost * pct / 100.0
+        # The other half of the floor is cost coverage, and it has to be the REAL round
+        # trip rather than a flat rupee stand-in. Rs.450 was doing this job and doing it
+        # unevenly: the actual round trip is Rs.125-202 across these four, so Rs.450 was
+        # never a cost floor at all -- it was an arbitrary line that happened to bind on
+        # exactly the two mid-sized contracts, handing NIFTY 5.77% and BANKNIFTY 6.00%
+        # while SENSEX got 4.50% and MIDCPNIFTY 2.21%. Deriving it puts every index on
+        # the same proportional rule and leaves cost coverage to bind only where the
+        # position really is too small to be worth locking.
+        try:
+            cost_floor = float(Scanner._round_trip_cost_rs(self, trade_like)) * float(
+                getattr(settings, "profit_lock_min_cost_multiple", 2.0) or 0.0
+            )
+        except Exception:
+            cost_floor = 0.0
+        return max(proportional, cost_floor)
+
     def _smart_lock_floor_collapse(
-        self, peak_pnl: float, current_pnl_rs: float, retention_ratio: float = 0.0
+        self, peak_pnl: float, current_pnl_rs: float, retention_ratio: float = 0.0,
+        floor_rs: Optional[float] = None,
     ) -> bool:
         """Whether the absolute keep-floor may cut this trade.
 
@@ -21940,7 +22039,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             smart_ratio = self._smart_lock_backstop_ratio(lock_ratio, scalp_mode)
             abs_floor_rs = float(getattr(get_settings(), "profit_lock_abs_floor_rs", 450.0) or 450.0)
             floor_collapse = self._smart_lock_floor_collapse(
-                previous_peak, current_pnl_rs, smart_ratio
+                previous_peak, current_pnl_rs, smart_ratio,
+                floor_rs=self._profit_lock_floor_rs(previous),
             )
             if smart_min_peak <= previous_peak and ladder_peak < 3000.0 and (current_pnl_rs < previous_peak * smart_ratio or floor_collapse):
                 exit_floor = float(lock_stop or 0.0)
@@ -28244,7 +28344,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if current_pnl_rs < (
                     trade.peak_pnl * backstop_ratio_live
                 ) or self._smart_lock_floor_collapse(
-                    trade.peak_pnl, current_pnl_rs, backstop_ratio_live
+                    trade.peak_pnl, current_pnl_rs, backstop_ratio_live,
+                    floor_rs=self._profit_lock_floor_rs(trade),
                 ):
                     if current_pnl_rs < 0.0:
                         recovery_action = handle_live_recovery_watch("SMART_PROFIT_LOCK")

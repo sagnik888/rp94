@@ -817,6 +817,54 @@ class Settings(BaseSettings):
     profit_lock_min_peak_rs: float = 500.0
     profit_lock_nonscalp_min_peak_rs: float = 250.0
     profit_lock_abs_floor_rs: float = 450.0
+    # The give-back floor as a share of what the position actually cost, because a flat
+    # rupee line means six different things across four indices. SENSEX trades 20 to a
+    # lot and MIDCPNIFTY 120, so Rs.500 is 25 points of premium on the first and barely
+    # 4 on the second — the same instruction asking one index to sit through six times
+    # the swing of another, on a system whose entries come from an ATR flip that needs
+    # room to breathe.
+    #
+    # 5% of position cost reproduces both reference points independently: SENSEX at a
+    # ~500 premium gives Rs.500 (25 points, the number that has been working), and
+    # MIDCPNIFTY at a ~170 premium gives Rs.1,020 (the ~Rs.1,000 the operator asked
+    # for). NIFTY and BANKNIFTY land at Rs.390 and Rs.375, below profit_lock_abs_floor_rs,
+    # which then does its original job — a cost-coverage minimum, since below roughly
+    # Rs.450 the round trip is mostly charges.
+    #
+    # The effective floor is max(cost x pct, round_trip x cost_multiple): at least this
+    # share of what was put at risk, and at least enough to clear the real round trip.
+    # Set to 0 to disable and fall back to the flat floor alone.
+    profit_lock_cost_pct: float = 5.0
+    # Cost coverage, derived rather than assumed. profit_lock_abs_floor_rs was carrying
+    # this job at a flat Rs.450 while the actual round trip on these four contracts is
+    # Rs.125-202 — so it was never a cost floor, just a line that happened to bind on the
+    # two mid-sized ones. That handed NIFTY 5.77% of position cost and BANKNIFTY 6.00%
+    # while SENSEX got 4.50% and MIDCPNIFTY 2.21%: the same unevenness the percentage
+    # above exists to remove, surviving in the place it was least visible.
+    #
+    # At 2x the round trip the coverage floor lands at Rs.250-404, below the 5% figure on
+    # every one of the four, so the proportional rule governs uniformly and this binds
+    # only where a position really is too small to be worth locking.
+    # profit_lock_abs_floor_rs remains the fallback for a row that cannot be priced or
+    # sized — never a floor of zero.
+    profit_lock_min_cost_multiple: float = 2.0
+    # The LOWEST locks — the rungs a lock arms on — scaled the same way, because this is
+    # where a flat rupee number bites hardest. The non-scalp base of Rs.250 is 12.5 points
+    # of premium on a 20-lot SENSEX and 2.1 points on a 120-lot MIDCPNIFTY. Two points is
+    # inside the noise of an ATR flip: MIDCPNIFTY was arming a lock before its entry had
+    # room to prove anything, while SENSEX got six times the room from the same setting.
+    #
+    # Anchored on SENSEX, whose behaviour today is the reference: on a ~Rs.10,000 position
+    # Rs.250 is 2.5% and Rs.500 is 5%. Every index now arms at the same share of what it
+    # put at risk, in points of premium:
+    #
+    #     arm (non-scalp, 2.5%)      NIFTY 3.0   BANKNIFTY  6.25   SENSEX 12.5   MIDCP 4.25
+    #     arm (scalp, 5.0%)          NIFTY 6.0   BANKNIFTY 12.50   SENSEX 25.0   MIDCP 8.50
+    #
+    # The R-multiple above still governs whenever risk x r_mult is larger; these set the
+    # floor under it. Set either to 0 to return to the flat rupee base.
+    profit_lock_arm_cost_pct: float = 2.5
+    profit_lock_arm_scalp_cost_pct: float = 5.0
     # The sub-Rs.1,000 rung retains 50% of peak, i.e. it stops a trade that gives back
     # half. Measured heat as a fraction of peak across every winner in 47 sessions:
     # TRENDING_UP 8%, TRENDING_DOWN 28%, RANGING 35%, BREAKOUT_DOWN 43%, BREAKOUT_UP
