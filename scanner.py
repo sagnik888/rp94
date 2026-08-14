@@ -6494,6 +6494,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         # EOD Square-off monitoring (Always active if trades or manual signal rows exist)
         session_now = self._session_squareoff_clock()
+        # Before anything else this cycle: settle what a previous shutdown left open.
+        # The EOD sweep below only sees rows for the CURRENT session day, so a row
+        # stranded by a crash in an earlier session is invisible to it forever.
+        if not getattr(self, "_prior_session_reconciled", False):
+            self._prior_session_reconciled = True
+            try:
+                self._reconcile_prior_session_open_rows(session_now)
+            except Exception as exc:
+                logger.warning(f"Prior-session reconcile failed: {exc}")
         self._force_exit_session_candidates_at_eod(session_now)
         # Orphans count as exposure here, not just local rows. An orphan makes
         # can_open_trade refuse EVERY entry ("Broker-only orphan position requires
@@ -19391,6 +19400,167 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "warning",
         )
         return len(exits)
+
+    @staticmethod
+    def _payload_lifecycle_key(payload: Dict[str, Any]) -> str:
+        """_candidate_lifecycle_key, for a stored ledger payload rather than an object."""
+        ts = str(
+            payload.get("source_signal_timestamp")
+            or payload.get("signal_timestamp")
+            or ""
+        )
+        return "|".join([
+            str(payload.get("instrument") or ""),
+            str(payload.get("timeframe") or ""),
+            str(payload.get("direction") or ""),
+            ts,
+        ])
+
+    def _reconcile_prior_session_open_rows(self, now: Optional[datetime] = None) -> int:
+        """Settle signal rows that a shutdown left open in an EARLIER session.
+
+        _load_session_trade_candidates only ever loads the CURRENT session day, and
+        _force_exit_session_candidates_at_eod only sweeps what is loaded. So a row left
+        open when the process died is unreachable the moment the day rolls over: nothing
+        loads it, nothing closes it, and the ledger keeps saying that trade never exited.
+        Replaying that session then reads an open position that in reality was closed
+        hours earlier.
+
+        Observed 2026-08-14: the process was down from before the 15:15 square-off until
+        after midnight, and a BANKNIFTY 57400PE entry stayed open in the ledger with its
+        real exit sitting right beside it, unmatched.
+
+        Two ways a row gets settled here, in order of how much they claim:
+
+        ADOPT   The exit exists but was keyed to a different lifecycle timestamp -- the
+                orphan's own exit, already recorded, simply not matched. Re-key it to the
+                entry it belongs to. This claims nothing new: the fill, the price and the
+                time are the ones the session actually produced.
+
+        SQUARE  No exit anywhere. Synthesize one at that session's own hard square-off,
+                marked STALE_SESSION_RECONCILE so a replay can tell a reconstructed close
+                from a real one, priced at the last mark the row carried.
+
+        Adoption only considers exits no other entry has claimed, so a correctly paired
+        exit is never stolen from its own entry.
+        """
+        if getattr(self, "mode", "") == "HISTORICAL":
+            return 0
+
+        now = now or self._session_squareoff_clock()
+        now = IST.localize(now) if now.tzinfo is None else now.astimezone(IST)
+        current_day = str(
+            getattr(self, "_session_candidate_day", "") or self._get_current_session_day()
+        )
+        exit_time = self._configured_session_time("ut_force_exit_time", "15:25")
+
+        def _parse(text) -> Optional[datetime]:
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(text))
+            except (TypeError, ValueError):
+                return None
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+        try:
+            days = list(db.list_session_signal_dates() or [])
+        except Exception as exc:
+            logger.warning(f"Prior-session reconcile skipped (ledger unreadable): {exc}")
+            return 0
+
+        settled = 0
+        for day in days:
+            if str(day) >= current_day:
+                continue
+            try:
+                payloads = list(db.load_session_signals(str(day)) or [])
+            except Exception as exc:
+                logger.warning(f"Prior-session reconcile skipped for {day}: {exc}")
+                continue
+            if not payloads:
+                continue
+
+            entries = [p for p in payloads if str(p.get("action") or "ENTRY").upper() == "ENTRY"]
+            exits = [p for p in payloads if str(p.get("action") or "").upper() == "EXIT"]
+            entry_keys = {self._payload_lifecycle_key(p) for p in entries}
+            exit_keys = {self._payload_lifecycle_key(p) for p in exits}
+            orphans = [p for p in entries if self._payload_lifecycle_key(p) not in exit_keys]
+            if not orphans:
+                continue
+
+            # An exit whose lifecycle key matches no entry is unclaimed and adoptable.
+            unclaimed = [p for p in exits if self._payload_lifecycle_key(p) not in entry_keys]
+            squareoff_ts = None
+            day_date = _parse(day)
+            if day_date is not None:
+                squareoff_ts = datetime.combine(day_date.date(), exit_time)
+            changed = False
+
+            for orphan in orphans:
+                entry_ts = _parse(orphan.get("source_signal_timestamp") or orphan.get("signal_timestamp"))
+                adopted = None
+                for candidate_exit in unclaimed:
+                    if any(
+                        str(candidate_exit.get(field) or "") != str(orphan.get(field) or "")
+                        for field in ("instrument", "timeframe", "direction", "trading_symbol")
+                    ):
+                        continue
+                    filled_at = _parse(candidate_exit.get("exit_timestamp"))
+                    if filled_at is None or (entry_ts is not None and filled_at < entry_ts):
+                        continue
+                    if adopted is None or filled_at < _parse(adopted.get("exit_timestamp")):
+                        adopted = candidate_exit
+                if adopted is not None:
+                    unclaimed.remove(adopted)
+                    adopted["source_signal_timestamp"] = str(
+                        orphan.get("source_signal_timestamp")
+                        or orphan.get("signal_timestamp")
+                        or ""
+                    )
+                    changed = True
+                    settled += 1
+                    logger.info(
+                        f"Prior-session reconcile {day}: matched {orphan.get('instrument')} "
+                        f"{orphan.get('trading_symbol')} entry to its recorded exit at "
+                        f"{adopted.get('exit_timestamp')} ({adopted.get('exit_reason')})."
+                    )
+                    continue
+
+                if squareoff_ts is None or now < IST.localize(squareoff_ts):
+                    continue
+                mark = orphan.get("current_price") or orphan.get("price") or 0.0
+                synthetic = dict(orphan)
+                synthetic["action"] = "EXIT"
+                synthetic["status"] = "EXIT SIGNAL"
+                synthetic["exit_reason"] = "STALE_SESSION_RECONCILE"
+                synthetic["exit_timestamp"] = squareoff_ts.isoformat()
+                synthetic["exit_price"] = float(mark or 0.0)
+                synthetic["id"] = (
+                    f"SESSION|{orphan.get('instrument')}|{orphan.get('timeframe')}|EXIT|"
+                    f"{orphan.get('direction')}|RECONCILE|{squareoff_ts.isoformat()}"
+                )
+                payloads.append(synthetic)
+                changed = True
+                settled += 1
+                logger.info(
+                    f"Prior-session reconcile {day}: no exit found for "
+                    f"{orphan.get('instrument')} {orphan.get('trading_symbol')}; squared off "
+                    f"at {exit_time.strftime('%H:%M')} on the last mark {float(mark or 0.0):.2f}."
+                )
+
+            if changed:
+                try:
+                    db.save_session_signals(str(day), payloads)
+                except Exception as exc:
+                    logger.warning(f"Prior-session reconcile could not save {day}: {exc}")
+
+        if settled:
+            self.log_event(
+                f"Startup reconcile: settled {settled} signal row(s) left open by a previous shutdown.",
+                "warning",
+            )
+        return settled
 
     def _close_superseded_session_entries(self, candidates: List[TradeCandidate]) -> None:
         """In manual mode, a fresh index signal closes older active manual rows for clean P&L."""
