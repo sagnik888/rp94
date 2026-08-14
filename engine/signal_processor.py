@@ -655,17 +655,36 @@ class SignalProcessor:
         if band <= 0 or edge <= 1.0:
             return leader
 
+        def _measured(candidate) -> float:
+            """Score with the standing ITM preference removed.
+
+            itm_bonus is a flat 0.15 added to the ITM candidate -- a policy preference,
+            not a measurement of that contract. Comparing raw scores meant the gap was
+            structurally at least 0.15 whenever ITM led, three times the default band,
+            so the tie-break could not fire. Netting it out lets liquidity compete with
+            the preference instead of being buried by it.
+            """
+            try:
+                return float(candidate.score) - float(
+                    getattr(candidate, "strike_preference_bonus", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                return float("nan")
+
         lead_oi, lead_vol = (
             getattr(leader, "strike_oi", 0.0) or 0.0,
             getattr(leader, "strike_volume", 0.0) or 0.0,
         )
+        lead_measured = _measured(leader)
         for challenger in ranked[1:]:
-            try:
-                gap = float(leader.score) - float(challenger.score)
-            except (TypeError, ValueError):
+            gap = lead_measured - _measured(challenger)
+            if gap != gap:  # NaN: an unscored candidate cannot be compared
                 continue
             if gap > band:
-                break  # sorted by score: everything after this is further away
+                # `continue`, not `break`: ranked is sorted by RAW score, and netting
+                # out the preference bonus can reorder it, so a later candidate may
+                # still be inside the band.
+                continue
             oi = float(getattr(challenger, "strike_oi", 0.0) or 0.0)
             vol = float(getattr(challenger, "strike_volume", 0.0) or 0.0)
             # Absent liquidity is no opinion, not a verdict. Only a strike the chain
@@ -6592,6 +6611,12 @@ class SignalProcessor:
                 )
                 setattr(candidate, "strike_oi", _strike_oi)
                 setattr(candidate, "strike_volume", _strike_vol)
+                # The ITM bonus is a standing PREFERENCE for ITM, not a measurement of
+                # this contract. Carried separately so the tie-break can compare the two
+                # candidates on measured quality alone: at 0.15 it is three times the
+                # default 0.05 band, so leaving it inside the score meant the ATM and ITM
+                # scores were never "near" and the liquidity comparison never ran.
+                setattr(candidate, "strike_preference_bonus", float(itm_bonus))
                 results_list.append(candidate)
                 logger.info(
                     f"Resolved candidate: {instrument} {best_tf} {best_sig.signal_type} -> "

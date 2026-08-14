@@ -4272,6 +4272,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     # trading_mode was ALREADY REAL — so every session that reached REAL
                     # via this switch (which is the normal premarket path) ran with an
                     # unclaimed lease and had all its orders refused at execution time.
+                    # ESTABLISHED, then ACQUIRED — main.py's REAL startup requires both
+                    # and this path required only the second. acquire_execution_lease
+                    # returns True when there is no lease to take (a broker built with a
+                    # blank kite_user_id has _execution_lease None), which is deliberate
+                    # so the fixtures in 50-odd test files keep working. The consequence
+                    # here was the opposite of the intent: an account-less broker sailed
+                    # through the only check and armed REAL with no lease at all. This
+                    # switch IS the normal premarket path, so it failed OPEN on exactly
+                    # the route most sessions take.
+                    established = getattr(
+                        self.trades.real_broker, "execution_lease_established", None
+                    )
+                    if callable(established) and not established():
+                        reason = (
+                            "REAL refused: broker has no account execution lease "
+                            "(kite_user_id is blank)"
+                        )
+                        logger.critical(f"❌ {reason}")
+                        self._last_configure_block_reason = reason
+                        self.mode = "HISTORICAL"  # fail closed, never trade unprotected
+                        self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
+                        self.trades.mode = self.mode
+                        if self.on_notification:
+                            self.on_notification(reason, "error")
+                        return False
                     acquire = getattr(self.trades.real_broker, "acquire_execution_lease", None)
                     if callable(acquire) and not acquire():
                         reason = ""

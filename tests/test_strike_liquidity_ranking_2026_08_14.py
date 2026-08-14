@@ -216,3 +216,57 @@ def test_the_selection_uses_the_tiebreak_and_reads_only_cached_chain():
     assert "_prefer_liquid_strike(results_list, settings)" in src
     assert "allow_fetch=False" in src, "the ranking must never trigger a broker fetch"
     assert "winner = results_list[0]" not in src
+
+
+# ── the standing ITM preference must not bury the tie-break ──────────────────
+
+def _cand_b(score, oi, vol, symbol="X", bonus=0.0):
+    return SimpleNamespace(
+        score=score, strike_oi=oi, strike_volume=vol,
+        trading_symbol=symbol, strike_preference_bonus=bonus,
+    )
+
+
+def test_the_itm_bonus_does_not_disable_the_tiebreak():
+    """itm_bonus is a flat 0.15 -- three times the default 0.05 band.
+
+    Left inside the score, the ATM/ITM gap was structurally >= 0.15 whenever ITM led,
+    so the two candidates were never "near" and the liquidity comparison never ran.
+    The ranking was inert in exactly the configuration that ships.
+    """
+    itm = _cand_b(0.65, 10_000, 2_000, "itm_thin", bonus=0.15)   # 0.50 measured
+    atm = _cand_b(0.52, 500_000, 250_000, "atm_deep", bonus=0.0)  # 0.52 measured
+
+    assert S._prefer_liquid_strike([itm, atm], _settings()).trading_symbol == "atm_deep"
+
+
+def test_a_genuinely_better_itm_still_wins_on_measured_score():
+    """Netting the bonus out must not invert the preference on real quality."""
+    itm = _cand_b(0.95, 10_000, 2_000, "itm_good", bonus=0.15)    # 0.80 measured
+    atm = _cand_b(0.50, 500_000, 250_000, "atm_deep", bonus=0.0)  # 0.50 measured
+
+    assert S._prefer_liquid_strike([itm, atm], _settings()).trading_symbol == "itm_good"
+
+
+def test_the_bonus_is_stamped_on_the_candidate():
+    import inspect
+
+    src = inspect.getsource(SignalProcessor.process_best_signal)
+
+    assert 'setattr(candidate, "strike_preference_bonus", float(itm_bonus))' in src
+
+
+def test_a_candidate_without_a_bonus_attribute_is_treated_as_unbiased():
+    lead = SimpleNamespace(score=0.80, strike_oi=10_000, strike_volume=2_000, trading_symbol="lead")
+    chal = SimpleNamespace(score=0.79, strike_oi=500_000, strike_volume=250_000, trading_symbol="deep")
+
+    assert S._prefer_liquid_strike([lead, chal], _settings()).trading_symbol == "deep"
+
+
+def test_a_later_candidate_inside_the_band_is_still_considered():
+    """Netting the bonus can reorder the list, so the scan must not stop early."""
+    lead = _cand_b(0.90, 10_000, 2_000, "lead", bonus=0.0)
+    mid = _cand_b(0.70, 1_000, 100, "mid", bonus=0.0)          # far outside the band
+    near = _cand_b(0.66, 500_000, 250_000, "near", bonus=-0.20)  # 0.86 measured
+
+    assert S._prefer_liquid_strike([lead, mid, near], _settings()).trading_symbol == "near"
