@@ -7,6 +7,7 @@ Dashboard: http://localhost:8001
 
 import sys
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -451,11 +452,35 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 if auto_now:
                     auto_mode_seen_on = True
                     state.pop("auto_off", None)
+                    state.pop("auto_never_armed", None)
                 elif auto_mode_seen_on and in_session:
                     _alert(
                         "auto_off",
                         "Auto Mode reverted to OFF during market hours - signals will "
                         "NOT execute until it is re-enabled",
+                        state,
+                    )
+                elif in_session and str(
+                    getattr(scanner, "mode", "") or ""
+                ).upper() == "REAL":
+                    # The restart case, which the latch above CANNOT see (2026-08-16).
+                    # auto_mode_seen_on is per-process, so a process that restarted
+                    # mid-session has never seen AUTO on and never trips the branch
+                    # above — while the 09:00 premarket worker DOES re-arm REAL after a
+                    # restart (completed_dates is in-memory). The result is a dashboard
+                    # showing REAL with feeds green and signals printing, zero entries
+                    # for the rest of the day, and not one CRITICAL raised. That is
+                    # indistinguishable from a quiet market until the close.
+                    #
+                    # REAL + in-session + AUTO off is worth saying out loud even on a
+                    # deliberately manual day: it costs one alert, and the alternative
+                    # is a silent full-day outage. _alert de-duplicates on the state key.
+                    _alert(
+                        "auto_never_armed",
+                        "broker mode is REAL during market hours but Auto Mode is OFF - "
+                        "signals will NOT execute. Auto Mode is not persisted, so a "
+                        "restart always reverts it to manual; re-enable it on the "
+                        "dashboard if this session is meant to trade unattended",
                         state,
                     )
 
@@ -523,6 +548,149 @@ def _contract_token_for(data_provider, symbol: str) -> str:
     return ""
 
 
+def _archive_missing_contract_count(value) -> int:
+    """Normalize manifest missing-contract coverage across schema generations."""
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _session_archive_manifest_complete(root: Path, day: str) -> bool:
+    path = root / "data_store" / "session_archive" / day / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        symbols = {
+            str(symbol or "").strip()
+            for symbol in (manifest.get("traded_symbols_recorded") or [])
+            if str(symbol or "").strip()
+        }
+        contract_count = int(manifest.get("contract_files_archived") or 0)
+        spot_count = int(manifest.get("spot_files_archived") or 0)
+        missing = _archive_missing_contract_count(
+            manifest.get("contract_files_without_day_bars")
+        )
+        archived_symbols_value = manifest.get("contract_symbols_archived")
+        archived_symbols = (
+            {
+                str(symbol or "").strip()
+                for symbol in archived_symbols_value
+                if str(symbol or "").strip()
+            }
+            if isinstance(archived_symbols_value, (list, tuple, set))
+            else set()
+        )
+        missing_symbols = _archive_missing_contract_count(
+            manifest.get("missing_contract_symbols")
+        )
+        exact_contract_coverage = bool(
+            not symbols
+            or (
+                isinstance(archived_symbols_value, (list, tuple, set))
+                and symbols.issubset(archived_symbols)
+                and missing_symbols == 0
+                and contract_count >= len(symbols)
+            )
+        )
+        return bool(
+            int(manifest.get("events") or 0) > 0
+            and spot_count >= 12
+            and missing == 0
+            and exact_contract_coverage
+        )
+    except Exception:
+        return False
+
+
+def _next_due_session_archive_day(
+    root: Path,
+    now: datetime,
+    run_at: dt_time,
+    attempted: set[str],
+) -> str | None:
+    """Select each due incomplete ledger once before retrying a failed date.
+
+    Newest-first keeps the latest session available quickly. ``attempted`` makes a
+    persistent failure yield to the rest of the backlog; after one complete pass it is
+    cleared so unresolved dates remain retryable rather than being abandoned.
+    """
+    now_ist = IST.localize(now) if now.tzinfo is None else now.astimezone(IST)
+    event_dir = root / "data_store" / "rtracker" / "events"
+    due_today = now_ist >= _ist_at(now_ist.date(), run_at)
+    due: list[str] = []
+    try:
+        for path in event_dir.glob("????-??-??.jsonl"):
+            day = path.stem
+            try:
+                parsed = datetime.strptime(day, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if parsed < now_ist.date() or (parsed == now_ist.date() and due_today):
+                if not _session_archive_manifest_complete(root, day):
+                    due.append(day)
+    except OSError as exc:
+        logger.warning(f"Unable to inspect session ledgers for archive catch-up: {exc}")
+        return None
+
+    due = sorted(set(due), reverse=True)
+    if not due:
+        attempted.clear()
+        return None
+    pending = [day for day in due if day not in attempted]
+    if not pending:
+        attempted.clear()
+        pending = due
+    return pending[0]
+
+
+def _fetch_contract_history_for_session(
+    data_provider,
+    session_day: str,
+    symbol: str,
+    token: str,
+) -> bool:
+    """Fetch one option contract with the requested session as the API end date."""
+    try:
+        target_date = datetime.strptime(str(session_day), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    target_end = _ist_at(target_date, dt_time(15, 45))
+    df = data_provider.get_historical_candles(
+        token,
+        "BFO" if str(symbol).upper().startswith("SENSEX") else "NFO",
+        "1min",
+        days_back=1,
+        instrument_name=symbol,
+        force_refresh=True,
+        to_date=target_end,
+    )
+    return df is not None and len(df) > 0
+
+
+def _resolve_session_archive_provider(data_provider):
+    """Return (provider, deferred_not_ready, reason) without touching broker state."""
+    if data_provider is None:
+        # An explicitly unwired scheduler is allowed to archive cache-only data.
+        return None, False, ""
+    if hasattr(data_provider, "get_historical_candles"):
+        return data_provider, False, ""
+    if not callable(data_provider):
+        return None, False, ""
+    try:
+        resolved = data_provider()
+    except Exception as exc:
+        return None, True, f"deferred provider unavailable: {exc}"
+    if resolved is None:
+        return None, True, "deferred provider not initialized"
+    if not hasattr(resolved, "get_historical_candles"):
+        return None, True, "deferred provider has no historical-candle API"
+    return resolved, False, ""
+
+
 def start_session_archiver_scheduler(data_provider=None):
     """Archive each session's trades + real option-premium candles after the close.
 
@@ -538,21 +706,33 @@ def start_session_archiver_scheduler(data_provider=None):
         return
 
     run_at = _parse_hhmm(os.getenv("SESSION_ARCHIVE_TIME", "15:50"), dt_time(15, 50))
+    try:
+        provider_retry_seconds = max(
+            5.0,
+            min(15.0, float(os.getenv("SESSION_ARCHIVE_PROVIDER_RETRY_SECONDS", "10") or 10.0)),
+        )
+    except (TypeError, ValueError):
+        provider_retry_seconds = 10.0
     root = Path(__file__).parent
     script = root / "scripts" / "archive_session_data.py"
 
+    def _manifest_complete(day: str) -> bool:
+        return _session_archive_manifest_complete(root, day)
+
+    def _latest_due_event_day(now: datetime, attempted: set[str]) -> str | None:
+        """Next incomplete ledger, rotating across the full due backlog."""
+        return _next_due_session_archive_day(root, now, run_at, attempted)
+
     def _archive_loop():
         completed: set[str] = set()
+        attempted: set[str] = set()
+        last_provider_wait_reason = ""
         while True:
             now = datetime.now(IST)
-            session_day = now.date().isoformat()
             today_run = _ist_at(now.date(), run_at)
-            if session_day in completed or now < today_run:
-                target = (
-                    _ist_at(now.date() + timedelta(days=1), run_at)
-                    if session_day in completed
-                    else today_run
-                )
+            session_day = _latest_due_event_day(now, attempted)
+            if session_day is None:
+                target = today_run if now < today_run else _ist_at(now.date() + timedelta(days=1), run_at)
                 time.sleep(max(30.0, (target - now).total_seconds()))
                 continue
             # BACK-FILL FIRST, in this process, because this is where the broker
@@ -567,35 +747,65 @@ def start_session_archiver_scheduler(data_provider=None):
             # this scheduler is started, so at wiring time there is nothing to pass.
             # A callable defers the lookup to the moment it is actually needed --
             # after the close, by which point the scanner exists.
-            provider = data_provider
-            if (
-                provider is not None
-                and not hasattr(provider, "get_historical_candles")
-                and callable(provider)
-            ):
-                try:
-                    provider = provider()
-                except Exception as exc:
-                    logger.warning(f"Data provider unavailable for back-fill: {exc}")
-                    provider = None
+            provider, provider_pending, provider_reason = _resolve_session_archive_provider(
+                data_provider
+            )
+            if provider_pending:
+                # Startup race: the scheduler thread can reach an overdue ledger before
+                # create_system publishes runtime["scanner"]. This is not an archive
+                # attempt. Do not rotate away from the newest day and do not run the
+                # cache-only child against data we already know is not ready yet.
+                if provider_reason != last_provider_wait_reason:
+                    logger.info(
+                        f"Session archive waiting for runtime data provider: {provider_reason}"
+                    )
+                    last_provider_wait_reason = provider_reason
+                time.sleep(provider_retry_seconds)
+                continue
+            last_provider_wait_reason = ""
+            # Mark only after deferred startup dependencies are ready. A real
+            # provider/back-fill/child failure should yield to the rest of the backlog.
+            attempted.add(session_day)
             if provider is not None:
                 try:
-                    from scripts.archive_session_data import backfill_contract_history
+                    from scripts.archive_session_data import (
+                        backfill_contract_history, contract_tokens, load_events,
+                    )
+
+                    # The token comes from the session's OWN event stream. Asking the
+                    # provider never worked: _contract_token_for probes four attributes
+                    # (get_token_for_symbol / resolve_token / symbol_token /
+                    # contract_master) that MarketDataProvider does not have -- it
+                    # exposes get_option_token(name, strike, option_type) instead. So the
+                    # token was always "", _fetch always returned False, and this
+                    # back-fill filled nothing on any session. It stays as a fallback.
+                    session_events = load_events(session_day)
+                    session_tokens = contract_tokens(session_events)
 
                     def _fetch(symbol: str) -> bool:
-                        token = _contract_token_for(provider, symbol)
+                        token = (
+                            session_tokens.get(symbol)
+                            or _contract_token_for(provider, symbol)
+                        )
                         if not token:
                             return False
-                        df = provider.get_historical_candles(
+                        # force_refresh, because the whole point of this call is to GO
+                        # AND GET the day. Otherwise get_historical_candles returns the
+                        # local option CSV whenever the file merely EXISTS, without
+                        # checking that it covers the day asked for -- so a contract
+                        # whose cache stops at an earlier session answers instantly with
+                        # a non-empty frame, this counts a success, and nothing new is
+                        # ever written for the archiver to copy.
+                        return _fetch_contract_history_for_session(
+                            provider,
+                            session_day,
+                            symbol,
                             token,
-                            "BFO" if symbol.upper().startswith("SENSEX") else "NFO",
-                            "1min",
-                            days_back=1,
-                            instrument_name=symbol,
                         )
-                        return df is not None and len(df) > 0
 
-                    filled = backfill_contract_history(session_day, _fetch, quiet=True)
+                    filled = backfill_contract_history(
+                        session_day, _fetch, events=session_events, quiet=True
+                    )
                     if filled:
                         logger.info(
                             f"Back-filled {len(filled)} contract histories before "
@@ -607,19 +817,32 @@ def start_session_archiver_scheduler(data_provider=None):
                     # still archive whatever it does have.
                     logger.warning(f"Contract back-fill skipped for {session_day}: {exc}")
             try:
-                subprocess.run(
+                result = subprocess.run(
                     [sys.executable, str(script), session_day, "--quiet"],
                     cwd=str(root),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
                     timeout=600,
+                    check=True,
+                    text=True,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
-                logger.info(f"Session archive written for {session_day}.")
+                if not _manifest_complete(session_day):
+                    raise RuntimeError("archive process returned success but manifest coverage is incomplete")
+                logger.info(f"Session archive verified for {session_day}.")
+                completed.add(session_day)
             except Exception as exc:
-                logger.warning(f"Session archive failed for {session_day}: {exc}")
-            completed.add(session_day)
+                detail = ""
+                if isinstance(exc, subprocess.CalledProcessError):
+                    detail = str((exc.stderr or exc.stdout or "").strip())[-500:]
+                logger.warning(
+                    f"Session archive failed for {session_day}: {exc}"
+                    + (f"; child output: {detail}" if detail else "")
+                )
+                # Retry the missed ledger instead of marking it complete, but do not
+                # spin a failing child process continuously.
+                time.sleep(300.0)
 
     threading.Thread(target=_archive_loop, daemon=True, name="SessionArchiver").start()
 

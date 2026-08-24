@@ -91,6 +91,18 @@ def _manager(trade, mode="HISTORICAL", broker=None):
     m.save_state = lambda: None
     m._log_ui = lambda *a, **k: None
     m._mark_recovery = lambda t, r: setattr(t, "execution_status", "RECOVERY_REQUIRED")
+    m.scanner = SimpleNamespace(
+        data=SimpleNamespace(
+            get_contract_touch_quote=lambda *a, **k: {
+                "bid": 239.5,
+                "ask": 240.0,
+                "age_seconds": 0.1,
+                "usable": True,
+                "reason": "ok",
+                "source": "test_touch",
+            }
+        )
+    )
     return m
 
 

@@ -9,9 +9,11 @@ Runs UT Bot across 1min, 5min, 15min simultaneously for each index.
 Confluence scoring: signal on 5min + aligned regime on 15min = higher confidence
 """
 
+import time
+
 import pandas as pd
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -29,6 +31,10 @@ class MultiTFResult:
     confluence_score: float = 0.0
     confluence_signal: str = "HOLD"  # BUY / SELL / HOLD
     active_signals: List[UTBotSignal] = field(default_factory=list)
+    # Per-timeframe provenance for the result returned by this pass.  Consumers that
+    # make execution decisions must be able to distinguish a freshly recomputed arrow
+    # from a cached arrow whose source input has since disappeared or failed.
+    timeframe_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 class MultiTimeframeEngine:
@@ -87,6 +93,15 @@ class MultiTimeframeEngine:
         self._result_cache: Dict[str, Dict] = {}
         self._data_hash: Dict[str, int] = {}
 
+        # Input and result generations are deliberately independent.  update_data()
+        # records every attempted timeframe input, including None/underfilled frames;
+        # result metadata records only the exact input generation that was processed.
+        # This closes a dangerous ambiguity where a prior arrow used to survive a
+        # missing frame or an engine exception and looked current to stabilization.
+        self._input_metadata: Dict[str, Dict[str, Any]] = {}
+        self._result_metadata: Dict[str, Dict[str, Any]] = {}
+        self._fresh_result_required_after: Dict[str, float] = {}
+
     def _build_all_engines(self):
         """(Re)build the per-(instrument,timeframe) engines from the active
         scanner_engine setting. The 1-minute engine stays realtime so active-trade
@@ -107,7 +122,7 @@ class MultiTimeframeEngine:
         caches so the next scan reprocesses with the new engine. Returns the mode
         actually applied."""
         mode = str(mode or "utbot").lower()
-        if mode not in {"utbot", "ema", "consensus", "auto", "utbot_ema", "utbot_consensus", "quad_union", "utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}:
+        if mode not in {"utbot", "ema", "consensus", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual"}:
             mode = "utbot"
         try:
             from config.settings import get_settings
@@ -115,8 +130,11 @@ class MultiTimeframeEngine:
         except Exception as exc:
             logger.error(f"set_scanner_engine: could not persist setting: {exc}")
         self._build_all_engines()
+        self._ensure_freshness_state()
         self._result_cache.clear()
         self._data_hash.clear()
+        self._result_metadata.clear()
+        self._fresh_result_required_after.clear()
         logger.info(f"Signal engine switched to '{mode}' and all engines rebuilt.")
         return mode
 
@@ -156,10 +174,118 @@ class MultiTimeframeEngine:
             logger.debug(f"Caught bare exception: {e}")
             return hash(len(df))
 
-    def update_data(self, instrument: str, timeframe: str, df: pd.DataFrame):
-        """Update candle data for an instrument-timeframe pair"""
+    @staticmethod
+    def _utc_iso(epoch: float) -> str:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+
+    def _ensure_freshness_state(self) -> None:
+        """Backfill metadata stores for lightweight ``__new__`` test doubles."""
+        if not hasattr(self, "_input_metadata"):
+            self._input_metadata = {}
+        if not hasattr(self, "_result_metadata"):
+            self._result_metadata = {}
+        if not hasattr(self, "_fresh_result_required_after"):
+            self._fresh_result_required_after = {}
+
+    def update_data(self, instrument: str, timeframe: str, df: Optional[pd.DataFrame]):
+        """Update candle data and record whether this timeframe input is usable.
+
+        ``None`` and short frames are inputs too: recording them prevents a previous
+        successful result from being silently presented as the result of this scan.
+        """
         key = f"{instrument}_{timeframe}"
+        self._ensure_freshness_state()
+        previous = self._input_metadata.get(key) or {}
+        version = int(previous.get("version") or 0) + 1
+        observed_at = time.time()
+        try:
+            row_count = int(len(df)) if df is not None else 0
+        except Exception:
+            row_count = 0
+        status = "ready" if row_count >= 15 else ("missing" if df is None else "underfilled")
         self._data_cache[key] = df
+        self._input_metadata[key] = {
+            "version": version,
+            "observed_at_epoch": observed_at,
+            "observed_at": self._utc_iso(observed_at),
+            "row_count": row_count,
+            "status": status,
+        }
+
+    def require_fresh_result(
+        self,
+        instrument: str,
+        timeframe: str,
+        *,
+        newer_than_epoch: Optional[float] = None,
+    ) -> float:
+        """Force the next valid pass to recompute this timeframe.
+
+        Stabilization calls this when it buffers a forming-bar arrow.  A same-hash
+        cache hit from before that instant is analytically useful for charts, but is
+        not a new observation and therefore cannot count as stabilization evidence.
+        """
+        self._ensure_freshness_state()
+        key = f"{instrument}_{timeframe}"
+        cutoff = float(newer_than_epoch if newer_than_epoch is not None else time.time())
+        self._fresh_result_required_after[key] = max(
+            cutoff,
+            float(self._fresh_result_required_after.get(key) or 0.0),
+        )
+        return cutoff
+
+    def get_timeframe_metadata(self, instrument: str, timeframe: str) -> Dict[str, Any]:
+        """Return a copy of current input/result provenance for one timeframe."""
+        self._ensure_freshness_state()
+        key = f"{instrument}_{timeframe}"
+        return {
+            "input": dict(self._input_metadata.get(key) or {}),
+            "result": dict(self._result_metadata.get(key) or {}),
+            "required_after_epoch": float(
+                self._fresh_result_required_after.get(key) or 0.0
+            ),
+        }
+
+    def _invalidate_result(self, key: str, status: str, error: str = "") -> Dict[str, Any]:
+        """Invalidate, rather than reuse, a result after an unusable processing pass."""
+        self._ensure_freshness_state()
+        previous = self._result_metadata.get(key) or {}
+        invalidated_at = time.time()
+        meta = {
+            "version": int(previous.get("version") or 0) + 1,
+            "status": str(status or "invalid"),
+            "computed_at_epoch": 0.0,
+            "computed_at": "",
+            "invalidated_at_epoch": invalidated_at,
+            "invalidated_at": self._utc_iso(invalidated_at),
+            "input_version": int((self._input_metadata.get(key) or {}).get("version") or 0),
+        }
+        if error:
+            meta["error"] = str(error)
+        self._result_cache.pop(key, None)
+        self._data_hash.pop(key, None)
+        self._result_metadata[key] = meta
+        return meta
+
+    def _record_result(self, key: str, input_hash: int) -> Dict[str, Any]:
+        self._ensure_freshness_state()
+        previous = self._result_metadata.get(key) or {}
+        computed_at = time.time()
+        input_meta = self._input_metadata.get(key) or {}
+        meta = {
+            "version": int(previous.get("version") or 0) + 1,
+            "status": "ready",
+            "computed_at_epoch": computed_at,
+            "computed_at": self._utc_iso(computed_at),
+            "input_version": int(input_meta.get("version") or 0),
+            "input_observed_at_epoch": float(input_meta.get("observed_at_epoch") or 0.0),
+            "input_hash": int(input_hash),
+        }
+        self._result_metadata[key] = meta
+        required_after = float(self._fresh_result_required_after.get(key) or 0.0)
+        if computed_at > required_after:
+            self._fresh_result_required_after.pop(key, None)
+        return meta
 
     def process_instrument(
         self,
@@ -184,17 +310,57 @@ class MultiTimeframeEngine:
             key = f"{instrument}_{tf}"
             engine = self.engines.get(key)
             data = self._data_cache.get(key)
+            self._ensure_freshness_state()
+            input_meta = dict(self._input_metadata.get(key) or {})
 
-            if engine is None or data is None or len(data) < 15:
-                # Use cached result if available
-                if key in self._result_cache:
-                    tf_results[tf] = self._result_cache[key]
+            try:
+                row_count = int(len(data)) if data is not None else 0
+            except Exception:
+                row_count = 0
+
+            if engine is None:
+                result_meta = self._invalidate_result(key, "engine_missing")
+                result.timeframe_metadata[tf] = {
+                    "status": "engine_missing",
+                    "input": input_meta,
+                    "result": dict(result_meta),
+                    "used_cache": False,
+                }
+                continue
+
+            if data is None or row_count < 15:
+                input_status = "missing" if data is None else "underfilled"
+                # Do not carry an old arrow across a failed/short fetch.  The old
+                # behavior explicitly reused _result_cache here, allowing a pending
+                # signal to accrue stable scans without any current timeframe input.
+                result_meta = self._invalidate_result(key, f"input_{input_status}")
+                result.timeframe_metadata[tf] = {
+                    "status": f"input_{input_status}",
+                    "input": input_meta,
+                    "result": dict(result_meta),
+                    "used_cache": False,
+                }
                 continue
 
             # ═══ SKIP if data hasn't changed ═══
             new_hash = self._hash_df(data, getattr(engine, "signal_mode", "realtime"))
-            if new_hash == self._data_hash.get(key, 0) and key in self._result_cache:
+            cached_meta = self._result_metadata.get(key) or {}
+            required_after = float(self._fresh_result_required_after.get(key) or 0.0)
+            cached_computed_at = float(cached_meta.get("computed_at_epoch") or 0.0)
+            cache_is_allowed = not required_after or cached_computed_at > required_after
+            if (
+                cache_is_allowed
+                and new_hash == self._data_hash.get(key, 0)
+                and key in self._result_cache
+                and cached_meta.get("status") == "ready"
+            ):
                 tf_results[tf] = self._result_cache[key]
+                result.timeframe_metadata[tf] = {
+                    "status": "cached",
+                    "input": input_meta,
+                    "result": dict(cached_meta),
+                    "used_cache": True,
+                }
             else:
                 try:
                     res = engine.process(
@@ -209,17 +375,26 @@ class MultiTimeframeEngine:
                     tf_results[tf] = res
                     self._result_cache[key] = res
                     self._data_hash[key] = new_hash
+                    result_meta = self._record_result(key, new_hash)
+                    result.timeframe_metadata[tf] = {
+                        "status": "recomputed",
+                        "input": input_meta,
+                        "result": dict(result_meta),
+                        "used_cache": False,
+                    }
                 except Exception as e:
                     logger.error(f"Error processing {key}: {e}")
-                    if key in self._result_cache:
-                        tf_results[tf] = self._result_cache[key]
+                    result_meta = self._invalidate_result(key, "processing_error", str(e))
+                    result.timeframe_metadata[tf] = {
+                        "status": "processing_error",
+                        "input": input_meta,
+                        "result": dict(result_meta),
+                        "used_cache": False,
+                    }
 
-            if tf == "1min":
-                result.results_1min = tf_results.get(tf)
-            elif tf == "5min":
-                result.results_5min = tf_results.get(tf)
-            elif tf == "15min":
-                result.results_15min = tf_results.get(tf)
+        result.results_1min = tf_results.get("1min")
+        result.results_5min = tf_results.get("5min")
+        result.results_15min = tf_results.get("15min")
 
         # ── Confluence Scoring ──
         result.confluence_score, result.confluence_signal = self._compute_confluence(
@@ -286,6 +461,7 @@ class MultiTimeframeEngine:
 
     def apply_engine_params(self, params: dict):
         """Dynamically update UT Engine parameters across all internal engines"""
+        self._ensure_freshness_state()
         self.engine_params = params
         for key, engine in self.engines.items():
             if "key_value" in params:
@@ -302,6 +478,8 @@ class MultiTimeframeEngine:
                 engine.strict_adx = params["strict_adx"]
         self._result_cache.clear()
         self._data_hash.clear()
+        self._result_metadata.clear()
+        self._fresh_result_required_after.clear()
 
     def get_all_states(self) -> Dict[str, Dict]:
         """Get current state for all instrument-timeframe combos"""

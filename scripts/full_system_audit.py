@@ -1,6 +1,7 @@
 
 import sys
 import os
+import math
 from pathlib import Path
 import pandas as pd
 from datetime import datetime, timedelta
@@ -46,23 +47,29 @@ def run_end_to_end_audit(days=7):
         totp_secret=settings.angelone_totp_secret
     )
 
-    # 1. TEST CONNECTIVITY
+    failures = []
+
+    # 1. TEST CONNECTIVITY (read-only: authentication + market-data streams only)
     logger.info("Step 1: Connectivity Handshake...")
-    angel_conn = run_with_timeout(
+    kite_conn = run_with_timeout(
         None,
-        "AngelOne connectivity",
+        "Kite connectivity",
         provider.connect,
         timeout=20,
         default=False,
     )
     fyers_conn = provider.fyers is not None
-    logger.info(f"  - AngelOne: {'🟢 Connected' if angel_conn else '🔴 Failed'}")
+    logger.info(f"  - Kite: {'🟢 Connected' if kite_conn else '🔴 Failed'}")
     logger.info(f"  - Fyers: {'🟢 Connected' if fyers_conn else '🔴 Failed'}")
+    if not kite_conn:
+        failures.append("Kite connectivity")
+    if not fyers_conn:
+        failures.append("Fyers connectivity")
 
     executor = None
 
     # 2. TEST HISTORICAL DATA INTEGRITY (Last 7 Days)
-    logger.info(f"Step 2: Historical Audit (7 Days)...")
+    logger.info(f"Step 2: Historical Audit ({days} Days)...")
     indices = list(settings.active_indices)
 
     for symbol in indices:
@@ -72,22 +79,23 @@ def run_end_to_end_audit(days=7):
         # A. Historical data integrity through the unified fetcher. For index
         # candles this prefers cache/Fyers and avoids competing with the live
         # scanner for AngelOne history quota.
-        df_angel = run_with_timeout(
+        unified_history = run_with_timeout(
             executor,
-            f"AngelOne {symbol} history",
+            f"Unified {symbol} history",
             lambda token=token, symbol=symbol: provider.get_historical_candles(
                 token, exchange, "5min", days_back=days, instrument_name=symbol
             ),
             timeout=25,
             default=pd.DataFrame(),
         )
-        if not df_angel.empty:
-            logger.info(f"    - AngelOne: 🟢 Found {len(df_angel)} candles")
+        if not unified_history.empty:
+            logger.info(f"    - Unified history: 🟢 Found {len(unified_history)} candles")
             # Timezone Check
-            last_time = df_angel.index[-1]
+            last_time = unified_history.index[-1]
             logger.info(f"    - IST Alignment: 🟢 Last candle at {last_time}")
         else:
-            logger.error(f"    - AngelOne: 🔴 No historical data found!")
+            logger.error(f"    - Unified history: 🔴 No historical data found!")
+            failures.append(f"{symbol} historical candles")
 
         # B. Fyers Volume Alignment
         f_sym = FYERS_INDEX_SYMBOLS.get(symbol)
@@ -105,14 +113,32 @@ def run_end_to_end_audit(days=7):
                     timeout=20,
                     default={"s": "timeout", "message": "timed out"},
                 )
-                if f_data.get('s') == 'ok':
+                if not isinstance(f_data, dict):
+                    logger.warning(
+                        f"    - Fyers History: 🔴 Malformed response "
+                        f"({type(f_data).__name__})"
+                    )
+                    failures.append(f"{symbol} Fyers volume history")
+                elif f_data.get('s') == 'ok':
                     f_df = pd.DataFrame(f_data.get('candles', []))
-                    vol_sum = f_df[5].sum() if not f_df.empty else 0
-                    logger.info(f"    - Fyers Volume: {'🟢 Sync Valid' if vol_sum > 0 else '🔴 Zero Volume'}")
+                    vol_sum = (
+                        float(pd.to_numeric(f_df[5], errors="coerce").sum(min_count=1))
+                        if not f_df.empty and 5 in f_df.columns
+                        else float("nan")
+                    )
+                    volume_ok = math.isfinite(vol_sum) and vol_sum > 0
+                    logger.info(
+                        f"    - Fyers Volume: "
+                        f"{'🟢 Sync Valid' if volume_ok else '🔴 Missing/Invalid Volume'}"
+                    )
+                    if not volume_ok:
+                        failures.append(f"{symbol} Fyers volume history")
                 else:
                     logger.warning(f"    - Fyers History: 🔴 Failed ({f_data.get('message')})")
+                    failures.append(f"{symbol} Fyers volume history")
             except Exception as e:
                 logger.error(f"    - Fyers Audit Error: {e}")
+                failures.append(f"{symbol} Fyers volume history")
         time.sleep(0.35)
 
     # 3. TEST LIVE PRICE & FAILOVER
@@ -134,13 +160,26 @@ def run_end_to_end_audit(days=7):
         freshest_label = str(freshest.get("source") or source)
         age = freshest.get("age_seconds")
         age_label = f", age={age}s" if age is not None else ""
-        entry_label = "entry-ok" if snapshot.get("entry_eligible") else "context-only"
+        quote_session = str(
+            quote.get("quote_label") or quote.get("quote_session") or quote.get("session") or "UNKNOWN"
+        ).upper()
+        try:
+            market_open = bool(provider.is_market_open())
+        except Exception:
+            market_open = quote_session in {"LIVE", "OPEN"}
+        entry_ok = bool(
+            market_open
+            and quote_session in {"LIVE", "OPEN"}
+            and snapshot.get("entry_eligible")
+        )
+        entry_label = "entry-ok" if entry_ok else f"context-only ({quote_session})"
         logger.info(
             f"  - {symbol}: ₹{price} (Quote: {source}; Freshest: "
             f"{freshest_label}{age_label}; {entry_label})"
         )
         if price <= 0:
             logger.error(f"  - {symbol}: 🔴 CRITICAL PRICE ERROR")
+            failures.append(f"{symbol} index quote")
 
     # 4. TEST OPTION CHAIN & PCR
     logger.info("Step 4: Option Intelligence Audit...")
@@ -167,13 +206,31 @@ def run_end_to_end_audit(days=7):
             )
         else:
             logger.error(f"  - {symbol} Chain: 🔴 Failed to fetch!")
+            failures.append(f"{symbol} option chain")
 
-    logger.info("🔚 Audit Complete.")
+    result = {
+        "ok": not failures,
+        "failures": sorted(set(failures)),
+        "indices": indices,
+        "days": int(days),
+        "read_only": True,
+    }
+    if failures:
+        logger.error("🔚 Audit FAILED: " + "; ".join(result["failures"]))
+    else:
+        logger.info("🔚 Audit PASSED (read-only data/intelligence checks).")
+    shutdown = getattr(provider, "shutdown_streams", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as exc:
+            logger.warning(f"Audit stream shutdown skipped: {exc}")
+    return result
 
 if __name__ == "__main__":
-    run_end_to_end_audit(days=7)
+    result = run_end_to_end_audit(days=7)
     try:
         logger.complete()
     except Exception:
         pass
-    os._exit(0)
+    raise SystemExit(0 if result.get("ok") else 1)

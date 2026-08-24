@@ -37,9 +37,14 @@ def test_tag_stays_within_the_20_char_kite_limit():
 
 
 def test_tag_keeps_the_parts_that_make_a_trade_unique():
-    """Instrument is dropped; counter + timestamp are what disambiguate."""
-    assert KiteBroker.order_tag("T0005_MIDCPNIFTY_07311451") == "T0005_07311451"
-    assert KiteBroker.order_tag("T0003_NIFTY_07311356") == "T0003_07311356"
+    """Instrument is dropped; counter + timestamp are what disambiguate.
+
+    The separating underscore went with it on 2026-08-16: the v3 docs specify the tag
+    as "alphanumeric, max 20 chars" and every entry order carries one.
+    """
+    assert KiteBroker.order_tag("T0005_MIDCPNIFTY_07311451") == "T000507311451"
+    assert KiteBroker.order_tag("T0003_NIFTY_07311356") == "T000307311356"
+    assert KiteBroker.order_tag("T0005_MIDCPNIFTY_07311451").isalnum()
 
 
 def test_two_trades_on_one_strike_get_distinct_tags():
@@ -88,7 +93,8 @@ def test_entry_limit_carries_ttl_and_tag():
     sent = b.api.sent
     assert sent["order_type"] == "LIMIT"
     assert sent["validity"] == "TTL" and sent["validity_ttl"] > 0
-    assert sent["tag"] == "T0003_08010930"
+    # Alphanumeric since 2026-08-16 — the v3 tag charset.
+    assert sent["tag"] == "T000308010930"
 
 
 def test_market_entry_is_tagged_too():
@@ -98,7 +104,8 @@ def test_market_entry_is_tagged_too():
                   trade_id="T0003_NIFTY_08010930", confidence=0.50)
     sent = b.api.sent
     assert sent["order_type"] == "MARKET"
-    assert sent["tag"] == "T0003_08010930"
+    # Alphanumeric since 2026-08-16 — the v3 tag charset.
+    assert sent["tag"] == "T000308010930"
     assert sent["validity"] == "DAY"
 
 

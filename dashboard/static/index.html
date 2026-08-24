@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <script src="/static/vendor/lightweight-charts-5.2.0/lightweight-charts.standalone.production.js?v=5.2.0-only"></script>
-    <link rel="stylesheet" href="/static/css/style.css?v=26-dyn-shock-topbar">
+    <link rel="stylesheet" href="/static/css/style.css?v=27-contained-index-quotes">
 </head>
 <body>
     <!-- ═══ TOP NAV BAR ═══ -->
@@ -36,28 +36,28 @@
             <div class="switch-group">
                 <span class="switch-label">SYS</span>
                 <label class="modern-toggle" title="Toggle System Execution">
-                    <input type="checkbox" id="powerToggle" checked>
+                    <input type="checkbox" id="powerToggle" aria-label="System execution" checked>
                     <span class="modern-slider"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">AUTO</span>
                 <label class="modern-toggle" title="Toggle Auto Execution">
-                    <input type="checkbox" id="autoModeSwitch" checked>
+                    <input type="checkbox" id="autoModeSwitch" aria-label="Automatic order execution" checked>
                     <span class="modern-slider"></span>
                 </label>
             </div>
             <div class="switch-group chart-stream-switch">
                 <span class="switch-label">CHART</span>
                 <label class="modern-toggle" title="Toggle dashboard chart streaming">
-                    <input type="checkbox" id="chartStreamSwitch" checked>
+                    <input type="checkbox" id="chartStreamSwitch" aria-label="Dashboard chart streaming" checked>
                     <span class="modern-slider"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">EXPIRY</span>
                 <label class="modern-toggle pill-style" title="Expiry-Day Gamma Mode — on expiry day (and T-1 if enabled) trade the CURRENT expiring ATM for max gamma instead of rolling to next week. Morning = full gamma; after the cutoff (default 13:00) reverts to safe behaviour. Default OFF.">
-                    <input type="checkbox" id="expiryGammaSwitch">
+                    <input type="checkbox" id="expiryGammaSwitch" aria-label="Expiry-day gamma mode">
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
@@ -69,21 +69,21 @@
             <div class="switch-group">
                 <span class="switch-label">DYN</span>
                 <label class="modern-toggle pill-style" title="Dynamic session mood — use rolling mood for late-session guards instead of sticky full-day day-type.">
-                    <input type="checkbox" id="sessionMoodDynamicSwitch" checked>
+                    <input type="checkbox" id="sessionMoodDynamicSwitch" aria-label="Dynamic session mood" checked>
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">SHOCK</span>
                 <label class="modern-toggle pill-style" title="Late multi-index LTP shock path (default window 14:45–15:11). Dump/rally relax + optional force-exit opposite.">
-                    <input type="checkbox" id="marketLtpShockSwitch" checked>
+                    <input type="checkbox" id="marketLtpShockSwitch" aria-label="Late-session market LTP shock protection" checked>
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="capsule-divider"></div>
             <div class="tf-policy-wrapper">
                 <span class="switch-label">TF</span>
-                <select id="topTimeframePolicy" class="tf-policy-select modern-select">
+                <select id="topTimeframePolicy" class="tf-policy-select modern-select" aria-label="Signal timeframe policy">
                     <option value="PRIMARY_15">15M</option>
                     <option value="INCLUDE_5MIN">5M+15M</option>
                 </select>
@@ -92,52 +92,47 @@
             <div class="switch-group">
                 <span class="switch-label">REGIME</span>
                 <label class="modern-toggle pill-style" title="Toggle Regime Adaptation">
-                    <input type="checkbox" id="regimeModeSwitch">
+                    <input type="checkbox" id="regimeModeSwitch" aria-label="Regime adaptation">
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">C-GRD</span>
                 <label class="modern-toggle pill-style" title="Toggle Concurrency Guard">
-                    <input type="checkbox" id="concurGuardSwitch">
+                    <input type="checkbox" id="concurGuardSwitch" aria-label="Concurrency guard">
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">1MSCALP</span>
                 <label class="modern-toggle pill-style" title="1mscalp: continuous 1-minute high-burst/spike entries. OFF keeps tracking/trailing; does not block p-win snap when that toggle is ON.">
-                    <input type="checkbox" id="oneMinScalpSwitch" checked>
+                    <input type="checkbox" id="oneMinScalpSwitch" aria-label="One-minute scalp entries" checked>
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">P-WIN SNAP</span>
                 <label class="modern-toggle pill-style" title="p-win snap: 3m reversion after major wins / SL / OI-PCR / open distress. 1min counter-trend even if 1mscalp is OFF. RR 1.5+.">
-                    <input type="checkbox" id="reversionScalpSwitch">
+                    <input type="checkbox" id="reversionScalpSwitch" aria-label="Post-win reversion scalp entries">
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
             <div class="switch-group">
                 <span class="switch-label">ENGINE</span>
-                <select id="scannerEngineSelect" class="tf-policy-select modern-select" title="Signal engine - UT1 / Consensus / EMA / Auto / combo engines / Quad Union / UT1 Prime / Quad Prime / Adaptive Hybrid / Quality Hybrid">
+                <select id="scannerEngineSelect" class="tf-policy-select modern-select" title="Signal engine - UT1 / EMA / Consensus / UT1+Consensus / Quad Union / Quad Prime / Adaptive Dual">
                     <option value="utbot">UTBOT</option>
-                    <option value="consensus">CONSENSUS</option>
                     <option value="ema">EMA</option>
-                    <option value="auto">AUTO</option>
-                    <option value="utbot_ema">UTBOT+EMA</option>
+                    <option value="consensus">CONSENSUS</option>
                     <option value="utbot_consensus">UTBOT+CONS</option>
                     <option value="quad_union">QUAD UNION</option>
-                    <option value="utbot_prime">UTBOT PRIME</option>
                     <option value="quad_prime" selected>QUAD PRIME</option>
-                    <option value="adaptive_hybrid">ADAPTIVE HYBRID</option>
                     <option value="adaptive_dual">ADAPTIVE DUAL</option>
-                    <option value="quality_hybrid">QUALITY HYBRID</option>
                 </select>
             </div>
             <div class="switch-group">
                 <span class="switch-label">EXIT-CFM</span>
                 <label class="modern-toggle pill-style" title="Combo only — Partner-Confirms-Exit. ON: a solo UT1 opposite-flip won't knock you out of a live trade; the partner (EMA/Consensus) must flip or both must agree (tames UT1's jumpy exits). OFF: raw union (either engine can exit). Protective stop/target always apply. Default ON.">
-                    <input type="checkbox" id="comboExitConfirmSwitch" checked>
+                    <input type="checkbox" id="comboExitConfirmSwitch" aria-label="Partner-confirmed combo exits" checked>
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
@@ -194,6 +189,7 @@
                                 <span class="inst-price" id="price_NIFTY">--</span>
                                 <span class="inst-change" id="change_NIFTY">--</span>
                             </div>
+                            <span class="inst-quote-status reference" id="quote_NIFTY">REF</span>
                             <span class="inst-signal" id="signal_NIFTY">SCANNING</span>
                         </button>
                         <button class="inst-tab" data-instrument="BANKNIFTY" id="tab_BANKNIFTY">
@@ -202,6 +198,7 @@
                                 <span class="inst-price" id="price_BANKNIFTY">--</span>
                                 <span class="inst-change" id="change_BANKNIFTY">--</span>
                             </div>
+                            <span class="inst-quote-status reference" id="quote_BANKNIFTY">REF</span>
                             <span class="inst-signal" id="signal_BANKNIFTY">SCANNING</span>
                         </button>
                         <button class="inst-tab" data-instrument="SENSEX" id="tab_SENSEX">
@@ -210,6 +207,7 @@
                                 <span class="inst-price" id="price_SENSEX">--</span>
                                 <span class="inst-change" id="change_SENSEX">--</span>
                             </div>
+                            <span class="inst-quote-status reference" id="quote_SENSEX">REF</span>
                             <span class="inst-signal" id="signal_SENSEX">SCANNING</span>
                         </button>
                         <button class="inst-tab" data-instrument="MIDCPNIFTY" id="tab_MIDCPNIFTY">
@@ -218,6 +216,7 @@
                                 <span class="inst-price" id="price_MIDCPNIFTY">--</span>
                                 <span class="inst-change" id="change_MIDCPNIFTY">--</span>
                             </div>
+                            <span class="inst-quote-status reference" id="quote_MIDCPNIFTY">REF</span>
                             <span class="inst-signal" id="signal_MIDCPNIFTY">SCANNING</span>
                         </button>
                     </div>
@@ -256,7 +255,7 @@
                 </div>
             </div>
             <div class="activity-log-container sidebar-mode">
-                <div class="log-messages" id="activityLog">
+                <div class="log-messages" id="activityLog" role="region" tabindex="0" aria-label="System activity log">
                     <!-- Logs will be dynamically injected here -->
                     <div class="log-msg system">System initialized...</div>
                 </div>
@@ -364,7 +363,7 @@
                 </div>
 
                 <!-- Diagnostics View -->
-                <div id="diagContentView" class="intel-view-pane" style="display: none;">
+                <div id="diagContentView" class="intel-view-pane" role="region" tabindex="0" aria-label="System diagnostics" style="display: none;">
                     <div class="diag-grid">
                         <div class="diag-card glass-card">
                             <span class="diag-label">Sources</span>
@@ -409,7 +408,7 @@
                             </div>
                         </div>
                         <div class="diag-reject-insights" id="diagRejectInsights">No rejected-signal counters yet.</div>
-                        <div class="diag-reject-list" id="diagRejectList">Waiting for diagnostics...</div>
+                        <div class="diag-reject-list" id="diagRejectList" role="region" tabindex="0" aria-label="Rejected signal diagnostics">Waiting for diagnostics...</div>
                     </div>
                 </div>
 
@@ -641,22 +640,22 @@
                 <div class="setting-group-title">Active Trading Indices</div>
                 <div class="index-selection-grid">
                     <label class="index-check">
-                        <input type="checkbox" id="checkNifty" checked>
+                        <input type="checkbox" id="checkNifty" aria-label="Enable NIFTY" checked>
                         <span class="check-box"></span>
                         <span class="index-name">NIFTY</span>
                     </label>
                     <label class="index-check">
-                        <input type="checkbox" id="checkBN" checked>
+                        <input type="checkbox" id="checkBN" aria-label="Enable BANKNIFTY" checked>
                         <span class="check-box"></span>
                         <span class="index-name">BANKNIFTY</span>
                     </label>
                     <label class="index-check">
-                        <input type="checkbox" id="checkSensex" checked>
+                        <input type="checkbox" id="checkSensex" aria-label="Enable SENSEX" checked>
                         <span class="check-box"></span>
                         <span class="index-name">SENSEX</span>
                     </label>
                     <label class="index-check">
-                        <input type="checkbox" id="checkMidcap" checked>
+                        <input type="checkbox" id="checkMidcap" aria-label="Enable MIDCPNIFTY" checked>
                         <span class="check-box"></span>
                         <span class="index-name">MIDCPNIFTY</span>
                     </label>
@@ -682,7 +681,7 @@
                 <div class="setting-group" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
                     <label style="margin:0">Stop Loss Mode (Natural ATR vs Fixed %)</label>
                     <label class="modern-toggle pill-style" title="Toggle Natural ATR vs Fixed % Stop Loss">
-                        <input type="checkbox" id="slModeSwitch" checked>
+                        <input type="checkbox" id="slModeSwitch" aria-label="Natural ATR stop-loss mode" checked>
                         <span class="modern-slider" data-on="NAT" data-off="FIX"></span>
                     </label>
                 </div>
@@ -828,10 +827,15 @@
     <div class="toast-container" id="toastContainer"></div>
 
     <script src="/static/js/trade-pagination.js?v=2-fut-opt"></script>
-    <script src="/static/js/trade-table.js?v=7-fut-opt-trades"></script>
+    <script src="/static/js/trade-table.js?v=8-normalized-trade-times"></script>
     <script src="/static/js/dashboard-charts.js?v=5.2.0-only"></script>
-    <script src="/static/js/dashboard-settings.js?v=24-per-tf-grading"></script>
-    <script src="/static/js/app.js?v=aug2026-v42-kite-login-flow"></script>
+    <!-- Bump this ?v= whenever dashboard-settings.js changes, or the browser serves the
+         cached copy and the new controls simply never appear. That is exactly what
+         happened on 2026-08-18: the breakeven-stop, give-back-cap and backtest-live-exit
+         controls were present in the file and mounted in the DOM, but invisible in the
+         running dashboard because the version string still said v=24. -->
+    <script src="/static/js/dashboard-settings.js?v=26-peak-threat-recalibration"></script>
+    <script src="/static/js/app.js?v=aug2026-v43-independent-quotes"></script>
 </body>
 
 

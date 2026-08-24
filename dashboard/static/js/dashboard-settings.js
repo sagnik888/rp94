@@ -4,30 +4,20 @@ const SCANNER_ENGINE_LABELS = {
     utbot: 'UT1',
     ema: 'EMA 9/21',
     consensus: 'Consensus ST+EMA',
-    auto: 'Auto Trend/Chop',
-    utbot_ema: 'UT1 + EMA',
     utbot_consensus: 'UT1 + Consensus',
     quad_union: 'Quad Union',
-    utbot_prime: 'UT1 Prime',
     quad_prime: 'Quad Prime',
-    adaptive_hybrid: 'Adaptive Hybrid',
     adaptive_dual: 'Adaptive Dual',
-    quality_hybrid: 'Quality Hybrid',
 };
 
 const SCANNER_ENGINE_OPTIONS = [
     ['utbot', 'UT1'],
     ['ema', 'EMA 9/21'],
     ['consensus', 'Consensus ST+EMA'],
-    ['auto', 'Auto Trend/Chop'],
-    ['utbot_ema', 'UT1 + EMA'],
     ['utbot_consensus', 'UT1 + Consensus'],
     ['quad_union', 'Quad Union'],
-    ['utbot_prime', 'UT1 Prime'],
     ['quad_prime', 'Quad Prime'],
-    ['adaptive_hybrid', 'Adaptive Hybrid'],
     ['adaptive_dual', 'Adaptive Dual'],
-    ['quality_hybrid', 'Quality Hybrid'],
 ];
 
 const UT_PRESET_HELP = {
@@ -89,11 +79,9 @@ function updateUtPresetHelp() {
         scope = 'Engine 11 dual-lane mode: Lane A uses Adaptive Hybrid; Lane B runs APEX five-gate confluence through the same gates and risk stack.';
     } else if (engine === 'quality_hybrid') {
         scope = 'Engine 12 independent scanner: Consensus ST+EMA, EMA, Aroon, Donchian, KAMA, and VWAP vote on direction; ATR stays stop/risk context only.';
-    } else if (engine === 'utbot_prime') {
-        scope = 'Uses UT1 as the only trigger; EMA, Supertrend, and Consensus only rank each UT1 arrow.';
-    } else if (engine === 'utbot_ema' || engine === 'utbot_consensus') {
+    } else if (engine === 'utbot_consensus') {
         scope = 'Affects the UT1 leg and shared ATR trail; partner flips stay engine-driven.';
-    } else if (engine === 'ema' || engine === 'consensus' || engine === 'auto') {
+    } else if (engine === 'ema' || engine === 'consensus') {
         scope = 'EMA/Consensus flips stay unchanged; ATR trail and protective exits still use this UT trail.';
     }
     help.textContent = `${engineLabel}: ${presetHelp}. ${scope}`;
@@ -538,7 +526,19 @@ function setupSettingsExperience() {
         makeSwitchCard('settPeakThreatLossExit', 'Loss Threat Exit', 'Cut small losers early when adverse evidence is overwhelming'),
         makeInputGroup('settPeakThreatLossScore', 'Loss Score', 'number', { step: '1', min: '1', max: '20' }),
         makeInputGroup('settPeakThreatLossMaxR', 'Loss Max R', 'number', { step: '0.05', min: '0.05', max: '5' }),
-        makeInputGroup('settOptionMajorWinTrendCap', 'Option Major-Win Trend Cap', 'number', { step: '0.01', min: '0.75', max: '1' })
+        makeInputGroup('settOptionMajorWinTrendCap', 'Option Major-Win Trend Cap', 'number', { step: '0.01', min: '0.75', max: '1' }),
+        makeSwitchCard('settBreakevenStop', 'Breakeven Stop', 'Once a trade has shown this much profit it may not close negative. Only fires on a trade already heading to a loss, so it never clips a winner still running'),
+        makeInputGroup('settBreakevenStopArm', 'Breakeven Arm Rs', 'number', { step: '25', min: '0', max: '100000' }),
+        makeInputGroup('settBreakevenStopFloor', 'Breakeven Floor Rs', 'number', { step: '10', min: '-5000', max: '5000' }),
+        makeSwitchCard('settPeakTrail', 'Peak Trail (large peaks only)', 'Above the gate below, the breakeven stop is raised from a flat floor to a share of the running peak. Gated on purpose: an ungated percentage trail clips winners and measured WORSE than no trail at every tightness'),
+        makeInputGroup('settPeakTrailAbove', 'Peak Trail Gate Rs', 'number', { step: '50', min: '0', max: '100000' }),
+        makeInputGroup('settPeakTrailGiveback', 'Peak Trail Give-back', 'number', { step: '0.05', min: '0', max: '1' }),
+        makeSwitchCard('settPeakGivebackCap', 'Give-back Cap', 'Cap how much a trade may hand back from its peak. Nets more than the breakeven stop but CAN exit a trade that is still in profit — off by default'),
+        makeInputGroup('settPeakGivebackCapArm', 'Give-back Arm Rs', 'number', { step: '25', min: '0', max: '100000' }),
+        makeInputGroup('settPeakGivebackCapRs', 'Give-back Cap Rs', 'number', { step: '25', min: '0', max: '100000' }),
+        makeInputGroup('settPeakGivebackCapPct', 'Give-back Cap % of Peak', 'number', { step: '0.05', min: '0', max: '1' }),
+        makeInputGroup('settPeakGivebackCapMaxPeak', 'Give-back Ceiling Rs', 'number', { step: '100', min: '0', max: '100000' }),
+        makeSwitchCard('settBacktestLiveExits', 'Backtest Uses Live Exits', 'Let the replay evaluate the live exit guards. OFF by default: a run with this on is NOT comparable to a run with it off')
     ]);
 
     const advMarketCard = makeCard('settings-market-wide', 'Market-Wide Reversal', [
@@ -653,24 +653,13 @@ function setupSettingsExperience() {
         makeInputGroup('settMixedBookMaxOpt', 'Max OPT Slots', 'number', { step: '1', min: '1', max: '24' })
     ]);
 
-    const advQualityHybridCard = makeCard('settings-quality-hybrid', 'Engine 12 Quality Hybrid', [
-        makeInputGroup('settQualityVoteScore', 'Min Vote Score', 'number', { step: '0.25', min: '0', max: '10' }),
-        makeInputGroup('settQualityBroadAgreement', 'Broad Agreement', 'number', { step: '1', min: '1', max: '7' }),
-        makeInputGroup('settQualityChopAgreement', 'Chop Agreement', 'number', { step: '1', min: '1', max: '7' }),
-        makeInputGroup('settQualityTrendAdx', 'Trend ADX', 'number', { step: '1', min: '0', max: '100' }),
-        makeInputGroup('settQualityTrendEr', 'Trend ER', 'number', { step: '0.01', min: '0', max: '1' }),
-        makeInputGroup('settQualityThrustVol', 'Thrust Volume', 'number', { step: '0.1', min: '0', max: '100' }),
-        makeInputGroup('settQualityThrustRange', 'Thrust Range ATR', 'number', { step: '0.05', min: '0', max: '100' }),
-        makeInputGroup('settQualityThrustClose', 'Thrust Close Location', 'number', { step: '0.05', min: '0', max: '1' })
-    ]);
-
     const advExecutionCard = makeCard('settings-execution', 'Execution Quality', [
         makeSwitchCard('settExecutionTouchQuote', 'Touch-Quote Execution', 'OFF keeps LTP/signal limit; ON anchors option limits to fresh bid/ask touch'),
         makeSwitchCard('settExecutionTouchQuoteShadow', 'Touch-Quote Shadow Compare', 'Record old-vs-touch would-fill quality while execution stays unchanged'),
         makeSwitchCard('settExecutionTouchQuoteStrict', 'Strict Touch Quote', 'If touch quote is stale/missing, block instead of falling back to signal/LTP anchor')
     ]);
 
-    advancedContent.append(advTradeCard, advTimingCard, advMomentumCard, advPeakExitCard, advMarketCard, advOneWayCascadeCard, advCascadeBookCard, advMissedReentryCard, advLateReclaimCard, advChoppyScalpCard, advDualLaneCard, advQualityHybridCard, advExecutionCard);
+    advancedContent.append(advTradeCard, advTimingCard, advMomentumCard, advPeakExitCard, advMarketCard, advOneWayCascadeCard, advCascadeBookCard, advMissedReentryCard, advLateReclaimCard, advChoppyScalpCard, advDualLaneCard, advExecutionCard);
     content.append(generalContent, advancedContent);
 
 
@@ -821,7 +810,19 @@ function syncSettingsFromConfig(data) {
         setChecked('settLateSessionChoppyGuard', cfg.late_session_choppy_entry_guard_enabled !== undefined ? cfg.late_session_choppy_entry_guard_enabled : true);
         setVal('settLateSessionRunway', cfg.late_session_choppy_min_runway_minutes !== undefined ? cfg.late_session_choppy_min_runway_minutes : 30.0);
         setChecked('settPeakThreatExit', cfg.peak_threat_exit_enabled !== undefined ? cfg.peak_threat_exit_enabled : true);
-        setVal('settPeakThreatMinPeak', cfg.peak_threat_exit_min_peak_rs !== undefined ? cfg.peak_threat_exit_min_peak_rs : 750.0);
+        setVal('settPeakThreatMinPeak', cfg.peak_threat_exit_min_peak_rs !== undefined ? cfg.peak_threat_exit_min_peak_rs : 400.0);
+        setChecked('settBreakevenStop', cfg.breakeven_stop_enabled !== undefined ? cfg.breakeven_stop_enabled : true);
+        setVal('settBreakevenStopArm', cfg.breakeven_stop_arm_rs !== undefined ? cfg.breakeven_stop_arm_rs : 150.0);
+        setVal('settBreakevenStopFloor', cfg.breakeven_stop_floor_rs !== undefined ? cfg.breakeven_stop_floor_rs : 80.0);
+        setChecked('settPeakTrail', cfg.peak_trail_enabled !== undefined ? cfg.peak_trail_enabled : false);
+        setVal('settPeakTrailAbove', cfg.peak_trail_above_rs !== undefined ? cfg.peak_trail_above_rs : 600.0);
+        setVal('settPeakTrailGiveback', cfg.peak_trail_giveback_pct !== undefined ? cfg.peak_trail_giveback_pct : 0.40);
+        setChecked('settPeakGivebackCap', cfg.peak_giveback_cap_enabled !== undefined ? cfg.peak_giveback_cap_enabled : false);
+        setVal('settPeakGivebackCapArm', cfg.peak_giveback_cap_arm_rs !== undefined ? cfg.peak_giveback_cap_arm_rs : 100.0);
+        setVal('settPeakGivebackCapRs', cfg.peak_giveback_cap_rs !== undefined ? cfg.peak_giveback_cap_rs : 200.0);
+        setVal('settPeakGivebackCapPct', cfg.peak_giveback_cap_pct !== undefined ? cfg.peak_giveback_cap_pct : 0.25);
+        setVal('settPeakGivebackCapMaxPeak', cfg.peak_giveback_cap_max_peak_rs !== undefined ? cfg.peak_giveback_cap_max_peak_rs : 1500.0);
+        setChecked('settBacktestLiveExits', cfg.backtest_live_exits_enabled !== undefined ? cfg.backtest_live_exits_enabled : false);
         setVal('settPeakThreatMinPeakR', cfg.peak_threat_exit_min_peak_r !== undefined ? cfg.peak_threat_exit_min_peak_r : 0.35);
         setVal('settPeakThreatRetention', cfg.peak_threat_exit_min_retention !== undefined ? cfg.peak_threat_exit_min_retention : 0.72);
         setVal('settPeakThreatScore', cfg.peak_threat_exit_min_score !== undefined ? cfg.peak_threat_exit_min_score : 5);
@@ -1128,7 +1129,19 @@ function saveSettings() {
         late_session_choppy_entry_guard_enabled: checkedVal('settLateSessionChoppyGuard', true),
         late_session_choppy_min_runway_minutes: numberVal('settLateSessionRunway', 30.0),
         peak_threat_exit_enabled: checkedVal('settPeakThreatExit', true),
-        peak_threat_exit_min_peak_rs: numberVal('settPeakThreatMinPeak', 750.0),
+        peak_threat_exit_min_peak_rs: numberVal('settPeakThreatMinPeak', 400.0),
+        breakeven_stop_enabled: checkedVal('settBreakevenStop', true),
+        breakeven_stop_arm_rs: numberVal('settBreakevenStopArm', 150.0),
+        breakeven_stop_floor_rs: numberVal('settBreakevenStopFloor', 80.0),
+        peak_trail_enabled: checkedVal('settPeakTrail', false),
+        peak_trail_above_rs: numberVal('settPeakTrailAbove', 600.0),
+        peak_trail_giveback_pct: numberVal('settPeakTrailGiveback', 0.40),
+        peak_giveback_cap_enabled: checkedVal('settPeakGivebackCap', false),
+        peak_giveback_cap_arm_rs: numberVal('settPeakGivebackCapArm', 100.0),
+        peak_giveback_cap_rs: numberVal('settPeakGivebackCapRs', 200.0),
+        peak_giveback_cap_pct: numberVal('settPeakGivebackCapPct', 0.25),
+        peak_giveback_cap_max_peak_rs: numberVal('settPeakGivebackCapMaxPeak', 1500.0),
+        backtest_live_exits_enabled: checkedVal('settBacktestLiveExits', false),
         peak_threat_exit_min_peak_r: numberVal('settPeakThreatMinPeakR', 0.35),
         peak_threat_exit_min_retention: numberVal('settPeakThreatRetention', 0.72),
         peak_threat_exit_min_score: intVal('settPeakThreatScore', 5),

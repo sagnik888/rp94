@@ -326,6 +326,19 @@ def validate_real_mode_readiness(
         except Exception as exc:
             warnings.append(f"calendar coverage check unavailable: {exc}")
 
+        # Same principle applied to the REPLAY data. A backtest run over a thin or
+        # different window produces a number that looks exactly as authoritative as one
+        # run over a full window, and on 2026-08-17 that cost hours: two installs were
+        # compared whose runs shared no calendar days at all, and the current code
+        # replayed over the other's window makes +Rs.48,750 against -Rs.64 over its own.
+        # Coverage has to travel with the result or the result gets over-read.
+        try:
+            from engine.replay_coverage import coverage_warnings
+
+            warnings.extend(coverage_warnings())
+        except Exception as exc:
+            warnings.append(f"replay coverage check unavailable: {exc}")
+
     # Free cash vs what one lot actually costs. An account that cannot fund a single
     # lot will have EVERY entry refused by RMS, which surfaces only as a generic
     # rejection per signal. Warn rather than block: margin moves intraday and a stale

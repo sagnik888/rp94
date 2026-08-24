@@ -78,18 +78,109 @@ _PRODUCT_MAP = {
 }
 
 # Kite order states that mean the order is still working at the exchange.
+# "modify validation pending", "cancel pending", "amo req received" and "modified" were
+# missing against the v3 lifecycle list (2026-08-16). An order sitting in any of them is
+# live: a cancel that has not been confirmed has NOT removed the order.
 _WORKING_STATUSES = {"open", "trigger pending", "open pending", "validation pending",
-                     "put order req received", "modify pending"}
+                     "put order req received", "modify pending",
+                     "modify validation pending", "cancel pending",
+                     "amo req received", "modified"}
+
+# The only states in which an order is definitively finished.
+_TERMINAL_STATUSES = {"complete", "cancelled", "rejected"}
+
+# Exchange quantity-freeze limits per index, in UNITS (not lots). An order above the
+# limit is rejected outright by the exchange, so a system that sizes up would fail with
+# an opaque broker error rather than a diagnosable one.
+#
+# WARN ONLY, deliberately. Two reasons this must never refuse an order:
+#  * the exchange is the real authority and these values are revised periodically, so a
+#    stale entry here would block orders that are in fact perfectly valid;
+#  * the spec's own remedy, the `autoslice` order parameter, does not exist in the
+#    installed pykiteconnect 5.2.1 — its place_order signature ends at
+#    market_protection — so passing it would raise TypeError on every entry.
+# Currently unreachable in any case: max 4 lots caps the largest order at 480 units
+# (MIDCPNIFTY), against a 4,200 limit. This exists so that raising the lot cap surfaces
+# a named warning instead of an exchange rejection nobody can trace.
+_FREEZE_QUANTITY_UNITS = {
+    "NIFTY": 1800,
+    "BANKNIFTY": 900,
+    "FINNIFTY": 1800,
+    "MIDCPNIFTY": 4200,
+    "SENSEX": 1000,
+    "BANKEX": 900,
+}
+
+
+def _warn_if_above_freeze_limit(symbol: str, qty: int) -> None:
+    """Log when an order would breach the exchange freeze limit. Never blocks."""
+    try:
+        units = int(qty or 0)
+    except (TypeError, ValueError):
+        return
+    if units <= 0:
+        return
+    name = str(symbol or "").upper()
+    # Longest name first: "BANKNIFTY" must not be matched as "NIFTY".
+    for index in sorted(_FREEZE_QUANTITY_UNITS, key=len, reverse=True):
+        if name.startswith(index):
+            limit = _FREEZE_QUANTITY_UNITS[index]
+            if units > limit:
+                logger.warning(
+                    f"{symbol} order quantity {units} exceeds the {index} exchange "
+                    f"freeze limit of {limit} units. The exchange will reject this "
+                    "outright. Split it across orders, or reduce the lot count."
+                )
+            return
+
+
+def _status_is_working(status: str) -> bool:
+    """True when this order may still be live at the exchange.
+
+    Anything that is not explicitly terminal counts as working, INCLUDING a status this
+    build has never seen. The v3 docs describe the status list as open-ended, and both
+    callers use this to decide whether to place another order: concluding "absent" from
+    an unrecognised state is what puts a second entry, or a second SL-M, on a position
+    that already has one. The duplicate is the expensive error, not the missed placement.
+
+    An empty status is NOT working: `_normalise_order` always sets the key, so a blank
+    one means the row carried no status at all rather than an unfamiliar one.
+    """
+    text = str(status or "").strip().lower()
+    if not text:
+        return False
+    return text not in _TERMINAL_STATUSES
 
 
 def classify_kite_exception(exc: Exception) -> str:
     """AMBIGUOUS / TERMINAL / RETRYABLE for one Kite SDK exception."""
-    if isinstance(exc, _AMBIGUOUS_EXCEPTIONS):
-        return "AMBIGUOUS"
     if isinstance(exc, _TERMINAL_EXCEPTIONS):
         return "TERMINAL"
     if isinstance(exc, OrderException):
         return "RETRYABLE"
+    if isinstance(exc, _AMBIGUOUS_EXCEPTIONS):
+        # A 4xx is Kite REFUSING the request, not failing to answer it (2026-08-16).
+        #
+        # pykiteconnect resolves the error class by NAME — connect.py:991 does
+        # `getattr(ex, data["error_type"], ex.GeneralException)` — and it defines no
+        # MarginException, HoldingException or UserException. So the single commonest
+        # real rejection, insufficient funds, arrives as GeneralException and landed in
+        # this AMBIGUOUS tuple: an order that provably never reached the exchange was
+        # reported as "it may be live". The cost is not a duplicate (the direction is
+        # fail-safe) but a leak — the entry-rate slot is held, the margin reservation is
+        # never released, and the trade sits in open_trades as RECOVERY_REQUIRED
+        # consuming one of max_concurrent_positions until a human clears it.
+        #
+        # The SDK only constructs these after parsing a complete HTTP response, and
+        # every exception carries that status as `.code`. A 4xx therefore means the
+        # request was received, understood and declined — definitively not at the
+        # exchange, which is exactly what RETRYABLE means here. 5xx, a timeout, and the
+        # SDK's default code=500 all stay AMBIGUOUS, so the safe direction is unchanged
+        # for everything that genuinely did not complete.
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and 400 <= code < 500:
+            return "RETRYABLE"
+        return "AMBIGUOUS"
     # An unrecognised failure is treated as ambiguous on purpose: assuming the order
     # did not reach the market is the assumption that can duplicate a live position.
     return "AMBIGUOUS"
@@ -108,7 +199,12 @@ class KiteBroker(Broker):
         self._auth = auth           # KiteAuth, so a dead token can be invalidated
         self._order_lock = threading.Lock()
         self._last_call_at = 0.0
-        self._min_call_interval = 0.34      # Kite allows ~3 order req/s; stay under it
+        # 0.34s (~2.9 req/s) until 2026-08-16, on a comment reading "Kite allows ~3 order
+        # req/s". That is the HISTORICAL-CANDLE row of the rate-limit table; order
+        # placement is documented at 10 req/s. Since every broker call is serialised
+        # behind this floor, the wrong row throttled exits as well as reads to a third of
+        # the allowance. 0.12s is ~8.3 req/s, keeping clear headroom under 10.
+        self._min_call_interval = 0.12
         self._entry_order_times: deque = deque()
         # Cash this process has committed to orders Kite's own margin figure has not yet
         # deducted. Guarded by its own lock: preflight runs on the entry workers, and two
@@ -153,8 +249,14 @@ class KiteBroker(Broker):
         # this call's 2s budget instead of the client default, and the restore could put
         # back a value another thread had just changed. The SDK default (7s) applies to
         # every call; bound a slow broker at a higher level, not by mutating shared state.
-        api = self.api
-        previous = None
+        # The lock deliberately still spans the network round trip. Releasing it around
+        # fn() would stop an emergency exit queueing behind a slow read, but pykiteconnect
+        # drives one requests.Session that is not documented thread-safe, and this process
+        # already SHARES that client with data/kite_market_data.py. Trading a bounded,
+        # measurable queueing delay for concurrent use of a non-thread-safe client in the
+        # order path is the wrong side of that bargain. The queueing was mostly the 0.34s
+        # pacing bug above, not the network time; the real fix for the rest is a second
+        # client dedicated to reads, which is a larger change than this audit warrants.
         with self._order_lock:
             gap = time.monotonic() - self._last_call_at
             if gap < self._min_call_interval:
@@ -166,6 +268,13 @@ class KiteBroker(Broker):
                 # watchdog surfaces a re-login instead of every call failing blindly.
                 if self._auth is not None:
                     self._auth.invalidate(f"{context}: {exc}")
+                # Drop our own reference too (2026-08-16). invalidate() nulls the client
+                # inside KiteAuth, but this broker holds a SEPARATE reference, so
+                # _require_api kept returning the dead client and every subsequent order
+                # made a full round trip for a guaranteed 403 — instead of failing
+                # instantly with the actionable "complete the daily login" message.
+                # replace_api() rebinds this on re-login, which is the intended path back.
+                self.api = None
                 raise
             finally:
                 self._last_call_at = time.monotonic()
@@ -401,9 +510,13 @@ class KiteBroker(Broker):
         Trade ids look like T0005_MIDCPNIFTY_07311451 (25 chars), so the instrument is
         dropped: the counter and timestamp are what make it unique.
 
-        The ENTRY/attempt-0 form is deliberately byte-identical to the single-argument
-        version this replaced, so a tagged order already resting at the exchange stays
-        findable across this change. Every other leg gets a distinct U1-prefixed tag —
+        Every tag is ALPHANUMERIC. The v3 docs are explicit — "An optional tag to apply
+        to an order to identify it (alphanumeric, max 20 chars)" — and every entry
+        carries one, so an invalid charset would fail the whole entry path. New entry
+        placement therefore uses the alphanumeric form introduced on 2026-08-16. The
+        reconciliation path still recognises the previous underscore-bearing attempt-0
+        form as an owned alias, so an order resting across that upgrade is not mistaken
+        for another trade's order. Every other leg gets a distinct U1-prefixed tag —
         without that, an exit and its entry would collide on one string and the lookup
         would return AMBIGUOUS exactly when it is needed most. The attempt code keeps a
         replaced entry distinct from the one it replaced, so a cancel/replace race
@@ -426,8 +539,17 @@ class KiteBroker(Broker):
             raise ValueError(f"unsupported order-tag leg: {leg!r}")
         parts = raw.split("_")
         if leg_code == "E" and int(attempt or 0) == 0:
-            candidate = f"{parts[0]}_{parts[-1]}" if len(parts) >= 3 else raw
-            return candidate[:20]
+            # The underscore is gone as of 2026-08-16. The v3 docs are explicit —
+            # "An optional tag to apply to an order to identify it (alphanumeric, max
+            # 20 chars)" — and EVERY entry carries this tag, so if Kite enforces the
+            # charset the whole entry path fails on the first live order.
+            #
+            # Placement must not revive the underscore-bearing legacy form. Read-side
+            # reconciliation preserves that upgrade compatibility separately in
+            # _own_entry_tags, without sending an invalid legacy tag on a new order.
+            # Uniqueness is unchanged: the counter and timestamp are what carry it.
+            candidate = f"{parts[0]}{parts[-1]}" if len(parts) >= 3 else raw
+            return re.sub(r"[^A-Za-z0-9]", "", candidate)[:20]
         compact = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
         if not compact or len(compact) > 15:
             compact = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:15].upper()
@@ -469,6 +591,54 @@ class KiteBroker(Broker):
             "order": row,
             "matches": matches,
             "reason": "exact order tag found",
+        }
+
+    def inspect_entry_order_for_trade(self, trade_id: str, attempts: int = 8) -> Dict[str, Any]:
+        """Find exactly one ENTRY order across every tag format this trade owns.
+
+        Attempt-zero entries placed before the alphanumeric-tag upgrade used an
+        underscore-bearing tag.  A process restarted after that upgrade has no order id
+        to query, so looking only for the new tag makes a still-working legacy order
+        invisible until a *new* entry is submitted.  Read all owned entry aliases from
+        one order-book snapshot instead.  More than one match (including one current
+        and one legacy tag) is deliberately AMBIGUOUS: choosing either could duplicate
+        or cancel the wrong exposure.
+        """
+        try:
+            tags = self._own_entry_tags(trade_id, attempts=attempts)
+        except Exception:
+            tags = set()
+        if not tags:
+            return {
+                "state": "UNKNOWN", "order_id": "", "matches": [],
+                "reason": "entry trade id has no recoverable tag aliases",
+            }
+        rows = self._order_book()
+        if rows is None:
+            return {
+                "state": "UNKNOWN", "order_id": "", "matches": [],
+                "reason": "order book could not be read",
+            }
+        matches = [row for row in rows if str(row.get("tag") or "").strip() in tags]
+        if not matches:
+            return {
+                "state": "ABSENT", "order_id": "", "matches": [],
+                "reason": "no owned entry tag found",
+            }
+        if len(matches) != 1:
+            return {
+                "state": "AMBIGUOUS", "order_id": "", "matches": matches,
+                "reason": f"{len(matches)} orders match this trade's entry-tag aliases",
+            }
+        row = matches[0]
+        return {
+            "state": "FOUND",
+            "order_id": str(row.get("orderid") or ""),
+            "status": str(row.get("orderstatus") or ""),
+            "tag": str(row.get("tag") or "").strip(),
+            "order": row,
+            "matches": matches,
+            "reason": "owned entry tag found",
         }
 
     @staticmethod
@@ -524,7 +694,20 @@ class KiteBroker(Broker):
         text = str(detail or "").lower()
         if not any(marker in text for marker in self._IP_BLOCK_MARKERS):
             return
-        match = re.search(r"IP \(([^)]+)\)", str(detail))
+        # Two published shapes, and only the parenthesised one was matched until
+        # 2026-08-16. This project's own 2026-08-04 incident read
+        #   IP (2405:201:...:1b61) is not allowed to place orders for this app
+        # but the Kite docs print it bare:
+        #   IP xxx.xxx.xx.xxx is not allowed to place orders for this app
+        # On the bare form `refused` came back empty, which sent the alert down the
+        # "the app has NO allowed IPs configured" branch — telling the operator to add
+        # an address when the real cause was an address that simply is not on the list.
+        # The fallback accepts IPv4 and IPv6 alike: it must start and end on a hex
+        # digit so the sentence's trailing punctuation is not swallowed.
+        detail_text = str(detail)
+        match = re.search(r"\bIP\s+\(([^)]+)\)", detail_text) or re.search(
+            r"\bIP\s+([0-9A-Fa-f](?:[0-9A-Fa-f:.]*[0-9A-Fa-f])?)", detail_text
+        )
         refused = match.group(1) if match else ""
         # The "no IPs configured" variant names no address at all, so the operator is
         # told to add an IP without being told WHICH. Look up what this machine actually
@@ -567,12 +750,8 @@ class KiteBroker(Broker):
         side: str,
         product_type: str = "CARRYFORWARD",
         price: float = 0.0,
-        # Accepted and deliberately IGNORED. trade_manager still computes and passes a
-        # touch quote, which fed AngelOne's bid/ask-anchored limit policy; that policy
-        # was retired here in favour of confidence-gated MARKET/LIMIT. Kept in the
-        # signature so the existing call site keeps working — the caller-side plumbing
-        # (and the option_*/execution_touch_* settings behind it) is now dead and wants
-        # its own removal pass.
+        # A fresh bid/ask lets option entries use a bounded marketable LIMIT instead of
+        # exposing a thin contract to an unbounded market fill.
         touch_quote: Optional[Dict[str, Any]] = None,
         trade_id: str = "",
         confidence: float = 0.0,
@@ -599,7 +778,7 @@ class KiteBroker(Broker):
         try:
             return self._submit_entry(
                 api, symbol, token, qty, side, product_type, price, trade_id, confidence,
-                momentum_urgency, tag,
+                momentum_urgency, tag, touch_quote,
             )
         except (BrokerOrderRejected, BrokerOrderAmbiguous):
             raise
@@ -614,6 +793,7 @@ class KiteBroker(Broker):
         self, api, symbol: str, token: str, qty: int, side: str, product_type: str,
         price: float, trade_id: str, confidence: float,
         momentum_urgency: float = 0.0, tag: str = "",
+        touch_quote: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         exchange = self._exchange_for_symbol(symbol)
         # Take the market unless the signal is strong enough to justify waiting for a
@@ -630,7 +810,72 @@ class KiteBroker(Broker):
         threshold = self._entry_limit_confidence_threshold()
         threshold += limit_confidence_penalty(momentum_urgency, _cfg())
         use_limit = float(price or 0.0) > 0 and float(confidence or 0.0) >= threshold
+        limit_price = float(price or 0.0)
+        settings = _cfg()
+        symbol_upper = str(symbol or "").upper()
+        is_option = symbol_upper.endswith(("CE", "PE"))
+        quote = touch_quote if isinstance(touch_quote, dict) else {}
+        quote_supplied = bool(quote)
+        quote_usable = bool(quote.get("usable", False))
+        use_touch = bool(
+            is_option
+            and quote_usable
+            and (
+                getattr(settings, "execution_use_touch_quote", True)
+                or getattr(settings, "execution_touch_quote_strict", True)
+            )
+        )
+        if is_option and quote_supplied and not quote_usable and bool(
+            getattr(settings, "execution_touch_quote_strict", True)
+        ):
+            self._release_entry_reservation()
+            raise BrokerOrderRejected(
+                f"Option entry refused: executable touch quote "
+                f"{quote.get('reason') or 'unusable'} for {symbol}",
+                terminal=True,
+            )
+        if use_touch:
+            try:
+                bid = float(quote.get("bid") or 0.0)
+                ask = float(quote.get("ask") or 0.0)
+                spread = ask - bid
+                mid = (ask + bid) / 2.0
+                spread_pct = spread / mid * 100.0 if mid > 0 else float("inf")
+                max_pct = float(
+                    getattr(settings, "option_touch_quote_max_spread_pct", 1.0) or 1.0
+                )
+                max_ticks = int(
+                    getattr(settings, "option_touch_quote_max_spread_ticks", 40) or 40
+                )
+            except (TypeError, ValueError):
+                bid = ask = 0.0
+                spread = spread_pct = float("inf")
+                max_pct, max_ticks = 1.0, 40
+            invalid_book = bid <= 0 or ask <= 0 or ask < bid
+            too_wide = (
+                (max_pct > 0 and spread_pct > max_pct)
+                or (max_ticks > 0 and spread > max_ticks * 0.05 + 1e-9)
+            )
+            if invalid_book or too_wide:
+                if bool(getattr(settings, "execution_touch_quote_strict", True)):
+                    self._release_entry_reservation()
+                    detail = "invalid" if invalid_book else f"too wide ({spread_pct:.2f}%)"
+                    raise BrokerOrderRejected(
+                        f"Option entry refused: executable book {detail} for {symbol}",
+                        terminal=True,
+                    )
+            else:
+                extra_ticks = max(
+                    0, int(getattr(settings, "option_touch_limit_extra_ticks", 1) or 0)
+                )
+                limit_price = (
+                    ask + extra_ticks * 0.05
+                    if str(side or "").upper() == "BUY"
+                    else max(0.05, bid - extra_ticks * 0.05)
+                )
+                use_limit = True
         order_type = "LIMIT" if use_limit else "MARKET"
+        _warn_if_above_freeze_limit(symbol, qty)
         params: Dict[str, Any] = {
             "variety": "regular",
             "exchange": exchange,
@@ -646,7 +891,7 @@ class KiteBroker(Broker):
             # Zerodha's automatic protection band is what makes it acceptable.
             params["market_protection"] = -1
         if order_type == "LIMIT":
-            params["price"] = self._tick_price(price)
+            params["price"] = self._tick_price(limit_price)
             # Backstop only — see kite_entry_limit_ttl_minutes. The cancel/replace
             # path handles staleness in ~12s; this exists so a limit left resting by a
             # dead process expires server-side instead of filling hours later.
@@ -715,6 +960,23 @@ class KiteBroker(Broker):
                 )
             if state == "FOUND":
                 found = str(resting.get("order_id") or "")
+                # The scan matches on contract + side + quantity and has no tag term, so
+                # on a strike another trade also touched it can hand back a STRANGER'S
+                # order -- which this entry would then adopt as its own: protection armed
+                # for quantity it does not hold, and the true owner's fill row rewritten
+                # (order_fills is INSERT OR REPLACE on order_id). The concurrency guard
+                # does not close this, because it only inspects open_trades while Kite's
+                # order book returns the whole day, including an earlier CLOSED trade.
+                #
+                # A row carrying a tag that is not one of OURS is positively somebody
+                # else's. An UNTAGGED row stays adoptable -- that is the case this whole
+                # fallback exists for, a broker that did not echo the tag back.
+                if self._entry_row_is_foreign(resting, found, trade_id):
+                    raise BrokerOrderAmbiguous(
+                        f"Kite returned no order id for {symbol} and the only matching "
+                        f"order in the book ({found}) carries another trade's tag. Not "
+                        "adopting it; reconcile this contract before acting."
+                    )
                 logger.warning(f"Recovered entry order id {found} for {symbol} from the order book.")
                 return found or None
             raise BrokerOrderAmbiguous(
@@ -737,6 +999,7 @@ class KiteBroker(Broker):
     ) -> Optional[str]:
         self._authorize_mutation("exit order")
         api = self._require_api("exit order")
+        _warn_if_above_freeze_limit(symbol, qty)
         try:
             order_id = self._api_call(
                 "place exit order",
@@ -761,12 +1024,25 @@ class KiteBroker(Broker):
             # An exit that failed is live risk. Say so loudly, and keep the ambiguous
             # case ambiguous so nothing double-exits the position.
             kind = classify_kite_exception(exc)
-            logger.critical(f"Kite refused EXIT for {symbol} [{kind}]: {type(exc).__name__}: {exc}")
+            detail = f"{type(exc).__name__}: {exc}"
+            logger.critical(f"Kite refused EXIT for {symbol} [{kind}]: {detail}")
             if kind == "AMBIGUOUS":
                 raise BrokerOrderAmbiguous(
                     f"Exit for {symbol} did not complete; it may be live ({exc})"
                 ) from exc
-            return None
+            # Until 2026-08-16 this returned None here and threw away the classification
+            # it had just computed. Two costs. This was the ONLY order path that never
+            # escalated an IP-permission block — place_order, place_protective_stop and
+            # modify_protective_stop all do — so a block that first showed itself on an
+            # exit stayed a per-order error line. And a TERMINAL refusal (dead session,
+            # permission denied) was indistinguishable from a transient one, so the
+            # caller retried the full attempt schedule against a broker that could only
+            # keep saying no, with real risk open the whole time.
+            # Safe to raise: all four call sites already catch BrokerOrderRejected
+            # (trade_manager.py:2546, 3702, 5497, 5923) and 3703 states outright that
+            # close_order "raises just like place_order".
+            self._escalate_if_ip_blocked(detail)
+            raise BrokerOrderRejected(detail, terminal=(kind == "TERMINAL")) from exc
         order_id = str(order_id or "")
         if not order_id:
             raise BrokerOrderAmbiguous(f"Kite exit for {symbol} returned no order id")
@@ -779,6 +1055,7 @@ class KiteBroker(Broker):
     ) -> Optional[str]:
         self._authorize_mutation("protective stop")
         api = self._require_api("protective stop")
+        _warn_if_above_freeze_limit(symbol, qty)
         trigger = self._tick_price(trigger_price)
         try:
             order_id = self._api_call(
@@ -793,6 +1070,12 @@ class KiteBroker(Broker):
                     order_type="SL-M",
                     trigger_price=trigger,
                     validity="DAY",
+                    # SL-M is the OTHER order type the spec's market-protection rule
+                    # names, and this one was missing it (2026-08-16). When this stop
+                    # triggers it becomes a market order into whatever book exists at
+                    # the moment the trade is going against us — the single worst time
+                    # to be unbounded. Same -1 (automatic band) as the market exit.
+                    market_protection=-1,
                     **({"tag": str(tag)[:20]} if tag else {}),
                 ),
             )
@@ -932,15 +1215,21 @@ class KiteBroker(Broker):
             condition = (row or {}).get("condition") or {}
             if str(condition.get("tradingsymbol") or "").upper() != wanted:
                 continue
-            if str((row or {}).get("status") or "").lower() != "active":
+            # "triggered" is FOUND, not absent (2026-08-16). A GTT firing is not a
+            # fill: it places a LIMIT order that can rest unfilled or be rejected, and
+            # the trigger row stays on Zerodha's books either way. Reading it as NONE
+            # let _arm_gtt_fallback arm a SECOND trigger on a contract that already had
+            # one — the same duplicate-protection hazard the SL-M path guards by name.
+            status = str((row or {}).get("status") or "").lower()
+            if status not in ("active", "triggered"):
                 continue
             return {
                 "state": "FOUND",
                 "trigger_id": str(row.get("id") or ""),
-                "reason": "active GTT found",
+                "reason": f"{status} GTT found",
                 "trigger_values": condition.get("trigger_values") or [],
             }
-        return {"state": "NONE", "trigger_id": "", "reason": "no active GTT"}
+        return {"state": "NONE", "trigger_id": "", "reason": "no active or triggered GTT"}
 
     def modify_protective_stop(
         self, order_id: str, symbol: str, token: str, qty: int, side: str,
@@ -962,6 +1251,10 @@ class KiteBroker(Broker):
                     quantity=int(qty),
                     order_type="SL-M",
                     trigger_price=self._tick_price(trigger_price),
+                    # Carried on the modify too: Kite replaces the order's parameters
+                    # rather than merging them, so omitting it here would strip the
+                    # protection band off the stop the first time it is tightened.
+                    market_protection=-1,
                 ),
             )
             return True
@@ -1068,6 +1361,10 @@ class KiteBroker(Broker):
             row.setdefault("buyavgprice", row.get("buy_price", 0.0))
             row.setdefault("sellavgprice", row.get("sell_price", 0.0))
             row.setdefault("producttype", row.get("product", ""))
+            # `ltp` was the one legacy name this mapping missed (2026-08-16). Kite sends
+            # last_price, so every consumer reading position["ltp"] — the orphan row on
+            # the dashboard among them — silently got 0.0.
+            row.setdefault("ltp", row.get("last_price", 0.0))
             rows.append(row)
         return {"data": rows}
 
@@ -1090,6 +1387,61 @@ class KiteBroker(Broker):
             return int(float(raw)) == wanted_qty
         except (TypeError, ValueError):
             return True
+
+    def _own_entry_tags(self, trade_id: str, attempts: int = 8) -> set:
+        """Every ENTRY tag this trade could have written, across replace attempts.
+
+        A cancel/replace stamps the replacement with attempt = entry_replace_count + 1,
+        so one trade legitimately owns more than one entry tag and a naive
+        "tag != mine means foreign" test would disown its own earlier order. Attempt 0
+        also owns the underscore-bearing tag written before the 2026-08-16 alphanumeric
+        upgrade. It is a read-side alias only; order_tag() remains the placement format.
+        """
+        tags = set()
+        for attempt in range(max(1, int(attempts))):
+            try:
+                tag = str(self.order_tag(trade_id, "ENTRY", attempt) or "")
+            except Exception:
+                continue
+            if tag:
+                tags.add(tag)
+        raw = str(trade_id or "").strip()
+        if raw:
+            # Exact former attempt-0 implementation. Keep this deliberately separate
+            # from order_tag(): Kite should never receive the legacy underscore on a
+            # new placement, but a row already resting at the broker still belongs to
+            # this trade and must survive reconciliation across the upgrade.
+            parts = raw.split("_")
+            legacy = f"{parts[0]}_{parts[-1]}" if len(parts) >= 3 else raw
+            if legacy:
+                tags.add(legacy[:20])
+        return tags
+
+    def _entry_row_is_foreign(
+        self, resting: Dict[str, Any], order_id: str, trade_id: str,
+    ) -> bool:
+        """Does the matched order carry a tag that belongs to a DIFFERENT trade?
+
+        False whenever the question cannot be answered — an untagged row, a row we cannot
+        find, or a trade with no derivable tags. Only a positively foreign tag counts, so
+        this can never turn a broker that does not echo tags into a refusal.
+        """
+        if not order_id or not str(trade_id or "").strip():
+            return False
+        row = next(
+            (
+                r for r in (resting.get("matches") or [])
+                if str(r.get("orderid") or "") == str(order_id)
+            ),
+            None,
+        )
+        if not row:
+            return False
+        row_tag = str(row.get("tag") or "").strip()
+        if not row_tag:
+            return False
+        own = self._own_entry_tags(trade_id)
+        return bool(own) and row_tag not in own
 
     def inspect_recent_entry_order(
         self, symbol: str, token: str = "", side: str = "", quantity: int = 0,
@@ -1124,7 +1476,7 @@ class KiteBroker(Broker):
         # Prefer a live/filled order over a rejected one when several exist.
         for row in matches:
             status = str(row.get("orderstatus") or "").lower()
-            if status in _WORKING_STATUSES or status == "complete":
+            if _status_is_working(status) or status == "complete":
                 return {
                     "state": "FOUND", "order_id": str(row.get("orderid") or ""),
                     "reason": f"order is {status}", "matches": matches,
@@ -1157,7 +1509,7 @@ class KiteBroker(Broker):
             row for row in rows
             if str(row.get("tradingsymbol") or "").upper() == wanted_symbol
             and str(row.get("ordertype") or "").upper() in {"SL", "SL-M"}
-            and str(row.get("orderstatus") or "").lower() in _WORKING_STATUSES
+            and _status_is_working(str(row.get("orderstatus") or ""))
             and (not wanted_side or str(row.get("transactiontype") or "").upper() == wanted_side)
         ]
         if not working:
@@ -1354,13 +1706,21 @@ class KiteBroker(Broker):
         if not equity and isinstance(funds, dict) and "available" in funds:
             equity = funds
         available = (equity.get("available") or {})
+        # ABSENT and ZERO are different answers and used to be conflated (2026-08-16).
+        # `if value:` is a truthiness test, so a live_balance of exactly 0.0 — the state
+        # of a fully deployed account, i.e. precisely when the funds gate must bite —
+        # fell through to `cash` and then to `opening_balance`. Neither of those
+        # decreases as margin is consumed (`opening_balance` is the day-start figure;
+        # utilisation is reported separately under `utilised.debits`), so the gate read
+        # back the morning's balance and passed. Only a MISSING key may fall through.
         for key in ("live_balance", "cash", "opening_balance"):
+            raw = available.get(key)
+            if raw is None or raw == "":
+                continue
             try:
-                value = float(available.get(key) or 0.0)
+                return float(raw)
             except (TypeError, ValueError):
                 continue
-            if value:
-                return value
         try:
             return float(equity.get("net") or 0.0)
         except (TypeError, ValueError):
@@ -1368,20 +1728,35 @@ class KiteBroker(Broker):
 
     def required_entry_margin(
         self, symbol: str, qty: int, side: str, product_type: str = "CARRYFORWARD",
+        price: float = 0.0,
     ) -> Optional[float]:
-        """Exact margin Kite will charge for this order, via /margins/orders."""
+        """Exact margin Kite will charge for this order, via /margins/orders.
+
+        `price` (2026-08-16): when the entry is going out as a LIMIT, price the margin
+        request the same way. Previously this always asked Kite to price a MARKET order
+        with no price field, so the figure the funds gate used was Kite's own LTP-derived
+        estimate rather than the debit the LIMIT will actually incur. Omitted or zero
+        keeps the MARKET form, which is right for a market entry.
+        """
         api = self.api
         if api is None:
             return None
+        limit_price = 0.0
+        try:
+            limit_price = float(price or 0.0)
+        except (TypeError, ValueError):
+            limit_price = 0.0
         payload = [{
             "exchange": self._exchange_for_symbol(symbol),
             "tradingsymbol": str(symbol),
             "transaction_type": str(side).upper(),
             "variety": "regular",
             "product": self._product(product_type),
-            "order_type": "MARKET",
+            "order_type": "LIMIT" if limit_price > 0 else "MARKET",
             "quantity": int(qty),
         }]
+        if limit_price > 0:
+            payload[0]["price"] = self._tick_price(limit_price)
         try:
             rows = self._api_call(
                 "order margins", lambda: api.order_margins(payload), timeout=3.0
@@ -1392,9 +1767,24 @@ class KiteBroker(Broker):
         if not rows:
             return None
         try:
-            return float((rows[0] or {}).get("total") or 0.0)
-        except (TypeError, ValueError, IndexError):
+            raw = (rows[0] or {}).get("total")
+        except (TypeError, IndexError):
             return None
+        if raw is None or raw == "":
+            return None
+        try:
+            total = float(raw)
+        except (TypeError, ValueError):
+            return None
+        # A zero total is an UNPRICED order, not a free one: buying an option always
+        # costs at least the premium, so Kite answering 0 means it did not price this.
+        # `or 0.0` used to turn that into a real requirement of 0.0, and preflight then
+        # computed committed=0.0, passed unconditionally and stored a zero-value
+        # reservation — the funds gate silently disabled instead of degrading to the
+        # MARGIN_UNVERIFIED state that exists for exactly this case (2026-08-16).
+        if total <= 0.0:
+            return None
+        return total
 
     def preflight_entry_margin(self, **kwargs) -> Dict[str, Any]:
         """Compare the exact required margin against free cash, where both are known.
@@ -1413,9 +1803,15 @@ class KiteBroker(Broker):
         qty = int(kwargs.get("qty") or kwargs.get("quantity") or 0)
         side = str(kwargs.get("side") or "BUY")
         product_type = str(kwargs.get("product_type") or "CARRYFORWARD")
+        # Accepted from the caller and silently dropped until 2026-08-16, so the gate
+        # priced a MARKET order even when the entry was about to go out as a LIMIT.
+        try:
+            price = float(kwargs.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
 
         required = (
-            self.required_entry_margin(symbol, qty, side, product_type)
+            self.required_entry_margin(symbol, qty, side, product_type, price=price)
             if symbol and qty > 0 else None
         )
         available = self.available_funds()
@@ -1425,10 +1821,44 @@ class KiteBroker(Broker):
                     "available": available, "required": None,
                     "limitation": "Kite did not return an order margin; entry not verified"}
         if available is None:
-            return {"ok": True, "reservation_id": "", "basis": "REQUIREMENT_ONLY",
+            # Failing OPEN here is deliberate and correct outside market hours:
+            # /user/margins answers "Request not registered" until Zerodha's RMS
+            # publishes the day's limits, and blocking every entry on a broker quirk is
+            # worse than proceeding with the requirement known.
+            #
+            # DURING market hours the same silence is not a quirk. It means the funds
+            # gate is inert at precisely the moment it is supposed to bite, and the
+            # first symptom is an RMS rejection on a live order. Detected here rather
+            # than left to someone to check at a particular minute (2026-08-16) — the
+            # honest trigger is "an entry is being priced and we cannot see the cash",
+            # not a clock reading.
+            from datetime import datetime as _dt, time as _t
+
+            import pytz as _pytz
+
+            _now = _dt.now(_pytz.timezone("Asia/Kolkata"))
+            _in_session = _now.weekday() < 5 and _t(9, 15) <= _now.time() <= _t(15, 30)
+            if _in_session and not getattr(self, "_funds_gate_inert_alerted", False):
+                # Latched: one alert per process, not one per entry attempt.
+                self._funds_gate_inert_alerted = True
+                logger.critical(
+                    "FUNDS GATE INERT: /user/margins is not answering during market "
+                    "hours, so free cash is unknown and every entry preflight is "
+                    "passing unchecked. Order margins still price correctly, so the "
+                    "requirement is known — what is missing is the balance to check it "
+                    "against. Expect RMS rejections rather than a clean refusal if the "
+                    "account is short."
+                )
+            return {"ok": True, "reservation_id": "",
+                    "basis": "FUNDS_UNCHECKED_IN_SESSION" if _in_session else "REQUIREMENT_ONLY",
                     "available": None, "required": required,
-                    "limitation": "free cash unavailable (RMS limits are not published "
-                                  "outside market hours); requirement known but unchecked"}
+                    "limitation": (
+                        "free cash unavailable DURING market hours — the funds gate is "
+                        "not checking anything; requirement known but unverified"
+                        if _in_session else
+                        "free cash unavailable (RMS limits are not published outside "
+                        "market hours); requirement known but unchecked"
+                    )}
 
         # Reserve against CONCURRENT entries. Without this, two entry workers reading the
         # same free cash both pass and the account over-commits: /user/margins does not

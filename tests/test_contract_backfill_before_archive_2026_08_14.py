@@ -153,6 +153,6 @@ def test_it_fetches_one_minute_bars():
     """The exit backtester replays 1-minute premium; anything else is unusable to it."""
     import main
 
-    src = inspect.getsource(main.start_session_archiver_scheduler)
+    src = inspect.getsource(main._fetch_contract_history_for_session)
 
     assert '"1min"' in src

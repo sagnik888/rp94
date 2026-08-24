@@ -33,6 +33,21 @@ def _open_trade(**overrides):
     return SimpleNamespace(**values)
 
 
+def _closed_trade(**overrides):
+    values = {
+        "id": "closed-1",
+        "entry_time": datetime.now(),
+        "inst_type": "OPT",
+        "pnl": 0.0,
+        "is_ghost": False,
+        "trading_symbol": "NIFTY31AUG24000CE",
+        "grade": "A",
+        "data_provenance": "LIVE",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_projected_stop_risk_uses_tighter_live_stop_and_trade_cap():
     manager = RiskManager(_Trades(), 100000.0)
     manager.update_settings(options_sl_pct=15.0, max_trade_loss_abs=5000.0)
@@ -58,3 +73,33 @@ def test_global_breaker_halts_on_projected_stop_loss_before_mark_to_market_loss(
     assert manager.check_circuit_breaker() is True
     assert manager.daily_loss_breached is True
     assert trades.closed == [("opt-1", 100.0, "GLOBAL_DAILY_LOSS_LIMIT")]
+
+
+def test_closed_pnl_cache_invalidates_when_pnl_changes_without_count_change():
+    trade = _closed_trade()
+    trades = _Trades()
+    trades.closed_trades = [trade]
+    manager = RiskManager(trades, 100000.0)
+
+    assert manager.check_circuit_breaker() is False
+
+    # Reconciliation can correct a closed row in place; list length is unchanged.
+    trade.pnl = -5000.0
+
+    assert manager.check_circuit_breaker() is True
+    assert manager.daily_loss_breached is True
+
+
+def test_closed_pnl_cache_invalidates_when_non_live_row_becomes_live():
+    trade = _closed_trade(is_ghost=True, pnl=-5000.0)
+    trades = _Trades()
+    trades.closed_trades = [trade]
+    manager = RiskManager(trades, 100000.0)
+
+    assert manager.check_circuit_breaker() is False
+
+    # Risk inclusion fields are part of the fingerprint, not just P&L and count.
+    trade.is_ghost = False
+
+    assert manager.check_circuit_breaker() is True
+    assert manager.daily_loss_breached is True

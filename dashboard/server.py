@@ -364,6 +364,21 @@ def _request_authorized(request: Request) -> bool:
 # and known numeric fields are type/range-validated before the scanner sees them.
 _BASE_COMMAND_FIELDS = {"cmd", "request_id"}
 _ADVANCED_CONFIG_FIELDS = {
+    # Peak-anchored give-back cap (2026-08-17). Tunable from the dashboard because the
+    # cap is the one number that must be re-validated against replayed pnl_path data
+    # before it is moved — below Rs.200 the measured hurt count triples.
+    "peak_giveback_cap_enabled",
+    "peak_giveback_cap_arm_rs",
+    "peak_giveback_cap_rs",
+    "peak_giveback_cap_pct",
+    "peak_giveback_cap_max_peak_rs",
+    "breakeven_stop_enabled",
+    "breakeven_stop_arm_rs",
+    "breakeven_stop_floor_rs",
+    "peak_trail_enabled",
+    "peak_trail_above_rs",
+    "peak_trail_giveback_pct",
+    "backtest_live_exits_enabled",
     "entry_preopen_signal_guard_enabled",
     "entry_mark_touch_validation_enabled",
     "entry_mark_max_ask_multiple",
@@ -648,6 +663,10 @@ _ADVANCED_CONFIG_FIELDS = {
     "pullback_hedge_max_hold_minutes",
 }
 _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
+    "peak_giveback_cap_enabled",
+    "breakeven_stop_enabled",
+    "peak_trail_enabled",
+    "backtest_live_exits_enabled",
     "entry_preopen_signal_guard_enabled",
     "entry_mark_touch_validation_enabled",
     "candidate_entry_mark_validation_enabled",
@@ -1306,7 +1325,7 @@ app = FastAPI(title="UT Bot Index Trading System", version="1.0.0", lifespan=lif
 
 _LOCAL_ONLY_API_PATHS = {
     "/api/status", "/api/state", "/api/diagnostics", "/api/trades",
-    "/api/signal-report", "/api/chart", "/api/calibration-status",
+    "/api/signal-report", "/api/chart", "/api/calibration-status", "/api/quotes",
 }
 
 # Audit #10: trade/ops read payloads require the dashboard token even on loopback,
@@ -1314,7 +1333,7 @@ _LOCAL_ONLY_API_PATHS = {
 # /api/status stays token-optional on loopback for health probes (start scripts).
 _TOKEN_REQUIRED_API_PATHS = {
     "/api/state", "/api/diagnostics", "/api/trades",
-    "/api/signal-report", "/api/chart", "/api/calibration-status",
+    "/api/signal-report", "/api/chart", "/api/calibration-status", "/api/quotes",
 }
 
 
@@ -1544,6 +1563,18 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 profit_lock_min_peak_rs=msg.get("profit_lock_min_peak_rs"),
                 profit_lock_nonscalp_min_peak_rs=msg.get("profit_lock_nonscalp_min_peak_rs"),
                 profit_lock_min_r_multiple=msg.get("profit_lock_min_r_multiple"),
+                peak_giveback_cap_enabled=msg.get("peak_giveback_cap_enabled"),
+                peak_giveback_cap_arm_rs=msg.get("peak_giveback_cap_arm_rs"),
+                peak_giveback_cap_rs=msg.get("peak_giveback_cap_rs"),
+                peak_giveback_cap_pct=msg.get("peak_giveback_cap_pct"),
+                peak_giveback_cap_max_peak_rs=msg.get("peak_giveback_cap_max_peak_rs"),
+                breakeven_stop_enabled=msg.get("breakeven_stop_enabled"),
+                breakeven_stop_arm_rs=msg.get("breakeven_stop_arm_rs"),
+                breakeven_stop_floor_rs=msg.get("breakeven_stop_floor_rs"),
+                peak_trail_enabled=msg.get("peak_trail_enabled"),
+                peak_trail_above_rs=msg.get("peak_trail_above_rs"),
+                peak_trail_giveback_pct=msg.get("peak_trail_giveback_pct"),
+                backtest_live_exits_enabled=msg.get("backtest_live_exits_enabled"),
                 profit_protect_cost_floor_enabled=msg.get("profit_protect_cost_floor_enabled"),
                 profit_protect_min_cost_multiple=msg.get("profit_protect_min_cost_multiple"),
                 first_rung_regime_retention_enabled=msg.get("first_rung_regime_retention_enabled"),
@@ -1916,7 +1947,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
     elif cmd == "set_scanner_engine":
         if scanner_ref:
             state = str(msg.get("state", "utbot") or "utbot").lower()
-            if state not in {"utbot", "ema", "consensus", "auto", "utbot_ema", "utbot_consensus", "quad_union", "utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}:
+            if state not in {"utbot", "ema", "consensus", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual"}:
                 await _send_command_response(ws, msg, "config_ack", {"status": "blocked", "reason": "invalid_scanner_engine"})
                 return
 
@@ -2900,6 +2931,83 @@ async def api_state():
     return _api_state_json_response(payload)
 
 
+_DASHBOARD_QUOTE_FIELDS = {
+    "ltp", "spot_price", "change", "change_points", "change_pct", "prev_close",
+    "quote_source", "quote_label", "quote_session", "session", "entry_eligible",
+    "quote_fresh", "quote_stale", "quote_age_seconds", "receipt_age_seconds",
+    "exchange_age_seconds", "received_at", "received_at_epoch", "exchange_timestamp",
+    "exchange_timestamp_epoch", "preopen_settlement", "selected_price_source",
+}
+
+
+def _dashboard_index_quote_snapshot() -> Dict[str, Any]:
+    """Read four index quotes straight from the provider's in-memory WS cache.
+
+    This deliberately never calls a broker REST method or the scanner event loop. The
+    full scan can spend tens of seconds in intelligence/chain work; the badge path must
+    remain bounded to a few lock-protected dictionary reads.
+    """
+    now = datetime.now()
+    payload: Dict[str, Any] = {
+        "status": "ok",
+        "quote_snapshot_at": now.isoformat(),
+        "quote_snapshot_epoch": time.time(),
+        "quote_lane": "provider_cache",
+        "instruments": {},
+    }
+    scanner = scanner_ref
+    if scanner is None:
+        payload["status"] = "starting"
+        return payload
+
+    cached_state: Dict[str, Any] = {}
+    try:
+        if hasattr(scanner, "dashboard_cache"):
+            cached_state = scanner.dashboard_cache.state() or {}
+    except Exception:
+        cached_state = {}
+    for key in ("market_status", "market_status_detail", "mode", "system_power"):
+        if key in cached_state:
+            payload[key] = cached_state[key]
+
+    configured = list(getattr(scanner, "active_indices", []) or [])
+    indices = [str(item or "").strip().upper() for item in configured if str(item or "").strip()]
+    if not indices:
+        indices = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+
+    provider = getattr(scanner, "data", None)
+    getter = getattr(provider, "get_cached_index_quote_snapshot", None)
+    fallback_instruments = cached_state.get("instruments") if isinstance(cached_state, dict) else {}
+    for instrument in indices:
+        quote = None
+        if callable(getter):
+            try:
+                quote = getter(instrument)
+            except Exception as exc:
+                logger.debug(f"Cache-only dashboard quote failed for {instrument}: {exc}")
+        if not isinstance(quote, dict):
+            quote = (fallback_instruments or {}).get(instrument) if isinstance(fallback_instruments, dict) else None
+            payload["quote_lane"] = "scan_cache_fallback"
+        if not isinstance(quote, dict):
+            continue
+        compact = {key: quote[key] for key in _DASHBOARD_QUOTE_FIELDS if key in quote}
+        try:
+            quote_ltp = float(compact.get("ltp") or compact.get("spot_price") or 0.0)
+        except (TypeError, ValueError):
+            quote_ltp = 0.0
+        if quote_ltp <= 0:
+            continue
+        compact.setdefault("spot_price", compact.get("ltp"))
+        compact.setdefault("ltp", compact.get("spot_price"))
+        payload["instruments"][instrument] = compact
+    return payload
+
+
+@app.get("/api/quotes")
+async def api_quotes():
+    return make_serializable(_dashboard_index_quote_snapshot())
+
+
 @app.get("/api/diagnostics")
 async def api_diagnostics():
     if not scanner_ref:
@@ -3187,8 +3295,25 @@ async def api_kite_postback(request: Request):
     order_id = str(payload.get("order_id") or "")
     stamp = str(payload.get("order_timestamp") or "")
     received = str(payload.get("checksum") or "")
+    # With no api_secret the "expected" checksum is sha256(order_id + timestamp + "") —
+    # a value anyone who can reach this route can compute, so every forged postback
+    # would verify. Refuse to serve the route at all rather than authenticate against
+    # a secret we do not have (2026-08-16). 503, because this is a server-side
+    # misconfiguration and not a bad request from Zerodha.
+    if not secret:
+        logger.error(
+            "Kite postback refused: no api_secret is configured, so no payload can be "
+            "authenticated. The route stays closed until a session exists."
+        )
+        return JSONResponse(
+            {"status": "error", "message": "postback not configured"}, status_code=503
+        )
     expected = hashlib.sha256(f"{order_id}{stamp}{secret}".encode("utf-8")).hexdigest()
-    if not received or received != expected:
+    # compare_digest, not != : a plain comparison short-circuits on the first differing
+    # byte and leaks the prefix length through timing. This route is public by
+    # necessity, which is exactly the condition that makes that worth closing. The
+    # dashboard's own token check at server.py:353 already uses compare_digest.
+    if not received or not secrets.compare_digest(received, expected):
         # Never act on an unverified payload: this route is public by necessity, so a
         # forged "COMPLETE" could convince the system a phantom position exists.
         logger.warning(f"Rejected Kite postback with bad checksum for order {order_id}")

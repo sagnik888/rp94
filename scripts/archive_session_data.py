@@ -74,6 +74,32 @@ def traded_symbols(events: list[dict]) -> set[str]:
     return syms
 
 
+def contract_tokens(events: list[dict]) -> dict[str, str]:
+    """{trading_symbol: symbol_token}, as the live session itself recorded it.
+
+    The back-fill needs a broker token per contract, and asking the data provider for one
+    does not work: main._contract_token_for probes get_token_for_symbol / resolve_token /
+    symbol_token / contract_master and MarketDataProvider exposes none of them (it has
+    get_option_token, which takes name/strike/option_type rather than a tradingsymbol).
+    So every fetch returned "" and the back-fill filled nothing.
+
+    The event stream already carries the exact token each trade was placed with, which is
+    better than re-deriving one: it is the identity the session actually used, and it
+    needs no expiry or strike parsing. Every traded contract in the 2026-08-11..13
+    sessions has one.
+    """
+    out: dict[str, str] = {}
+    for e in events:
+        c = e.get("contract")
+        if not isinstance(c, dict):
+            continue
+        symbol = str(c.get("trading_symbol") or "").strip()
+        token = str(c.get("symbol_token") or "").strip()
+        if symbol and token:
+            out.setdefault(symbol, token)
+    return out
+
+
 def missing_contract_symbols(day: str, events: list[dict]) -> list[str]:
     """Traded contracts whose 1-minute premium is NOT in the live candle cache.
 
@@ -135,16 +161,34 @@ def day_slice(csv_path: Path, day: str) -> pd.DataFrame | None:
 
 
 def candidate_contract_files(day: str, symbols: set[str]) -> list[Path]:
-    """Prefer exact traded symbols; otherwise fall back to every option contract that
-    has bars for the day (so older sessions without contract identity still archive)."""
+    """Return replay-compatible 1-minute premium files for the requested session.
+
+    The exit-lifecycle replay reads only ``*CE_1min.csv``/``*PE_1min.csv``. A 5-minute
+    cache file for the right contract therefore cannot satisfy archive coverage.
+    """
     files: list[Path] = []
     if symbols:
         for sym in symbols:
-            files.extend(Path(p) for p in glob.glob(str(CANDLES / f"{sym}_*.csv")))
-    if not files:
-        files = [Path(p) for p in
-                 glob.glob(str(CANDLES / "*CE_*.csv")) + glob.glob(str(CANDLES / "*PE_*.csv"))]
+            path = CANDLES / f"{sym}_1min.csv"
+            if path.exists():
+                files.append(path)
+        # Exact identity is available, so an empty result means the traded contracts
+        # are missing. Falling back here would archive unrelated contracts and could
+        # make a file-count coverage check look complete.
+        return sorted(set(files))
+    files = [Path(p) for p in
+             glob.glob(str(CANDLES / "*CE_1min.csv"))
+             + glob.glob(str(CANDLES / "*PE_1min.csv"))]
     return sorted(set(files))
+
+
+def archived_contract_symbols(filenames: list[str], symbols: set[str]) -> set[str]:
+    """Exact traded identities represented by replay-compatible 1-minute files."""
+    return {
+        symbol
+        for symbol in symbols
+        if f"{symbol}_1min.csv" in filenames
+    }
 
 
 def archive_day(day: str, *, force: bool = False, quiet: bool = False) -> dict:
@@ -192,6 +236,9 @@ def archive_day(day: str, *, force: bool = False, quiet: bool = False) -> dict:
     for e in events:
         decisions[str(e.get("decision") or "?")] = decisions.get(str(e.get("decision") or "?"), 0) + 1
 
+    archived_symbols = archived_contract_symbols(archived, symbols)
+    missing_symbols = sorted(symbols - archived_symbols)
+
     manifest = {
         "date": day,
         "archived_at": datetime.now().isoformat(timespec="seconds"),
@@ -199,6 +246,8 @@ def archive_day(day: str, *, force: bool = False, quiet: bool = False) -> dict:
         "decisions": decisions,
         "traded_symbols_recorded": sorted(symbols),
         "contract_files_archived": len(archived),
+        "contract_symbols_archived": sorted(archived_symbols),
+        "missing_contract_symbols": missing_symbols,
         "spot_files_archived": len(spot),
         "contract_files_without_day_bars": skipped,
         "has_contract_identity": bool(symbols),
@@ -208,6 +257,20 @@ def archive_day(day: str, *, force: bool = False, quiet: bool = False) -> dict:
             "legacy session: no contract identity in events — replay must premium-match"
         ),
     }
+    coverage_errors = []
+    if len(spot) < len(INDICES) * 3:
+        coverage_errors.append(
+            f"spot coverage {len(spot)}/{len(INDICES) * 3} index/timeframe files"
+        )
+    if missing_symbols:
+        coverage_errors.append(
+            f"contract symbol coverage {len(archived_symbols)}/{len(symbols)}; "
+            f"missing {', '.join(missing_symbols)}"
+        )
+    if skipped:
+        coverage_errors.append(f"{skipped} contract file(s) had no bars for {day}")
+    manifest["complete"] = not coverage_errors
+    manifest["coverage_errors"] = coverage_errors
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _log(
         f"[ok] {day}: {len(events)} events, {len(archived)} contract + {len(spot)} spot "
@@ -224,8 +287,16 @@ def main() -> None:
     days = [a for a in args if re.match(r"^\d{4}-\d{2}-\d{2}$", a)]
     if not days:
         days = [date.today().isoformat()]
+    failures = []
     for day in days:
-        archive_day(day, force=force, quiet=quiet)
+        result = archive_day(day, force=force, quiet=quiet)
+        if result.get("skipped") or result.get("complete") is False:
+            failures.append({"date": day, "result": result})
+    if failures:
+        if not quiet:
+            for failure in failures:
+                print(f"[failed] {failure['date']}: {failure['result']}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

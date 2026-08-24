@@ -1610,6 +1610,13 @@ def test_session_smart_lock_falls_back_to_giveback_exit_when_floor_unavailable()
     scanner._trade_like_initial_risk_rs = lambda *_args, **_kwargs: 848.4
     scanner._profit_lock_min_peak = lambda *_args, **_kwargs: 848.4
     scanner._profit_lock_floor = lambda *_args, **_kwargs: (0.0, "", 0.0)
+    # This test is about the smart-lock ladder's FALLBACK when its floor is
+    # unavailable. The breakeven stop added on 2026-08-18 also fires on this shape —
+    # correctly, and earlier: a trade that peaked Rs.1,554 and is now at -Rs.214 is the
+    # exact case it exists for, and it would cut at zero rather than let the giveback
+    # guard book -Rs.294. It is stubbed off so the assertion stays pointed at the
+    # fallback under test rather than at whichever guard happens to reach it first.
+    scanner._peak_giveback_cap_exit = lambda *_args, **_kwargs: (False, "")
 
     scanner._check_session_candidates_breaches_locked("BANKNIFTY")
 
@@ -1709,6 +1716,14 @@ def _faded_winner_scanner(current_gross):
     scanner._trade_like_initial_risk_rs = lambda *_args, **_kwargs: 730.5
     scanner._profit_lock_min_peak = lambda *_args, **_kwargs: 250.0
     scanner._profit_lock_floor = lambda *_args, **_kwargs: (128.47, "SMART_PROFIT_LOCK", 0.50)
+    # These two tests are about the LADDER and its backstop, in isolation. The
+    # peak-anchored give-back cap added on 2026-08-17 is a separate, independently
+    # validated exit that also fires on this shape (Rs.1000 peak faded to Rs.600 hands
+    # back 40%, past its 25% allowance), so it is stubbed off here to keep the assertion
+    # pointed at the thing under test. It does NOT reintroduce the bug these tests guard:
+    # that bug booked the exit at the ladder's Rs.500 floor, a price the trade had never
+    # reached, whereas the cap books at the live Rs.600 the trade is actually at.
+    scanner._peak_giveback_cap_exit = lambda *_args, **_kwargs: (False, "")
     return scanner
 
 

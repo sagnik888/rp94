@@ -92,23 +92,34 @@ def test_main_passes_a_getter_not_a_provider_object():
 
 def test_the_backfill_resolves_a_callable_before_use():
     """A getter must be called, and a plain provider must still work unchanged."""
-    src = inspect.getsource(main_module.start_session_archiver_scheduler)
+    class Provider:
+        def get_historical_candles(self):
+            return None
 
-    assert "callable(provider)" in src
-    assert 'hasattr(provider, "get_historical_candles")' in src, (
-        "a real provider must be used directly, never invoked as a getter"
+    provider = Provider()
+    calls = []
+
+    resolved, pending, reason = main_module._resolve_session_archive_provider(provider)
+    assert resolved is provider
+    assert pending is False
+    assert reason == ""
+
+    resolved, pending, reason = main_module._resolve_session_archive_provider(
+        lambda: calls.append(True) or provider
     )
+    assert calls == [True]
+    assert resolved is provider
+    assert pending is False
+    assert reason == ""
 
 
-def test_a_getter_that_raises_does_not_stop_the_archive():
-    """The archive must run even when the back-fill cannot be set up.
+def test_a_getter_that_raises_defers_archive_until_provider_is_ready():
+    """A bootstrap race must retry without consuming or spawning an archive attempt."""
+    def unavailable():
+        raise RuntimeError("scanner still starting")
 
-    Pinned at source rather than by driving the daemon loop, which sleeps to the
-    next session boundary.
-    """
-    src = inspect.getsource(main_module.start_session_archiver_scheduler)
-    i = src.index("provider = provider()")
-    window = src[i: i + 260]
+    provider, pending, reason = main_module._resolve_session_archive_provider(unavailable)
 
-    assert "except Exception" in window, "a failing getter must not kill the archiver"
-    assert "provider = None" in window, "it must fall through to archiving without back-fill"
+    assert provider is None
+    assert pending is True
+    assert "scanner still starting" in reason

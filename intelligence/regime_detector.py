@@ -245,12 +245,41 @@ class RegimeDetector:
                     # label; flag it so downstream/telemetry can see the near-miss.
                     breakout_direction = "UNCONFIRMED_UP" if touched_up else "UNCONFIRMED_DOWN"
             raw_regime = regime.value
+            # ER veto. ADX is a smoothed memory of a move that may already be finished;
+            # the Efficiency Ratio is a statement about the tape right now. A directional
+            # label that ER cannot corroborate is demoted to RANGING, whatever ADX says.
+            # This is the only path by which ER can make the regime LESS directional —
+            # every other use of it above can only promote.
+            er_veto_reason = ""
+            if self._setting_enabled(
+                getattr(_settings, "regime_er_veto_enabled", True), True
+            ) and regime.value in {
+                MarketRegime.TRENDING_UP.value,
+                MarketRegime.TRENDING_DOWN.value,
+                MarketRegime.BREAKOUT_UP.value,
+                MarketRegime.BREAKOUT_DOWN.value,
+            }:
+                try:
+                    er_floor = float(getattr(_settings, "regime_er_veto_floor", 0.15) or 0.0)
+                except (TypeError, ValueError):
+                    er_floor = 0.15
+                # An unmeasurable ER (too few bars) must not veto: absence of evidence
+                # is not evidence of chop, and the open would otherwise be blanket-vetoed.
+                if er_floor > 0.0 and not pd.isna(kaufman_er) and kaufman_er < er_floor:
+                    er_veto_reason = (
+                        f"er_veto_{regime.value}_er{kaufman_er:.3f}_below_{er_floor:.2f}"
+                        f"_adx{adx_val:.0f}"
+                    )
+                    regime = MarketRegime.RANGING
+                    confidence = min(confidence, 55)
+
             range_day_guard_reason = ""
             guarded_regime = self._range_day_guarded_regime(
                 settings=_settings,
                 session_context=session_context,
                 regime=regime.value,
                 adx_val=adx_val,
+                er_value=kaufman_er,
             )
             if guarded_regime:
                 range_day_guard_reason = f"confirmed_range_day_demoted_{regime.value}"
@@ -338,6 +367,8 @@ class RegimeDetector:
                 "er_promotion": er_promotion,
                 "er_promotion_reason": er_promotion_reason,
                 "er_promotion_blocked": er_promotion_blocked,
+                "er_veto": bool(er_veto_reason),
+                "er_veto_reason": er_veto_reason,
                 "range_day_trend_guard": bool(range_day_guard_reason),
                 "range_day_trend_guard_reason": range_day_guard_reason,
                 "breakout_direction": breakout_direction,
@@ -647,6 +678,7 @@ class RegimeDetector:
         session_context: Optional[Dict[str, Any]],
         regime: str,
         adx_val: float = 0.0,
+        er_value: float = float("nan"),
     ) -> bool:
         if not self._setting_enabled(
             getattr(settings, "regime_range_day_trend_guard_enabled", True),
@@ -671,7 +703,23 @@ class RegimeDetector:
             getattr(settings, "regime_range_day_trend_guard_adx_override", 35.0) or 0.0
         )
         if adx_override > 0.0 and float(adx_val or 0.0) >= adx_override:
-            return False
+            # The escape was keyed on ADX alone — the very number this guard exists to
+            # distrust. 2026-08-19: MIDCPNIFTY held ADX 51-58 inside a 41-point range,
+            # which disabled the guard for three hours and admitted five losing entries.
+            # A strong ADX now escapes only if the tape is actually travelling.
+            needs_er = self._setting_enabled(
+                getattr(settings, "regime_range_day_adx_override_needs_er", True), True
+            )
+            if not needs_er:
+                return False
+            try:
+                er_floor = float(getattr(settings, "regime_er_veto_floor", 0.15) or 0.0)
+            except (TypeError, ValueError):
+                er_floor = 0.15
+            er_now = float(er_value) if er_value is not None else float("nan")
+            # Unmeasurable ER keeps the historical behaviour: escape granted.
+            if er_floor <= 0.0 or pd.isna(er_now) or er_now >= er_floor:
+                return False
 
         ctx = session_context or {}
         if str(ctx.get("day_type") or "").upper() != "RANGE_DAY":

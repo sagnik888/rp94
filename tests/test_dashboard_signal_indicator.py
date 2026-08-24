@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 
-def test_normal_scan_ticks_use_non_animated_live_indicator():
+def test_normal_scan_ticks_use_non_animated_running_indicator():
     app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
     css = Path("dashboard/static/css/style.css").read_text(encoding="utf-8")
 
@@ -15,11 +15,11 @@ def test_normal_scan_ticks_use_non_animated_live_indicator():
     signal_sync = signal_sync_match.group("body")
 
     assert "data.scan_count > lastSystemScanCount" in signal_sync
-    assert "state-live" in signal_sync
+    assert "state-running" in signal_sync
     assert "classList.add('state-analysing')" not in signal_sync
-    assert "LIVE" in signal_sync
+    assert "RUNNING" in signal_sync
     assert "syncSignalState(data);" in app_js
-    assert ".analysing-signal.state-live .signal-dot" in css
+    assert ".analysing-signal.state-running .signal-dot" in css
     assert "animation: none" in css
 
 
@@ -40,11 +40,8 @@ def test_settings_engine_and_ut_trail_controls_are_explicit():
     assert "SCANNER_ENGINE_OPTIONS" in settings_js
     assert "ensureScannerEngineOptions(settingsEl)" in settings_js
     assert "['quad_union', 'Quad Union']" in settings_js
-    assert "['utbot_prime', 'UT1 Prime']" in settings_js
     assert "['quad_prime', 'Quad Prime']" in settings_js
-    assert "['adaptive_hybrid', 'Adaptive Hybrid']" in settings_js
     assert "['adaptive_dual', 'Adaptive Dual']" in settings_js
-    assert "['quality_hybrid', 'Quality Hybrid']" in settings_js
     assert "cmd: 'set_scanner_engine'" in settings_js
     assert "settEngineLab" in settings_js
     assert "settEngineLabRealOnly" in settings_js
@@ -55,13 +52,7 @@ def test_settings_engine_and_ut_trail_controls_are_explicit():
     assert "Balanced - Trail 1.3x / ATR 10" in settings_js
     assert "Conservative - Trail 1.6x / ATR 14" in settings_js
     assert "EMA/Consensus flips stay unchanged" in settings_js
-    assert "Uses UT1 as the only trigger" in settings_js
-    assert "Engine 10 meta-router" in settings_js
     assert "Engine 11 dual-lane mode" in settings_js
-    assert "Engine 12 Quality Hybrid" in settings_js
-    assert "settQualityVoteScore" in settings_js
-    assert "quality_hybrid_min_vote_score" in settings_js
-    assert "quality_hybrid_thrust_close_loc" in settings_js
     assert ".settings-control-help" in css
 
 

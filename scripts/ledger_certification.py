@@ -99,15 +99,38 @@ def _report(ledger: Dict[str, Dict[str, int]], positions: Dict[str, int], offlin
         live = {t: q for t, q in holdings.items() if q > 0}
         detail = ", ".join(f"{t}={q}" for t, q in sorted(live.items())) or "-"
 
+        # A trade whose own orders net NEGATIVE has had more exit quantity recorded
+        # against it than entry, which is precisely the mis-attribution this gate exists
+        # to catch. db.owned_quantity clamps that away with max(0, ...) for the sizing
+        # callers, so this script is the ONLY place the sign is visible -- and summing it
+        # into led_total let one trade's excess cancel another's deficit and report
+        # agreement. The `q > 0` filter on `detail` hid the offending trade as well.
+        negatives = {t: q for t, q in holdings.items() if q < 0}
+        if negatives:
+            detail += " | NEGATIVE: " + ", ".join(
+                f"{t}={q}" for t, q in sorted(negatives.items())
+            )
+
         if offline:
             print(f"{symbol:<28} {'n/a':>8} {led_total:>8}  {detail}")
+            if negatives:
+                problems.append(
+                    f"{symbol}: {len(negatives)} trade(s) attribute negative quantity "
+                    f"({', '.join(f'{t}={q}' for t, q in sorted(negatives.items()))})"
+                )
             continue
 
-        flag = " " if led_total == broker_qty else " <-- MISMATCH"
+        flag = " " if led_total == broker_qty and not negatives else " <-- MISMATCH"
         print(f"{symbol:<28} {broker_qty:>8} {led_total:>8}  {detail}{flag}")
         if led_total != broker_qty:
             problems.append(
                 f"{symbol}: broker holds {broker_qty}, ledger attributes {led_total}"
+            )
+        if negatives:
+            problems.append(
+                f"{symbol}: {len(negatives)} trade(s) attribute negative quantity "
+                f"({', '.join(f'{t}={q}' for t, q in sorted(negatives.items()))}); the "
+                "aggregate can still match while attribution is wrong"
             )
         if len(live) > 1 and broker_qty:
             print(f"{'':<28} {'':>8} {'':>8}  ^ shared contract: the case stacking depends on")

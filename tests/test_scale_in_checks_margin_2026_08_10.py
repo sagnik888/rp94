@@ -65,8 +65,22 @@ def _tm(*, verdict, place=None, released=None):
     tm.save_state = lambda: None
     tm._lock = __import__("threading").RLock()
     tm._confirmed_scaled_quantity = lambda t, exp, **k: exp
-    tm._book_scale_in = lambda t, l, p, r: None
+    # **k so the double tolerates filled_quantity, which the real method now takes to
+    # weight the average entry on what the add ACTUALLY filled.
+    tm._book_scale_in = lambda t, l, p, r, **k: None
     tm.ensure_broker_protection = lambda t, q: True
+    tm.scanner = SimpleNamespace(
+        data=SimpleNamespace(
+            get_contract_touch_quote=lambda *a, **k: {
+                "bid": 119.5,
+                "ask": 120.0,
+                "age_seconds": 0.1,
+                "usable": True,
+                "reason": "ok",
+                "source": "test_touch",
+            }
+        )
+    )
     tm.calls = calls
     return tm
 

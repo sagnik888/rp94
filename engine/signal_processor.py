@@ -3,7 +3,7 @@ import copy
 import re
 from datetime import date, datetime, time as dtime, timedelta
 from types import SimpleNamespace
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from loguru import logger
 from dataclasses import dataclass, field
 from config.settings import get_settings
@@ -454,6 +454,14 @@ class TradeCandidate:
     execution_touch_age_seconds: float = 0.0
     execution_touch_usable: bool = False
     execution_touch_reason: str = ""
+    # Per-contract tradeability evidence carried from the cached option chain to
+    # the execution boundary.  Availability is explicit because a measured zero
+    # must fail a minimum-liquidity rule while a missing chain is merely unknown.
+    strike_oi: float = 0.0
+    strike_volume: float = 0.0
+    strike_oi_available: bool = False
+    strike_volume_available: bool = False
+    strike_liquidity_available: bool = False
     source_engine: str = ""
     source_engines: list[str] = field(default_factory=list)
     source_lane: str = ""
@@ -598,6 +606,55 @@ class SignalProcessor:
         return result if isinstance(result, dict) else fallback_result, score, str(context_regime or "UNKNOWN")
 
     @staticmethod
+    def _strike_liquidity_snapshot(chain, strike, option_type) -> Dict[str, Any]:
+        """Measured OI/volume for one strike, preserving missing-vs-zero.
+
+        The previous tuple-only helper collapsed both states to ``(0, 0)``.  That
+        is safe for a ranking tie-break (missing data has no opinion) but unsafe
+        for an absolute admission gate, where a broker-measured zero is evidence
+        that the contract is not tradeable enough.
+        """
+        empty = {
+            "oi": 0.0,
+            "volume": 0.0,
+            "oi_available": False,
+            "volume_available": False,
+            "available": False,
+        }
+        if chain is None or not len(chain) or "strike" not in getattr(chain, "columns", []):
+            return empty
+        side = "call" if str(option_type or "").upper() == "CE" else "put"
+        oi_col, vol_col = f"{side}_oi", f"{side}_volume"
+        try:
+            target = float(strike or 0.0)
+            if target <= 0:
+                return empty
+            # Strikes arrive as floats from the broker; match on proximity, not equality.
+            row = chain[(chain["strike"] - target).abs() < 0.5]
+            if not len(row):
+                return empty
+            values = row.iloc[0]
+        except (TypeError, ValueError, KeyError, IndexError):
+            return empty
+
+        result = dict(empty)
+        for metric, column in (("oi", oi_col), ("volume", vol_col)):
+            if column not in chain.columns:
+                continue
+            try:
+                value = float(values[column])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if value != value:  # NaN is absent evidence, not a measured zero.
+                continue
+            result[metric] = max(0.0, value)
+            result[f"{metric}_available"] = True
+        result["available"] = bool(
+            result["oi_available"] and result["volume_available"]
+        )
+        return result
+
+    @staticmethod
     def _strike_liquidity(chain, strike, option_type) -> Tuple[float, float]:
         """(open interest, traded volume) at ONE strike, from the already-cached chain.
 
@@ -606,25 +663,13 @@ class SignalProcessor:
         the answer is not knowable, which the caller treats as "no opinion" rather than
         as "illiquid": an unreadable chain must never move the selection.
         """
-        if chain is None or not len(chain) or "strike" not in getattr(chain, "columns", []):
+        snapshot = SignalProcessor._strike_liquidity_snapshot(
+            chain, strike, option_type
+        )
+        # Backward-compatible ranking API: unavailable remains "no opinion".
+        if not snapshot["available"]:
             return 0.0, 0.0
-        side = "call" if str(option_type or "").upper() == "CE" else "put"
-        oi_col, vol_col = f"{side}_oi", f"{side}_volume"
-        if oi_col not in chain.columns or vol_col not in chain.columns:
-            return 0.0, 0.0
-        try:
-            target = float(strike or 0.0)
-            # Strikes arrive as floats from the broker; match on proximity, not equality.
-            row = chain[(chain["strike"] - target).abs() < 0.5]
-            if not len(row):
-                return 0.0, 0.0
-            oi = float(row.iloc[0][oi_col] or 0.0)
-            vol = float(row.iloc[0][vol_col] or 0.0)
-        except (TypeError, ValueError, KeyError, IndexError):
-            return 0.0, 0.0
-        if oi != oi or vol != vol:  # NaN
-            return 0.0, 0.0
-        return max(0.0, oi), max(0.0, vol)
+        return float(snapshot["oi"]), float(snapshot["volume"])
 
     @staticmethod
     def _prefer_liquid_strike(ranked, settings):
@@ -736,6 +781,24 @@ class SignalProcessor:
         return regime, float(normalize_intelligence_score(graded_raw))
 
     @staticmethod
+    def _graded_candidate_intel_result(best_sig, fallback_intel_result: Dict) -> Dict:
+        """Return the full intelligence bundle that graded ``best_sig``.
+
+        The scalar regime/score already crossed the grading→candidate seam, but the
+        candidate's pillar/context payload was still built from the function-scope
+        five-minute bundle.  Downstream gates and exits therefore saw a mixed object:
+        a 15-minute scalar beside 5-minute OI/volume/session context.
+
+        When per-timeframe grading is disabled, the grading loop stores the exact
+        fallback object here, so this helper returns that same object and preserves
+        flag-off behavior rather than manufacturing a second policy path.
+        """
+        graded = getattr(best_sig, "graded_intel_result", None)
+        if isinstance(graded, dict):
+            return graded
+        return fallback_intel_result if isinstance(fallback_intel_result, dict) else {}
+
+    @staticmethod
     def _build_timeframe_contexts(scanner, instrument: str, settings) -> Optional[Dict[str, Dict]]:
         """Collect each timeframe's own cached intelligence snapshot.
 
@@ -819,11 +882,107 @@ class SignalProcessor:
         signal_ts: datetime,
         signal_type: str,
         last_ts: datetime,
-        last_identity: str,
+        last_identity,
     ) -> bool:
-        """Allow a forming candle to emit again when its BUY/SELL identity changes."""
+        """Return whether this exact timestamp/direction identity is still virgin.
+
+        Union engines can legitimately retain both BUY and SELL at the same timestamp
+        (different source families flipped on the same bar).  A single remembered
+        identity therefore oscillates BUY -> SELL -> BUY on every scan and makes both
+        arrows look new forever.  Accept the legacy scalar as well as the current
+        collection so warm/partial scanner objects remain compatible.
+        """
         identity = f"{signal_ts.isoformat()}|{signal_type}"
-        return signal_ts > last_ts or (signal_ts == last_ts and identity != last_identity)
+        identities = SignalProcessor._live_signal_identities(last_identity)
+        return signal_ts > last_ts or (signal_ts == last_ts and identity not in identities)
+
+    @staticmethod
+    def _live_signal_identities(value) -> set[str]:
+        """Normalize legacy scalar and current collection identity state."""
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            return {value} if value else set()
+        try:
+            return {str(item) for item in value if str(item)}
+        except TypeError:
+            text = str(value)
+            return {text} if text else set()
+
+    @classmethod
+    def _remember_live_signal_identity(
+        cls,
+        scanner,
+        dedup_key: str,
+        signal_ts: datetime,
+        signal_identity: str,
+    ) -> None:
+        """Remember every direction seen at the lane's latest timestamp.
+
+        The set is naturally bounded: when the lane advances to a newer candle it is
+        replaced, and for the current union engines it contains at most BUY and SELL.
+        """
+        if not hasattr(scanner, "_last_signal_time"):
+            scanner._last_signal_time = {}
+        if not hasattr(scanner, "_last_signal_identity"):
+            scanner._last_signal_identity = {}
+
+        signal_check = (
+            signal_ts.replace(tzinfo=None)
+            if getattr(signal_ts, "tzinfo", None)
+            else signal_ts
+        )
+        current_ts = scanner._last_signal_time.get(dedup_key) or datetime.min
+        current_check = (
+            current_ts.replace(tzinfo=None)
+            if getattr(current_ts, "tzinfo", None)
+            else current_ts
+        )
+        identities = cls._live_signal_identities(
+            scanner._last_signal_identity.get(dedup_key)
+        )
+        if signal_check > current_check:
+            identities.clear()
+        if signal_check >= current_check:
+            identities.add(signal_identity)
+            scanner._last_signal_identity[dedup_key] = identities
+            scanner._last_signal_time[dedup_key] = max(current_check, signal_check)
+
+    @classmethod
+    def _forget_live_signal_identity(
+        cls,
+        scanner,
+        dedup_key: str,
+        signal_ts: datetime,
+        signal_identity: str,
+    ) -> bool:
+        """Withdraw only the repainted identity without reopening its opposite peer."""
+        identity_store = getattr(scanner, "_last_signal_identity", {})
+        identities = cls._live_signal_identities(identity_store.get(dedup_key))
+        if signal_identity not in identities:
+            return False
+
+        identities.discard(signal_identity)
+        if identities:
+            identity_store[dedup_key] = identities
+            return True
+
+        identity_store.pop(dedup_key, None)
+        signal_check = (
+            signal_ts.replace(tzinfo=None)
+            if getattr(signal_ts, "tzinfo", None)
+            else signal_ts
+        )
+        last_times = getattr(scanner, "_last_signal_time", {})
+        current_ts = last_times.get(dedup_key) or datetime.min
+        current_check = (
+            current_ts.replace(tzinfo=None)
+            if getattr(current_ts, "tzinfo", None)
+            else current_ts
+        )
+        if current_check == signal_check:
+            last_times[dedup_key] = signal_check - timedelta(microseconds=1)
+        return True
 
     @classmethod
     def _live_signal_recheck_due(
@@ -2034,6 +2193,10 @@ class SignalProcessor:
         rr: float,
         natural_sl_distance: Optional[float] = None,
         max_sl_pct: float = 0.15,
+        # Units held, only needed to convert premium points into the rupee P&L the live
+        # guards are written in. 0 (the default) leaves the live-exit path inert, so
+        # every existing caller keeps the pure stop/target simulation unchanged.
+        qty: int = 0,
     ) -> Optional[Dict]:
         if option_df is None or option_df.empty:
             return None
@@ -2067,11 +2230,56 @@ class SignalProcessor:
         exit_price = float(window.iloc[-1]["close"])
         exit_time = window.index[-1]
         exit_reason = "HISTORICAL"
+
+        # Optionally let the replay see the LIVE trade-management guards. Without this
+        # the only reachable outcomes are SL HIT / TARGET_HIT / HISTORICAL, so a
+        # backtest measures entry selection and a fixed stop/target and nothing else.
+        # The guard is CALLED, never copied — one implementation, no second copy to
+        # drift. Imported here because scanner imports this module.
+        live_guard = None
+        live_qty = 0
+        try:
+            if _setting_enabled(
+                getattr(get_settings(), "backtest_live_exits_enabled", False), False
+            ):
+                live_qty = max(0, int(qty or 0))
+                if live_qty > 0:
+                    from scanner import Scanner as _Scanner
+
+                    live_guard = _Scanner._peak_giveback_cap_exit
+        except Exception:
+            live_guard = None          # a replay must never fail on an optional probe
+        live_self = SimpleNamespace(_setting_enabled=_setting_enabled)
+        live_trade = SimpleNamespace(instrument="", inst_type="OPT")
+        peak_rs = 0.0
+
         for ts, row in window.iloc[1:].iterrows():
             low = float(row.get("low", row.get("close", 0.0)) or 0.0)
             high = float(row.get("high", row.get("close", 0.0)) or 0.0)
             op = float(row.get("open", row.get("close", 0.0)) or 0.0)
-            
+
+            if live_guard is not None:
+                # Premium points -> rupees, which is what the guards are written in.
+                close_px = float(row.get("close", op) or op)
+                pnl_rs = (close_px - entry_premium) * live_qty
+                peak_rs = max(peak_rs, (high - entry_premium) * live_qty)
+                try:
+                    verdict = live_guard(
+                        live_self, live_trade,
+                        current_pnl_rs=pnl_rs, peak_pnl_rs=peak_rs,
+                    )
+                    fired, why = verdict
+                    # The guard hosts two rules; report the one that actually fired
+                    # so a replay's exit reasons mean the same thing as a live log's.
+                    fired_rule = getattr(verdict, "rule", "") or "PEAK_GIVEBACK_CAP"
+                except Exception:
+                    fired, why, fired_rule = False, "", ""
+                if fired:
+                    exit_price = close_px
+                    exit_time = ts
+                    exit_reason = fired_rule
+                    break
+
             if low <= sl_price and high >= target_price:
                 dist_to_sl = abs(op - sl_price)
                 dist_to_tgt = abs(op - target_price)
@@ -4497,13 +4705,12 @@ class SignalProcessor:
                                     "Live guard ignored stale historical signal echo(s); details retained in the server log.",
                                     "data",
                                 )
-                            # Still advance the dedup lock so we don't re-check
-                            scanner._last_signal_time[dedup_key] = max(
-                                naive_ts(scanner._last_signal_time[dedup_key]), s_ts
+                            # Still advance the dedup lock so we don't re-check. Keep
+                            # every identity at this timestamp: quad-prime can retain an
+                            # opposite source-family arrow on the same bar.
+                            self._remember_live_signal_identity(
+                                scanner, dedup_key, s_ts, signal_identity
                             )
-                            if not hasattr(scanner, "_last_signal_identity"):
-                                scanner._last_signal_identity = {}
-                            scanner._last_signal_identity[dedup_key] = signal_identity
                             getattr(scanner, "_live_signal_recheck_eligible", {}).pop(dedup_key, None)
                             continue
 
@@ -4584,6 +4791,11 @@ class SignalProcessor:
                         setattr(sig, "graded_timeframe", str(tf or ""))
                         setattr(sig, "graded_intel_score", float(_tf_intel_score or 0.0))
                         setattr(sig, "graded_regime", str(_tf_regime or ""))
+                        # Kept off GRADING_TELEMETRY_ATTRS deliberately: the decision
+                        # tape needs the scalar/pillars, not a duplicate full bundle.
+                        # Candidate construction below consumes it directly and copies
+                        # only the established compact context fields.
+                        setattr(sig, "graded_intel_result", _tf_intel_result)
                     except Exception:
                         pass
                     _live_session_ctx = (
@@ -4612,11 +4824,12 @@ class SignalProcessor:
                         "signal_identity": signal_identity,
                     })
                     
-                    # Fix: Always update the lock to prevent evaluating the same signal on every tick
-                    scanner._last_signal_time[dedup_key] = max(naive_ts(scanner._last_signal_time.get(dedup_key, datetime.min)), s_ts)
-                    if not hasattr(scanner, "_last_signal_identity"):
-                        scanner._last_signal_identity = {}
-                    scanner._last_signal_identity[dedup_key] = signal_identity
+                    # Always update the lock to prevent evaluating the same signal on
+                    # every tick. The identity state is a set because union engines may
+                    # emit a legitimate BUY and SELL at the same timestamp.
+                    self._remember_live_signal_identity(
+                        scanner, dedup_key, s_ts, signal_identity
+                    )
                     getattr(scanner, "_live_signal_recheck_eligible", {}).pop(dedup_key, None)
 
         self._append_adaptive_dual_apex_candidates(
@@ -4735,22 +4948,23 @@ class SignalProcessor:
             setattr(rej, "adx_value", float(getattr(sig, "adx_value", 0.0) or 0.0))
             setattr(rej, "market_regime", str(regime or "UNKNOWN"))
             setattr(rej, "intelligence_score", float(normalize_intelligence_score(intel_score)))
-            if isinstance(intel_result, dict):
+            rejected_intel_result = self._graded_candidate_intel_result(sig, intel_result)
+            if isinstance(rejected_intel_result, dict):
                 setattr(
                     rej,
                     "market_intelligence_context",
                     {
-                        "aggregate": dict(intel_result.get("aggregate", {}) or {}),
-                        "regime": dict(intel_result.get("regime", {}) or {}),
-                        "volume": dict(intel_result.get("volume", {}) or {}),
-                        "order_flow": dict(intel_result.get("order_flow", {}) or {}),
-                        "session_context": dict(intel_result.get("session_context", {}) or {}),
-                        "anchor_regime": dict(intel_result.get("anchor_regime", {}) or {}),
-                        "breadth_context": dict(intel_result.get("breadth_context", {}) or {}),
-                        "top_down_context": dict(intel_result.get("top_down_context", {}) or {}),
-                        "market_structure": dict(intel_result.get("market_structure", {}) or {}),
-                        "aroon": dict(intel_result.get("aroon_context", {}) or {}),
-                        "wavetrend": dict(intel_result.get("wavetrend", {}) or {}),
+                        "aggregate": dict(rejected_intel_result.get("aggregate", {}) or {}),
+                        "regime": dict(rejected_intel_result.get("regime", {}) or {}),
+                        "volume": dict(rejected_intel_result.get("volume", {}) or {}),
+                        "order_flow": dict(rejected_intel_result.get("order_flow", {}) or {}),
+                        "session_context": dict(rejected_intel_result.get("session_context", {}) or {}),
+                        "anchor_regime": dict(rejected_intel_result.get("anchor_regime", {}) or {}),
+                        "breadth_context": dict(rejected_intel_result.get("breadth_context", {}) or {}),
+                        "top_down_context": dict(rejected_intel_result.get("top_down_context", {}) or {}),
+                        "market_structure": dict(rejected_intel_result.get("market_structure", {}) or {}),
+                        "aroon": dict(rejected_intel_result.get("aroon_context", {}) or {}),
+                        "wavetrend": dict(rejected_intel_result.get("wavetrend", {}) or {}),
                     },
                 )
             return [rej]
@@ -5923,13 +6137,22 @@ class SignalProcessor:
             elif strike_selection == "ITM": target_strikes = [itm_strike_val]
             else: target_strikes = [atm_strike_val, itm_strike_val]
 
-        # Read ONCE, and only when there is actually a choice to make. allow_fetch=False
-        # means this uses the chain already in cache or nothing at all -- no broker call,
-        # no latency added to an entry.
+        # Read ONCE whenever an option needs either strike ranking or absolute
+        # liquidity admission. allow_fetch=False means this uses the chain already
+        # in cache or nothing at all -- no broker call and no latency added to entry.
         _liquidity_chain = None
-        if len(target_strikes) > 1 and _setting_enabled(
-            getattr(settings, "option_strike_liquidity_ranking_enabled", True), True
-        ):
+        _needs_liquidity_chain = str(inst_type or "").upper() == "OPT" and (
+            _setting_enabled(
+                getattr(settings, "option_contract_liquidity_gate_enabled", True), True
+            )
+            or (
+                len(target_strikes) > 1
+                and _setting_enabled(
+                    getattr(settings, "option_strike_liquidity_ranking_enabled", True), True
+                )
+            )
+        )
+        if _needs_liquidity_chain:
             try:
                 _liquidity_chain, _ = scanner._get_option_chain_cached(
                     instrument, cfg, allow_fetch=False
@@ -6502,22 +6725,25 @@ class SignalProcessor:
                     best_sig, regime, intel_norm
                 )
                 setattr(candidate, "intelligence_score", float(_stamp_intel_norm))
-                if isinstance(intel_result, dict):
+                candidate_intel_result = self._graded_candidate_intel_result(
+                    best_sig, intel_result
+                )
+                if isinstance(candidate_intel_result, dict):
                     setattr(
                         candidate,
                         "market_intelligence_context",
                         {
-                            "aggregate": dict(intel_result.get("aggregate", {}) or {}),
-                            "regime": dict(intel_result.get("regime", {}) or {}),
-                            "volume": dict(intel_result.get("volume", {}) or {}),
-                            "order_flow": dict(intel_result.get("order_flow", {}) or {}),
-                            "session_context": dict(intel_result.get("session_context", {}) or {}),
-                            "anchor_regime": dict(intel_result.get("anchor_regime", {}) or {}),
-                            "breadth_context": dict(intel_result.get("breadth_context", {}) or {}),
-                            "top_down_context": dict(intel_result.get("top_down_context", {}) or {}),
-                            "market_structure": dict(intel_result.get("market_structure", {}) or {}),
-                            "aroon": dict(intel_result.get("aroon_context", {}) or {}),
-                            "wavetrend": dict(intel_result.get("wavetrend", {}) or {}),
+                            "aggregate": dict(candidate_intel_result.get("aggregate", {}) or {}),
+                            "regime": dict(candidate_intel_result.get("regime", {}) or {}),
+                            "volume": dict(candidate_intel_result.get("volume", {}) or {}),
+                            "order_flow": dict(candidate_intel_result.get("order_flow", {}) or {}),
+                            "session_context": dict(candidate_intel_result.get("session_context", {}) or {}),
+                            "anchor_regime": dict(candidate_intel_result.get("anchor_regime", {}) or {}),
+                            "breadth_context": dict(candidate_intel_result.get("breadth_context", {}) or {}),
+                            "top_down_context": dict(candidate_intel_result.get("top_down_context", {}) or {}),
+                            "market_structure": dict(candidate_intel_result.get("market_structure", {}) or {}),
+                            "aroon": dict(candidate_intel_result.get("aroon_context", {}) or {}),
+                            "wavetrend": dict(candidate_intel_result.get("wavetrend", {}) or {}),
                         },
                     )
                 setattr(candidate, "strategy_revision", str(getattr(settings, "strategy_revision", "") or ""))
@@ -6610,11 +6836,18 @@ class SignalProcessor:
                         f"Confirmed impulse bypass ADX={adx_value:.1f}, intel={normalize_intelligence_score(intel_score):.2f}"
                     ]
                 # Tradeability of THIS strike, for the near-tie break below.
-                _strike_oi, _strike_vol = self._strike_liquidity(
+                _liquidity = self._strike_liquidity_snapshot(
                     _liquidity_chain, strike_local, option_type_local
                 )
-                setattr(candidate, "strike_oi", _strike_oi)
-                setattr(candidate, "strike_volume", _strike_vol)
+                candidate.strike_oi = float(_liquidity["oi"])
+                candidate.strike_volume = float(_liquidity["volume"])
+                candidate.strike_oi_available = bool(_liquidity["oi_available"])
+                candidate.strike_volume_available = bool(
+                    _liquidity["volume_available"]
+                )
+                candidate.strike_liquidity_available = bool(
+                    _liquidity["available"]
+                )
                 # The ITM bonus is a standing PREFERENCE for ITM, not a measurement of
                 # this contract. Carried separately so the tie-break can compare the two
                 # candidates on measured quality alone: at 0.15 it is three times the

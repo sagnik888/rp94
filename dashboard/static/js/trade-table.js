@@ -65,6 +65,34 @@ function formatDashboardDate(value) {
     return new Date(ms).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' });
 }
 
+function normalizeTradeDateTime(explicitTime, explicitDate, fallbackTimestamp) {
+    const rawTime = String(explicitTime || '').trim();
+    const fallback = fallbackTimestamp || '';
+    let timeText = '';
+
+    // Accept both time-only values and ISO/full datetime values. substring(0, 8)
+    // rendered an ISO value as "2026-08-", which made real closed rows ambiguous.
+    const clock = rawTime.match(/(?:^|[T\s])(\d{2}:\d{2}(?::\d{2})?)(?:[.Z+\-]|$)/);
+    if (clock) {
+        timeText = clock[1].length === 5 ? `${clock[1]}:00` : clock[1];
+    } else if (/^\d{2}:\d{2}(?::\d{2})?$/.test(rawTime)) {
+        timeText = rawTime.length === 5 ? `${rawTime}:00` : rawTime;
+    } else {
+        timeText = formatDashboardTime(rawTime || fallback);
+    }
+
+    let dateText = String(explicitDate || '').trim();
+    if (dateText) {
+        // Preserve the conventional "21 Aug 26" label while bounding arbitrary
+        // broker strings before insertion into the table.
+        dateText = dateText.split(/\s+/).slice(0, 3).join(' ');
+    } else {
+        const timeCarriesDate = /^\d{4}-\d{2}-\d{2}[T\s]/.test(rawTime);
+        dateText = formatDashboardDate(timeCarriesDate ? rawTime : fallback);
+    }
+    return { timeText, dateText };
+}
+
 function getTradeRowSortRank(row) {
     const status = String(row && row.status ? row.status : '').toUpperCase();
     if (status === 'OPEN' || (row && row.row_kind === 'manager_open')) return 0;
@@ -529,7 +557,14 @@ function updateTradesPanel(trades, simId) {
             let typeLabel = 'FUT';
             let typeClass = 'fut-badge';
             if (isOpt) {
-                const strike = t.atm_strike || (t.instrument.match(/\d+/) ? t.instrument.match(/\d+/)[0] : '');
+                // The fallback used to be `instrument.match(/\d+/)[0]` — the FIRST run of
+                // digits — which on a monthly symbol is the expiry YEAR, not the strike:
+                // NIFTY26AUG24350CE rendered as "26CE". Take the digits immediately
+                // before the CE/PE suffix instead, and prefer the server's atm_strike,
+                // which trade_dashboard.py now parses properly for orphan rows too.
+                const symText = String(t.trading_symbol || t.instrument || '');
+                const tailMatch = symText.match(/(\d+)(?:CE|PE)$/);
+                const strike = t.atm_strike || (tailMatch ? tailMatch[1] : '');
                 const optType = t.option_type || (t.instrument.includes('CE') ? 'CE' : 'PE');
                 typeLabel = `${strike}${optType}`;
                 typeClass = optType === 'CE' ? 'ce-badge' : 'pe-badge';
@@ -551,14 +586,16 @@ function updateTradesPanel(trades, simId) {
             const stopPrice = stopValue ? formatPrice(stopValue) : '--';
             const mergedPriceHtml = renderLtpExitCell(t, isClosedTradeRow, isExitSignalRow);
             
-            const eDate = t.entry_date ? t.entry_date.split(' ').slice(0,2).join(' ') : '';
-            const xDate = t.exit_date ? t.exit_date.split(' ').slice(0,2).join(' ') : '';
-            const entryTime = t.entry_time || formatDashboardTime(t.entry_timestamp || t.timestamp || t.signal_timestamp);
-            const exitTime = t.exit_time || formatDashboardTime(t.exit_timestamp);
-            const entryDate = eDate || formatDashboardDate(t.entry_timestamp || t.timestamp || t.signal_timestamp);
-            const exitDate = xDate || formatDashboardDate(t.exit_timestamp);
-            const eTimeStr = entryTime ? `<div class="time-col-wrapper"><span>${entryTime.substring(0, 8)}</span><span style="font-size:0.65rem; opacity:0.5">${entryDate}</span></div>` : '--:--:--';
-            const xTimeStr = exitTime ? `<div class="time-col-wrapper"><span>${exitTime.substring(0, 8)}</span><span style="font-size:0.65rem; opacity:0.5">${exitDate}</span></div>` : '--:--:--';
+            const entryStamp = t.entry_timestamp || t.timestamp || t.signal_timestamp;
+            const exitStamp = t.exit_timestamp;
+            const entryClock = normalizeTradeDateTime(t.entry_time, t.entry_date, entryStamp);
+            const exitClock = normalizeTradeDateTime(t.exit_time, t.exit_date, exitStamp);
+            const eTimeStr = entryClock.timeText
+                ? `<div class="time-col-wrapper"><span>${escHtml(entryClock.timeText)}</span><span style="font-size:0.65rem; opacity:0.5">${escHtml(entryClock.dateText)}</span></div>`
+                : '--:--:--';
+            const xTimeStr = exitClock.timeText
+                ? `<div class="time-col-wrapper"><span>${escHtml(exitClock.timeText)}</span><span style="font-size:0.65rem; opacity:0.5">${escHtml(exitClock.dateText)}</span></div>`
+                : '--:--:--';
             const pointsText = formatTradePoints(getTradePoints(t));
             const lotsText = t.lots ? `<span class="lots-chip">[${t.lots}]</span>` : '';
             const pnlText = `₹${pnl.toLocaleString()}${pointsText ? `<span class="points-chip">(${pointsText})</span>` : ''}${lotsText}`;

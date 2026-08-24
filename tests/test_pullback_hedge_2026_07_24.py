@@ -146,7 +146,12 @@ def test_dashboard_toggle_is_fully_wired():
     # Bump the cache-buster whenever this bundle changes, or browsers keep serving the
     # old JS and the new control never appears for the operator.
     index_html = (root / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
-    assert "dashboard-settings.js?v=24-per-tf-grading" in index_html
+    # Pins the CURRENT cache-buster, so bumping the bundle forces this to be updated
+    # deliberately. Bumped to v25 on 2026-08-18 when the breakeven-stop,
+    # give-back-cap and backtest-live-exit controls were added: they were present
+    # in the JS and mounted in the DOM, but invisible in the running dashboard
+    # because the version string still said v=24 and browsers served the cache.
+    assert "dashboard-settings.js?v=26-peak-threat-recalibration" in index_html
 
 
 def test_configure_applies_and_reverts_the_toggle(monkeypatch):

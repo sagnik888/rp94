@@ -35,6 +35,7 @@ RESTOREPOINT_*/
 dashboard/static_backup/
 experiments/
 reports/*.png
+/dogfood-output/
 check_step.py
 extract_diffs.py
 extract_server_diffs.py
@@ -45,6 +46,8 @@ test_save.py
 # Never track env backups (2026-07-10: credential leak scrub)
 .env.bak*
 *.env.bak*
+/.env.prune_backup_*
+/.tmp_*
 
 # Scratch/verify workspace stays local
 scratch/

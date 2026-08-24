@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import shutil
 import tempfile
@@ -44,9 +45,10 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "atm_strike", "option_type", "target", "rr_ratio", "confidence",
     "inst_type", "instrument_multiplier", "exec_type", "status",
     "current_price", "entry_spot", "spot_stop", "spot_target", "exit_price",
-    "exit_time", "exit_reason", "pnl", "charges", "peak_pnl", "max_drawdown",
+    "exit_time", "exit_reason", "pnl", "charges", "broker_realised_cumulative",
+    "peak_pnl", "max_drawdown",
     "is_ghost", "market_regime", "data_provenance", "price_action_verdict",
-    "intelligence_score", "strategy_revision", "strategy_direction_mode",
+    "entry_intelligence_score", "intelligence_score", "strategy_revision", "strategy_direction_mode",
     "initial_stop", "scalp_lock_mode", "market_wide_reversal_entry",
     "volume_spike_entry", "power_move", "source_lane",
     # Exchange-side protection + recovery state: read by from_dict(), so it has to
@@ -127,6 +129,13 @@ class DatabaseManager:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.write_lock = threading.Lock()
+        # The dashboard, scanner and reconciliation threads read while checkpoint
+        # writes occur. WAL prevents readers from blocking that safety-critical write;
+        # FULL keeps acknowledged trade state durable across an OS/power interruption.
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = FULL")
+        self.conn.execute("PRAGMA foreign_keys = ON")
         
         self._create_tables()
         # CONSTRUCTION DOES NOT PRUNE. This used to call cleanup_old_records() on every
@@ -417,7 +426,9 @@ class DatabaseManager:
                     "market_regime": "TEXT",
                     "data_provenance": "TEXT",
                     "price_action_verdict": "TEXT",
+                    "entry_intelligence_score": "REAL",
                     "intelligence_score": "REAL",
+                    "broker_realised_cumulative": "REAL",
                     "strategy_revision": "TEXT",
                     "strategy_direction_mode": "TEXT",
                     "initial_stop": "REAL",
@@ -634,7 +645,7 @@ class DatabaseManager:
                 cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
                 logger.info(f"Added missing DB column {table}.{name}")
 
-    def save_trade(self, trade_dict: dict):
+    def save_trade(self, trade_dict: dict) -> bool:
         """Insert or replace a trade record."""
         # SQLite doesn't natively support datetime objects without adapters, 
         # so we ensure entry_time and exit_time are strings.
@@ -665,9 +676,12 @@ class DatabaseManager:
                 cursor.execute(sql, values)
                 self.conn.commit()
             except Exception as e:
+                self.conn.rollback()
                 logger.error(f"Error saving trade to DB: {e}")
+                raise
+        return True
 
-    def save_trades(self, trade_dicts: List[Dict]) -> None:
+    def save_trades(self, trade_dicts: List[Dict]) -> bool:
         """Persist a trade snapshot in one transaction instead of one commit per row."""
         grouped: Dict[tuple, List[tuple]] = {}
         for trade_dict in trade_dicts:
@@ -690,7 +704,7 @@ class DatabaseManager:
             grouped.setdefault(columns, []).append(tuple(values))
 
         if not grouped:
-            return
+            return True
         with self.write_lock:
             cursor = self.conn.cursor()
             try:
@@ -705,6 +719,46 @@ class DatabaseManager:
             except Exception as exc:
                 self.conn.rollback()
                 logger.error(f"Error saving trade snapshot to DB: {exc}")
+                raise
+        return True
+
+    def quarantine_open_trades(self, trade_ids: List[str], reason: str) -> int:
+        """Atomically remove proven-invalid rows from the OPEN recovery set.
+
+        The rows remain in SQLite for audit, but can no longer resurrect on a later
+        restart when the broker instrument list is temporarily unavailable.
+        """
+        ids = sorted({str(item or "").strip() for item in trade_ids if str(item or "").strip()})
+        if not ids:
+            return 0
+        changed = 0
+        with self.write_lock:
+            cursor = self.conn.cursor()
+            try:
+                # Stay below SQLite's common 999-parameter limit.
+                for offset in range(0, len(ids), 900):
+                    batch = ids[offset:offset + 900]
+                    placeholders = ", ".join("?" for _ in batch)
+                    cursor.execute(
+                        f"""
+                        UPDATE trades
+                           SET status = 'QUARANTINED',
+                               execution_status = 'QUARANTINED',
+                               execution_error = ?,
+                               exit_reason = 'DELISTED_CONTRACT_QUARANTINED',
+                               exit_time = COALESCE(exit_time, ?)
+                         WHERE status = 'OPEN' AND id IN ({placeholders})
+                        """,
+                        [str(reason or "Invalid open-trade recovery record")[:500],
+                         datetime.now(IST).isoformat(), *batch],
+                    )
+                    changed += max(0, int(cursor.rowcount or 0))
+                self.conn.commit()
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"Error quarantining invalid open trades: {exc}")
+                raise
+        return changed
 
     def load_all_trades(self) -> List[Dict]:
         """Load all trades from the database."""
@@ -714,14 +768,63 @@ class DatabaseManager:
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
+    _TRADABLE_SYMBOLS: Optional[frozenset] = None
+
+    INSTRUMENT_LISTING_PATH = "data_store/kite_instruments.json"
+
+    @classmethod
+    def _tradable_symbols(cls, path: Optional[str] = None) -> Optional[frozenset]:
+        """Every symbol the broker currently lists, or None if that is unknowable.
+
+        None is the important return: it means "no opinion", and every caller must then
+        keep whatever it has. A missing or unreadable instrument file must never be
+        allowed to look like "this contract does not exist".
+        """
+        if path is None and cls._TRADABLE_SYMBOLS is not None:
+            return cls._TRADABLE_SYMBOLS or None
+        try:
+            listing_path = Path(path or cls.INSTRUMENT_LISTING_PATH)
+            if not listing_path.exists():
+                return None
+            with open(listing_path, encoding="utf-8") as handle:
+                listing = json.load(handle)
+            symbols = {
+                str(row.get("symbol") or row.get("tradingsymbol") or "")
+                for row in listing
+                if isinstance(row, dict)
+            }
+            symbols.discard("")
+            if len(symbols) < 1000:
+                # A plausible instrument dump is tens of thousands of rows. Anything
+                # smaller is a truncated or half-written file, and trusting it would
+                # delete live positions.
+                logger.warning(
+                    f"Instrument list looks truncated ({len(symbols)} symbols); "
+                    f"skipping the expired-contract check entirely."
+                )
+                return None
+            result = frozenset(symbols)
+            if path is None:
+                cls._TRADABLE_SYMBOLS = result
+            return result
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning(f"Instrument list unreadable, keeping every open row: {exc}")
+            return None
+
     def load_open_trades(self) -> List[Dict]:
-        """Load only open trades from the database."""
+        """Load only open trades from the database.
+
+        A PURE accessor: it returns what is stored, unfiltered. The delisted-contract
+        guard deliberately lives in TradeManager.load_state instead — filtering here
+        would also change what the persistence round-trip reads back, and "save a row
+        then read it again" must mean exactly that. See _tradable_symbols above.
+        """
         with self.write_lock:
             cursor = self.conn.cursor()
             cursor.execute("SELECT * FROM trades WHERE status = 'OPEN'")
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
-            
+
     def load_closed_trades(self) -> List[Dict]:
         """Load only closed trades from the database."""
         with self.write_lock:

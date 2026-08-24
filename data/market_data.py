@@ -281,6 +281,10 @@ class MarketDataProvider:
         self.on_kite_reauth = None
         self.is_connected = False
         self.kws = None                       # KiteTicker
+        # Callable taking one Kite order-update payload. Wired by whoever owns the
+        # TradeManager; when unset the feed only logs, so the socket is never coupled
+        # to a consumer that may not exist yet.
+        self.order_update_sink = None
         self._kite_ws_connected = False
         self._last_kite_ws_tick = 0.0
         self._active_kite_tokens: set = set()
@@ -327,6 +331,15 @@ class MarketDataProvider:
         self._cache_ttl = 5
         self._ltp_cache: Dict[str, Dict[str, Any]] = {}
         self._ws_cache: Dict[str, Dict[str, Any]] = {}
+        # Kite and Fyers websocket callbacks run on different SDK threads.  Index
+        # quotes therefore need their own short-lived guard: without one, a reader can
+        # observe a half-transition between the two feeds and, more importantly, both
+        # callbacks can independently decide that their price is the one CandleBuilder
+        # should consume.  The route state below makes the feeds active/standby for
+        # PRICE while still allowing Fyers' cumulative index VOLUME to travel alongside
+        # the selected Kite price.
+        self._index_quote_lock = threading.RLock()
+        self._index_price_route: Dict[str, Dict[str, Any]] = {}
         self._touch_quote_cache: Dict[str, Dict[str, Any]] = {}
         self._index_tick_volume_diag: Dict[str, Dict[str, Any]] = {}
         self._active_angel_tokens = {1: set(["26000", "26009", "26017", "26074"]), 3: set(["19000"])}
@@ -682,6 +695,54 @@ class MarketDataProvider:
         logger.debug(f"WS teardown during {context}: socket has no close method")
         return False
 
+    def shutdown_streams(self, timeout: float = 3.0) -> bool:
+        """Bounded shutdown for the Fyers and Kite market-data sockets.
+
+        SDK close calls are not uniformly bounded (and KiteTicker owns its own worker
+        thread), so invoke each close on a daemon helper and wait only up to ``timeout``.
+        Advancing the Fyers generation first prevents its reconnect loop from creating a
+        replacement socket while shutdown is in progress. This is used by audits and the
+        application shutdown path; it never submits or changes an order.
+        """
+        self._fyers_ws_generation = getattr(self, "_fyers_ws_generation", 0) + 1
+        self._fyers_ws_auth_failed = True
+        self._fyers_ws_connected = False
+        self._fyers_ws_connected_since = 0.0
+        self._kite_ws_connected = False
+        sockets = [
+            ("fyers shutdown", getattr(self, "_fyers_ws", None)),
+            ("kite shutdown", getattr(self, "kws", None)),
+        ]
+        workers = []
+        results: Dict[str, bool] = {}
+
+        def _close(label: str, socket: Any) -> None:
+            results[label] = self._close_ws_socket(socket, label)
+
+        for label, socket in sockets:
+            if socket is None:
+                results[label] = True
+                continue
+            worker = threading.Thread(
+                target=_close,
+                args=(label, socket),
+                name=f"MarketDataShutdown-{label.split()[0]}",
+                daemon=True,
+            )
+            worker.start()
+            workers.append((label, worker))
+
+        deadline = time.monotonic() + max(0.1, float(timeout or 0.1))
+        for label, worker in workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
+                results[label] = False
+                logger.warning(f"Market-data {label} exceeded shutdown timeout")
+
+        self._fyers_ws = None
+        self.kws = None
+        return all(results.values())
+
     @staticmethod
     def _fyers_ws_tick_stalled(last_tick: float, connected_since: float,
                                now_ts: float, stall_seconds: float) -> bool:
@@ -744,7 +805,8 @@ class MarketDataProvider:
                     if symbol and ltp:
                         last_ws_debug = getattr(self, "_last_ws_debug_log", {})
                         now_ts = time.time()
-                        self._ws_cache[symbol] = {
+                        exchange_at = self._exchange_timestamp_from_payload(m)
+                        cache_entry = {
                             'ltp': float(ltp),
                             'oi': int(oi) if oi else 0,
                             'vol': int(vol) if vol else 0,
@@ -754,8 +816,12 @@ class MarketDataProvider:
                             'change_pct': float(m.get('chp') or 0.0),
                             'previous_close': self._quote_float(m, *PREVIOUS_CLOSE_KEYS),
                             'time': now_ts,
+                            'received_at': now_ts,
+                            'exchange_at': exchange_at,
                             'source': 'fyers_ws',
                         }
+                        with self._index_quote_guard():
+                            self._ws_cache[symbol] = cache_entry
                         if now_ts - last_ws_debug.get(symbol, 0) >= 10:
                             logger.debug(f"Fyers WS Tick: {symbol} -> {ltp}")
                             last_ws_debug[symbol] = now_ts
@@ -797,9 +863,14 @@ class MarketDataProvider:
                                     vol_fields,
                                     now_ts,
                                 )
-                                self._emit_index_tick(
-                                    index_name, float(ltp), int(vol) if vol else 0,
+                                self._emit_arbitrated_index_tick(
+                                    index_name,
+                                    float(ltp),
+                                    int(vol) if vol else 0,
                                     "fyers_index" if vol else "",
+                                    "fyers_ws",
+                                    received_at=now_ts,
+                                    exchange_at=exchange_at,
                                 )
 
             def on_open():
@@ -1335,6 +1406,16 @@ class MarketDataProvider:
     # gates entries; 0.015% puts that at ~3.6 points. The default is the fallback here —
     # quote_divergence_alert_pct is the live knob.
     QUOTE_DIVERGENCE_ALERT_PCT = 0.015
+    QUOTE_DIVERGENCE_CRITICAL_PCT = 0.05
+    # Price-source routing is intentionally stricter than quote DISPLAY fallback.
+    # A Kite tick is the price the execution venue will fill against, so it owns the
+    # candle while it is fresh.  Fyers must see two ticks over a small dwell after
+    # Kite goes stale before taking over; this prevents a one-packet scheduling gap
+    # from flipping the active feed twice inside one candle.
+    INDEX_KITE_PRICE_FRESH_SECONDS = 6.0
+    INDEX_FYERS_PRICE_FRESH_SECONDS = 15.0
+    INDEX_PRICE_FAILOVER_MIN_TICKS = 2
+    INDEX_PRICE_FAILOVER_HYSTERESIS_SECONDS = 0.25
 
     def _quote_divergence_alert_pct(self) -> float:
         """The configured divergence tolerance, with the class default as fallback."""
@@ -1350,6 +1431,62 @@ class MarketDataProvider:
             return float(MarketDataProvider.QUOTE_DIVERGENCE_ALERT_PCT)
         return value
 
+    @staticmethod
+    def _naive_kolkata_index(df):
+        """Force a candle frame's index to NAIVE Asia/Kolkata, the house convention.
+
+        Every live producer already ends in `.tz_localize(None)` (see the Fyers and
+        Kite history paths), so candles in memory are naive. Candles read back from a
+        CSV cache are not necessarily: `parse_dates=True` on a file whose timestamps
+        carry a `+05:30` suffix yields `datetime64[us, tzoffset(None, 19800)]`, and a
+        different writer produces `datetime64[us, UTC+05:30]`. Both are "+05:30" to a
+        human and neither is comparable with a naive Timestamp.
+
+        That is the whole of the 2026-08-19 freeze. `scanner:process_task` slices these
+        frames with `df.index <= as_of`, raises "Invalid comparison between
+        dtype=datetime64[us, tzoffset(None, 19800)] and Timestamp", and its handler
+        returns `{"error": ...}` for the index — which the dashboard renders as unknown
+        data. It only ever bit within ~16-500s of a restart, because that is when the
+        cache is read and merged; all 18 occurrences in the log sit inside a restart
+        window and none outside one.
+
+        Normalising on the way in means the mixed dtypes never meet.
+        """
+        try:
+            idx = getattr(df, "index", None)
+            if idx is None or getattr(idx, "tz", None) is None:
+                return df
+            df.index = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        except (AttributeError, TypeError, ValueError) as exc:
+            # A frame we cannot normalise is left exactly as it was: this is a
+            # defensive tidy-up on a read path, never a reason to lose the candles.
+            # Said out loud rather than swallowed — an unnormalised frame is the
+            # precondition for the mixed-dtype comparison this method exists to stop,
+            # so silence here would hide the next occurrence of the original bug.
+            logger.debug(f"Candle index tz normalisation skipped: {exc}")
+        return df
+
+    def _quote_divergence_critical_pct(self) -> float:
+        """The bar for a CRITICAL line and a desktop notification.
+
+        Separate from the tracking tolerance above: tracking stays sensitive so the
+        dashboard sees drift, while only a real disagreement is worth an alarm. Never
+        returns below the tracking bar — a critical threshold under the threshold that
+        gates it would be silently meaningless.
+        """
+        floor = self._quote_divergence_alert_pct()
+        try:
+            from config.settings import get_settings
+
+            value = float(
+                getattr(get_settings(), "quote_divergence_critical_pct", 0.0) or 0.0
+            )
+        except Exception:
+            return max(floor, float(MarketDataProvider.QUOTE_DIVERGENCE_CRITICAL_PCT))
+        if value <= 0:
+            return max(floor, float(MarketDataProvider.QUOTE_DIVERGENCE_CRITICAL_PCT))
+        return max(floor, value)
+
     def _flag_quote_divergence(
         self, symbol: str, primary: str, primary_ltp: float,
         secondary: str, secondary_ltp: float,
@@ -1361,20 +1498,35 @@ class MarketDataProvider:
         # that can raise is a monitor that takes down the thing it was watching.
         if not isinstance(getattr(self, "_quote_divergence", None), dict):
             self._quote_divergence = {}
+        # The alert cooldown must OUTLIVE the divergence record. It used to be stored
+        # inside that record, which is popped the moment the feeds agree again — so a
+        # quote flickering across the threshold cleared its own cooldown and re-alerted
+        # on the next crossing. 2026-08-18: 1,815 CRITICAL lines, 98% of them inside the
+        # 300s window they were supposed to be suppressed by, at a median gap of 13-21s.
+        if not isinstance(getattr(self, "_quote_divergence_alerted_at", None), dict):
+            self._quote_divergence_alerted_at = {}
+
         deviation = abs(primary_ltp - secondary_ltp) / primary_ltp * 100.0
         if deviation < self._quote_divergence_alert_pct():
             self._quote_divergence.pop(symbol, None)
             return deviation
 
         now = time.time()
-        last = float((self._quote_divergence.get(symbol) or {}).get("alerted_at", 0.0) or 0.0)
+        last = float(self._quote_divergence_alerted_at.get(symbol, 0.0) or 0.0)
         self._quote_divergence[symbol] = {
             "symbol": symbol, "deviation_pct": round(deviation, 3),
             "primary": primary, "primary_ltp": primary_ltp,
             "secondary": secondary, "secondary_ltp": secondary_ltp,
             "at": now, "alerted_at": last or now,
         }
+        # Tracking (above) is sensitive so the dashboard sees every disagreement.
+        # Alerting (below) is not: only a divergence past the critical bar is worth a
+        # CRITICAL line and a desktop notification.
+        if deviation < self._quote_divergence_critical_pct():
+            return deviation
+
         if now - last >= 300.0:
+            self._quote_divergence_alerted_at[symbol] = now
             self._quote_divergence[symbol]["alerted_at"] = now
             message = (
                 f"BAD MARKET DATA: {symbol} {secondary}={secondary_ltp:,.2f} disagrees with "
@@ -1447,7 +1599,8 @@ class MarketDataProvider:
                     depth = tick.get("depth") or {}
                     buy = (depth.get("buy") or [{}])[0] if depth.get("buy") else {}
                     sell = (depth.get("sell") or [{}])[0] if depth.get("sell") else {}
-                    self._ws_cache[token] = {
+                    exchange_at = self._exchange_timestamp_from_payload(tick)
+                    cache_entry = {
                         "ltp": price,
                         "oi": int(tick.get("oi") or 0),
                         "oi_change_pct": 0.0,
@@ -1463,8 +1616,12 @@ class MarketDataProvider:
                         "bid_qty": int(buy.get("quantity") or 0),
                         "ask_qty": int(sell.get("quantity") or 0),
                         "time": now_ts,
+                        "received_at": now_ts,
+                        "exchange_at": exchange_at,
                         "source": "kite_ws",
                     }
+                    with self._index_quote_guard():
+                        self._ws_cache[token] = cache_entry
                     self._last_kite_ws_tick = now_ts
                     self._last_ws_tick = now_ts
                     self._last_ltp_time = now_ts
@@ -1484,7 +1641,15 @@ class MarketDataProvider:
                             index_name, "kite_ws", float(volume), "volume_traded",
                             {"volume_traded": volume}, now_ts,
                         )
-                        self._emit_index_tick(index_name, price, volume, carried_source)
+                        self._emit_arbitrated_index_tick(
+                            index_name,
+                            price,
+                            volume,
+                            carried_source,
+                            "kite_ws",
+                            received_at=now_ts,
+                            exchange_at=exchange_at,
+                        )
                 except Exception as exc:
                     logger.debug(f"Kite tick parse failed: {exc}")
 
@@ -1530,12 +1695,44 @@ class MarketDataProvider:
                 "Prices fall back to slower REST polling until restart."
             )
 
+        def on_order_update(ws, data):
+            """Kite's order-state push, riding the socket already open for ticks.
+
+            Added 2026-08-16. The payload is the same order object an HTTP postback
+            carries, minus the checksum — the socket is already authenticated, so there
+            is nothing to verify. Crucially it needs NO public URL, no tunnel and no
+            inbound firewall rule, which is what makes it usable here: kite_postback_url
+            defaults to empty, so before this the system had no push order-state channel
+            at all and learned every fill, rejection and stop trigger from a 5s poll.
+
+            Dispatched off-thread on purpose. kiteconnect calls this synchronously on
+            the socket thread (see the note above on_ticks), and the sink takes the
+            TradeManager lock and writes state — blocking here stalls the tick feed for
+            all four indices.
+            """
+            sink = getattr(self, "order_update_sink", None)
+            if not callable(sink):
+                logger.debug(f"Kite order update, no sink attached: {str(data)[:200]}")
+                return
+            try:
+                payload = dict(data or {})
+            except (TypeError, ValueError):
+                logger.warning(f"Kite order update had an unreadable payload: {data!r}")
+                return
+            threading.Thread(
+                target=self._dispatch_order_update,
+                args=(sink, payload),
+                name="kite-order-update",
+                daemon=True,
+            ).start()
+
         ticker.on_ticks = on_ticks
         ticker.on_connect = on_connect
         ticker.on_close = on_close
         ticker.on_error = on_error
         ticker.on_reconnect = on_reconnect
         ticker.on_noreconnect = on_noreconnect
+        ticker.on_order_update = on_order_update
         self.kws = ticker
         try:
             ticker.connect(threaded=True)
@@ -1544,6 +1741,19 @@ class MarketDataProvider:
             return False
         logger.info("🚀 Kite WebSocket thread started")
         return True
+
+    @staticmethod
+    def _dispatch_order_update(sink, payload: Dict) -> None:
+        """Hand one order update to the sink, off the socket thread."""
+        try:
+            sink(payload)
+        except Exception as exc:
+            # Never let a consumer fault kill the dispatch thread silently — an order
+            # update that vanishes is a fill the system does not know it has.
+            logger.error(
+                f"Kite order-update sink failed for order "
+                f"{payload.get('order_id', '?')}: {exc}"
+            )
 
     def _load_kite_index_tokens(self) -> None:
         """Map index instrument_tokens to names so on_tick still fires for indices.
@@ -1745,6 +1955,162 @@ class MarketDataProvider:
     # UNIFIED PRICE BRIDGE (The "Master" Lock)
     # ═══════════════════════════════════════════════════════════
 
+    def _index_quote_guard(self):
+        """The short-lived guard shared by both websocket callback threads.
+
+        Focused tests construct the provider with ``__new__``. Lazily materialising
+        the lock keeps those probes valid while normal production instances create it
+        before either socket starts.
+        """
+        guard = getattr(self, "_index_quote_lock", None)
+        if guard is None:
+            guard = threading.RLock()
+            self._index_quote_lock = guard
+        return guard
+
+    @staticmethod
+    def _market_timestamp_epoch(value: Any) -> Optional[float]:
+        """Normalise a broker market timestamp to epoch seconds when possible."""
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            try:
+                return float(value.timestamp())
+            except (OSError, OverflowError, ValueError):
+                return None
+        try:
+            epoch = float(value)
+        except (TypeError, ValueError):
+            try:
+                text = str(value).strip().replace("Z", "+00:00")
+                epoch = float(datetime.fromisoformat(text).timestamp())
+            except (TypeError, ValueError, OSError, OverflowError):
+                return None
+        # SDKs variously expose seconds, milliseconds, microseconds or nanoseconds.
+        while epoch > 100_000_000_000.0:
+            epoch /= 1000.0
+        # Smaller values are generally a time-of-day or an expiry identifier, not an
+        # exchange timestamp that can participate in a freshness decision.
+        return epoch if epoch >= 946_684_800.0 else None
+
+    @classmethod
+    def _exchange_timestamp_from_payload(cls, payload: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(payload, dict):
+            return None
+        for key in (
+            "exchange_timestamp",
+            "exch_feed_time",
+            "last_trade_time",
+            "last_traded_time",
+            "tt",
+        ):
+            epoch = cls._market_timestamp_epoch(payload.get(key))
+            if epoch is not None:
+                return epoch
+        return None
+
+    def _quote_age_components(
+        self,
+        payload: Dict[str, Any],
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Optional[float]]:
+        """Return receipt, exchange and conservative effective quote ages."""
+        now = time.time() if now_ts is None else float(now_ts)
+        receipt_raw = payload.get("received_at", payload.get("time"))
+        if isinstance(receipt_raw, datetime):
+            receipt_epoch = self._market_timestamp_epoch(receipt_raw) or 0.0
+        else:
+            try:
+                receipt_epoch = float(receipt_raw or 0.0)
+            except (TypeError, ValueError):
+                receipt_epoch = 0.0
+        exchange_epoch = self._market_timestamp_epoch(
+            payload.get("exchange_at", payload.get("exchange_timestamp"))
+        )
+        receipt_age = max(0.0, now - receipt_epoch) if receipt_epoch > 0 else None
+        exchange_age = max(0.0, now - exchange_epoch) if exchange_epoch else None
+        comparable = [age for age in (receipt_age, exchange_age) if age is not None]
+        return {
+            "received_at": receipt_epoch or None,
+            "exchange_at": exchange_epoch,
+            "receipt_age": receipt_age,
+            "exchange_age": exchange_age,
+            # A freshly received replay of an old exchange packet is still old. max()
+            # catches both that case and the ordinary stopped-socket case.
+            "age": max(comparable) if comparable else None,
+        }
+
+    @staticmethod
+    def _quote_epoch_iso(epoch: Optional[float]) -> Optional[str]:
+        """Render a cached epoch without changing its timezone or freshness meaning."""
+        if epoch is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(epoch)).astimezone().isoformat()
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+
+    def _quote_timing_metadata(
+        self,
+        payload: Dict[str, Any],
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Expose exchange time separately from local receipt time.
+
+        Exchange time is preferable for diagnosing a replayed/delayed packet, while
+        receipt time diagnoses a locally stalled consumer.  ``quote_age_seconds`` is
+        deliberately the worse of the two so a just-received old packet never looks
+        fresh merely because it crossed the process boundary a moment ago.
+        """
+        ages = self._quote_age_components(payload, now_ts)
+        received_at = ages.get("received_at")
+        exchange_at = ages.get("exchange_at")
+        quote_at = exchange_at if exchange_at is not None else received_at
+        return {
+            "received_at": received_at,
+            "received_at_epoch": received_at,
+            "exchange_at": exchange_at,
+            "exchange_timestamp_epoch": exchange_at,
+            "receipt_timestamp": self._quote_epoch_iso(received_at),
+            "exchange_timestamp": self._quote_epoch_iso(exchange_at),
+            "quote_timestamp": self._quote_epoch_iso(quote_at),
+            "receipt_age_seconds": ages.get("receipt_age"),
+            "exchange_age_seconds": ages.get("exchange_age"),
+            "quote_age_seconds": ages.get("age"),
+            "freshness_basis": (
+                "exchange_and_receipt" if exchange_at is not None else "receipt"
+            ),
+        }
+
+    def _freshest_cached_index_quote(
+        self,
+        keys: Tuple[str, ...],
+        max_age: float,
+        now_ts: float,
+    ) -> Optional[Tuple[float, Dict[str, Any]]]:
+        candidates = []
+        with self._index_quote_guard():
+            ws_cache = getattr(self, "_ws_cache", {}) or {}
+            cached_rows = [
+                dict(ws_cache.get(key) or {})
+                for key in dict.fromkeys(key for key in keys if key)
+            ]
+        for cached in cached_rows:
+            if float(cached.get("ltp", 0.0) or 0.0) <= 0:
+                continue
+            ages = self._quote_age_components(cached, now_ts)
+            age = ages.get("age")
+            if age is not None and age <= max_age:
+                candidates.append((float(age), cached))
+        return min(candidates, key=lambda item: item[0]) if candidates else None
+
+    def _index_broker_cache_keys(self, symbol: str, token: str = "") -> Tuple[str, ...]:
+        kite_token = self._kite_token_for_index(symbol)
+        configured_token = INDEX_SPOT_TOKENS.get(symbol, ("", ""))[0]
+        legacy_token = token or configured_token
+        short_token = legacy_token[3:] if legacy_token.startswith("999") else legacy_token
+        return tuple(dict.fromkeys(k for k in (kite_token, legacy_token, short_token) if k))
+
     def _select_index_ws_quote(
         self,
         symbol: str,
@@ -1764,23 +2130,6 @@ class MarketDataProvider:
         was reading it.
         """
         now = time.time() if now_ts is None else float(now_ts)
-        kite_token = self._kite_token_for_index(symbol)
-        configured_token = INDEX_SPOT_TOKENS.get(symbol, ("", ""))[0]
-        angel_token = token or configured_token
-        short_token = angel_token[3:] if angel_token.startswith("999") else angel_token
-
-        def freshest(keys: Tuple[str, ...], max_age: float):
-            candidates = []
-            for key in dict.fromkeys(key for key in keys if key):
-                cached = self._ws_cache.get(key)
-                if not isinstance(cached, dict):
-                    continue
-                if float(cached.get("ltp", 0.0) or 0.0) <= 0:
-                    continue
-                age = max(0.0, now - float(cached.get("time") or 0.0))
-                if age <= max_age:
-                    candidates.append((age, cached))
-            return min(candidates, key=lambda item: item[0]) if candidates else None
 
         # Selection is by TRUST first, freshness second. Picking the fresher tick let a
         # continuously-streaming bad feed outrank a briefly-quiet good one: on
@@ -1796,28 +2145,194 @@ class MarketDataProvider:
             market_open = bool(self.is_market_open())
         except Exception:
             market_open = True
-        broker_window = 6.0 if market_open else 86400.0
-        broker = freshest((kite_token, angel_token, short_token), broker_window)
-        fyers = freshest((FYERS_INDEX_SYMBOLS.get(symbol, ""),), 15.0)
+        broker_window = self.INDEX_KITE_PRICE_FRESH_SECONDS if market_open else 86400.0
+        broker = self._freshest_cached_index_quote(
+            self._index_broker_cache_keys(symbol, token), broker_window, now
+        )
+        if broker is not None and not str(
+            broker[1].get("source") or ""
+        ).lower().startswith("kite"):
+            broker = None
+        fyers = self._freshest_cached_index_quote(
+            (FYERS_INDEX_SYMBOLS.get(symbol, ""),),
+            self.INDEX_FYERS_PRICE_FRESH_SECONDS,
+            now,
+        )
+        if fyers is not None and not str(
+            fyers[1].get("source") or ""
+        ).lower().startswith("fyers"):
+            fyers = None
 
         if broker is not None and fyers is not None:
             broker_ltp = float(broker[1].get("ltp", 0.0) or 0.0)
             fyers_ltp = float(fyers[1].get("ltp", 0.0) or 0.0)
-            deviation = self._flag_quote_divergence(
+            self._flag_quote_divergence(
                 symbol, "kite", broker_ltp, "fyers", fyers_ltp
             )
-            if deviation >= self._quote_divergence_alert_pct():
-                # Disagreement this large is a fault in one of them. Trust the venue
-                # that fills the orders and quarantine the other for this symbol.
-                return broker[1], broker[0]
-            # They agree; take whichever is fresher.
-            selected = min((broker, fyers), key=lambda item: item[0])
-            return selected[1], selected[0]
+            # Fresh Kite remains authoritative even when the feeds agree. Choosing the
+            # newest packet here caused sub-threshold source flips several times a second,
+            # while both callbacks independently mutated one OHLC candle.
+            return broker[1], broker[0]
 
         selected = broker or fyers
         if selected is None:
             return None, None
         return selected[1], selected[0]
+
+    def _emit_arbitrated_index_tick(
+        self,
+        index_name: str,
+        price: float,
+        volume: float,
+        volume_source: str,
+        price_source: str,
+        received_at: Optional[float] = None,
+        exchange_at: Optional[float] = None,
+    ) -> bool:
+        """Emit one index tick only after active/standby price-source arbitration.
+
+        Fyers remains the volume provider. While Kite is fresh, a Fyers volume tick is
+        emitted with the cached Kite PRICE; a Fyers price-only tick is suppressed. If
+        Kite stops, two fresh Fyers packets over a short dwell are required before Fyers
+        owns price. A recovering Kite tick takes ownership immediately.
+        """
+        now = time.time() if received_at is None else float(received_at)
+        try:
+            value = float(price or 0.0)
+            emit_volume = float(volume or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if value <= 0:
+            return False
+        source = str(price_source or "").lower()
+        is_kite = source.startswith("kite")
+        is_fyers = source.startswith("fyers")
+        if not (is_kite or is_fyers):
+            return False
+
+        try:
+            market_open = bool(self.is_market_open())
+        except Exception:
+            market_open = True
+        source_exchange_at = self._market_timestamp_epoch(exchange_at)
+        if market_open and source_exchange_at is not None:
+            source_age = max(0.0, now - source_exchange_at)
+            source_limit = (
+                self.INDEX_KITE_PRICE_FRESH_SECONDS
+                if is_kite
+                else self.INDEX_FYERS_PRICE_FRESH_SECONDS
+            )
+            if source_age > source_limit:
+                return False
+
+        # Websocket SDKs can replay the closing packet after a reconnect and Fyers has
+        # previously streamed synthetic weekend values. Cache those packets for a REF
+        # badge, but never stamp their *receipt* minute into the live CandleBuilder.
+        if not market_open:
+            return False
+
+        broker_window = self.INDEX_KITE_PRICE_FRESH_SECONDS
+        broker = self._freshest_cached_index_quote(
+            self._index_broker_cache_keys(index_name), broker_window, now
+        )
+        if broker is not None and not str(
+            broker[1].get("source") or ""
+        ).lower().startswith("kite"):
+            broker = None
+        stale_broker = self._freshest_cached_index_quote(
+            self._index_broker_cache_keys(index_name), float("inf"), now
+        )
+        if stale_broker is not None and not str(
+            stale_broker[1].get("source") or ""
+        ).lower().startswith("kite"):
+            stale_broker = None
+
+        emit_price = None
+        with self._index_quote_guard():
+            routes = getattr(self, "_index_price_route", None)
+            if not isinstance(routes, dict):
+                routes = {}
+                self._index_price_route = routes
+            route = routes.setdefault(str(index_name), {})
+            session_date = datetime.fromtimestamp(now).date().isoformat()
+            if route.get("session_date") != session_date:
+                route.clear()
+                route["session_date"] = session_date
+
+            if is_kite:
+                route.update(
+                    {
+                        "active_source": "kite_ws",
+                        "last_authoritative_price": value,
+                        "last_switch_at": now,
+                        "fyers_candidate_since": 0.0,
+                        "fyers_candidate_ticks": 0,
+                    }
+                )
+                emit_price = value
+            elif broker is not None:
+                authoritative = float(broker[1].get("ltp", 0.0) or 0.0)
+                route.update(
+                    {
+                        "active_source": "kite_ws",
+                        "last_authoritative_price": authoritative,
+                        "fyers_candidate_since": 0.0,
+                        "fyers_candidate_ticks": 0,
+                    }
+                )
+                # Keep Fyers cumulative volume without allowing its competing price to
+                # alter close/high/low. Price-only packets add no information.
+                if emit_volume > 0 and authoritative > 0:
+                    emit_price = authoritative
+            elif str(route.get("active_source") or "") == "fyers_ws":
+                route["last_authoritative_price"] = value
+                emit_price = value
+            else:
+                if not route.get("active_source") and stale_broker is not None:
+                    route["active_source"] = "kite_ws"
+                    route["last_authoritative_price"] = float(
+                        stale_broker[1].get("ltp", 0.0) or 0.0
+                    )
+                since = float(route.get("fyers_candidate_since", 0.0) or 0.0)
+                if since <= 0:
+                    since = now
+                    route["fyers_candidate_since"] = since
+                    route["fyers_candidate_ticks"] = 0
+                ticks = int(route.get("fyers_candidate_ticks", 0) or 0) + 1
+                route["fyers_candidate_ticks"] = ticks
+                ready = bool(
+                    ticks >= self.INDEX_PRICE_FAILOVER_MIN_TICKS
+                    and now - since >= self.INDEX_PRICE_FAILOVER_HYSTERESIS_SECONDS
+                )
+                if ready:
+                    route.update(
+                        {
+                            "active_source": "fyers_ws",
+                            "last_authoritative_price": value,
+                            "last_switch_at": now,
+                            "fyers_candidate_since": 0.0,
+                            "fyers_candidate_ticks": 0,
+                        }
+                    )
+                    emit_price = value
+                elif emit_volume > 0:
+                    # During the short handoff dwell the previous Kite price can carry
+                    # the advancing Fyers volume. Its cumulative baseline means no
+                    # volume is lost when Fyers becomes active on the next packet.
+                    prior = float(route.get("last_authoritative_price", 0.0) or 0.0)
+                    if prior > 0:
+                        emit_price = prior
+
+        if emit_price is None:
+            return False
+        self._emit_index_tick(
+            index_name,
+            float(emit_price),
+            emit_volume,
+            str(volume_source or ""),
+            timestamp=datetime.fromtimestamp(now),
+        )
+        return True
 
     # A Fyers index-volume reading older than this counts as the feed being down.
     # 120s was far too slack for a live market: at 5min bars that is a third of a
@@ -1835,7 +2350,14 @@ class MarketDataProvider:
     # reconnects would otherwise leave the system on futures volume indefinitely.
     FYERS_RECOVERY_PROBE_SECONDS = 3.0
 
-    def _emit_index_tick(self, index_name: str, price: float, volume, source: str) -> None:
+    def _emit_index_tick(
+        self,
+        index_name: str,
+        price: float,
+        volume,
+        source: str,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
         """Hand a tick to the candle builder, telling it which feed the volume came from.
 
         The source label is what stops a Fyers(shares) -> futures(contracts) switch being
@@ -1852,7 +2374,7 @@ class MarketDataProvider:
         if self._tick_callback_takes_source is None or self._tick_callback_ref is not callback:
             self._tick_callback_ref = callback
             self._tick_callback_takes_source = self._accepts_five_args(callback)
-        stamp = datetime.now()
+        stamp = timestamp or datetime.now()
         if self._tick_callback_takes_source:
             callback(index_name, price, volume, stamp, source)
         else:
@@ -2218,8 +2740,9 @@ class MarketDataProvider:
         """The Master Source for Index Spot Prices — Weekend Precision Fix"""
         def _remember_ltp_time(val: Any) -> float:
             if isinstance(val, dict):
-                self._last_ltp_time = float(val.get("time") or time.time())
-                return val.get('ltp', 0.0)
+                timing = self._quote_age_components(val)
+                self._last_ltp_time = float(timing.get("received_at") or time.time())
+                return float(val.get('ltp', 0.0) or 0.0)
             self._last_ltp_time = time.time()
             return val
 
@@ -2257,40 +2780,75 @@ class MarketDataProvider:
         # returned NIFTY at 25,965.35 against a true 24,383.60 — a 6.49% error that
         # the dashboard displayed and the engine would have traded on.
         kite_ltp = 0.0
+        kite_received_at = 0.0
         kite_source = getattr(self, "kite", None)
         if kite_source is not None and kite_source.is_connected:
             try:
                 kite_symbol, kite_exchange = self._kite_quote_target(symbol, token, exchange)
                 if kite_symbol:
                     kite_ltp = float(kite_source.get_ltp(kite_exchange, kite_symbol) or 0.0)
+                    kite_received_at = time.time()
             except Exception as exc:
                 logger.debug(f"Kite REST quote failed for {symbol}: {exc}")
 
         # 3. TIER 2 — FYERS, used as a cross-check when the broker answered, and as a
         # fallback when it did not.
         fyers_ltp = 0.0
+        fyers_values: Dict[str, Any] = {}
+        fyers_received_at = 0.0
+        fyers_exchange_at = None
         if getattr(self, 'fyers', None):
             try:
                 f_sym = FYERS_INDEX_SYMBOLS.get(symbol)
                 if f_sym:
                     f_resp = self.fyers.quotes({"symbols": f_sym})
                     if f_resp and f_resp.get('s') == 'ok':
-                        fyers_ltp = float(f_resp.get('d', [{}])[0].get('v', {}).get('lp', 0) or 0.0)
+                        fyers_values = dict(
+                            f_resp.get('d', [{}])[0].get('v', {}) or {}
+                        )
+                        fyers_ltp = float(fyers_values.get('lp', 0) or 0.0)
+                        fyers_received_at = time.time()
+                        fyers_exchange_at = self._exchange_timestamp_from_payload(fyers_values)
             except Exception as exc:
                 logger.debug(f"Fyers REST quote fallback failed for {symbol}: {exc}")
+
+        fyers_previous_close = self._quote_float(fyers_values, *PREVIOUS_CLOSE_KEYS)
+        if fyers_previous_close > 0:
+            self._remember_previous_close(symbol, fyers_previous_close, "fyers_rest")
 
         if kite_ltp > 0:
             if fyers_ltp > 0:
                 self._flag_quote_divergence(symbol, "kite", kite_ltp, "fyers", fyers_ltp)
-            self._last_ltp_time = time.time()
-            self._ltp_cache[symbol] = {"ltp": kite_ltp, "time": datetime.now(), "source": "kite"}
+            received_at = kite_received_at or time.time()
+            self._last_ltp_time = received_at
+            cache_entry = {
+                "ltp": kite_ltp,
+                "time": datetime.fromtimestamp(received_at),
+                "received_at": received_at,
+                "exchange_at": None,
+                "source": "kite",
+            }
+            with self._index_quote_guard():
+                self._ltp_cache[symbol] = cache_entry
             return kite_ltp
         if fyers_ltp > 0:
             # No broker price to check it against. Accept it, but say so — an
             # unverified quote is how the wrong number reached the screen.
             logger.debug(f"{symbol} quote from Fyers only (no broker price to cross-check)")
-            self._last_ltp_time = time.time()
-            self._ltp_cache[symbol] = {"ltp": fyers_ltp, "time": datetime.now(), "source": "fyers"}
+            received_at = fyers_received_at or time.time()
+            self._last_ltp_time = received_at
+            cache_entry = {
+                "ltp": fyers_ltp,
+                "change": float(fyers_values.get("ch", 0.0) or 0.0),
+                "change_pct": float(fyers_values.get("chp", 0.0) or 0.0),
+                "previous_close": fyers_previous_close,
+                "time": datetime.fromtimestamp(received_at),
+                "received_at": received_at,
+                "exchange_at": fyers_exchange_at,
+                "source": "fyers",
+            }
+            with self._index_quote_guard():
+                self._ltp_cache[symbol] = cache_entry
             return fyers_ltp
 
         # 3b. Legacy AngelOne REST. Retired: smart_api is always None now, so this is
@@ -2343,8 +2901,17 @@ class MarketDataProvider:
                             self._remember_previous_close(symbol, close_px, "angel_rest")
 
                         if ltp > 0:
-                            self._last_ltp_time = time.time()
-                            self._ltp_cache[symbol] = {'ltp': ltp, 'time': datetime.now(), 'source': 'angel'}
+                            received_at = time.time()
+                            self._last_ltp_time = received_at
+                            cache_entry = {
+                                'ltp': ltp,
+                                'time': datetime.fromtimestamp(received_at),
+                                'received_at': received_at,
+                                'exchange_at': None,
+                                'source': 'angel',
+                            }
+                            with self._index_quote_guard():
+                                self._ltp_cache[symbol] = cache_entry
                             return ltp
                 except Exception as e:
                     if "Invalid Token" in str(e) or "AG8001" in str(e):
@@ -2367,15 +2934,25 @@ class MarketDataProvider:
                 y_ltp = y_data.last_price
                 if y_ltp > 0:
                     logger.warning(f"⚠️ EMERGENCY: Using 15min delayed Yahoo data for {symbol}")
-                    self._last_ltp_time = time.time()
+                    received_at = time.time()
+                    self._last_ltp_time = received_at
                     self._yahoo_last_used_at = self._last_ltp_time
-                    self._ltp_cache[symbol] = {'ltp': y_ltp, 'time': datetime.now(), 'source': 'yahoo'}
+                    cache_entry = {
+                        'ltp': y_ltp,
+                        'time': datetime.fromtimestamp(received_at),
+                        'received_at': received_at,
+                        'exchange_at': None,
+                        'source': 'yahoo',
+                    }
+                    with self._index_quote_guard():
+                        self._ltp_cache[symbol] = cache_entry
                     return y_ltp
             except Exception as exc:
                 logger.debug(f"Yahoo fast_info fallback failed for {symbol}: {exc}")
 
         # 5. INTERNAL CACHE FALLBACK
-        return self._ltp_cache.get(symbol, {}).get('ltp', 0.0)
+        with self._index_quote_guard():
+            return (getattr(self, "_ltp_cache", {}) or {}).get(symbol, {}).get('ltp', 0.0)
 
     def _get_preopen_fyers_index_quote(
         self,
@@ -2403,13 +2980,15 @@ class MarketDataProvider:
             age = now_ts - float(cached.get("time") or 0.0)
             if 0 <= age <= ttl_seconds and isinstance(cached.get("quote"), dict):
                 quote = dict(cached["quote"])
-                quote["quote_age_seconds"] = age
+                quote.update(self._quote_timing_metadata(quote, now_ts))
                 return quote
 
         try:
             values = self._fyers_index_quote_values(symbol)
             ltp = float(values.get("lp", 0.0) or 0.0)
             if ltp > 0:
+                received_at = time.time()
+                exchange_at = self._exchange_timestamp_from_payload(values)
                 previous_close = self._quote_float(values, *PREVIOUS_CLOSE_KEYS)
                 if previous_close > 0:
                     self._remember_previous_close(symbol, previous_close, "fyers_rest")
@@ -2420,15 +2999,237 @@ class MarketDataProvider:
                     "previous_close": previous_close,
                     "prev_close": previous_close,
                     "source": "fyers_rest_preopen",
-                    "quote_age_seconds": 0.0,
+                    "received_at": received_at,
+                    "exchange_at": exchange_at,
                 }
-                cache[symbol] = {"time": now_ts, "quote": quote}
-                self._last_ltp_time = now_ts
-                self._ltp_cache[symbol] = {"ltp": ltp, "time": datetime.now(), "source": "fyers_rest_preopen"}
+                quote.update(self._quote_timing_metadata(quote, received_at))
+                cache[symbol] = {"time": received_at, "quote": quote}
+                self._last_ltp_time = received_at
+                ltp_cache_entry = {
+                    "ltp": ltp,
+                    "change": quote["change"],
+                    "change_pct": quote["change_pct"],
+                    "previous_close": previous_close,
+                    "time": datetime.fromtimestamp(received_at),
+                    "received_at": received_at,
+                    "exchange_at": exchange_at,
+                    "source": "fyers_rest_preopen",
+                }
+                with self._index_quote_guard():
+                    self._ltp_cache[symbol] = ltp_cache_entry
                 return dict(quote)
         except Exception as exc:
             logger.debug(f"Pre-open Fyers quote fetch failed for {symbol}: {exc}")
         return None
+
+    def get_cached_index_quote_snapshot(
+        self,
+        symbol: str,
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Return the selected index quote from memory without broker/network I/O.
+
+        This is intentionally safe for a fast independent dashboard lane.  It never
+        calls ``get_index_quote``, ``get_previous_close`` or a broker adapter.  The
+        websocket callbacks and this reader share ``_index_quote_lock``, so source,
+        price and timing metadata describe one coherent cache snapshot.
+        """
+        name = str(symbol or "").upper()
+        now = time.time() if now_ts is None else float(now_ts)
+        now_dt = datetime.fromtimestamp(now)
+
+        def _cached_float(value: Any) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        try:
+            session_label = self.get_market_session_label(now_dt)
+        except Exception:
+            session_label = "UNKNOWN"
+
+        base: Dict[str, Any] = {
+            "symbol": name,
+            "ltp": 0.0,
+            "spot_price": 0.0,
+            "change": 0.0,
+            "change_points": 0.0,
+            "change_pct": 0.0,
+            "previous_close": 0.0,
+            "prev_close": 0.0,
+            "source": "unavailable",
+            "quote_source": "unavailable",
+            "quote_label": session_label,
+            "quote_session": session_label,
+            "session": session_label,
+            "is_preopen": session_label == "PRE-OPEN",
+            "is_fresh": False,
+            "is_stale": False,
+            "quote_fresh": False,
+            "quote_stale": False,
+            "freshness": "unavailable",
+            "cached_only": True,
+            "received_at": None,
+            "received_at_epoch": None,
+            "exchange_at": None,
+            "receipt_timestamp": None,
+            "exchange_timestamp": None,
+            "exchange_timestamp_epoch": None,
+            "quote_timestamp": None,
+            "receipt_age_seconds": None,
+            "exchange_age_seconds": None,
+            "quote_age_seconds": None,
+            "freshness_basis": "none",
+            "source_role": "unavailable",
+            "selected_price_source": "unavailable",
+            "candle_price_source": "",
+        }
+        if name not in INDEX_SPOT_TOKENS:
+            return base
+
+        token = INDEX_SPOT_TOKENS.get(name, ("", ""))[0]
+        broker_keys = self._index_broker_cache_keys(name, token)
+        fyers_keys = (FYERS_INDEX_SYMBOLS.get(name, ""),)
+        broker_window = (
+            self.INDEX_KITE_PRICE_FRESH_SECONDS
+            if session_label == "LIVE"
+            else 86400.0
+        )
+
+        with self._index_quote_guard():
+            broker = self._freshest_cached_index_quote(broker_keys, broker_window, now)
+            if broker is not None and not str(
+                broker[1].get("source") or ""
+            ).lower().startswith("kite"):
+                broker = None
+            fyers = self._freshest_cached_index_quote(
+                fyers_keys, self.INDEX_FYERS_PRICE_FRESH_SECONDS, now
+            )
+            if fyers is not None and not str(
+                fyers[1].get("source") or ""
+            ).lower().startswith("fyers"):
+                fyers = None
+            rest_cached = dict(
+                (getattr(self, "_ltp_cache", {}) or {}).get(name) or {}
+            )
+            route = dict(
+                (getattr(self, "_index_price_route", {}) or {}).get(name) or {}
+            )
+            previous_close_cached = _cached_float(
+                (getattr(self, "_prev_close_global_cache", {}) or {}).get(name, 0.0)
+            )
+            stale_broker = self._freshest_cached_index_quote(
+                broker_keys, float("inf"), now
+            )
+            if stale_broker is not None and not str(
+                stale_broker[1].get("source") or ""
+            ).lower().startswith("kite"):
+                stale_broker = None
+            stale_fyers = self._freshest_cached_index_quote(
+                fyers_keys, float("inf"), now
+            )
+            if stale_fyers is not None and not str(
+                stale_fyers[1].get("source") or ""
+            ).lower().startswith("fyers"):
+                stale_fyers = None
+
+        selected: Dict[str, Any] = {}
+        if broker is not None:
+            selected = dict(broker[1])
+        elif fyers is not None:
+            selected = dict(fyers[1])
+        else:
+            rest_ltp = _cached_float(rest_cached.get("ltp", 0.0))
+            rest_source = str(rest_cached.get("source") or "").lower()
+            rest_age = self._quote_age_components(rest_cached, now).get("age")
+            rest_limit = (
+                self.INDEX_KITE_PRICE_FRESH_SECONDS
+                if rest_source.startswith("kite")
+                else self.INDEX_FYERS_PRICE_FRESH_SECONDS
+            )
+            rest_is_live = (
+                rest_ltp > 0
+                and rest_age is not None
+                and rest_age <= rest_limit
+                and not rest_source.startswith("yahoo")
+            )
+            if rest_is_live:
+                selected = rest_cached
+            else:
+                # No live source is available. Keep the deterministic trust order so a
+                # delayed vendor packet cannot displace the last execution-broker mark.
+                if stale_broker is not None:
+                    selected = dict(stale_broker[1])
+                elif stale_fyers is not None:
+                    selected = dict(stale_fyers[1])
+                elif rest_ltp > 0:
+                    selected = rest_cached
+
+        try:
+            ltp = float(selected.get("ltp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ltp = 0.0
+        if ltp <= 0:
+            return base
+
+        source = str(selected.get("source") or "cached")
+        source_lower = source.lower()
+        timing = self._quote_timing_metadata(selected, now)
+        quote_age = timing.get("quote_age_seconds")
+        fresh_limit = (
+            self.INDEX_KITE_PRICE_FRESH_SECONDS
+            if source_lower.startswith("kite")
+            else self.INDEX_FYERS_PRICE_FRESH_SECONDS
+        )
+        is_fresh = bool(
+            quote_age is not None
+            and quote_age <= fresh_limit
+            and not source_lower.startswith("yahoo")
+        )
+        previous_close = _cached_float(selected.get("previous_close", 0.0))
+        if previous_close <= 0:
+            previous_close = previous_close_cached
+        change = _cached_float(selected.get("change", 0.0))
+        change_pct = _cached_float(selected.get("change_pct", 0.0))
+        if previous_close > 0:
+            change = ltp - previous_close
+            change_pct = change / previous_close * 100.0
+
+        if source_lower.startswith("kite"):
+            source_role = "primary"
+        elif source_lower.startswith("fyers"):
+            source_role = "failover"
+        elif source_lower.startswith("yahoo"):
+            source_role = "delayed"
+        else:
+            source_role = "fallback"
+        freshness = "fresh" if is_fresh else (
+            "reference" if session_label == "CLOSED" else "stale"
+        )
+        base.update(
+            {
+                "ltp": ltp,
+                "spot_price": ltp,
+                "change": change,
+                "change_points": change,
+                "change_pct": change_pct,
+                "previous_close": previous_close,
+                "prev_close": previous_close,
+                "source": source,
+                "quote_source": source,
+                "is_fresh": is_fresh,
+                "is_stale": not is_fresh,
+                "quote_fresh": is_fresh,
+                "quote_stale": not is_fresh,
+                "freshness": freshness,
+                "source_role": source_role,
+                "selected_price_source": source,
+                "candle_price_source": str(route.get("active_source") or ""),
+            }
+        )
+        base.update(timing)
+        return base
 
     def get_index_quote(self, symbol: str) -> Dict[str, Any]:
         """Return index LTP plus broker-provided change fields when available."""
@@ -2448,7 +3249,6 @@ class MarketDataProvider:
 
         now_ts = time.time()
         token, exchange = INDEX_SPOT_TOKENS.get(symbol, ("", "NSE"))
-        short_token = token[3:] if token.startswith("999") else token
         fyers_symbol = FYERS_INDEX_SYMBOLS.get(symbol)
 
         preopen_rest_allowed = self._preopen_rest_quote_allowed(
@@ -2463,21 +3263,34 @@ class MarketDataProvider:
                 quote.update(preopen_quote)
                 return quote
 
-        cached, quote_age = self._select_index_ws_quote(symbol, token, now_ts)
+        cached, _quote_age = self._select_index_ws_quote(symbol, token, now_ts)
         if cached is not None:
+            timing = self._quote_timing_metadata(cached, now_ts)
             previous_close = float(cached.get("previous_close", 0.0) or 0.0)
             if previous_close <= 0:
                 previous_close = self.get_previous_close(symbol)
+            source = str(cached.get("source") or "ws")
+            freshness_limit = (
+                self.INDEX_KITE_PRICE_FRESH_SECONDS
+                if source.lower().startswith("kite")
+                else self.INDEX_FYERS_PRICE_FRESH_SECONDS
+            )
+            effective_age = timing.get("quote_age_seconds")
+            is_fresh = bool(
+                effective_age is not None and effective_age <= freshness_limit
+            )
             quote.update({
                 "ltp": float(cached.get("ltp", 0.0) or 0.0),
                 "change": float(cached.get("change", 0.0) or 0.0),
                 "change_pct": float(cached.get("change_pct", 0.0) or 0.0),
                 "previous_close": previous_close,
                 "prev_close": previous_close,
-                "source": str(cached.get("source") or "ws"),
-                "quote_age_seconds": quote_age,
+                "source": source,
+                "is_fresh": is_fresh,
+                "is_stale": not is_fresh,
             })
-            self._last_ltp_time = float(cached.get("time") or now_ts)
+            quote.update(timing)
+            self._last_ltp_time = float(timing.get("received_at") or now_ts)
             # A live WebSocket LTP must never be replaced by a slower REST
             # quote merely because the WS payload omitted day-change fields.
             # The scanner uses LTP to build the forming candle and detect UT
@@ -2490,38 +3303,31 @@ class MarketDataProvider:
                     quote["change_pct"] = quote["change"] / previous_close * 100.0
             return quote
 
-        if getattr(self, "fyers", None) and fyers_symbol:
-            try:
-                values = self._fyers_index_quote_values(symbol)
-                ltp = float(values.get("lp", 0.0) or 0.0)
-                if ltp > 0:
-                    previous_close = self._quote_float(values, *PREVIOUS_CLOSE_KEYS)
-                    if previous_close > 0:
-                        self._remember_previous_close(symbol, previous_close, "fyers_rest")
-                    quote.update({
-                        "ltp": ltp,
-                        "change": float(values.get("ch", 0.0) or 0.0),
-                        "change_pct": float(values.get("chp", 0.0) or 0.0),
-                        "previous_close": previous_close,
-                        "prev_close": previous_close,
-                        "source": "fyers_rest",
-                        "quote_age_seconds": 0.0,
-                    })
-                    self._last_ltp_time = now_ts
-                    self._ltp_cache[symbol] = {"ltp": ltp, "time": datetime.now(), "source": "fyers"}
-                    return quote
-            except Exception as exc:
-                logger.debug(f"Fyers quote fetch failed for {symbol}: {exc}")
-
+        # No websocket quote passed freshness checks. Resolve REST through the one
+        # Kite-first bridge above; the old direct Fyers call here silently bypassed the
+        # execution broker and made the dashboard's source order differ from trading.
         ltp = self.get_latest_price_by_token(token, symbol, exchange)
-        cached_source = self._ltp_cache.get(symbol, {})
+        resolved_at = time.time()
+        with self._index_quote_guard():
+            cached_source = dict(
+                (getattr(self, "_ltp_cache", {}) or {}).get(symbol) or {}
+            )
+        # A custom/legacy resolver can return a live value without populating the cache.
+        # Give that value a receipt clock; absence of cache metadata must not turn a
+        # successful live response into a falsely stale badge.
+        if float(ltp or 0.0) > 0 and not cached_source:
+            cached_source = {
+                "ltp": float(ltp),
+                "time": datetime.fromtimestamp(resolved_at),
+                "received_at": resolved_at,
+                "source": "fallback",
+            }
+        timing = self._quote_timing_metadata(cached_source, time.time())
         quote["ltp"] = float(ltp or 0.0)
         quote["source"] = str(cached_source.get("source") or "fallback")
-        if "time" in cached_source:
-            quote["quote_age_seconds"] = (datetime.now() - cached_source["time"]).total_seconds()
-        else:
-            quote["quote_age_seconds"] = 0.0
-        prev_close = self.get_previous_close(symbol)
+        quote.update(timing)
+        cached_previous_close = float(cached_source.get("previous_close", 0.0) or 0.0)
+        prev_close = cached_previous_close or self.get_previous_close(symbol)
         quote["previous_close"] = prev_close
         quote["prev_close"] = prev_close
 
@@ -2554,6 +3360,23 @@ class MarketDataProvider:
         if quote["ltp"] > 0 and prev_close > 0:
             quote["change"] = quote["ltp"] - prev_close
             quote["change_pct"] = quote["change"] / prev_close * 100.0
+        source_lower = str(quote.get("source") or "").lower()
+        freshness_limit = (
+            self.INDEX_KITE_PRICE_FRESH_SECONDS
+            if source_lower.startswith("kite")
+            else self.INDEX_FYERS_PRICE_FRESH_SECONDS
+        )
+        effective_age = quote.get("quote_age_seconds")
+        is_fresh = bool(
+            quote["ltp"] > 0
+            and effective_age is not None
+            and effective_age <= freshness_limit
+            and not source_lower.startswith("yahoo")
+            and source_lower not in {"previous_close", "unavailable"}
+            and not source_lower.endswith("_stale")
+        )
+        quote["is_fresh"] = is_fresh
+        quote["is_stale"] = bool(quote["ltp"] > 0 and not is_fresh)
         return quote
 
     def get_ltp(self, exchange: str, symbol: str, token: str) -> Optional[float]:
@@ -2571,6 +3394,28 @@ class MarketDataProvider:
             if value > 0:
                 return value
         return 0.0
+
+    @staticmethod
+    def _numeric_payload_evidence(
+        values: Dict[str, Any], keys: Tuple[str, ...]
+    ) -> Tuple[float, bool]:
+        """Return (non-negative value, explicitly supplied).
+
+        ``dict.get(...) or 0`` cannot distinguish a missing field from a broker
+        reporting zero.  Liquidity admission needs that distinction: only the
+        latter is evidence of an empty contract/book.
+        """
+        for key in keys:
+            if key not in values or values.get(key) is None:
+                continue
+            try:
+                value = float(values.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value != value:  # NaN
+                continue
+            return max(0.0, value), True
+        return 0.0, False
 
     def _touch_quote_from_payload(
         self,
@@ -2613,17 +3458,42 @@ class MarketDataProvider:
                 "offer_price",
             ),
         )
+        bid_qty, bid_qty_available = self._numeric_payload_evidence(
+            payload, ("bid_qty", "bid_size", "bidsize")
+        )
+        ask_qty, ask_qty_available = self._numeric_payload_evidence(
+            payload, ("ask_qty", "ask_size", "asksize")
+        )
+        oi, oi_available = self._numeric_payload_evidence(
+            payload, ("oi", "open_interest", "openInterest")
+        )
+        volume, volume_available = self._numeric_payload_evidence(
+            payload, ("volume", "volume_traded", "vol", "v")
+        )
         depth = payload.get("depth") or payload.get("market_depth") or payload.get("best5") or payload.get("bidask")
         if (bid <= 0 or ask <= 0) and depth:
             parsed_depth = self._parse_depth_payload(depth, source)
             bid = bid or float(parsed_depth.get("bid", 0.0) or 0.0)
             ask = ask or float(parsed_depth.get("ask", 0.0) or 0.0)
+            if not bid_qty_available:
+                bid_qty = float(parsed_depth.get("bid_qty", 0.0) or 0.0)
+                bid_qty_available = "bid_qty" in parsed_depth
+            if not ask_qty_available:
+                ask_qty = float(parsed_depth.get("ask_qty", 0.0) or 0.0)
+                ask_qty_available = "ask_qty" in parsed_depth
         result = {
             "bid": bid,
             "ask": ask,
-            "ltp": float(payload.get("ltp") or payload.get("lp") or payload.get("last_traded_price") or 0.0),
-            "bid_qty": int(float(payload.get("bid_qty") or payload.get("bid_size") or payload.get("bidsize") or 0.0)),
-            "ask_qty": int(float(payload.get("ask_qty") or payload.get("ask_size") or payload.get("asksize") or 0.0)),
+            "ltp": float(payload.get("ltp") or payload.get("lp") or payload.get("last_traded_price") or payload.get("last_price") or 0.0),
+            "bid_qty": int(bid_qty),
+            "ask_qty": int(ask_qty),
+            "bid_qty_available": bool(bid_qty_available),
+            "ask_qty_available": bool(ask_qty_available),
+            "depth_available": bool(bid_qty_available and ask_qty_available),
+            "oi": oi,
+            "volume": volume,
+            "oi_available": bool(oi_available),
+            "volume_available": bool(volume_available),
             "source": source,
             "age_seconds": age,
             "usable": False,
@@ -2633,6 +3503,9 @@ class MarketDataProvider:
             return result
         if ask < bid:
             result["reason"] = "crossed_book"
+            return result
+        if payload.get("usable") is False:
+            result["reason"] = str(payload.get("reason") or "provider_rejected_book")
             return result
         if age > max_age_seconds:
             result["reason"] = "stale"
@@ -2685,6 +3558,32 @@ class MarketDataProvider:
             if quote.get("usable"):
                 self._touch_quote_cache[cache_key] = {"time": now_ts, "quote": quote}
                 return quote
+
+        # The broker that will execute the order is authoritative for its own book.
+        # A synchronous REST read is acceptable here because callers invoke this only
+        # at an execution boundary (scale-ins run on the execution queue), never on the
+        # scanner's per-tick pricing path.
+        kite_source = getattr(self, "kite", None)
+        if (
+            kite_source is not None
+            and bool(getattr(kite_source, "is_connected", False))
+            and callable(getattr(kite_source, "get_depth", None))
+        ):
+            try:
+                depth_payload = kite_source.get_depth(exchange, symbol)
+                quote = self._touch_quote_from_payload(
+                    depth_payload,
+                    "kite_rest_touch",
+                    now_ts,
+                    max_age_seconds,
+                )
+                self._touch_quote_cache[cache_key] = {"time": now_ts, "quote": quote}
+                # A definitive Kite book is also the safest refusal.  Do not replace
+                # an empty/crossed/wide execution-broker book with another venue's
+                # superficially better price and then send the order to Kite anyway.
+                return quote
+            except Exception as exc:
+                logger.debug(f"Kite touch quote fetch failed for {symbol}: {exc}")
 
         if getattr(self, "fyers", None):
             # Current instrument master is Angel-token based; option Fyers symbols
@@ -2984,9 +3883,22 @@ class MarketDataProvider:
                 logger.error(f"❌ AngelOne History Fetch Error: {e}")
         return pd.DataFrame()
 
-    def get_historical_candles(self, token, exchange, interval, days_back=15, instrument_name="") -> pd.DataFrame:
+    def get_historical_candles(
+        self, token, exchange, interval, days_back=15, instrument_name="",
+        force_refresh: bool = False, to_date: Optional[datetime] = None,
+    ) -> pd.DataFrame:
         """
         Unified Historical Data Fetcher — Strictly prioritized for AngelOne.
+
+        `force_refresh` skips BOTH read caches below and goes to the broker. Callers that
+        merely want the series keep the default and keep every rate-limit saving; the one
+        caller that sets it is the post-close premium back-fill, whose entire purpose is
+        to ACQUIRE a day the cache does not have. The option-CSV short-circuit answers on
+        file EXISTENCE, not on coverage, so without this a contract whose cache ends at an
+        earlier session returns that stale frame, looks like a successful fetch, and the
+        day is never written -- which is why 139 archived option files exist and not one
+        of them is from August. ``to_date`` pins that back-fill to the ledger's own
+        session instead of silently asking for one day relative to process time.
         """
         cache_dir = Path("data_store/candles")
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2995,8 +3907,9 @@ class MarketDataProvider:
 
         # 0. GLOBAL API CACHE CHECK (Applies to both Fyers and AngelOne)
         now = time.time()
+        target_key = to_date.isoformat() if isinstance(to_date, datetime) else "latest"
         cache_key = (
-            f"hist_api_{instrument_name}_{exchange}_{token}_{interval}_{int(days_back)}"
+            f"hist_api_{instrument_name}_{exchange}_{token}_{interval}_{int(days_back)}_{target_key}"
         )
         if not hasattr(self, "_api_hist_cache"): self._api_hist_cache = {}
         if not hasattr(self, "_last_api_hist_fetch"): self._last_api_hist_fetch = {}
@@ -3008,7 +3921,7 @@ class MarketDataProvider:
             last_fetch = last_fetch.timestamp()
         elif not isinstance(last_fetch, (int, float)):
             last_fetch = 0
-        if now - last_fetch < history_ttl:
+        if not force_refresh and now - last_fetch < history_ttl:
             cached_df = self._api_hist_cache.get(cache_key)
             if cached_df is not None:
                 logger.debug(f"Using cached API history for {cache_key}")
@@ -3018,7 +3931,7 @@ class MarketDataProvider:
         # local per-symbol CSV cache before touching broker APIs to avoid rate-limit
         # stalls and session-token noise for expired option contracts.
         is_option_symbol = bool(instrument_name) and str(instrument_name).upper().endswith(("CE", "PE"))
-        if is_option_symbol and cache_file.exists():
+        if not force_refresh and is_option_symbol and cache_file.exists():
             try:
                 cached_df = get_option_history_store().load(cache_file)
                 if not cached_df.empty:
@@ -3028,6 +3941,48 @@ class MarketDataProvider:
                     return cached_df
             except Exception as exc:
                 logger.debug(f"Option history cache read failed for {instrument_name}: {exc}")
+
+        # 0b. THE ONLY LIVE HISTORY SOURCE FOR AN OPTION CONTRACT.
+        # Everything below this point that could fetch a CE/PE goes through
+        # get_historical_candles_angel -> self.smart_api, and self.smart_api has been
+        # permanently None since the Kite execution migration (it is assigned in exactly
+        # one place in this file, to None). So an option request has had NO reachable
+        # broker source since 2026-08-01 -- which is precisely why no option CSV holds a
+        # bar newer than 2026-07-31 and every August session archived zero premium.
+        # Skipping the caches was never going to be enough on its own; there was nothing
+        # behind them to reach.
+        #
+        # `token` here is the Kite instrument_token, which is what the session event log
+        # records and what historical_data() wants.
+        if is_option_symbol:
+            kite_source = getattr(self, "kite", None)
+            if kite_source is not None and getattr(kite_source, "is_connected", False):
+                try:
+                    kite_df = kite_source.get_historical(
+                        int(token), interval, days_back=days_back, to_date=to_date
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.debug(f"Kite option history rejected {instrument_name}: {exc}")
+                    kite_df = pd.DataFrame()
+                except Exception as exc:
+                    logger.warning(f"Kite option history failed for {instrument_name}: {exc}")
+                    kite_df = pd.DataFrame()
+                if kite_df is not None and not kite_df.empty:
+                    # scripts/archive_session_data.day_slice keys on a "timestamp"
+                    # column, so the index has to carry that name into the CSV or the
+                    # archiver cannot see the day it just fetched.
+                    kite_df = kite_df.copy()
+                    kite_df.index.name = "timestamp"
+                    # Explicit None test: `merged or kite_df` would evaluate the truth
+                    # value of a DataFrame, which raises.
+                    merged = self._save_and_merge_candles(kite_df, cache_file)
+                    df = kite_df if merged is None else merged
+                    self._api_hist_cache[cache_key] = df
+                    self._last_api_hist_fetch[cache_key] = now
+                    logger.info(
+                        f"📈 Kite option history for {instrument_name}: {len(df)} candles"
+                    )
+                    return df
 
         # 1. PRIMARY SOURCE FOR INDICES: FYERS (To get Volume which AngelOne lacks)
         if getattr(self, 'fyers', None) and instrument_name in FYERS_INDEX_SYMBOLS:
@@ -3152,9 +4107,17 @@ class MarketDataProvider:
                     logger.warning(f"⚠️ Fyers history fetch failed for {instrument_name}: {e}")
 
         # 2. SECONDARY: LOCAL CACHE (If Broker fails or Market is closed)
-        if df.empty and cache_file.exists():
+        if df.empty and cache_file.exists() and not force_refresh:
+            # NOT on a forced refresh. This branch is the second way the same stale frame
+            # comes back: the caller asked to go and GET a day, every source failed, and
+            # handing back the old cache here makes the failure look like a success --
+            # the back-fill then counts the contract "filled" and logs a number, while
+            # nothing new was written and the archive stays empty. A forced refresh that
+            # fetched nothing must return empty and say so.
             try:
-                cached_df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                cached_df = self._naive_kolkata_index(
+                    pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                )
                 if not cached_df.empty:
                     df = cached_df
                     logger.info(f"📦 Using Local Cache for {instrument_name}")
@@ -3289,7 +4252,10 @@ class MarketDataProvider:
             
         try:
             if cache_file.exists():
-                existing_df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                existing_df = self._naive_kolkata_index(
+                    pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                )
+                df = self._naive_kolkata_index(df)
                 if not existing_df.empty:
                     for frame in (existing_df, df):
                         frame.columns = [c.lower() for c in frame.columns]

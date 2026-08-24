@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List
 
@@ -10,6 +11,50 @@ import pytz
 
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# Longest first: BANKNIFTY must not be matched as NIFTY.
+_INDEX_PREFIXES = ("MIDCPNIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "BANKEX", "NIFTY")
+
+
+def option_strike_from_symbol(symbol: str) -> float:
+    """Strike out of a Kite index-option tradingsymbol, or 0.0 when unreadable.
+
+    There are two live formats and the naive "first run of digits" reads the EXPIRY
+    YEAR out of the monthly one, which is how an orphan row came to display as
+    "25CE"/"26CE" instead of its real strike:
+
+        monthly   NIFTY26AUG24350CE   -> 26 AUG   strike 24350
+        weekly    NIFTY2681824350CE   -> 26 8 18  strike 24350
+
+    The weekly month is one character: 1-9 for Jan-Sep, then O/N/D. Validated against
+    every index option in the contract master (7,220 symbols across all six indices,
+    zero mismatches). Stock options are deliberately not handled — this system trades
+    index derivatives only, and 0.0 is the honest answer for anything else.
+    """
+    text = str(symbol or "").upper().strip()
+    rest = None
+    for prefix in sorted(_INDEX_PREFIXES, key=len, reverse=True):
+        if text.startswith(prefix):
+            rest = text[len(prefix):]
+            break
+    if rest is None or not rest.endswith(("CE", "PE")):
+        return 0.0
+    body = rest[:-2]
+    match = re.match(r"^\d{2}[A-Z]{3}(\d+)$", body)      # monthly
+    if match:
+        return float(match.group(1))
+    match = re.match(r"^\d{2}[1-9OND]\d{2}(\d+)$", body)  # weekly
+    if match:
+        return float(match.group(1))
+    return 0.0
+
+
+def _index_base_name(symbol: str) -> str:
+    text = str(symbol or "").upper().strip()
+    for prefix in sorted(_INDEX_PREFIXES, key=len, reverse=True):
+        if text.startswith(prefix):
+            return prefix
+    return text
 
 
 def _to_ist_naive(value: Any) -> datetime | None:
@@ -115,9 +160,28 @@ def _serialize_orphan_position(manager: Any, symbol: str, position: Dict[str, An
         "exit_order_id": "",
         "broker_quantity": abs(quantity),
         "instrument": symbol,
+        # The unambiguous identity. Without it the UI had only `instrument` to work
+        # from and guessed the strike out of it with a regex.
+        "trading_symbol": symbol,
+        "base_instrument": _index_base_name(symbol),
         "direction": "LONG" if quantity > 0 else "SHORT",
-        "entry_price": float(position.get("buyavgprice") or position.get("sellavgprice") or 0.0),
-        "current_price": float(position.get("ltp") or 0.0),
+        # `average_price` added 2026-08-16. Kite reports the day's buy/sell prices as 0
+        # for a position CARRIED from a previous session — the buy did not happen today
+        # — so a carried orphan rendered with a blank entry price beside a populated
+        # P&L, which reads as a fabricated number. `average_price` is the net position's
+        # own average and is populated in exactly that case.
+        "entry_price": float(
+            position.get("buyavgprice")
+            or position.get("sellavgprice")
+            or position.get("average_price")
+            or 0.0
+        ),
+        # `ltp` is the AngelOne name. Kite sends `last_price`, and get_positions maps
+        # buyavgprice/sellavgprice/producttype/netqty but never mapped this one, so the
+        # orphan row's current price was ALWAYS 0.0.
+        "current_price": float(
+            position.get("ltp") or position.get("last_price") or 0.0
+        ),
         "exit_price": 0.0,
         "trailing_stop": 0.0,
         "target": 0.0,
@@ -127,7 +191,10 @@ def _serialize_orphan_position(manager: Any, symbol: str, position: Dict[str, An
         "grade": "RECOVERY",
         "confidence": 0.0,
         "rr_ratio": 0.0,
-        "atm_strike": 0.0,
+        # Was a hard 0.0, which is FALSY in JS — so trade-table.js fell through to its
+        # "first run of digits in the symbol" fallback and rendered the expiry YEAR as
+        # the strike ("25CE" for a 2025-dated contract, "26CE" for a 2026 one).
+        "atm_strike": option_strike_from_symbol(symbol),
         "option_type": "CE" if "CE" in symbol else ("PE" if "PE" in symbol else ""),
         "inst_type": "OPT" if "CE" in symbol or "PE" in symbol else "FUT",
         "timeframe": "--",

@@ -327,6 +327,14 @@ def test_reconciliation_accepts_large_legitimate_option_fill(monkeypatch):
         atm_strike=24000.0,
         entry_spot=24000.0,
         entry_time=IST.localize(datetime(2026, 6, 15, 10, 0)),
+        execution_touch_quote={
+            "bid": 49.80,
+            "ask": 50.20,
+            "usable": True,
+            "source": "test_book",
+            "age_seconds": 0.1,
+            "reason": "ok",
+        },
     )
     row = {
         "tradingsymbol": trade.trading_symbol,

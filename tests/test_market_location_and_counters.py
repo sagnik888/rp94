@@ -307,15 +307,10 @@ def test_late_session_reclaim_context_is_engine_mode_agnostic(monkeypatch):
         "utbot",
         "ema",
         "consensus",
-        "auto",
-        "utbot_ema",
         "utbot_consensus",
         "quad_union",
-        "utbot_prime",
         "quad_prime",
-        "adaptive_hybrid",
         "adaptive_dual",
-        "quality_hybrid",
     ]
 
     signal_ts = datetime(2026, 7, 6, 14, 50)
@@ -1385,15 +1380,10 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
         "utbot",
         "ema",
         "consensus",
-        "auto",
-        "utbot_ema",
         "utbot_consensus",
         "quad_union",
-        "utbot_prime",
         "quad_prime",
-        "adaptive_hybrid",
         "adaptive_dual",
-        "quality_hybrid",
     ]:
         monkeypatch.setattr(settings, "scanner_engine", mode)
         for instrument in all_indices:

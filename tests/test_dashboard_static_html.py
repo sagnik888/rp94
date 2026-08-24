@@ -25,7 +25,7 @@ def test_dashboard_recovers_immediately_and_periodically_from_omitted_ws_state()
     assert "refreshDashboardSnapshot('websocket-payload-omitted', { force: true })" in js
     assert "state.wsPayloadOmitted || wsIsStale || !hasState" in js
     assert "state.wsPayloadOmitted = false" in js
-    assert "app.js?v=aug2026-v42-kite-login-flow" in html
+    assert "app.js?v=aug2026-v43-independent-quotes" in html
 
 
 def test_index_cards_render_preopen_settlement_quote_label():
@@ -237,15 +237,6 @@ def test_topbar_exposes_one_min_scalping_toggle():
     assert "app.js?v=" in html
 
 
-def test_topbar_exposes_utbot_prime_engine_option():
-    html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
-    app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
-
-    assert 'value="utbot_prime"' in html
-    assert "UTBOT PRIME" in html
-    assert "utbot_prime: 'UT1 Prime" in app_js
-
-
 def test_topbar_exposes_quad_prime_engine_option():
     html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
     app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
@@ -258,15 +249,6 @@ def test_topbar_exposes_quad_prime_engine_option():
     assert "scanner_engine || 'quad_prime'" in app_js or "scanner_engine || \"quad_prime\"" in app_js
 
 
-def test_topbar_exposes_adaptive_hybrid_engine_option():
-    html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
-    app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
-
-    assert 'value="adaptive_hybrid"' in html
-    assert "ADAPTIVE HYBRID" in html
-    assert "adaptive_hybrid: 'Adaptive Hybrid" in app_js
-
-
 def test_topbar_exposes_adaptive_dual_engine_option():
     html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
     app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
@@ -275,15 +257,6 @@ def test_topbar_exposes_adaptive_dual_engine_option():
     assert "ADAPTIVE DUAL" in html
     assert "adaptive_dual: 'Adaptive Dual" in app_js
     assert "12-Engine Lab" in app_js
-
-
-def test_topbar_exposes_quality_hybrid_engine_option():
-    html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
-    app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
-
-    assert 'value="quality_hybrid"' in html
-    assert "QUALITY HYBRID" in html
-    assert "quality_hybrid: 'Quality Hybrid" in app_js
 
 
 def test_market_intel_volume_tile_uses_explicit_display_ratio():

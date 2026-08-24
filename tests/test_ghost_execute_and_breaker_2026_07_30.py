@@ -73,7 +73,9 @@ def test_real_live_trade_is_counted():
 def test_closed_trade_loop_filters_non_live_rows():
     """The contaminated loop must now skip virtual rows, like the open-trade loop."""
     src = inspect.getsource(RiskManager.check_circuit_breaker)
-    closed_section = src.split("Closed Trades for today")[1][:400]
+    closed_section = src.split("Closed Trades for today", 1)[1].split(
+        "# 2. Open Trades", 1
+    )[0]
     assert "_is_non_live_trade" in closed_section
 
 

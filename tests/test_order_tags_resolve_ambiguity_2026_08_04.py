@@ -30,10 +30,23 @@ TRADE_ID = "T0005_NIFTY_07311451"
 
 # ── the tag itself ───────────────────────────────────────────────────────────
 
-def test_the_entry_tag_is_unchanged_by_the_leg_aware_form():
-    """An order already resting at the exchange must stay findable across this change."""
-    assert KiteBroker.order_tag(TRADE_ID) == "T0005_07311451"
-    assert KiteBroker.order_tag(TRADE_ID, "ENTRY", 0) == "T0005_07311451"
+def test_the_entry_tag_is_alphanumeric():
+    """Superseded 2026-08-16. This test used to assert the ENTRY tag was byte-identical
+    to the pre-leg-aware form, so an order already resting at the exchange stayed
+    findable across a deploy. That guarantee has been given up deliberately.
+
+    The v3 docs are explicit about the charset: "An optional tag to apply to an order to
+    identify it (alphanumeric, max 20 chars)". The old form carried an underscore, and
+    EVERY entry order carries this tag — so if Kite enforces the charset the entire
+    entry path fails on the first live order. The compatibility this protected covers a
+    case that cannot arise here: no live order round trip has ever completed on this
+    system (exit_order_id is empty on every stored row).
+
+    Uniqueness is unaffected — the counter and the timestamp are what carry it.
+    """
+    assert KiteBroker.order_tag(TRADE_ID) == "T000507311451"
+    assert KiteBroker.order_tag(TRADE_ID, "ENTRY", 0) == "T000507311451"
+    assert KiteBroker.order_tag(TRADE_ID).isalnum()
 
 
 def test_each_leg_gets_a_distinct_tag():

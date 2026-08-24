@@ -559,7 +559,7 @@ def test_enable_auto_mode_while_already_real_is_blocked_when_not_ready(monkeypat
     scanner = _real_scanner()
     monkeypatch.setattr(
         "scanner.validate_real_mode_readiness",
-        lambda settings, provider: {
+        lambda settings, provider, **kwargs: {
             "ok": False,
             "blockers": ["all broker sources unavailable"],
             "warnings": [],
@@ -581,6 +581,20 @@ def test_enable_auto_mode_in_real_succeeds_when_ready(monkeypatch):
     scanner.auto_mode = False
     scanner.on_notification = None
     scanner.data = SimpleNamespace()
+    scanner.active_indices = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+    today = datetime.now(IST).date().isoformat()
+    scanner._morning_refresh_summary = {
+        "session_day": today,
+        "history": True,
+        "expiry": True,
+        "index_quotes": 4,
+        "chains": 4,
+        "indices": {
+            name: {"quote": True, "chain": True}
+            for name in scanner.active_indices
+        },
+        "complete": True,
+    }
     scanner.futures_sl_pct = 0.3
     scanner.options_sl_pct = 15.0
     scanner.max_daily_loss_pct = 3.0
@@ -598,7 +612,7 @@ def test_enable_auto_mode_in_real_succeeds_when_ready(monkeypatch):
     scanner.mtf = SimpleNamespace(apply_engine_params=lambda *a, **k: None)
     monkeypatch.setattr(
         "scanner.validate_real_mode_readiness",
-        lambda settings, provider: {"ok": True, "blockers": [], "warnings": []},
+        lambda settings, provider, **kwargs: {"ok": True, "blockers": [], "warnings": []},
     )
 
     configured = scanner.configure(

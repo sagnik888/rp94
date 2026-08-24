@@ -58,6 +58,9 @@ const state = {
     lastRenderedFilter: 'all',
     lastRenderedEngineLabData: '',
     restHydrationTimer: null,
+    quoteRefreshTimer: null,
+    quoteRefreshInFlight: false,
+    quoteRefreshUnavailable: false,
     chartRefreshTimer: null,
     lastRestHydrationAt: 0,
     lastWsUpdateAt: 0,
@@ -92,6 +95,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initChart();
     applyChartStreamState(state.chartStreamEnabled, { notifyBackend: false, requestSnapshot: false });
     connectWebSocket();
+    startIndexQuoteRefresh();
     setupChartEventListeners();
     setupSettingsEventListeners();
     setupEventListeners();
@@ -140,6 +144,47 @@ async function authFetch(url, options = {}) {
     const headers = { ...(options.headers || {}) };
     if (token) headers['X-Dashboard-Token'] = token;
     return fetch(url, { ...options, headers });
+}
+
+function startIndexQuoteRefresh() {
+    if (state.quoteRefreshTimer) return;
+    // Index badges use a cache-only endpoint that is independent of the full signal
+    // scan. A slow option-chain/intelligence cycle therefore cannot freeze the spot
+    // LTP for the 10-41 seconds observed in the live Aug-21 logs.
+    void refreshIndexQuotes();
+    state.quoteRefreshTimer = setInterval(refreshIndexQuotes, 500);
+}
+
+async function refreshIndexQuotes() {
+    if (state.quoteRefreshInFlight || state.quoteRefreshUnavailable) return;
+    state.quoteRefreshInFlight = true;
+    try {
+        const response = await authFetch('/api/quotes', { cache: 'no-store' });
+        if (response.status === 404) {
+            // Supports a dashboard page served briefly by an older backend during a
+            // rolling restart. The normal websocket/scan snapshot remains the fallback.
+            state.quoteRefreshUnavailable = true;
+            if (state.quoteRefreshTimer) clearInterval(state.quoteRefreshTimer);
+            state.quoteRefreshTimer = null;
+            return;
+        }
+        if (!response.ok) return;
+        const quoteData = await response.json();
+        if (!quoteData?.instruments || Object.keys(quoteData.instruments).length === 0) return;
+        const merged = mergeDashboardData(state.latestData, quoteData);
+        state.latestData = merged;
+        const normalized = {};
+        Object.entries(merged.instruments || {}).forEach(([key, value]) => {
+            normalized[TICKER_MAP[key] || key] = value;
+        });
+        updateInstrumentSelectors(normalized, merged);
+        updateQuoteSessionLabel(merged);
+    } catch (_) {
+        // Websocket scan snapshots remain a safe fallback during a transient local
+        // HTTP failure. Avoid a console flood from a 500ms best-effort refresh lane.
+    } finally {
+        state.quoteRefreshInFlight = false;
+    }
 }
 
 async function connectWebSocket() {
@@ -363,16 +408,13 @@ async function connectWebSocket() {
                 state.latestData.config.scanner_engine = mode;
             }
             const labels = {
-                consensus: 'Consensus (ST+EMA)', ema: 'EMA (9/21)',
-                auto: 'Auto (trend→consensus, chop→EMA)',
-                utbot_ema: 'UT1 + EMA (union)', utbot_consensus: 'UT1 + Consensus (union)',
+                utbot: 'UT1',
+                ema: 'EMA (9/21)',
+                consensus: 'Consensus (ST+EMA)',
+                utbot_consensus: 'UT1 + Consensus (union)',
                 quad_union: 'Quad Union (UT+EMA+ST+CONS)',
-                utbot_prime: 'UT1 Prime (UT trigger + trend ranking)',
                 quad_prime: 'Quad Prime (all entries + confluence exits)',
-                adaptive_hybrid: 'Adaptive Hybrid (regime-aware meta-router)',
                 adaptive_dual: 'Adaptive Dual (Adaptive Hybrid + APEX)',
-                quality_hybrid: 'Quality Hybrid (Engine 12 confluence scanner)',
-                utbot: 'UT1'
             };
             showToast(`Signal Engine: ${labels[mode] || mode}`, mode === 'utbot' ? 'info' : 'warning');
         });
@@ -589,13 +631,15 @@ function syncSignalState(data) {
         if (data.scan_count !== undefined && data.scan_count > lastSystemScanCount) {
             lastSystemScanCount = data.scan_count;
         }
-        // Always transition to state-live when system is ON.
+        // "RUNNING" describes the scanner process only. Calling this state LIVE made
+        // closed/stale quotes look current even while the separate market label said
+        // REF, which is unsafe operator feedback.
         // This prevents state-analysing (force-rescan pulsing) from getting stuck
         // permanently when scan_count updates arrive as lightweight deltas that
         // bypass updateDashboard.
-        if (!signalBtn.classList.contains('state-live')) {
-            signalBtn.className = 'analysing-signal state-live';
-            if (analysisText) analysisText.textContent = 'LIVE';
+        if (!signalBtn.classList.contains('state-running')) {
+            signalBtn.className = 'analysing-signal state-running';
+            if (analysisText) analysisText.textContent = 'RUNNING';
         }
     }
 }
@@ -771,7 +815,7 @@ function updateDashboard(data) {
         }
     }
     
-    try { updateInstrumentSelectors(normalizedInst); } catch(e) { console.error("Tabs Error:", e); }
+    try { updateInstrumentSelectors(normalizedInst, data); } catch(e) { console.error("Tabs Error:", e); }
     
     // 4. Active Instrument Updates
     const inst = normalizedInst[state.currentInstrument];
@@ -1083,7 +1127,7 @@ function appendLogItem(container, item) {
 }
 
 
-function updateInstrumentSelectors(instruments) {
+function updateInstrumentSelectors(instruments, dashboardContext = {}) {
     INDEX_NAMES.forEach(name => {
         const d = instruments[name];
         if (!d) return;
@@ -1098,11 +1142,23 @@ function updateInstrumentSelectors(instruments) {
             changeEl.textContent = `${formatPointChange(changePoints)} (${pct.toFixed(2)}%)`;
             changeEl.className = 'inst-change ' + (changePoints > 0 ? 'green' : changePoints < 0 ? 'red' : 'neutral');
         }
-        const sessionLabel = normalizeQuoteLabel(d);
+        const sessionLabel = normalizeQuoteLabel(d, dashboardContext);
         const tabEl = document.getElementById(`tab_${name}`);
         if (tabEl) {
             tabEl.dataset.quoteSession = sessionLabel;
             tabEl.title = quoteTooltip(d, sessionLabel);
+        }
+
+        const quoteEl = document.getElementById(`quote_${name}`);
+        if (quoteEl) {
+            const age = Number(d.quote_age_seconds);
+            const explicitlyStale = d.quote_fresh === false || d.quote_stale === true;
+            const stale = sessionLabel === 'LIVE' && (explicitlyStale || !Number.isFinite(age) || age > 3);
+            const displayLabel = stale ? 'STALE' : sessionLabel;
+            quoteEl.textContent = `${displayLabel}·${formatQuoteAge(age)}`;
+            quoteEl.className = 'inst-quote-status ' + quoteStatusClass(displayLabel);
+            quoteEl.title = quoteTooltip(d, displayLabel);
+            quoteEl.setAttribute('aria-label', `${name} quote ${displayLabel}, ${formatQuoteAge(age)} old`);
         }
 
         // Update Signal
@@ -1118,12 +1174,23 @@ function updateInstrumentSelectors(instruments) {
             signalEl.textContent = sessionLabel === 'LIVE' ? signal : sessionLabel;
             signalEl.className = 'inst-signal ' + (signal === 'BUY' ? 'buy' : signal === 'SELL' ? 'sell' : 'neutral');
             signalEl.classList.toggle('preopen', sessionLabel === 'PRE-OPEN' || sessionLabel === 'SETTLE');
-            signalEl.classList.toggle('reference', sessionLabel === 'REF' || sessionLabel === 'CLOSED');
+            signalEl.classList.toggle(
+                'reference',
+                sessionLabel === 'REF' || sessionLabel === 'CLOSED' || sessionLabel === 'HISTORICAL'
+            );
         }
     });
 }
 
-function normalizeQuoteLabel(d) {
+function normalizeQuoteLabel(d, dashboardContext = {}) {
+    // Quote packets describe the exchange session, while the dashboard context also
+    // describes whether this process is replaying history.  A cached packet can retain
+    // quote_label=LIVE across either transition; never let that packet overrule the
+    // current operator-facing runtime/session state.
+    const runtimeMode = String(dashboardContext?.mode || '').toUpperCase();
+    const marketStatus = String(dashboardContext?.market_status || '').toUpperCase();
+    if (runtimeMode === 'HISTORICAL' || marketStatus === 'HISTORICAL') return 'HISTORICAL';
+    if (marketStatus === 'CLOSED') return 'CLOSED';
     if (d?.preopen_settlement === true) return 'SETTLE';
     const raw = String(d.quote_label || d.quote_session || '').toUpperCase();
     if (raw.includes('PRE')) return 'PRE-OPEN';
@@ -1139,7 +1206,25 @@ function quoteTooltip(d, label) {
     if (label === 'SETTLE') return `Pre-open settlement quote from ${source}; ${ageText}. Used as the index-card LTP before the normal session opens.`;
     if (label === 'PRE-OPEN') return `Pre-open quote from ${source}; ${ageText}. Indicative/reference values may not tick like normal market data.`;
     if (label === 'LIVE') return `Live quote from ${source}; ${ageText}.`;
+    if (label === 'STALE') return `Stale live-session quote from ${source}; ${ageText}. Do not use this badge as an execution mark.`;
     return `Reference/closed-session quote from ${source}; ${ageText}.`;
+}
+
+function formatQuoteAge(age) {
+    if (!Number.isFinite(age) || age < 0) return '--';
+    if (age < 10) return `${age.toFixed(1)}s`;
+    if (age < 60) return `${Math.round(age)}s`;
+    if (age < 3600) return `${Math.floor(age / 60)}m`;
+    return `${Math.floor(age / 3600)}h`;
+}
+
+function quoteStatusClass(label) {
+    if (label === 'LIVE') return 'live';
+    if (label === 'STALE') return 'stale';
+    if (label === 'PRE-OPEN') return 'preopen';
+    if (label === 'SETTLE') return 'settlement';
+    if (label === 'CLOSED') return 'closed';
+    return 'reference';
 }
 
 function resolveIndexChangePoints(d, ltp, pct) {
@@ -1190,15 +1275,10 @@ function scannerEngineLabel(raw) {
         utbot: 'UT1',
         ema: 'EMA 9/21',
         consensus: 'Consensus ST+EMA',
-        auto: 'Auto Consensus/EMA',
-        utbot_ema: 'UT1 + EMA',
         utbot_consensus: 'UT1 + Consensus',
         quad_union: 'Quad Union',
-        utbot_prime: 'UT1 Prime',
         quad_prime: 'Quad Prime',
-        adaptive_hybrid: 'Adaptive Hybrid',
         adaptive_dual: 'Adaptive Dual',
-        quality_hybrid: 'Quality Hybrid'
     }[mode] || titleCaseToken(mode);
 }
 
@@ -2369,8 +2449,12 @@ async function submitFyersCode(authCode) {
 }
 
 function updateGatewayStatus(status) {
+    const kiteSessionKnown = Object.prototype.hasOwnProperty.call(status || {}, 'kite_session_live');
+    const kiteOnline = kiteSessionKnown
+        ? status.kite_session_live === true && status.kite_data_fresh !== false
+        : status.kite === true;
     const gateways = {
-        'gw_kite': status.kite,
+        'gw_kite': kiteOnline,
         'gw_fyers': status.fyers,
         'gw_yahoo': status.yahoo
     };
@@ -2386,6 +2470,14 @@ function updateGatewayStatus(status) {
                 el.classList.remove('online');
             }
         }
+    }
+    const kiteEl = document.getElementById('gw_kite');
+    if (kiteEl) {
+        const age = Number(status.kite_tick_age_seconds);
+        const ageText = Number.isFinite(age) ? `${formatQuoteAge(age)} since last tick` : 'tick age unavailable';
+        kiteEl.title = kiteOnline
+            ? `Kite order session live; ${ageText}. Click to inspect/login.`
+            : `Kite order session or data feed unavailable; ${ageText}. Click to log in.`;
     }
     const fyersEl = document.getElementById('gw_fyers');
     if (fyersEl) {

@@ -101,15 +101,42 @@ def test_a_stale_reservation_expires_rather_than_halting_trading():
 
 
 def test_an_unanswerable_margin_question_still_fails_open():
-    """Preserved on purpose: /margins is routinely quiet outside market hours."""
-    no_requirement = _broker(available=51_284.0, required=None)
-    assert no_requirement.required_entry_margin() is None
-    verdict = _preflight(no_requirement)
-    assert verdict["ok"] is True and verdict["basis"] == "MARGIN_UNVERIFIED"
+    """Preserved on purpose: /margins is routinely quiet outside market hours.
 
-    no_funds = _broker(available=None, required=13_240.0)
-    verdict = _preflight(no_funds)
-    assert verdict["ok"] is True and verdict["basis"] == "REQUIREMENT_ONLY"
+    The clock is pinned. preflight_entry_margin reads the wall clock
+    (trading/kite_broker.py:1719-1721) and returns a DIFFERENT basis inside market
+    hours, so an unpinned version of this test passes overnight and fails between
+    09:15 and 15:30 — it failed at 09:41 on 2026-08-21 for exactly that reason.
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-20 18:00:00"):   # after the close, IST-safe
+        no_requirement = _broker(available=51_284.0, required=None)
+        assert no_requirement.required_entry_margin() is None
+        verdict = _preflight(no_requirement)
+        assert verdict["ok"] is True and verdict["basis"] == "MARGIN_UNVERIFIED"
+
+        no_funds = _broker(available=None, required=13_240.0)
+        verdict = _preflight(no_funds)
+        assert verdict["ok"] is True and verdict["basis"] == "REQUIREMENT_ONLY"
+        assert verdict["reservation_id"] == "", "reserved against an unknown balance"
+
+
+def test_silence_during_market_hours_is_named_differently():
+    """The same silence at 11:00 is not a quirk — the funds gate is inert.
+
+    It still fails OPEN, deliberately, but the basis says so rather than pretending
+    this is the ordinary out-of-hours quiet.
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-20 05:30:00"):   # 11:00 IST, a Thursday
+        no_funds = _broker(available=None, required=13_240.0)
+        verdict = _preflight(no_funds)
+
+    assert verdict["ok"] is True
+    assert verdict["basis"] == "FUNDS_UNCHECKED_IN_SESSION"
+    assert "not checking anything" in verdict["limitation"]
     assert verdict["reservation_id"] == "", "reserved against an unknown balance"
 
 

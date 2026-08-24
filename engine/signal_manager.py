@@ -133,14 +133,15 @@ class SignalManager:
         2. INTELLIGENCE (Volume/OI/PCR)
         3. REGIME (Market Structure/Context)
         """
+        from config.settings import get_settings
+        _s = get_settings()
         tech_score = 0.0
         
         # ── VIX Patch ──
         vix_penalty = 0.0
         reasons = []
         try:
-            from config.settings import get_settings as _get_vix_settings
-            _vix_settings = _get_vix_settings()
+            _vix_settings = _s
             vix_high_threshold = float(
                 getattr(_vix_settings, "signal_vix_high_threshold", 20.0) or 20.0
             )
@@ -168,8 +169,7 @@ class SignalManager:
             
             # ── ADX Penalization Patch ──
             if adx > 40:
-                from config.settings import get_settings
-                settings = get_settings()
+                settings = _s
                 if getattr(settings, "ut_dynamic_confidence", False):
                     tech_score -= 0.10
                     reasons.append(f"Momentum: Extreme (ADX: {signal.adx_value:.1f}) - Risk of exhaustion")
@@ -337,7 +337,7 @@ class SignalManager:
                 from config.settings import get_settings as _gs3
                 _settings = _gs3()
             scanner_mode = str(getattr(_settings, "scanner_engine", "") or "").lower()
-            if scanner_mode in {"utbot_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}:
+            if scanner_mode in {"adaptive_dual", "quad_prime"}:
                 agreement = max(0, min(3, int(getattr(signal, "trend_agreement", 0) or 0)))
                 per = max(
                     0.0,
@@ -359,11 +359,7 @@ class SignalManager:
                     label = (
                         "Adaptive Dual Lane A"
                         if scanner_mode == "adaptive_dual"
-                        else (
-                            "Quality Hybrid"
-                            if scanner_mode == "quality_hybrid"
-                            else ("Adaptive Hybrid" if scanner_mode == "adaptive_hybrid" else "UT1 Prime")
-                        )
+                        else "Quad Prime"
                     )
                     reasons.append(
                         f"{label} agreement {agreement}/3{source_text}: +{bonus:.0%} confidence"

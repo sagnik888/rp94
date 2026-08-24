@@ -25,15 +25,10 @@ ENGINE_LAB_MODES = (
     "utbot",
     "ema",
     "consensus",
-    "auto",
-    "utbot_ema",
     "utbot_consensus",
     "quad_union",
-    "utbot_prime",
     "quad_prime",
-    "adaptive_hybrid",
     "adaptive_dual",
-    "quality_hybrid",
 )
 
 

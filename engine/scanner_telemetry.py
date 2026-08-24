@@ -458,12 +458,34 @@ class ScannerTelemetryMixin:
             "queued_tasks": queue_size,
         }
 
+    def _default_executor_queue_depth(self) -> Optional[int]:
+        """Work waiting for a default-executor thread, not just how many threads exist.
+
+        `max_workers` alone cannot distinguish "the pool is idle" from "the pool is full
+        and four index tasks are queued behind a state save" — and the scan cycle submits
+        _process_instrument for every index through this pool. On 2026-08-14 the four
+        indices blew their 9s budget together on 2.2% of cycles with no I/O path
+        correlating above 1.0x, which is the shape of contention rather than slow work.
+        A depth of 0 through such a spike rules this pool out and points at the GIL.
+        """
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return None
+            executor = getattr(loop, "_default_executor", None)
+            work_queue = getattr(executor, "_work_queue", None) if executor else None
+            return int(work_queue.qsize()) if work_queue is not None else None
+        except Exception:
+            return None
+
     def _worker_resources_payload(self) -> Dict[str, Any]:
         active_indices = len(list(getattr(self, "active_indices", []) or []))
         estimated_executor_workers = self._estimated_default_executor_max_workers()
         default_executor_workers = self._default_executor_max_workers()
         live_inflight = len(getattr(self, "_live_processing_futures", {}) or {})
         return {
+            "default_executor_queued_tasks": self._default_executor_queue_depth(),
             "logical_cpu_count": int(os.cpu_count() or 1),
             "active_threads": threading.active_count(),
             "active_indices": active_indices,

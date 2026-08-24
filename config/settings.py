@@ -393,13 +393,13 @@ class Settings(BaseSettings):
     # Absolute floor on the option limit buffer in ticks (0.05 each) so cheap
     # premiums (e.g. Rs.30 far-week MIDCPNIFTY) still cross the spread and fill.
     option_limit_buffer_min_ticks: int = 2
-    # Guarded touch-quote execution. OFF keeps today's LTP/signal anchored limits,
-    # while shadow mode still compares the old limit against bid/ask touch quotes
-    # whenever the feed provides them. When enabled, option entry limits anchor to
-    # ask+ticks for BUY and bid-ticks for SELL, subject to freshness/spread checks.
-    execution_use_touch_quote: bool = False
+    # Guarded touch-quote execution. Option entries use a fresh executable book and a
+    # marketable LIMIT (ask+ticks for BUY, bid-ticks for SELL), so a thin contract can
+    # never turn an AUTO entry into an unbounded MARKET fill. AUTO additionally refuses
+    # to enter when the book is missing, stale, crossed, or too wide.
+    execution_use_touch_quote: bool = True
     execution_touch_quote_shadow_enabled: bool = True
-    execution_touch_quote_strict: bool = False
+    execution_touch_quote_strict: bool = True
     execution_touch_quote_max_age_seconds: float = 1.5
     option_touch_limit_extra_ticks: int = 1
     option_touch_quote_max_spread_pct: float = 1.0
@@ -496,6 +496,24 @@ class Settings(BaseSettings):
     # ~3.6 points on NIFTY, ~7 on BANKNIFTY and ~12 on SENSEX — tight enough that a
     # lagging feed is caught while a normal tick-timing difference is not.
     quote_divergence_alert_pct: float = 0.015
+
+    # The CRITICAL bar, separate from the tracking bar above (2026-08-19).
+    #
+    # One threshold used to do both jobs, and at 0.015% it logged CRITICAL on ordinary
+    # tick-timing jitter. 2026-08-18: 1,815 CRITICAL lines, 98% of every critical event
+    # in the session. Measured over those same lines, the divergence distribution is:
+    #     BANKNIFTY  n=524  p50 0.020%  p90 0.030%  p99 0.040%  max 0.060%
+    #     MIDCPNIFTY n=456  p50 0.020%  p90 0.020%  p99 0.040%  max 0.150%
+    #     NIFTY      n=411  p50 0.020%  p90 0.020%  p99 0.040%  max 0.050%
+    #     SENSEX     n=424  p50 0.020%  p90 0.020%  p99 0.030%  max 0.120%
+    # The noise floor tops out around 0.04%, so 0.05% sits just above it: it would have
+    # kept 10 of the 1,815 lines (0.6%) — the actual outliers — and silenced the rest.
+    #
+    # Tracking is deliberately left at the sensitive 0.015%. The dashboard and watchdog
+    # still see every disagreement via get_quote_divergences(); what changes is only
+    # which ones are worth waking someone for. An alarm that fires 1,815 times a day is
+    # not an alarm, and it was burying everything else in the log.
+    quote_divergence_critical_pct: float = 0.05
     shared_host_mode: bool = False
     allow_plaintext_broker_secrets: bool = True
     option_strike_selection: Literal["ATM", "ITM", "BOTH"] = "BOTH"
@@ -547,6 +565,15 @@ class Settings(BaseSettings):
     # scale-free: OI is standing interest and volume is today's activity, and inventing
     # a weight between them would be the arbitrary part.
     option_strike_liquidity_min_advantage: float = 1.25
+    # Absolute contract-admissibility floor, evaluated after strike selection and
+    # again from any fresh executable quote.  Thresholds are expressed in lots so
+    # the same policy scales across NIFTY/BANKNIFTY/SENSEX lot-size changes.  A
+    # metric is enforced only when the broker/chain explicitly supplied it; a
+    # measured zero is rejected, while an unavailable metric is kept distinct.
+    option_contract_liquidity_gate_enabled: bool = True
+    option_contract_min_oi_lots: float = 5.0
+    option_contract_min_volume_lots: float = 1.0
+    option_contract_min_touch_depth_lots: float = 1.0
     inst_pref: Literal["FUT", "OPT", "AUTO"] = "AUTO"
     sl_mode: Literal["NATURAL", "HARDCODED"] = "NATURAL"
     signal_grade_preference: Literal["auto", "B", "B+", "A", "A+"] = "A"
@@ -647,6 +674,202 @@ class Settings(BaseSettings):
     fut_loss_cut_r: float = 0.8
     opt_early_loss_cut_enabled: bool = True
     opt_loss_cut_r: float = 0.8
+    # ── Peak-anchored give-back cap (2026-08-17) ────────────────────────────────
+    # The single biggest measured leak in the book, and it is a CALIBRATION problem
+    # rather than a signal one. Across 288 positions in every stored session:
+    #   77% of trades went green at some point   -> entries work
+    #   aggregate peak reached Rs.179,599, booked Rs.48,687 -> only 27% captured
+    #   105 trades went green then closed NEGATIVE, booking -Rs.27,585
+    # The cause is that every profit guard arms ABOVE where the trades actually live.
+    # Peak distribution of green trades: p25 Rs.216, median Rs.454, p75 Rs.875, against
+    # arms of Rs.250 (profit lock), Rs.500 (giveback) and Rs.750 (peak-threat) — so the
+    # strongest guard sees only 26% of trades, and 61 green-then-red trades peaked below
+    # even the lowest arm and had NO profit protection possible at all (-Rs.15,102).
+    #
+    # This guard is deliberately NOT another retention ladder. Retention is a fraction of
+    # peak, which is too loose on a small peak (38% of Rs.200 is Rs.76) and gives away a
+    # fortune on a large one (62% of Rs.1,194 is Rs.740). Premium noise is roughly
+    # ABSOLUTE, so the cap is absolute: once the trade has shown `arm` of profit, never
+    # let it hand back more than `cap` from its own high-water mark.
+    #
+    # It is really a loss-limiter anchored to the PEAK instead of to entry. Its value is
+    # turning -Rs.428/-477/-534 into about -Rs.50, not banking gains.
+    #
+    # Validated by replaying recorded pnl_path samples (49 positions, 4 sessions):
+    #     policy                net      delta   helped  hurt  worst   per-session
+    #     ACTUAL             Rs.  694       +0        0     0      0   -705/+1209/+512/-323
+    #     arm 100 / cap 200  Rs.6,569   +5,875       23     3   -238   +471/+1239/+2653/+2207
+    #     arm 150 / cap 200  Rs.5,210   +4,516       17     2    -66
+    #     arm  50 / cap 250  Rs.4,849   +4,155       20     5   -412
+    #     arm  50 / cap 150  Rs.4,640   +3,946       24     9   -706  (08-13 goes NEGATIVE)
+    # arm 100 / cap 200 is positive in all four sessions with the best helped:hurt ratio.
+    #
+    # It DOES cost money sometimes and that is accepted: a trade peaking Rs.1,179 books
+    # Rs.896 here against Rs.961 actual, and one trade breached the cap off a running
+    # peak of Rs.335 and then ran to Rs.670. 23 helped against 3 hurt is the trade.
+    #
+    # Do NOT tighten cap below 200 without re-running the replay: at 150 the hurt count
+    # jumps to 9, worst-case damage to -Rs.706, and one whole session flips negative.
+    # The allowance is max(cap_rs, cap_pct x peak) — a HYBRID, and the pct half is not
+    # optional. A flat Rs.200 was tried first and the suite caught it immediately: on a
+    # Rs.4,859 peak that fires on a 4% pullback and guts the major-win guard, whose whole
+    # job is to let a large winner breathe through a retracement. The replay set topped
+    # out near Rs.1,194 of peak, so the large-peak regime was outside the validated range.
+    # 0.25 keeps the absolute cap binding below ~Rs.800 of peak (where the leak actually
+    # is) and hands large peaks a proportional allowance instead.
+    #
+    # And there is a CEILING. The replay set's peaks are median Rs.247, p75 Rs.526,
+    # p90 Rs.1,038, max Rs.2,401 — so the evidence is dense below ~Rs.1,000 and thins to
+    # two positions above Rs.1,500. The large-winner regime already has purpose-built,
+    # tested handling: the major-win guard and the trend lock deliberately tolerate a deep
+    # pullback on a big runner, and the suite caught a flat Rs.200 cap pre-empting exactly
+    # that (a Rs.4,000 peak handing back Rs.1,250, which they exist to hold). Above the
+    # ceiling this guard steps aside rather than overruling them on two samples.
+    # The ceiling excludes 2 of 49 replay positions (4%), so the measured result below is
+    # essentially unchanged by it. Raise it only after the replay set covers that range.
+    # DEFAULT OFF as of 2026-08-18. It nets more on the replay (+Rs.5,505 against the
+    # breakeven stop's +Rs.3,192) but it earns that by exiting trades that are STILL IN
+    # PROFIT — a Rs.800 peak sitting at +Rs.600 trips it — and it hurt 3 of 49 replayed
+    # positions. The operator's stated complaint is precisely "exiting early on gaining
+    # trades", so a rule whose whole mechanism is capping a live gain works against the
+    # thing being fixed, whatever its total. The breakeven stop below delivers the other
+    # half of the complaint with zero hurt. Turn this back on only to trade some winner
+    # upside for a smaller give-back, deliberately.
+    peak_giveback_cap_enabled: bool = False
+    peak_giveback_cap_arm_rs: float = 100.0
+    peak_giveback_cap_rs: float = 200.0
+    peak_giveback_cap_pct: float = 0.25
+    peak_giveback_cap_max_peak_rs: float = 1500.0
+
+    # ── Breakeven stop: a proven trade may not close negative ───────────────────
+    # The operator's own description of the problem was "exiting early on gaining
+    # trades and late on losing trades". Measured over 288 positions, those are two
+    # different buckets of very different size:
+    #   105 trades went GREEN and then closed NEGATIVE, booking -Rs.27,585. Had they
+    #       merely closed FLAT the book goes Rs.48,687 -> Rs.76,272, i.e. +57%.
+    #   117 winners kept 75% of their peak, leaving Rs.37,429 on the table.
+    #
+    # This rule addresses ONLY the first bucket, and that is the point. Once a trade
+    # has shown `arm` of profit its stop moves to `floor`; it is otherwise left alone.
+    # It cannot exit a trade that is still in profit, so it cannot make the second
+    # bucket worse — which the give-back cap above can, and does on 3 of 49 replayed
+    # positions.
+    #
+    # Replayed through the real guard (49 positions, 4 sessions):
+    #     ACTUAL                     Rs.  694
+    #     breakeven after peak 150   Rs.3,886   +3,192   helped 10   HURT 0
+    #     breakeven after peak 250   Rs.1,761   +1,067   helped  4   HURT 0
+    #     give-back cap              Rs.6,199   +5,505   helped 22   hurt 3
+    # Zero hurt at every arm tested: it never books a worse number than what actually
+    # happened, because it only fires on a trade already on its way to a loss.
+    #
+    # floor = the ROUND-TRIP COST, not zero (2026-08-19).
+    #
+    # A floor of 0.0 states "do not close negative" in GROSS terms, so the trade still
+    # closes negative net of the ~Rs.80 it paid to open and close. Worse, the condition
+    # `now <= 0` is by construction only observable once the trade is already there:
+    # P&L is sampled on a poll (2026-08-18 cadence: median 2.4-6.9s, max 20s) and option
+    # premium moves a long way between samples. That session's five firings each had a
+    # POSITIVE reading 1.9-8.6s before they fired, and booked -Rs.135 to -Rs.294 anyway:
+    # Rs.1,242 handed back below the last price the guard itself had seen.
+    #
+    # Re-measured over every recorded pnl_path (60 positions, 5 sessions, 08-12..08-18),
+    # replayed through the real guard, holding arm at 150:
+    #     ACTUAL                  Rs.2,256
+    #     floor   0 (was)         Rs.5,849   +3,592   helped 15   hurt 0
+    #     floor  80 (now)         Rs.6,687   +4,431   helped 15   hurt 4   worst -Rs.226
+    #     floor 100               Rs.4,917   +2,661   helped 15   hurt 6   worst -Rs.1,806
+    #     floor 150               Rs.5,729   +3,473   helped 15   hurt 8   worst -Rs.1,806
+    #
+    # This DOES give up the "hurt 0" property the floor-0 version had, and that is the
+    # deliberate trade: 4 positions book Rs.226-or-less worse so that 15 stop booking a
+    # loss on a trade they had already proven.
+    #
+    # 80 is chosen because it is the round trip, NOT because it is the argmax. Note the
+    # cliff above it: at floor 100 a single position (2026-08-14 SENSEX 5min, actual
+    # +Rs.1,901, peak Rs.2,401) dips to +Rs.95 at 25.3s and gets clipped for -Rs.1,806.
+    # Floor 80 happens to sit just under that dip. Reading that as evidence FOR 80 would
+    # be fitting to one trade; read it instead as the warning it is — above the round
+    # trip this guard starts taking money off winners, which is not its job.
+    #
+    # Two things measured and rejected here, recorded so they are not re-tried blind:
+    #  - A max-peak ceiling (as the give-back cap has) changes NOTHING at any value.
+    #    The guard fires early, while the running peak is still small; a ceiling on that
+    #    peak cannot see the big winner coming.
+    #  - A min-hold lowers the total at every floor (it delays protective exits and lets
+    #    losses run). It does defuse the floor-100 cliff at >=45s, but only by paying
+    #    more elsewhere than it saves.
+    breakeven_stop_enabled: bool = True
+    breakeven_stop_arm_rs: float = 150.0
+    breakeven_stop_floor_rs: float = 80.0
+
+    # ── Peak trail, gated to LARGE peaks only (2026-08-19) ─────────────────────
+    # Raises the breakeven stop's exit level from a flat floor to peak*(1-giveback),
+    # but ONLY once the peak is big enough for a percentage to mean anything. Below
+    # the gate a percentage is noise (40% of a Rs.300 peak is Rs.120, inside the
+    # spread); above it, handing back 40% of a proven peak is worse than banking 60%.
+    #
+    # DEFAULT OFF, and the measurement is why. An ungated percentage trail is simply
+    # the give-back cap again, and it fails the same way — over the same 60 recorded
+    # paths, at arm 150 / floor 80:
+    #     no trail                Rs.6,687   helped 15  hurt  4  worst -Rs.226
+    #     trail 50% (ungated)     Rs.5,375   helped 16  hurt  8  worst -Rs.1,806
+    #     trail 25% (ungated)     Rs.3,413   helped 18  hurt 14  worst -Rs.1,806
+    # Tighter is monotonically worse. That is the operator's original complaint about
+    # the cap — "exiting early on gaining trades" — reproducing exactly.
+    #
+    # Gated above Rs.600 of peak it stops clipping winners and turns mildly positive:
+    #     trail 40% above Rs.600  Rs.6,986   helped 17  hurt  4  worst -Rs.226
+    # Hurt count and worst case are UNCHANGED from no-trail; the whole difference is
+    # two positions that kept more. Two positions out of 60, across 2 of 5 sessions,
+    # is not enough to change a live default on, which is why this ships off.
+    #
+    # A note for whoever measures this next: evaluating a trail on a hand-picked set
+    # of trades that ended NEGATIVE will always flatter it, because a trail cannot
+    # lose money on a trade that already lost money. It has to be measured on the
+    # whole book, winners included, or it will look like free money and is not.
+    peak_trail_enabled: bool = False
+    peak_trail_above_rs: float = 600.0
+    peak_trail_giveback_pct: float = 0.40
+
+    # ── Let the BACKTEST see the live trade-management guards ───────────────────
+    # The replay's exit simulator (_simulate_actual_option_exit) can only ever produce
+    # SL HIT / TARGET_HIT / HISTORICAL / SESSION_END. It walks the option candles for a
+    # stop or target and force-closes at the window end. Every live guard — profit lock,
+    # peak-threat, loss-threat, early loss cut, breakeven stop — exists in scanner.py and
+    # is NOT reached from that path. PEAK_GIVEBACK_CAP had never fired in any log for
+    # exactly this reason: the fix was not in the code being measured.
+    #
+    # So a backtest cannot evaluate trade management at all, and two builds compared on
+    # it are being compared on entry selection plus a fixed SL/target. That is worth
+    # knowing before reading any such comparison as a verdict on exits.
+    #
+    # With this ON the simulator additionally evaluates the SHARED guard at each bar.
+    # It CALLS Scanner._peak_giveback_cap_exit rather than reimplementing it — there is
+    # deliberately no second copy of the rule to drift out of step with the live one.
+    #
+    # Default OFF: it changes backtest numbers, so it must be an explicit choice, and a
+    # run with it on is not comparable to a run with it off.
+    backtest_live_exits_enabled: bool = False
+
+    # EARLY_LOSS_CUT guards (2026-08-16). Measured over 19 sessions: 18 cuts (ex the
+    # two stale-mark trades already fixed) for -Rs.9,108. The exit EARNS its place —
+    # on the 9 rows with a measurable stop it lost Rs.3,455 where the full stop would
+    # have cost Rs.7,710, saving Rs.473/trade. So the R thresholds are deliberately
+    # NOT touched here. What it lacked was the three guards every other major exit
+    # already carries.
+    #  - min hold: p10 was 2.0s and 5 of 18 fired under 15s. Kept SHORT on purpose —
+    #    this exit's job is to be fast, so the 60s used by LOSS_THREAT_EXIT would
+    #    disable it rather than guard it.
+    #  - defer to lock: 7 of 18 had already peaked POSITIVE (to Rs.348) before being
+    #    booked as an "early loss". A green trade giving back is a give-back, and the
+    #    profit lock owns that case. It never got the chance: the two monitor paths
+    #    disagreed on order — loss guard ran BEFORE the lock in one and AFTER it in
+    #    the other. Deferring inside the decision fixes both paths at once.
+    #  - cost floor: a loss smaller than the round trip cannot be worth a round trip.
+    early_loss_cut_min_hold_seconds: float = 15.0
+    early_loss_cut_defer_to_profit_lock_enabled: bool = True
+    early_loss_cut_cost_floor_enabled: bool = True
     # Intel-accelerated loss-guard: when OI/PCR/volume/order-flow + price action
     # confirm a BIG reversal (not a small pullback), cut earlier than base 0.8R.
     # Small pullbacks (trend still supportive, no fast reverse) still wait for 0.8R.
@@ -742,6 +965,51 @@ class Settings(BaseSettings):
     regime_early_trend_er_period: int = 10
     regime_early_trend_er_threshold: float = 0.60
     regime_early_trend_er_adx_ceiling: float = 20.0
+
+    # ── ER may now VETO a trend label, not only promote one (2026-08-19) ───────
+    #
+    # Until today the Efficiency Ratio could only ever make the regime MORE
+    # directional: the promotion above fires when ADX is below its ceiling (20), so
+    # above ADX 20 the ER was computed, logged, and then consulted by nothing. Every
+    # regime decision keyed on ADX alone, and ADX is an EMA-smoothed memory of a move
+    # that may already be over.
+    #
+    # 2026-08-19 is the clean demonstration. MIDCPNIFTY made a real move 09:15-10:30
+    # (the session's only winner, +Rs.2,806). The tape then died: 10:30-13:41 held a
+    # 41-point range with ~90 one-minute direction flips. ADX, still remembering the
+    # morning, read 51-58 on the 5m. So:
+    #     adx >= 20  -> TRENDING_UP
+    #     adx >= 20  -> any 60-bar band touch becomes BREAKOUT_UP at confidence 70
+    #     adx >= 35  -> the confirmed-range-day guard STEPS ASIDE (see below)
+    #     adx >= 20  -> the ER promotion is skipped, so ER is never read at all
+    # The engine entered MIDCPNIFTY 14850CE five times on that reading, at A+ and
+    # 93-96% confidence, for -Rs.1,900. Measured ER at those five entries: 0.070,
+    # 0.135, 0.097, 0.013, 0.201. An ER of 0.013 means price travelled 77x its net
+    # displacement. Nothing in the stack was allowed to say so.
+    #
+    # Swept over every recorded lifecycle (312 positions, 25 sessions, 07-08..08-19),
+    # blocking entries whose own-timeframe ER sat below the floor:
+    #     floor 0.10   +Rs. 7,425     floor 0.25   +Rs. 7,231
+    #     floor 0.15   +Rs.12,934     floor 0.30   +Rs. 6,118
+    #     floor 0.20   +Rs. 8,653     floor 0.35   -Rs. 2,058
+    # At 0.15: 14 sessions better, 7 worse, worst single session -Rs.2,084. The
+    # blocked set is 64 trades with an 18/46 win/loss split against 105/143 for the
+    # kept set — so this is removing a genuinely worse population, not a random slice.
+    #
+    # 0.15 is deliberately LOW. Winner and loser ER distributions overlap heavily
+    # (median 0.285 vs 0.242), so ER is not a classifier and must not be used as one.
+    # It is a TAIL filter: it identifies tape that is provably going nowhere. Raising
+    # it toward the medians is where the measured edge dies — by 0.35 the sweep is
+    # already negative.
+    regime_er_veto_enabled: bool = False   # SAFETY-OFF 2026-08-19 14:15, see note below
+    regime_er_veto_floor: float = 0.15
+    # The range-day guard's ADX escape must clear the same bar. That escape exists so a
+    # genuinely strong trend is not demoted on a range-day label — but it was keyed on
+    # ADX alone, which is exactly the number that lies in this failure mode. On
+    # 2026-08-19 ADX 51-58 disabled the one guard written for "ADX can rise inside a
+    # 50-100pt box and manufacture TRENDING/BREAKOUT labels". Requiring ER as well
+    # keeps the escape for real trends and closes it for remembered ones.
+    regime_range_day_adx_override_needs_er: bool = False  # SAFETY-OFF with the veto above
     regime_early_trend_er_range_day_min_confidence: float = 0.60
     # Relax the VOLATILE 5min confidence floor (0.70 -> this) when the 15m trend
     # agrees with the signal — an aligned pullback-entry in a volatile-but-directional
@@ -1156,7 +1424,25 @@ class Settings(BaseSettings):
     # adverse intel, cross-index turn), exit at market instead of waiting for the
     # profit-lock/giveback layers to be hit.
     peak_threat_exit_enabled: bool = True
-    peak_threat_exit_min_peak_rs: float = 750.0
+    # 750 -> 400 on 2026-08-17. Calibration, not a new rule: at Rs.750 this guard could
+    # only ever see 26% of trades, because the measured peak distribution of the 222
+    # positions that went green is p25 Rs.216 / median Rs.454 / p75 Rs.875. It was set
+    # for a book of Rs.750+ peaks and the book is made of Rs.454 peaks.
+    #
+    # The uncovered middle is where the money went: 110 trades peaked between Rs.150 and
+    # Rs.750, and 66 of those closed NEGATIVE for -Rs.16,837.
+    #
+    # Low risk because the ARM is not the trigger. Every evidence gate still applies —
+    # peak_threat_exit_min_score, >=2 evidence domains with price mandatory,
+    # peak_threat_exit_min_retention, the confirm window and the round-trip cost floor.
+    # Lowering the arm only lets the guard CONSIDER a trade it previously could not look
+    # at; it cannot fire without adverse evidence.
+    #
+    # NOT replay-validated: this guard needs OI/volume/intel evidence scores that the
+    # pnl_path replay does not carry, so unlike the breakeven stop this is a threshold
+    # aligned to a measured distribution rather than a simulated result. Revert to 750
+    # if live sessions show it firing on trades that would have recovered.
+    peak_threat_exit_min_peak_rs: float = 400.0
     peak_threat_exit_min_peak_r: float = 0.35
     peak_threat_exit_min_retention: float = 0.72
     peak_threat_exit_min_score: int = 5
@@ -1421,40 +1707,21 @@ class Settings(BaseSettings):
     # Direction comes from the chosen source; the protective stop stays the UT ATR
     # trail, and all downstream grading/gates/exits are untouched. "quad_union"
     # unions UT1 + EMA + Supertrend + Consensus raw arrows after repaint buffering.
-    # "utbot_prime": UT1 is the SOLE entry trigger (no union dilution — preserves
-    # UTBot's high-frequency options edge); EMA(9/21) + Supertrend(10,3) + their
-    # Consensus are used ONLY to RANK each UT1 entry by agreement (more agree ->
-    # higher conviction -> small capped confidence boost), never to add their own
-    # slower, theta-decayed entries. Exits stay pure UTBot. This is the "rank, don't
-    # union" answer to quad_union diluting UTBot's edge.
     # "quad_prime": all four raw sources can enter like quad_union, but opposite exits
     # need cross-family confirmation (UT1 + EMA/Supertrend/Consensus) unless the
     # trade is losing or protected profit is threatened.
-    # "adaptive_hybrid": Engine 10 meta-router. It evaluates UTBot/EMA/Supertrend/
-    # Consensus flips, then admits the source mix that fits current candle context:
-    # trend/opening drive, power thrust, balanced UTBot+Consensus, or strict
-    # consensus in chop. It is intentionally not a blind union.
     # "adaptive_dual": Engine 11. Lane A is adaptive_hybrid v2; Lane B runs the
     # uploaded APEX v5.5 five-gate confluence engine (regime, HTF direction,
     # score, conflict margin, volume/body confirmation), then sends both lanes
     # through the same gates, sizing, quote, risk, and exit stack.
-    # "quality_hybrid": Engine 12. Independent confluence scanner from the ATR
-    # replacement benchmark: Consensus ST+EMA, EMA, Aroon, Donchian, KAMA, and
-    # session VWAP vote on direction. UTBot/ATR is retained only for stop/risk
-    # arrays and downstream lifecycle compatibility, not as the entry trigger.
     scanner_engine: Literal[
         "utbot",
         "ema",
         "consensus",
-        "auto",
-        "utbot_ema",
         "utbot_consensus",
         "quad_union",
-        "utbot_prime",
         "quad_prime",
-        "adaptive_hybrid",
         "adaptive_dual",
-        "quality_hybrid",
     ] = "quad_prime"
     # Quad Prime raw-entry hygiene: raw source access is allowed, but weak solo flips
     # must not skip all live quality floors or every winner becomes a tiny scalp while
@@ -1643,7 +1910,20 @@ class Settings(BaseSettings):
     # entry gate and the EOD exit logic contradict each other.
     block_entries_during_eod_protect: bool = True
     ut_force_exit_time: str = "15:15"
-    trade_product_type: Literal["CARRYFORWARD"] = "CARRYFORWARD"
+    # CARRYFORWARD -> Kite NRML, INTRADAY -> Kite MIS (_PRODUCT_MAP in kite_broker.py).
+    # A single-member Literal until 2026-08-16, so MIS could not be selected at all even
+    # though the broker mapped it. The DEFAULT is deliberately unchanged, because for a
+    # long-premium book the choice is not about margin — buying an option costs the full
+    # premium under either product, so MIS buys no leverage here. What differs is the
+    # broker's own square-off: Zerodha force-closes MIS positions in the 15:20 window,
+    # NRML it does not.
+    #   NRML  no broker square-off, so no surprise market order into a thin 15:20 book —
+    #         but if this system's own 15:15 force-exit fails to complete (crash, dead
+    #         session, IP block) the position carries OVERNIGHT with gap risk.
+    #   MIS   the broker becomes a 5-minute safety net behind ut_force_exit_time, at the
+    #         cost of that net being a market order at whatever the book then shows.
+    # Both are defensible; making it configurable is the fix, not picking for you.
+    trade_product_type: Literal["CARRYFORWARD", "INTRADAY"] = "CARRYFORWARD"
     live_filter_leniency_pct: float = 0.0 # Keep live gates strict; loosen only during deliberate diagnostics
     intelligence_cache_ttl_seconds: float = 90.0 # Option-chain cache TTL for live intelligence
     # How long a COMPUTED intelligence bundle stays usable. This used to be the line
@@ -2333,6 +2613,26 @@ class Settings(BaseSettings):
         if self.capital_fut + self.capital_opt > self.capital_total:
             issues.append("segment capital exceeds total capital")
         warnings = []
+        # A segment whose ENTIRE daily budget cannot pay one round trip is disabled in
+        # practice: every entry is refused on budget wherever the entry-risk gate runs,
+        # and the same figure becomes that segment's circuit-breaker threshold. The only
+        # capital test above is `<= 0`, so the live CAPITAL_FUT=1.0 (Rs.0.015 of budget
+        # at RISK_FUT_PCT=1.5) certified clean — ok=True with no warnings at all, and
+        # the dashboard reported a segment nobody can trade as healthy.
+        #
+        # Whether that value is a typo or a deliberate way to ban futures is the
+        # operator's call; this only makes the condition visible. Warning and not issue
+        # for the same reason: `ok` gates startup surfaces, and a segment disabled on
+        # purpose must not break the run.
+        for _label, _budget, _cost in (
+            ("FUT", fut_budget, float(getattr(self, "fut_cost", 200.0) or 0.0)),
+            ("OPT", opt_budget, float(getattr(self, "opt_cost", 80.0) or 0.0)),
+        ):
+            if _cost > 0 and _budget < _cost:
+                warnings.append(
+                    f"{_label} daily budget Rs.{_budget:,.2f} is below one round trip "
+                    f"(Rs.{_cost:,.0f}) — the segment cannot fund a single trade"
+                )
         # max_trade_loss_abs is advisory / circuit-breaker projection only when
         # auto risk sizing is OFF — it does not shrink lots. 0 = disabled.
         if self.auto_risk_sizing_enabled and self.max_trade_loss_abs > 0:

@@ -33,6 +33,14 @@ VECTOR_KEYS = (
 )
 
 
+# P&L units are part of the archive contract.  The scanner's exit guards consume a
+# gross, pre-charge path, while the outcome stored in ``pnl`` is net of the round trip.
+# Keeping the names explicit prevents an offline replay from comparing a gross early
+# exit with a net booked result (which overstates every replayed exit by the charges).
+PNL_BASIS_NET = "NET_AFTER_ROUND_TRIP_COST"
+PNL_BASIS_GROSS = "GROSS_BEFORE_ROUND_TRIP_COST"
+
+
 #: Serialises the event APPEND only. The scanner event loop takes this lock
 #: synchronously (_rtracker_record_candidate, called from inside _scan_cycle), so
 #: anything held across it stalls the 100ms exit monitor. Hold it for the write and
@@ -296,6 +304,28 @@ class RegimeTracker:
             else:
                 final_decision = "CANDIDATE"
 
+        # A candidate can pass the grading gate and THEN be refused further down — the
+        # live-readiness gate is the common one. Until 2026-08-18 such a row was still
+        # written as ACCEPTED, because accepted_by_gate had already been set and nothing
+        # downstream revisited the label. Four rows in the stored book say
+        # "Live trade readiness gate blocked it" while claiming ACCEPTED.
+        #
+        # It is a small count but it corrupts the one number every analysis starts from:
+        # 2026-08-17 read as "12 accepted, 11 exits", and that phantom gap was chased as
+        # a missing exit when in fact no twelfth trade was ever taken. An accepted count
+        # that includes refusals also inflates any acceptance rate computed from it.
+        if final_decision == "ACCEPTED":
+            blocked_markers = ("blocked it", "gate blocked", "readiness gate")
+            haystack = " ".join(
+                str(part) for part in (
+                    _candidate_value(candidate, "reasons", "") or "",
+                    _candidate_value(candidate, "reject_reason", "") or "",
+                    reason or "",
+                )
+            ).lower()
+            if any(marker in haystack for marker in blocked_markers):
+                final_decision = "REJECTED"
+
         ctx = _candidate_value(candidate, "market_intelligence_context", {}) or {}
         if not isinstance(ctx, dict):
             ctx = {}
@@ -362,7 +392,24 @@ class RegimeTracker:
             # from archived sessions.
             "grading": {
                 "timeframe": str(_candidate_value(candidate, "graded_timeframe", "") or ""),
-                "intel_score": _safe_float(_candidate_value(candidate, "graded_intel_score", 0.0)),
+                # Falls back to the position's own intelligence_score. `graded_intel_score`
+                # is set on the CANDIDATE at grading time; an EXIT event is built from the
+                # Trade, which never carries that attribute, so the default fired and every
+                # exit recorded intel_score 0.0 — including the 13 of 14 lifecycles on
+                # 2026-08-19 whose ACCEPTED event held the real value (-0.3935 .. +0.2667).
+                #
+                # Decisions were never affected: the ACCEPTED record is what grading used
+                # and it was always correct. But an archive that says "intelligence was
+                # zero" on every exit is worse than one that says nothing, because it
+                # invites exactly the wrong conclusion — that the 30%-weight intelligence
+                # pillar is dead. It is not; reading exits alone made it look that way.
+                "intel_score": _safe_float(
+                    _candidate_value(
+                        candidate,
+                        "graded_intel_score",
+                        _candidate_value(candidate, "intelligence_score", 0.0),
+                    )
+                ),
                 "regime": str(_candidate_value(candidate, "graded_regime", "") or ""),
                 # What each pillar actually contributed. The three collapse into one
                 # confidence before anything is recorded, so without this a rejected B+
@@ -393,6 +440,17 @@ class RegimeTracker:
                 "bb_width": _measured_float(regime_ctx, "bb_width"),
                 "range_day_trend_guard": bool(regime_ctx.get("range_day_trend_guard", False)),
                 "range_day_trend_guard_reason": str(regime_ctx.get("range_day_trend_guard_reason") or ""),
+                # Index SPOT at decision time (2026-08-17). Nothing on an event recorded
+                # the underlying level, so the day's actual index range could not be
+                # measured from the tracker at all — a post-session review could only
+                # read back the engine's OWN regime labels, never check them against what
+                # the index really did. Four indices move differently on the same day, so
+                # this has to be per event rather than a session summary.
+                "spot": _safe_float(
+                    regime_ctx.get("spot",
+                        _candidate_value(candidate, "spot_price",
+                            _candidate_value(candidate, "index_spot", 0.0)))
+                ),
             },
             "session": {
                 "day_type": str(session_ctx.get("day_type") or ""),
@@ -448,6 +506,18 @@ class RegimeTracker:
                 "power_move": bool(_candidate_value(candidate, "power_move", False)),
             },
         }
+        if final_decision == "EXIT":
+            # Additive fields keep rtracker.v1 readers compatible while making every
+            # newly-written exit self-describing.  TradeCandidate paths are gross;
+            # Trade paths are net.  The discriminator below uses the fields each holder
+            # actually exposes and honours an explicit producer override.
+            event.update(
+                {
+                    "pnl_basis": _candidate_pnl_basis(candidate),
+                    "pnl_path_basis": _candidate_pnl_path_basis(candidate),
+                    "round_trip_cost": _candidate_round_trip_cost(candidate),
+                }
+            )
         if extra:
             event["extra"] = _compact(extra)
         return event
@@ -847,6 +917,240 @@ def _pnl_path_rows(value: Any) -> list:
         except (TypeError, ValueError):
             continue
     return rows
+
+
+def _candidate_has(candidate: Any, name: str) -> bool:
+    if isinstance(candidate, dict):
+        return name in candidate
+    return hasattr(candidate, name)
+
+
+def _number_or_none(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return number
+
+
+def _canonical_pnl_basis(value: Any, *, default: str = "") -> str:
+    text = str(value or "").strip().upper()
+    aliases = {
+        "NET": PNL_BASIS_NET,
+        "NET_AFTER_COST": PNL_BASIS_NET,
+        "NET_AFTER_CHARGES": PNL_BASIS_NET,
+        PNL_BASIS_NET: PNL_BASIS_NET,
+        "GROSS": PNL_BASIS_GROSS,
+        "GROSS_BEFORE_COST": PNL_BASIS_GROSS,
+        "GROSS_BEFORE_CHARGES": PNL_BASIS_GROSS,
+        PNL_BASIS_GROSS: PNL_BASIS_GROSS,
+    }
+    return aliases.get(text, default)
+
+
+def _candidate_pnl_basis(candidate: Any) -> str:
+    explicit = _canonical_pnl_basis(_candidate_value(candidate, "pnl_basis", None))
+    # Both objects currently recorded on an EXIT hold net booked P&L in ``pnl``:
+    # TradeCandidate uses Scanner._candidate_net_pnl and Trade uses its accounting
+    # finalizer.  An explicit producer field wins if another source is added later.
+    return explicit or PNL_BASIS_NET
+
+
+def _candidate_pnl_path_basis(candidate: Any) -> str:
+    explicit = _canonical_pnl_basis(
+        _candidate_value(candidate, "pnl_path_basis", None)
+    )
+    if explicit:
+        return explicit
+    # TradeCandidate exposes ``price`` and is sampled from _candidate_gross_pnl.
+    # Trade exposes ``entry_price`` (not ``price``) and sample_pnl_path reads its net
+    # ``pnl`` attribute.  RTracker historically records TradeCandidate, so gross is the
+    # safe legacy fallback if a minimal test double exposes neither discriminator.
+    if _candidate_has(candidate, "price"):
+        return PNL_BASIS_GROSS
+    if _candidate_has(candidate, "entry_price"):
+        return PNL_BASIS_NET
+    return PNL_BASIS_GROSS
+
+
+def _candidate_quantity(candidate: Any) -> float:
+    lots = _number_or_none(_candidate_value(candidate, "lots", None))
+    lot_size = _number_or_none(_candidate_value(candidate, "lot_size", None))
+    if lots is not None and lot_size is not None and lots > 0 and lot_size > 0:
+        return lots * lot_size
+    for name in ("broker_quantity", "quantity", "qty"):
+        quantity = _number_or_none(_candidate_value(candidate, name, None))
+        if quantity is not None and quantity > 0:
+            return quantity
+    return 0.0
+
+
+def _gross_outcome_pnl(
+    *,
+    entry_price: Any,
+    exit_price: Any,
+    quantity: Any,
+    inst_type: Any,
+    direction: Any,
+    multiplier: Any = 1.0,
+) -> Optional[float]:
+    entry = _number_or_none(entry_price)
+    exit_ = _number_or_none(exit_price)
+    qty = _number_or_none(quantity)
+    mult = _number_or_none(multiplier)
+    if entry is None or exit_ is None or qty is None or entry <= 0 or exit_ <= 0 or qty <= 0:
+        return None
+    mult = mult if mult is not None and mult > 0 else 1.0
+    kind = str(inst_type or "").upper()
+    side = str(direction or "").upper()
+    # Index options in this engine are premium-long for both CE and PE.  Direction is
+    # the underlying view, not an instruction to short the option premium.
+    if kind == "OPT" or side in {"LONG", "BUY"}:
+        return (exit_ - entry) * qty * (1.0 if kind == "OPT" else mult)
+    if side in {"SHORT", "SELL"}:
+        return (entry - exit_) * qty * mult
+    return None
+
+
+def _candidate_round_trip_cost(candidate: Any) -> Optional[float]:
+    explicit = _number_or_none(_candidate_value(candidate, "round_trip_cost", None))
+    if explicit is not None and explicit >= 0:
+        return round(explicit, 2)
+    charges = _number_or_none(_candidate_value(candidate, "charges", None))
+    if charges is not None and charges > 0:
+        return round(charges, 2)
+
+    entry = _candidate_value(
+        candidate,
+        "price",
+        _candidate_value(candidate, "entry_price", None),
+    )
+    exit_ = _candidate_value(
+        candidate,
+        "exit_price",
+        _candidate_value(candidate, "current_price", None),
+    )
+    kind = str(_candidate_value(candidate, "inst_type", "") or "").upper()
+    multiplier = (
+        _candidate_value(candidate, "multiplier", 1.0)
+        if kind != "OPT"
+        else 1.0
+    )
+    if kind != "OPT" and not _candidate_has(candidate, "multiplier"):
+        multiplier = _candidate_value(candidate, "instrument_multiplier", 1.0)
+    gross = _gross_outcome_pnl(
+        entry_price=entry,
+        exit_price=exit_,
+        quantity=_candidate_quantity(candidate),
+        inst_type=kind,
+        direction=_candidate_value(candidate, "direction", ""),
+        multiplier=multiplier,
+    )
+    booked = _number_or_none(_candidate_value(candidate, "pnl", None))
+    if gross is None or booked is None:
+        return None
+    cost = gross - booked
+    # A few paise of serialization/rounding disagreement is not a negative fee.
+    if cost < -0.01:
+        return None
+    return round(max(0.0, cost), 2)
+
+
+def _event_round_trip_cost(event: Dict[str, Any]) -> Optional[float]:
+    explicit = _number_or_none(event.get("round_trip_cost"))
+    if explicit is not None and explicit >= 0:
+        return round(explicit, 2)
+    charges = _number_or_none(event.get("charges"))
+    if charges is not None and charges >= 0:
+        return round(charges, 2)
+
+    # Legacy rtracker.v1 exits omitted the cost but retained enough option-contract
+    # identity to recover it exactly: gross terminal P&L minus the stored net outcome.
+    # Do not attempt this when a producer explicitly says its stored outcome is gross.
+    pnl_basis = _canonical_pnl_basis(event.get("pnl_basis"), default=PNL_BASIS_NET)
+    if pnl_basis != PNL_BASIS_NET:
+        return None
+    contract = event.get("contract") if isinstance(event.get("contract"), dict) else {}
+    lots = _number_or_none(contract.get("lots"))
+    lot_size = _number_or_none(contract.get("lot_size"))
+    quantity = (
+        lots * lot_size
+        if lots is not None and lot_size is not None and lots > 0 and lot_size > 0
+        else _number_or_none(contract.get("quantity"))
+    )
+    gross = _gross_outcome_pnl(
+        entry_price=event.get("price", event.get("entry_price")),
+        exit_price=event.get("exit_price") or event.get("current_price"),
+        quantity=quantity,
+        inst_type=contract.get("inst_type"),
+        direction=event.get("direction"),
+        multiplier=contract.get("multiplier", 1.0),
+    )
+    booked = _number_or_none(event.get("pnl"))
+    if gross is None or booked is None:
+        return None
+    cost = gross - booked
+    if cost < -0.01:
+        return None
+    return round(max(0.0, cost), 2)
+
+
+def normalize_replay_pnl_event(event: Any) -> Optional[Dict[str, Any]]:
+    """Return one tracker exit on consistent gross-decision/net-booking bases.
+
+    Exit guards in Scanner consume gross P&L, so ``pnl_path_gross`` is the path to feed
+    them.  If a guard fires at sample *i*, ``pnl_path_net[i]`` is what that exit would
+    have booked after the same round-trip cost as the real outcome.  ``pnl`` is the
+    real outcome normalized to net.
+
+    New events carry explicit bases and cost.  Legacy rtracker.v1 exits are supported by
+    inferring their cost from contract quantity and entry/exit prices.  If the units
+    cannot be established, return ``None`` instead of silently mixing them.
+    """
+    if not isinstance(event, dict):
+        return None
+    path = _pnl_path_rows(event.get("pnl_path"))
+    booked = _number_or_none(event.get("pnl"))
+    if not path or booked is None:
+        return None
+
+    pnl_basis = _canonical_pnl_basis(
+        event.get("pnl_basis"), default=PNL_BASIS_NET
+    )
+    path_basis = _canonical_pnl_basis(
+        event.get("pnl_path_basis"), default=PNL_BASIS_GROSS
+    )
+    if not pnl_basis or not path_basis:
+        return None
+    cost = _event_round_trip_cost(event)
+    # Replaying a gross-threshold guard always needs both views of the path.  Refuse an
+    # event whose round trip cannot be known rather than treating an absent fee as zero.
+    if cost is None:
+        return None
+
+    booked_net = booked - cost if pnl_basis == PNL_BASIS_GROSS else booked
+    gross_path = []
+    net_path = []
+    for seconds, pnl in path:
+        if path_basis == PNL_BASIS_GROSS:
+            gross, net = pnl, pnl - cost
+        else:
+            gross, net = pnl + cost, pnl
+        gross_path.append([seconds, round(gross, 2)])
+        net_path.append([seconds, round(net, 2)])
+    return {
+        "pnl": round(booked_net, 2),
+        "pnl_path_gross": gross_path,
+        "pnl_path_net": net_path,
+        "round_trip_cost": round(cost, 2),
+        "pnl_basis": PNL_BASIS_NET,
+        "pnl_path_gross_basis": PNL_BASIS_GROSS,
+        "pnl_path_net_basis": PNL_BASIS_NET,
+    }
 
 
 def _safe_int(value: Any) -> int:

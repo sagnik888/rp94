@@ -20,6 +20,21 @@ from pathlib import Path
 from datetime import date, datetime, time as dtime, timedelta
 import pytz
 IST = pytz.timezone('Asia/Kolkata')
+
+# Postback states after which an order is finished. A live-state payload arriving after
+# one of these is a late redelivery and must not reopen the order's recorded state.
+_POSTBACK_TERMINAL_STATUSES = frozenset({"COMPLETE", "CANCELLED", "REJECTED"})
+
+# Direction each leg moves the holding, for the SIGNED fill ledger. Adding or removing a
+# leg here without its sign silently corrupts _ledger_owned_quantity, which is summed.
+_POSTBACK_LEG_SIGNS = {
+    "ENTRY": 1,
+    "ADD": 1,
+    "EXIT": -1,
+    "PROTECTIVE": -1,
+    "PARTIAL_EXIT": -1,
+}
+
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, replace
 from loguru import logger
@@ -197,6 +212,10 @@ class Trade:
     exit_reason: str = ""
     pnl: float = 0.0
     charges: float = 0.0
+    # Kite's position.realised after this close. It is cumulative per contract/day,
+    # so persisting the consumed total on the same CLOSED row lets a same-day process
+    # restart restore the delta baseline without booking earlier P&L a second time.
+    broker_realised_cumulative: Optional[float] = None
     peak_pnl: float = 0.0
     max_drawdown: float = 0.0
     # Bounded (seconds_since_entry, pnl) samples. peak_pnl and max_drawdown are the only
@@ -225,6 +244,10 @@ class Trade:
     market_regime: str = ""   # Regime at entry (for post-hoc attribution)
     data_provenance: str = "" # LIVE / HISTORICAL / RECOVERY / EOD — data source of the entry
     price_action_verdict: str = "" # FAVORABLE/NEUTRAL/ADVERSE from the price-action patch (advisory)
+    # Entry-time attribution only.  Exit decisions must use the fresh intelligence
+    # context supplied by the scanner, not this frozen telemetry snapshot.
+    entry_intelligence_score: float = 0.0
+    # Backward-compatible serialized alias used by older archives/readers.
     intelligence_score: float = 0.0
     strategy_revision: str = ""
     strategy_direction_mode: str = ""
@@ -390,6 +413,7 @@ class Trade:
                 (self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0, 0
             ),
             "charges": self.charges,
+            "broker_realised_cumulative": self.broker_realised_cumulative,
             "lots": self.lots,
             "lot_size": self.lot_size,
             "grade": self.grade,
@@ -422,6 +446,7 @@ class Trade:
             "market_regime": self.market_regime,
             "data_provenance": self.data_provenance,
             "price_action_verdict": self.price_action_verdict,
+            "entry_intelligence_score": self.entry_intelligence_score,
             "intelligence_score": self.intelligence_score,
             "strategy_revision": self.strategy_revision,
             "strategy_direction_mode": self.strategy_direction_mode,
@@ -511,6 +536,11 @@ class Trade:
         # Extract base instrument name (strip strike info like "NIFTY 24100 CE" -> "NIFTY")
         raw_instrument = data.get("instrument", "")
         base_instrument = raw_instrument.split()[0] if raw_instrument else ""
+        entry_intelligence_score = data.get("entry_intelligence_score")
+        if entry_intelligence_score is None:
+            # Rows written before the explicit entry field used intelligence_score
+            # for this same entry-time telemetry.
+            entry_intelligence_score = data.get("intelligence_score", 0.0)
         
         return cls(
             id=data.get("id", ""),
@@ -574,6 +604,11 @@ class Trade:
             exit_time=exit_time,
             exit_reason=data.get("exit_reason", ""),
             pnl=data.get("pnl", 0.0),
+            broker_realised_cumulative=(
+                float(data.get("broker_realised_cumulative"))
+                if data.get("broker_realised_cumulative") is not None
+                else None
+            ),
             peak_pnl=data.get("peak_pnl", 0.0),
             max_drawdown=data.get("max_drawdown", 0.0),
             is_ghost=bool(data.get("is_ghost", False)),
@@ -589,7 +624,12 @@ class Trade:
             market_regime=str(data.get("market_regime") or ""),
             data_provenance=str(data.get("data_provenance") or ""),
             price_action_verdict=str(data.get("price_action_verdict") or ""),
-            intelligence_score=float(data.get("intelligence_score") or 0.0),
+            entry_intelligence_score=float(entry_intelligence_score or 0.0),
+            intelligence_score=float(
+                data.get("intelligence_score")
+                or data.get("entry_intelligence_score")
+                or 0.0
+            ),
             strategy_revision=str(data.get("strategy_revision") or ""),
             strategy_direction_mode=str(data.get("strategy_direction_mode") or ""),
             market_wide_reversal_entry=bool(data.get("market_wide_reversal_entry", False)),
@@ -690,6 +730,16 @@ class TradeManager:
             except Exception as e:
                 logger.error(f"Failed to dispatch UI log: {e}")
 
+    def _mark_dirty(self):
+        """Signal the write-behind persistence thread that state has changed.
+
+        Safe to call even on partially-initialised instances (e.g. tests that
+        use ``TradeManager.__new__`` without calling ``__init__``).
+        """
+        dirty = getattr(self, "_dirty", None)
+        if dirty is not None:
+            dirty.set()
+
     def __init__(
         self,
         broker=None,
@@ -699,6 +749,9 @@ class TradeManager:
         on_notification=None,
     ):
         self.broker = broker
+        # Write-behind DB persistence event — initialised first so that any
+        # code path that touches self._mark_dirty() during __init__ is safe.
+        self._dirty = threading.Event()
         self.ui_logger = None
         # Injected desktop notifier (main.py passes send_desktop_notification). Falls
         # back to importing it directly, so behaviour is unchanged when not supplied.
@@ -732,8 +785,38 @@ class TradeManager:
         
         # Start background broker position sync
         self._sync_active = True
+        # Wakes the position-sync loop immediately instead of letting it finish a blind
+        # sleep. Without it a new position waited out whatever interval the loop had
+        # already committed to — up to position_sync_idle_interval_seconds (30s), which
+        # is precisely the interval in force when the book is empty, i.e. before the
+        # FIRST entry of the day. That is the 5-30s lag between a fill happening and
+        # anything on screen reflecting it.
+        self._sync_wake = threading.Event()
         self._sync_thread = threading.Thread(target=self._position_sync_loop, daemon=True, name="PositionSync")
         self._sync_thread.start()
+
+        # Start write-behind persistence thread
+        self._persistence_thread = threading.Thread(
+            target=self._persistence_loop, daemon=True, name="Persistence"
+        )
+        self._persistence_thread.start()
+
+    def _persistence_loop(self):
+        """Background loop to persist state out-of-band to avoid blocking the hot path."""
+        while getattr(self, "_sync_active", True):
+            # Wait up to 1 second for a write request. This naturally coalesces
+            # rapid bursts of changes (like 10 PnL ticks) into a single write.
+            if self._dirty.wait(timeout=1.0):
+                self._dirty.clear()
+                try:
+                    self.save_state()
+                except Exception as exc:
+                    # A failed checkpoint is still dirty. Retain the wake and retry
+                    # instead of killing this daemon thread and reporting later writes
+                    # as successful.
+                    self._dirty.set()
+                    logger.error(f"Trade persistence checkpoint failed; retrying: {exc}")
+                    time.sleep(1.0)
 
     def _position_sync_loop(self):
         """Background loop to sync internal open_trades with broker positions.
@@ -771,7 +854,22 @@ class TradeManager:
                 logger.error(f"Error in position sync loop: {exc}")
                 backoff = min(5.0 if backoff <= 0 else backoff * 2.0, 60.0)
                 interval = backoff
-            time.sleep(interval)
+            # Interruptible: nudge_position_sync() cuts the wait short the moment a
+            # position changes, so a fill is reconciled in milliseconds rather than
+            # after the remainder of a 5s (or 30s idle) sleep.
+            if self._sync_wake.wait(timeout=interval):
+                self._sync_wake.clear()
+
+    def nudge_position_sync(self) -> None:
+        """Ask the sync loop to reconcile now rather than after its current wait.
+
+        Cheap and idempotent: setting an already-set Event is a no-op, and the loop
+        clears it on wake. Safe to call from any thread and from paths that may run
+        before the loop exists.
+        """
+        wake = getattr(self, "_sync_wake", None)
+        if wake is not None:
+            wake.set()
 
     @staticmethod
     def _position_quantity(position: Dict) -> int:
@@ -779,6 +877,32 @@ class TradeManager:
             return int(float(position.get("netqty", 0) or 0))
         except (TypeError, ValueError):
             return 0
+
+    def _reconciled_exit_price(self, trade: Trade, position: Dict) -> float:
+        """Exit fill price, preferring the exit ORDER's own executions.
+
+        _position_exit_price reads the position row's sellavgprice, which Kite blends
+        across EVERY sell on that contract for the day. Two round trips on one strike
+        therefore priced the second exit partly at the first one's fill. The entry leg
+        has always been sourced correctly — from the order's own trades — and get_fill()
+        returns exactly that for the exit too (a quantity-weighted average of its own
+        executions); it was already being called on this path with only the quantity
+        read and average_price discarded. Position aggregate stays the fallback for a
+        trade with no exit order id, e.g. one closed by a broker square-off.
+        """
+        order_id = str(getattr(trade, "exit_order_id", "") or "").strip()
+        broker = getattr(self, "broker", None)
+        filler = getattr(broker, "get_fill", None) if broker is not None else None
+        if order_id and callable(filler):
+            try:
+                detail = filler(order_id) or {}
+                if str(detail.get("state") or "") == "FILLED":
+                    price = float(detail.get("average_price") or 0.0)
+                    if price > 0:
+                        return price
+            except Exception as exc:
+                logger.debug(f"Exit-fill lookup failed for {order_id}: {exc}")
+        return self._position_exit_price(trade, position)
 
     @staticmethod
     def _position_exit_price(trade: Trade, position: Dict) -> float:
@@ -891,10 +1015,27 @@ class TradeManager:
 
         Precedence, most authoritative first:
           1. an explicitly REQUESTED quantity, including 0
-          2. the ledger, which distinguishes a known 0 from no information at all
+          2. the ledger, which distinguishes a known 0 from no information at all,
+             capped by a confirmed broker holding -- see below
           3. a confirmed broker fill
           4. intent -- and only here, where nothing is known and the entry may simply
              not have been confirmed yet, which is the case the old fallback was for
+
+        The ledger is authoritative about ATTRIBUTION -- which of several trades on one
+        contract owns which lots -- and never about TOTAL exposure. It sums only orders
+        THIS system placed, so anything that removes quantity without a recorded order
+        leaves it stale HIGH: an operator squaring off part of the position at the Kite
+        terminal (which this file tells them to do in four places), or, with no operator
+        at all, a partial de-risk whose own reduce order cannot be read back --
+        _record_leg_fill_from_order stays deliberately silent on an UNKNOWN fill, while
+        the positions-derived broker_quantity still drops. The next full exit then sells
+        the ORIGINAL size against what is left, which on options writes a naked short in
+        a CARRYFORWARD/NRML product the broker will not square off.
+
+        _allocate_broker_quantity already applies exactly this rule, capping every
+        ledger answer by what remains of the broker's row so "nothing is ever armed for
+        more than the account actually holds". Reading db.owned_quantity directly was
+        the one path that skipped it.
         """
         if requested is not None:
             try:
@@ -903,7 +1044,27 @@ class TradeManager:
                 return 0
         owned = self._ledger_owned_quantity(str(getattr(trade, "id", "") or ""))
         if owned is not None:
-            return max(0, int(owned))
+            owned = max(0, int(owned))
+            confirmed = self._confirmed_broker_quantity(trade)
+            # Only a POSITIVE confirmation may cap. Zero there means "the entry is not
+            # reconciled yet", not "the account is flat", and clamping to it would
+            # refuse to exit a position that is genuinely live.
+            if confirmed > 0 and confirmed < owned:
+                # Say so. The clamp is the right answer -- selling what the broker does
+                # not confirm is how a naked short is written -- but it deliberately
+                # UNDER-sizes, so an exit taken on this number leaves a residual. That
+                # residual is squared off by the 15:25 sweep (check_session_end routes
+                # PARTIAL_EXIT to emergency_flatten_trade) and not before, so it can sit
+                # unprotected for the rest of the session. Silent is the one thing it
+                # must not be.
+                logger.warning(
+                    f"Ledger/broker divergence on {getattr(trade, 'trading_symbol', '?')} "
+                    f"({getattr(trade, 'id', '?')}): the ledger attributes {owned} but the "
+                    f"broker confirms {confirmed}. Sizing on {confirmed}; any remainder is "
+                    "left for reconciliation and the session-end sweep."
+                )
+                return confirmed
+            return owned
         confirmed = self._confirmed_broker_quantity(trade)
         if confirmed > 0:
             return confirmed
@@ -1155,26 +1316,47 @@ class TradeManager:
         reason: str,
         exit_time: Optional[datetime] = None,
         realised_pnl: Optional[float] = None,
+        broker_realised_cumulative: Optional[float] = None,
     ) -> bool:
         # The trade is finished, so whatever it still held has left the book. Booked
         # here rather than at the exit ACK because an acknowledgement is not a fill, and
         # a ledger that decrements early would under-state a position that is still on.
         _held = self._confirmed_broker_quantity(trade)
-        if _held:
+        # Ask the LEDGER whether anything is still attributed to this trade, not just
+        # broker_quantity. Gating the whole block on broker_quantity meant the exit leg
+        # was never recorded on the one path that closes REAL trades: reconcile reads a
+        # flat position row, sets trade.broker_quantity = allocated_qty (which is 0 for a
+        # netqty==0 row) and calls straight through to here, so `_held` was ALWAYS 0 and
+        # the ENTRY row stayed on the books at full size forever. Nothing in the live
+        # path reads a closed trade's row, so no order was mis-sized -- but
+        # scripts/ledger_certification.py sums every row per contract, so every contract
+        # that had ever closed reported broker 0 vs ledger 75 and the certification gate
+        # (the thing that decides whether same-contract stacking may come back) could
+        # never pass. The number this block exists to correct cannot also be its guard.
+        _sum = self._ledger_owned_quantity(getattr(trade, "id", ""))
+        if _held or _sum:
             # Prefer the exit ORDER's own executions, like every other leg. When the
             # order cannot state them, close the ledger out EXACTLY: a finished trade
             # holds nothing, so the closing delta is the negative of whatever the ledger
             # currently believes -- not of trade.broker_quantity, which is the number the
             # ledger exists to stop trusting.
-            if not self._record_leg_fill_from_order(
+            if self._record_leg_fill_from_order(
                 trade, str(getattr(trade, "exit_order_id", "") or ""), "FULL_EXIT", -1
             ):
-                _sum = self._ledger_owned_quantity(getattr(trade, "id", ""))
+                # The exit order stated its own fill, which is the best evidence there
+                # is -- but it may be a PARTIAL one. A trade that is finished holds
+                # nothing by definition, so whatever the ledger still attributes to it
+                # after that write is a remainder that no later order will ever clear,
+                # and it reports as a broker/ledger mismatch forever. Re-read and settle
+                # the balance rather than assuming the order covered the whole holding.
+                _residual = self._ledger_owned_quantity(getattr(trade, "id", ""))
+                _close = _residual if _residual is not None else 0
+            else:
                 _close = _held if _sum is None else _sum
-                if _close:
-                    self._record_fill(
-                        trade, f"{getattr(trade, 'id', '')}|CLOSE", -_close, "FULL_EXIT"
-                    )
+            if _close:
+                self._record_fill(
+                    trade, f"{getattr(trade, 'id', '')}|CLOSE", -_close, "FULL_EXIT"
+                )
         from config.settings import get_settings
         from engine.trade_accounting import estimate_trade_charges
 
@@ -1193,6 +1375,8 @@ class TradeManager:
             trade.current_price = trade.exit_price
             trade.exit_time = exit_time or datetime.now(IST)
             trade.exit_reason = reason
+            if broker_realised_cumulative is not None:
+                trade.broker_realised_cumulative = float(broker_realised_cumulative)
             if getattr(trade, "exit_order_id", ""):
                 self._record_exit_slippage(trade, exit_decision_price, trade.exit_price)
                 self._stamp_fill_quality(trade, leg="EXIT", requested=exit_decision_price)
@@ -1216,10 +1400,22 @@ class TradeManager:
                 trade.instrument_multiplier,
                 instrument=trade.instrument,
             )
-            trade.pnl = float(realised_pnl) if realised_pnl is not None else gross - trade.charges
+            # Charges come off BOTH branches (2026-08-16). Kite's position `realised` is
+            # a price-based figure — brokerage, STT, exchange and GST are reported
+            # separately and are not in it — so taking it verbatim booked every
+            # reconcile-closed trade gross while the computed branch right above booked
+            # net. trade.charges was already being calculated on this path and then
+            # thrown away. Both numbers feed the daily-loss breaker, so the two branches
+            # disagreeing meant the breaker's threshold meant different things depending
+            # on which code path happened to close the trade.
+            trade.pnl = (
+                float(realised_pnl) - trade.charges
+                if realised_pnl is not None
+                else gross - trade.charges
+            )
             self.closed_trades.append(trade)
             del self.open_trades[trade_id]
-        self.save_state()
+        self._mark_dirty()
         
         profit_str = f"+₹{trade.pnl:.2f}" if trade.pnl >= 0 else f"-₹{abs(trade.pnl):.2f}"
         msg = f"✅ Trade Closed: {trade.instrument} @ {trade.exit_price:.2f} (Reason: {reason}) | PnL: {profit_str}"
@@ -1448,6 +1644,29 @@ class TradeManager:
     # Broker conditions that refuse EVERY order until a human changes something
     # outside this process. Matched against the broker's own refusal text.
     _BLOCKING_BROKER_CONDITIONS = (
+        # "registered ip" is the AngelOne-era wording and was the ONLY IP marker here
+        # until 2026-08-16, so a Kite block never reached this alert at all. The refusal
+        # this project actually captured on 2026-08-04 reads:
+        #   PermissionException: IP (2405:201:...:1b61) is not allowed to place orders
+        #   for this app. Update allowed IPs on the Kite developer console.
+        # which contains none of the four markers that were listed. KiteBroker's own
+        # _escalate_if_ip_blocked did fire, but it is logger.critical only — this tuple
+        # is the single path that reaches _log_ui and the desktop notifier, so the one
+        # condition that kills every order was also the one the operator never saw.
+        # Both Kite shapes are covered: a refused address, and an empty allow-list.
+        (
+            "is not allowed to place orders",
+            "The broker is refusing orders from this machine's public IP ({detail}). "
+            "Add that address on the Kite developer console (developers.kite.trade -> "
+            "your app) and restart. Check the address family: a whitelisted IPv4 does "
+            "NOT cover an IPv6 egress. Until then NO order can reach the exchange.",
+        ),
+        (
+            "allowed ips",
+            "The broker is refusing orders on the app's allowed-IP list ({detail}). "
+            "Add this machine's address on the Kite developer console. An EMPTY "
+            "allowed-IP list denies every order rather than allowing all.",
+        ),
         (
             "registered ip",
             "The broker is refusing orders from this machine's public IP ({detail}). "
@@ -1494,8 +1713,23 @@ class TradeManager:
             # The broker names the offending IP in its own message; quote it back
             # rather than guessing, because the SDK's X-ClientPublicIP header is a
             # hardcoded constant and never reflects this machine.
-            found = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", str(error or ""))
-            message = "TRADING BLOCKED: " + template.format(detail=found.group(0) if found else "unknown")
+            # IPv4-only until 2026-08-16 — and the incident this alert exists for was an
+            # IPv6 egress, so on the very case it was written for the address rendered
+            # as "unknown". Parenthesised form first (what Kite actually sent), then a
+            # bare IPv6, then a bare IPv4.
+            text_for_ip = str(error or "")
+            found = (
+                re.search(r"\bIP\s+\(([^)]+)\)", text_for_ip)
+                # At least FOUR colon groups. A looser {2,7} also matches a clock time
+                # such as 12:37:25, and these messages routinely carry one.
+                or re.search(r"\b([0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){4,7})\b", text_for_ip)
+                or re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text_for_ip)
+            )
+            # group(1), not group(0): the parenthesised pattern's group(0) carries the
+            # literal "IP (" prefix along with the address.
+            message = "TRADING BLOCKED: " + template.format(
+                detail=found.group(1) if found else "unknown"
+            )
             logger.critical(message)
             self._log_ui(message, "error")
             try:
@@ -1543,39 +1777,124 @@ class TradeManager:
         status = str((payload or {}).get("status") or "").upper()
         if not order_id:
             return False
-        with self._lock:
-            trade = next(
-                (t for t in self.open_trades.values()
-                 if str(getattr(t, "broker_order_id", "")) == order_id),
-                None,
-            )
-        if trade is None:
-            return False
+        # The order API reports CANCELLED; the postbacks prose uses CANCEL. Accept both.
+        if status == "CANCEL":
+            status = "CANCELLED"
 
-        message = str(payload.get("status_message") or "").strip()
-        if status == "REJECTED":
-            trade.execution_error = message or "Broker rejected the order"
-            logger.error(f"Postback: {trade.trading_symbol} entry REJECTED — {trade.execution_error}")
-            self._alert_blocking_broker_condition(trade.execution_error)
-        elif status == "COMPLETE":
+        stamp = str(
+            payload.get("exchange_update_timestamp")
+            or payload.get("exchange_timestamp")
+            or payload.get("order_timestamp")
+            or ""
+        )
+
+        # Whole body under the lock as of 2026-08-16. It used to take the lock ONLY to
+        # find the trade and then mutate outside it, so a postback could rewrite
+        # broker_quantity while the exit path was reading it.
+        with self._lock:
+            trade, leg = self._trade_for_broker_order(order_id)
+            if trade is None:
+                return False
+
+            # Idempotency + ordering. Zerodha redelivers, and delivery order is not
+            # guaranteed. Neither was checked: the concrete hazard is a delayed
+            # entry-COMPLETE arriving after a partial reduce and rewriting
+            # broker_quantity back to the pre-reduce fill — moments before an SL-M is
+            # re-armed from exactly that field, for a quantity no longer held.
+            applied = getattr(self, "_postback_applied", None)
+            if applied is None:
+                applied = self._postback_applied = {}
+            seen = applied.get(order_id)
+            if seen is not None:
+                prev_stamp, prev_status = seen
+                if prev_status in _POSTBACK_TERMINAL_STATUSES and status not in _POSTBACK_TERMINAL_STATUSES:
+                    return False          # a live-state update arriving after a final one
+                if stamp and prev_stamp:
+                    if stamp < prev_stamp:
+                        return False      # strictly older than what we already applied
+                    if stamp == prev_stamp and status == prev_status:
+                        return False      # verbatim redelivery
+            applied[order_id] = (stamp, status)
+
+            message = str(payload.get("status_message") or "").strip()
             try:
                 filled = int(float(payload.get("filled_quantity") or 0))
+            except (TypeError, ValueError):
+                filled = 0
+            try:
                 average = float(payload.get("average_price") or 0.0)
             except (TypeError, ValueError):
-                filled, average = 0, 0.0
-            if filled > 0:
-                trade.broker_quantity = filled
-                # The entry order's OWN fill: the first and most important ledger fact.
-                self._record_fill(trade, getattr(trade, "broker_order_id", ""), filled, "ENTRY")
-            if average > 0:
-                trade.execution_error = ""
-            logger.info(
-                f"Postback: {trade.trading_symbol} COMPLETE filled={filled} avg={average}"
-            )
-        elif status == "CANCELLED":
-            trade.execution_error = message or "Broker cancelled the order"
-        self.save_state()
+                average = 0.0
+
+            if status == "REJECTED":
+                trade.execution_error = message or "Broker rejected the order"
+                logger.error(
+                    f"Postback: {trade.trading_symbol} {leg} REJECTED — {trade.execution_error}"
+                )
+                self._alert_blocking_broker_condition(trade.execution_error)
+            elif status == "COMPLETE":
+                if filled > 0:
+                    # broker_quantity describes the ENTRY holding, so only the entry leg
+                    # may set it. Before this, an exit or stop fill was never matched at
+                    # all; matching it and then writing its quantity here would be worse
+                    # than the bug it replaces.
+                    if leg == "ENTRY":
+                        trade.broker_quantity = filled
+                    # SIGNED. _record_fill's contract is "an entry or add is positive, an
+                    # exit negative, so a trade's holding is the sum" — and the first cut
+                    # of this rewrite passed `filled` positive for every leg. Matching the
+                    # exit legs (A2) without their sign was worse than not matching them:
+                    # a protective stop filling 65 wrote +65 into the ledger, so a FLAT
+                    # position reported 130 owned, and that total feeds exit sizing, the
+                    # frozen 1R and the scale-in gate. Order id is the ledger's primary
+                    # key under INSERT OR REPLACE, and for an exchange-side SL-M there is
+                    # no competing correctly-signed writer at all.
+                    self._record_fill(
+                        trade, order_id, _POSTBACK_LEG_SIGNS.get(leg, 1) * filled, leg
+                    )
+                if average > 0 and leg == "ENTRY":
+                    trade.execution_error = ""
+                logger.info(
+                    f"Postback: {trade.trading_symbol} {leg} COMPLETE filled={filled} avg={average}"
+                )
+            elif status == "UPDATE":
+                # Partial fills arrive as UPDATE. There was no branch for it and no
+                # else, so the push channel was structurally blind to every partial.
+                # Recorded only — reconciliation remains the sole authority that may
+                # open or close a position, which is what keeps a duplicated or
+                # out-of-order postback from inventing a fill.
+                logger.info(
+                    f"Postback: {trade.trading_symbol} {leg} partial fill "
+                    f"filled={filled} avg={average}"
+                )
+            elif status == "CANCELLED":
+                trade.execution_error = message or "Broker cancelled the order"
+        self._mark_dirty()
         return True
+
+    # Order-id fields in the order a postback should be attributed. Until 2026-08-16
+    # ONLY broker_order_id was matched, so every postback for an exit, a protective
+    # stop, a partial reduce or a scale-in returned False and was dropped — including
+    # "your protective stop just filled", which is the commonest real exit there is.
+    _POSTBACK_LEG_FIELDS = (
+        ("broker_order_id", "ENTRY"),
+        ("exit_order_id", "EXIT"),
+        ("protective_order_id", "PROTECTIVE"),
+        ("protective_stop_order_id", "PROTECTIVE"),
+        ("partial_reduce_order_id", "PARTIAL_EXIT"),
+        ("scale_in_order_id", "ADD"),
+    )
+
+    def _trade_for_broker_order(self, order_id: str):
+        """(trade, leg) owning this broker order id, or (None, "")."""
+        wanted = str(order_id or "").strip()
+        if not wanted:
+            return None, ""
+        for trade in list(self.open_trades.values()):
+            for field, leg in self._POSTBACK_LEG_FIELDS:
+                if str(getattr(trade, field, "") or "").strip() == wanted:
+                    return trade, leg
+        return None, ""
 
     def _withdraw_stale_entry_remainder(self, trade: Trade, filled_qty: int, expected_qty: int) -> None:
         """Cancel the unfilled tail of a partially filled ENTRY once it has gone stale.
@@ -1907,10 +2226,10 @@ class TradeManager:
                     trade.protective_trigger = trigger
                     trade.protective_quantity = qty
                     trade.protective_updated_at = datetime.now(IST)
-                    self.save_state()
+                    self._mark_dirty()
                     return True
                 self._mark_recovery(trade, "Broker protective stop could not be tightened")
-                self.save_state()
+                self._mark_dirty()
                 return False
 
             # ── Idempotent placement (audit BLOCKER-1/2 fix) ──
@@ -1936,7 +2255,7 @@ class TradeManager:
                         f"SL-M {order_id} is live but the GTT fallback could not be "
                         "cancelled; both are armed and would exit the position twice.",
                     )
-                    self.save_state()
+                    self._mark_dirty()
                     return False
                 # The level the EXCHANGE holds, which is not always the level we want.
                 # Writing the desired trigger for a stale-trigger adoption made every
@@ -1950,7 +2269,7 @@ class TradeManager:
                 trade.protective_updated_at = datetime.now(IST)
                 trade.recovery_required_since = None
                 self._last_protective_sync[trade.id] = now
-                self.save_state()
+                self._mark_dirty()
                 logger.info(
                     f"{note} for {trade.trading_symbol}: {order_id} qty={qty} trigger={trigger:.2f}"
                 )
@@ -1994,7 +2313,7 @@ class TradeManager:
                     f"{prior_state.lower()}; refusing to place another. Reconcile the "
                     "order book manually.",
                 )
-                self.save_state()
+                self._mark_dirty()
                 return False
             if prior:
                 owner = self._trade_owning_protective_order(prior, exclude_id=trade.id)
@@ -2007,7 +2326,7 @@ class TradeManager:
                         f"The only working stop on {trade.trading_symbol} belongs to trade "
                         f"{owner.id}; refusing to adopt or duplicate it.",
                     )
-                    self.save_state()
+                    self._mark_dirty()
                     return False
                 return _adopt(prior, "Adopted existing broker SL-M")
 
@@ -2037,7 +2356,7 @@ class TradeManager:
                 if recovered:
                     return _adopt(recovered, "Recovered ambiguous broker SL-M")
                 self._mark_recovery(trade, f"Protective stop acknowledgement ambiguous: {exc}")
-                self.save_state()
+                self._mark_dirty()
                 return False
             except (BrokerOrderRejected, PermissionError) as exc:
                 # The OTHER two ways place_protective_stop fails: a dead broker session
@@ -2058,7 +2377,7 @@ class TradeManager:
                     f"Protective stop refused: {exc}"
                     + ("; GTT fallback armed on the server" if armed else ""),
                 )
-                self.save_state()
+                self._mark_dirty()
                 return False
 
             self._last_protective_sync[trade.id] = now
@@ -2076,7 +2395,7 @@ class TradeManager:
                 "Confirmed broker position has no exchange-side protective stop"
                 + ("; GTT fallback armed on the server" if armed else ""),
             )
-            self.save_state()
+            self._mark_dirty()
             return False
 
     def _clear_flatten_block(self, trade: Trade) -> None:
@@ -2305,11 +2624,26 @@ class TradeManager:
 
     def _book_partial_child(
         self, trade: Trade, close_lots: int, exit_price: float, reason: str,
-        exit_time: Optional[datetime] = None,
+        exit_time: Optional[datetime] = None, closed_quantity: Optional[int] = None,
     ) -> None:
-        """Realise `close_lots` as a closed child row and shrink the parent."""
+        """Realise `close_lots` as a closed child row and shrink the parent.
+
+        `closed_quantity` is what the reduce order ACTUALLY executed. A MARKET exit in a
+        thin option book can come back part-filled, and sizing the realised row off the
+        requested lots then books P&L on quantity that never left: request 75, fill 30,
+        and the child carries 75 units of profit against 30 units of reality while the
+        parent still holds the rest. That figure feeds the daily loss cap and every R
+        computed downstream. The protective stop is NOT affected -- it is armed from the
+        corrected broker_quantity -- so this is an accounting error, not a naked-position
+        one, which is why it survived this long.
+        """
         from dataclasses import replace as _replace
 
+        realised_qty = (
+            max(0, int(closed_quantity))
+            if closed_quantity is not None
+            else int(close_lots) * int(trade.lot_size or 1)
+        )
         child = _replace(trade)
         child.id = f"{trade.id}#P{int(close_lots)}"
         child.lots = int(close_lots)
@@ -2320,7 +2654,7 @@ class TradeManager:
         child.exit_reason = reason
         child.exit_time = exit_time or datetime.now(IST)
         child.exit_price = float(exit_price)
-        child.broker_quantity = int(close_lots) * int(trade.lot_size or 1)
+        child.broker_quantity = realised_qty
         child.protective_order_id = ""
         child.gtt_trigger_id = ""
         gross = (float(exit_price) - float(trade.entry_price)) * child.broker_quantity
@@ -2396,7 +2730,7 @@ class TradeManager:
             else:
                 self._book_partial_child(trade, close_lots, price, reason, exit_time)
                 trade.partial_derisk_done = True
-                self.save_state()
+                self._mark_dirty()
                 return True
 
         self._request_broker_partial_reduce(trade, close_lots, price, reason, exit_time)
@@ -2429,7 +2763,7 @@ class TradeManager:
                 setattr(trade, "_partial_reduce_inflight", False)
                 trade.partial_reduce_order_id = ""
                 trade.partial_reduce_requested_quantity = 0
-                self.save_state()
+                self._mark_dirty()
 
         from engine.async_queue import execution_queue
 
@@ -2490,7 +2824,7 @@ class TradeManager:
 
         trade.partial_reduce_order_id = str(order_id)
         trade.partial_reduce_requested_quantity = quantity
-        self.save_state()
+        self._mark_dirty()
 
         expected_remaining = max(0, int(trade.broker_quantity or 0) - quantity)
         confirmed = self._confirmed_reduced_quantity(trade, expected_remaining)
@@ -2502,9 +2836,52 @@ class TradeManager:
             )
             return
 
+        # What the reduce order actually executed. Ask the ORDER, which states its own
+        # executions, rather than subtracting two independently-read snapshots of
+        # trade.broker_quantity: reconcile rewrites that field on a ~5s timer while the
+        # confirm helper polls for up to 2s, so a pass landing in between makes the
+        # difference meaningless -- and a difference of 0 would fall back to booking the
+        # REQUESTED size, which is the arithmetic this replaced.
+        # _record_leg_fill_from_order fetches this same number a few lines below.
+        filled_now = self._order_filled_quantity(
+            str(getattr(trade, "partial_reduce_order_id", "") or "")
+        )
+        if filled_now is None:
+            # The order cannot state it; fall back to the positions-derived difference.
+            prior_quantity = int(trade.broker_quantity or 0)
+            actually_closed = max(0, min(int(quantity), prior_quantity - int(confirmed)))
+        else:
+            actually_closed = max(0, min(int(quantity), int(filled_now)))
+        if actually_closed and actually_closed != int(quantity):
+            logger.warning(
+                f"Partial de-risk on {trade.trading_symbol} filled {actually_closed} of "
+                f"{int(quantity)}; realising the filled quantity, not the requested one."
+            )
         with self._lock:
-            self._book_partial_child(trade, close_lots, exit_price, reason, exit_time)
-            trade.broker_quantity = confirmed or trade.broker_quantity
+            # `actually_closed or None` until 2026-08-16, which re-introduced the exact
+            # fallback the comment above warns about: _book_partial_child reads None as
+            # "size off the REQUESTED lots" (line 2556), so a stated zero fill booked a
+            # full-size closed child carrying P&L on lots that never left the account,
+            # and then set broker_quantity to 0. Reachable: _order_filled_quantity
+            # returns 0 for a NO_FILL order. Nothing closed means no child at all.
+            if actually_closed > 0:
+                self._book_partial_child(
+                    trade, close_lots, exit_price, reason, exit_time,
+                    closed_quantity=actually_closed,
+                )
+            else:
+                logger.warning(
+                    f"Partial de-risk on {trade.trading_symbol} closed NOTHING — the "
+                    "reduce order stated a zero fill. Booking no realised child; the "
+                    "holding is taken from the positions book below."
+                )
+            # int(), not `or`. UNKNOWN already returned above via _mark_recovery, so a 0
+            # arriving here is a FACT the positions book stated: the reduce closed the
+            # whole holding, or the row is simply gone. `or` read that fact as absent and
+            # kept the pre-reduce number -- and the very next line re-arms protection from
+            # it, which on a bought option is an oversized SELL SL-M against an account
+            # that now holds nothing: a naked written leg the moment it triggers.
+            trade.broker_quantity = int(confirmed)
             trade.partial_derisk_done = True
             # From the REDUCE ORDER's own executions. `confirmed` is positions-derived
             # (_confirmed_reduced_quantity reads the per-tradingsymbol aggregate), so on
@@ -2516,7 +2893,7 @@ class TradeManager:
             self._record_leg_fill_from_order(
                 trade, getattr(trade, "partial_reduce_order_id", ""), "PARTIAL_EXIT", -1
             )
-        self.save_state()
+        self._mark_dirty()
         logger.success(
             f"Partial de-risk booked for {trade.trading_symbol}: {close_lots} lot(s) "
             f"realised, {trade.lots} running."
@@ -2616,7 +2993,7 @@ class TradeManager:
             )
             if not is_real:
                 self._book_scale_in(trade, add_lots, price, reason)
-                self.save_state()
+                self._mark_dirty()
                 return True, "booked"
             setattr(trade, "_scale_in_inflight", True)
 
@@ -2694,15 +3071,36 @@ class TradeManager:
         )
         return abs(entry - stop) * max(1, qty) * max(0.0, mult)
 
-    def _book_scale_in(self, trade: Trade, add_lots: int, fill_price: float, reason: str) -> None:
-        """Fold a confirmed add into the parent. Caller holds the lock."""
+    def _book_scale_in(
+        self, trade: Trade, add_lots: int, fill_price: float, reason: str,
+        filled_quantity: Optional[int] = None,
+    ) -> None:
+        """Fold a confirmed add into the parent. Caller holds the lock.
+
+        `filled_quantity` is what the add order ACTUALLY executed. The weighted-average
+        entry price is the whole point of this method, and weighting it by the REQUESTED
+        size on a part-filled add moves it to a price the position never paid -- which
+        then defines every R multiple, the frozen initial risk, and the open P&L on the
+        screen. Requesting 75 and filling 30 booked an average of 220 where the truth was
+        210.
+        """
         # Freeze R BEFORE the entry price moves — afterwards the original is unrecoverable.
         if float(getattr(trade, "frozen_initial_risk_rs", 0.0) or 0.0) <= 0:
             trade.frozen_initial_risk_rs = self._frozen_initial_risk_rs(trade)
 
         old_lots = max(0, int(trade.lots or 0))
-        old_qty = old_lots * int(trade.lot_size or 1)
-        add_qty = int(add_lots) * int(trade.lot_size or 1)
+        # Weight the EXISTING side by what is actually held, not by lots x lot_size.
+        # trade.lots is deliberately left at the requested count on a partial fill (order
+        # sizing never reads it), so after one part-filled add the lots-derived figure
+        # overstates the position -- and a SECOND add would then compound the first add's
+        # error into the average entry. broker_quantity is the reconciled truth; the `or`
+        # tail keeps the unreconciled and non-REAL paths exactly as they were.
+        old_qty = int(getattr(trade, "broker_quantity", 0) or 0) or old_lots * int(trade.lot_size or 1)
+        add_qty = (
+            max(0, int(filled_quantity))
+            if filled_quantity is not None
+            else int(add_lots) * int(trade.lot_size or 1)
+        )
         total_qty = old_qty + add_qty
         if total_qty > 0:
             trade.entry_price = (
@@ -2737,7 +3135,7 @@ class TradeManager:
                 setattr(trade, "_scale_in_inflight", False)
                 trade.scale_in_order_id = ""
                 trade.scale_in_requested_quantity = 0
-                self.save_state()
+                self._mark_dirty()
 
         from engine.async_queue import execution_queue
 
@@ -2748,12 +3146,210 @@ class TradeManager:
                 "the position is untouched and fully protected."
             )
 
+    def _option_contract_liquidity_admission(
+        self,
+        *,
+        inst_type: str,
+        lot_size: int,
+        touch_quote: Optional[Dict[str, Any]],
+        trading_symbol: str = "",
+        is_recovery: bool = False,
+    ) -> Tuple[bool, str]:
+        """Apply absolute OI/volume/depth floors when those facts exist.
+
+        Missing evidence is not silently converted to zero.  Initial REAL AUTO
+        entries already require an executable touch quote; manual/recovery flows
+        retain their existing semantics.  A broker- or chain-measured zero,
+        however, is a real observation and must face the configured floor.
+        """
+        if is_recovery or str(inst_type or "").upper() != "OPT":
+            return True, ""
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not _setting_enabled(
+            getattr(settings, "option_contract_liquidity_gate_enabled", True), True
+        ):
+            return True, ""
+        quote = touch_quote if isinstance(touch_quote, dict) else {}
+        size = max(1, int(lot_size or 1))
+
+        try:
+            min_oi = max(
+                0.0, float(getattr(settings, "option_contract_min_oi_lots", 5.0) or 0.0)
+            ) * size
+            min_volume = max(
+                0.0,
+                float(getattr(settings, "option_contract_min_volume_lots", 1.0) or 0.0),
+            ) * size
+            min_depth = max(
+                0.0,
+                float(
+                    getattr(settings, "option_contract_min_touch_depth_lots", 1.0)
+                    or 0.0
+                ),
+            ) * size
+        except (TypeError, ValueError):
+            return False, "invalid option-contract liquidity configuration"
+
+        def _available(flag: str, value_key: str) -> bool:
+            # New provider snapshots carry explicit flags.  Hand-built/manual
+            # integrations that predate them may still communicate evidence by
+            # supplying the value key itself.
+            if flag in quote:
+                return bool(quote.get(flag))
+            return value_key in quote and quote.get(value_key) is not None
+
+        def _value(key: str) -> Optional[float]:
+            try:
+                value = float(quote.get(key))
+            except (TypeError, ValueError):
+                return None
+            if value != value or value < 0:
+                return None
+            return value
+
+        # Prefer the current broker quote; fall back to the selected strike's
+        # cached-chain evidence when the quote endpoint does not publish OI/volume.
+        evidence = (
+            ("open interest", "oi", "oi_available", min_oi),
+            ("traded volume", "volume", "volume_available", min_volume),
+        )
+        for label, direct_key, direct_flag, threshold in evidence:
+            key, available = direct_key, _available(direct_flag, direct_key)
+            if not available:
+                key = "strike_oi" if direct_key == "oi" else "strike_volume"
+                flag = f"{key}_available"
+                available = _available(flag, key)
+            if not available or threshold <= 0:
+                continue
+            value = _value(key)
+            if value is None:
+                return False, f"invalid measured option {label} on {trading_symbol or 'contract'}"
+            if value + 1e-9 < threshold:
+                return False, (
+                    f"option {label} {value:,.0f} below {threshold:,.0f} "
+                    f"({threshold / size:.1f} lots) on {trading_symbol or 'contract'}"
+                )
+
+        if min_depth > 0:
+            for side in ("bid", "ask"):
+                key = f"{side}_qty"
+                if not _available(f"{key}_available", key):
+                    continue
+                value = _value(key)
+                if value is None:
+                    return False, f"invalid measured option {side} depth on {trading_symbol or 'contract'}"
+                if value + 1e-9 < min_depth:
+                    return False, (
+                        f"option {side} depth {value:,.0f} below {min_depth:,.0f} "
+                        f"({min_depth / size:.1f} lots) on {trading_symbol or 'contract'}"
+                    )
+        return True, ""
+
+    def _scale_in_option_touch_quote(
+        self, trade: Trade
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Fresh executable option book for an add, or a fail-closed reason."""
+        from config.settings import get_settings
+
+        place_order = getattr(getattr(self, "broker", None), "place_order", None)
+        if not callable(place_order) or not self._accepts_kwarg(place_order, "touch_quote"):
+            return None, "broker cannot accept a bounded touch quote for option adds"
+        scanner = getattr(self, "scanner", None)
+        data = getattr(scanner, "data", None) or getattr(self, "data", None)
+        getter = getattr(data, "get_contract_touch_quote", None)
+        if not callable(getter):
+            return None, "no executable option-book provider is connected"
+
+        settings = get_settings()
+        try:
+            max_age = max(
+                0.05,
+                float(
+                    getattr(settings, "execution_touch_quote_max_age_seconds", 1.5)
+                    or 1.5
+                ),
+            )
+        except (TypeError, ValueError):
+            max_age = 1.5
+        symbol = str(getattr(trade, "trading_symbol", "") or "")
+        token = str(getattr(trade, "symbol_token", "") or "")
+        if not symbol or not token:
+            return None, "option contract identity is incomplete"
+        exchange = "BFO" if "SENSEX" in symbol.upper() else "NFO"
+        try:
+            quote = getter(exchange, symbol, token, max_age_seconds=max_age)
+        except Exception as exc:
+            return None, f"option-book lookup failed: {exc}"
+        if not isinstance(quote, dict) or not bool(quote.get("usable", False)):
+            detail = str((quote or {}).get("reason") or "unavailable")
+            return None, f"executable option book is {detail}"
+        try:
+            bid = float(quote.get("bid") or 0.0)
+            ask = float(quote.get("ask") or 0.0)
+            age = float(quote["age_seconds"])
+        except (TypeError, ValueError, KeyError):
+            return None, "executable option book has no valid price/freshness evidence"
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None, "executable option book is empty or crossed"
+        if age != age or age < 0 or age > max_age:
+            return None, f"executable option book is stale ({age:.2f}s)"
+
+        spread = ask - bid
+        mid = (ask + bid) / 2.0
+        spread_pct = spread / mid * 100.0 if mid > 0 else float("inf")
+        try:
+            max_pct = max(
+                0.0,
+                float(getattr(settings, "option_touch_quote_max_spread_pct", 1.0) or 0.0),
+            )
+            max_ticks = max(
+                0,
+                int(getattr(settings, "option_touch_quote_max_spread_ticks", 40) or 0),
+            )
+        except (TypeError, ValueError):
+            max_pct, max_ticks = 1.0, 40
+        if (max_pct > 0 and spread_pct > max_pct) or (
+            max_ticks > 0 and spread > max_ticks * 0.05 + 1e-9
+        ):
+            return None, f"executable option spread is too wide ({spread_pct:.2f}%)"
+        liquid, reason = self._option_contract_liquidity_admission(
+            inst_type="OPT",
+            lot_size=int(getattr(trade, "lot_size", 1) or 1),
+            touch_quote=quote,
+            trading_symbol=symbol,
+        )
+        if not liquid:
+            return None, reason
+        return dict(quote), ""
+
     def _run_scale_in(
         self, trade: Trade, add_lots: int, quantity: int, price: float, reason: str,
     ) -> None:
         entry_side = "BUY" if trade.inst_type == "OPT" else (
             "BUY" if str(trade.direction).upper() in {"LONG", "BUY"} else "SELL"
         )
+        is_option = str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
+        order_kwargs = self._tag_kwargs(self.broker.place_order, trade, "ADD")
+        order_price = float(price or 0.0)
+        if is_option:
+            touch_quote, touch_reason = self._scale_in_option_touch_quote(trade)
+            if not touch_quote:
+                logger.warning(
+                    f"Option scale-in refused for {trade.trading_symbol}: {touch_reason}; "
+                    "the existing position and protective stop are unchanged."
+                )
+                return
+            order_price = float(touch_quote.get("ask") or 0.0)
+            order_kwargs["touch_quote"] = touch_quote
+            # A non-zero ask plus maximum confidence is a second guard against an
+            # integration disabling touch routing: Kite still chooses LIMIT, never
+            # the old unbounded MARKET add.
+            if self._accepts_kwarg(self.broker.place_order, "trade_id"):
+                order_kwargs["trade_id"] = str(getattr(trade, "id", "") or "")
+            if self._accepts_kwarg(self.broker.place_order, "confidence"):
+                order_kwargs["confidence"] = 1.0
         # Every new entry funnels through _entry_margin_verdict, which both checks the
         # exact Kite order margin against free cash AND reserves it so a concurrent entry
         # cannot spend the same rupees. The add path did neither. The missing reservation
@@ -2769,7 +3365,7 @@ class TradeManager:
         # touches nothing on the parent position — it is still running, still protected by
         # the stop that covers its current quantity.
         preflight = self._entry_margin_verdict(
-            trade.trading_symbol, quantity, entry_side, price
+            trade.trading_symbol, quantity, entry_side, order_price
         )
         if preflight is not None and not preflight.get("ok", True):
             logger.error(
@@ -2787,8 +3383,8 @@ class TradeManager:
         try:
             order_id = self.broker.place_order(
                 trade.trading_symbol, trade.symbol_token, quantity, entry_side,
-                self.product_type, price=0.0,
-                **self._tag_kwargs(self.broker.place_order, trade, "ADD"),
+                self.product_type, price=order_price if is_option else 0.0,
+                **order_kwargs,
             )
         except (BrokerOrderRejected, PermissionError) as exc:
             # Definite refusal: this order consumed nothing, so give the margin back.
@@ -2816,7 +3412,7 @@ class TradeManager:
 
         trade.scale_in_order_id = str(order_id)
         trade.scale_in_requested_quantity = quantity
-        self.save_state()
+        self._mark_dirty()
 
         expected_total = int(trade.broker_quantity or trade.quantity or 0) + quantity
         confirmed = self._confirmed_scaled_quantity(trade, expected_total)
@@ -2828,10 +3424,47 @@ class TradeManager:
             )
             return
 
+        # What the add order actually executed, so the weighted average entry moves by
+        # the quantity that truly arrived. Read through _confirmed_broker_quantity, the
+        # SAME expression _confirmed_scaled_quantity used for its own `prior`: taking
+        # `broker_quantity or trade.quantity` here instead made the two ends disagree on
+        # an unreconciled trade, the subtraction came out 0, and the booking silently
+        # fell back to the requested size -- the very arithmetic this is replacing.
+        filled_now = self._order_filled_quantity(
+            str(getattr(trade, "scale_in_order_id", "") or "")
+        )
+        if filled_now is None:
+            prior_quantity = self._confirmed_broker_quantity(trade)
+            actually_added = max(0, min(int(quantity), int(confirmed) - prior_quantity))
+        else:
+            actually_added = max(0, min(int(quantity), int(filled_now)))
+        if actually_added and actually_added != int(quantity):
+            logger.warning(
+                f"Scale-in on {trade.trading_symbol} filled {actually_added} of "
+                f"{int(quantity)}; weighting the average entry on the filled quantity."
+            )
         with self._lock:
-            self._book_scale_in(trade, add_lots, price, reason)
-            trade.broker_quantity = confirmed or trade.broker_quantity
-        self.save_state()
+            # Same rule as the reduce, and for the same reason: `or None` would make
+            # _book_scale_in size off the REQUESTED lots. An add cannot confirm to 0
+            # today, so this is defensive rather than a live bug — but the two paths
+            # must not disagree about what a 0 means, which is what made the reduce
+            # dangerous in the first place.
+            if actually_added > 0:
+                self._book_scale_in(
+                    trade, add_lots, order_price, reason,
+                    filled_quantity=actually_added,
+                )
+            else:
+                logger.warning(
+                    f"Scale-in on {trade.trading_symbol} added NOTHING — the add order "
+                    "stated a zero fill. Booking no add."
+                )
+            # Same rule as the reduce: UNKNOWN returned above, so this is a stated fact.
+            # An add cannot confirm to 0 today (prior + filled, both non-negative, with
+            # filled > 0 on the order branch), but the two paths must not disagree about
+            # what a 0 MEANS -- that divergence is what made the reduce dangerous.
+            trade.broker_quantity = int(confirmed)
+        self._mark_dirty()
 
         if not self.ensure_broker_protection(trade, trade.broker_quantity):
             self._mark_recovery(
@@ -2888,7 +3521,7 @@ class TradeManager:
     def _entry_mark_admission(
         self, *, inst_type: str, price: float, signal_time: Optional[datetime],
         entry_time: Optional[datetime], touch_quote: Optional[Dict[str, Any]],
-        trading_symbol: str, is_recovery: bool,
+        trading_symbol: str, is_recovery: bool, require_usable_touch: bool = False,
     ) -> Tuple[bool, str]:
         """Refuse an entry built on a pre-open signal or a stale entry mark.
 
@@ -2947,15 +3580,52 @@ class TradeManager:
             return True, ""
         quote = touch_quote if isinstance(touch_quote, dict) else {}
         if not quote or not bool(quote.get("usable", False)):
+            if require_usable_touch:
+                detail = str(quote.get("reason") or "unavailable")
+                return False, (
+                    f"fresh executable option book required on {trading_symbol or inst_type} "
+                    f"(touch quote {detail})"
+                )
             return True, ""
         try:
             bid = float(quote.get("bid") or 0.0)
             ask = float(quote.get("ask") or 0.0)
             mark = float(price or 0.0)
         except (TypeError, ValueError):
+            if require_usable_touch:
+                return False, f"invalid executable option book on {trading_symbol or inst_type}"
             return True, ""
         if mark <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+            if require_usable_touch:
+                return False, f"invalid executable option book on {trading_symbol or inst_type}"
             return True, ""
+        if require_usable_touch:
+            spread = ask - bid
+            mid = (ask + bid) / 2.0
+            spread_pct = (spread / mid * 100.0) if mid > 0 else float("inf")
+            try:
+                max_spread_pct = float(
+                    getattr(settings, "option_touch_quote_max_spread_pct", 1.0) or 1.0
+                )
+            except (TypeError, ValueError):
+                max_spread_pct = 1.0
+            try:
+                max_spread_ticks = int(
+                    getattr(settings, "option_touch_quote_max_spread_ticks", 40) or 40
+                )
+            except (TypeError, ValueError):
+                max_spread_ticks = 40
+            tick_size = 0.05
+            if max_spread_pct > 0 and spread_pct > max_spread_pct:
+                return False, (
+                    f"option book spread {spread_pct:.2f}% exceeds {max_spread_pct:.2f}% "
+                    f"on {trading_symbol or inst_type}"
+                )
+            if max_spread_ticks > 0 and spread > max_spread_ticks * tick_size + 1e-9:
+                return False, (
+                    f"option book spread {spread:.2f} exceeds {max_spread_ticks} ticks "
+                    f"on {trading_symbol or inst_type}"
+                )
         max_mult = float(getattr(settings, "entry_mark_max_ask_multiple", 1.50) or 1.50)
         min_mult = float(getattr(settings, "entry_mark_min_bid_multiple", 0.50) or 0.50)
         if max_mult > 0 and mark > ask * max_mult:
@@ -3279,20 +3949,63 @@ class TradeManager:
         and the distinction matters to the caller, so AMBIGUOUS (two orders sharing a
         tag) escalates rather than being quietly treated as absent.
         """
+        leg_name = str(leg).upper()
+        attempt = (
+            int(getattr(trade, "entry_replace_count", 0) or 0)
+            if leg_name == "ENTRY"
+            else 0
+        )
+        # ENTRY has one format migration that no other leg has: pre-2026-08-16
+        # attempt-zero orders used an underscore.  A restart with a persisted
+        # ENTRY_PENDING/RECOVERY_REQUIRED row has no broker id, so it must query every
+        # owned alias before it can safely reconcile or cancel the resting order.  The
+        # Kite helper reads one order-book snapshot and reports AMBIGUOUS if aliases
+        # resolve to more than one row.
+        entry_inspector = (
+            getattr(self.broker, "inspect_entry_order_for_trade", None)
+            if leg_name == "ENTRY"
+            else None
+        )
+        if callable(entry_inspector):
+            try:
+                result = entry_inspector(trade.id, attempts=max(8, attempt + 1)) or {}
+            except Exception as exc:
+                logger.warning(f"Tagged entry recovery failed for {trade.id}: {exc}")
+                return ""
+            state = str(result.get("state") or "UNKNOWN").upper()
+            matched_tag = str(result.get("tag") or "")
+            if state == "AMBIGUOUS":
+                self._mark_recovery(
+                    trade,
+                    "Multiple broker orders match this trade's entry-tag aliases",
+                )
+                return ""
+            if state != "FOUND":
+                return ""
+            order_id = str(result.get("order_id") or "")
+            if not order_id:
+                self._mark_recovery(
+                    trade,
+                    "Owned entry tag"
+                    + (f" {matched_tag}" if matched_tag else "")
+                    + " was found without an order id",
+                )
+                return ""
+            if matched_tag and matched_tag != self._broker_order_tag(trade, "ENTRY", attempt):
+                logger.info(
+                    f"Recovered {trade.id} entry under a legacy entry tag {matched_tag}."
+                )
+            return order_id
+
         inspector = getattr(self.broker, "inspect_order_by_tag", None)
         if not callable(inspector):
             return ""
-        attempt = (
-            int(getattr(trade, "entry_replace_count", 0) or 0)
-            if str(leg).upper() == "ENTRY"
-            else 0
-        )
         tag = self._broker_order_tag(trade, leg, attempt)
         if not tag:
             return ""
         legacy = [
             self._broker_order_tag(trade, alt, attempt)
-            for alt in self._LEGACY_TAG_LEGS.get(str(leg).upper(), ())
+            for alt in self._LEGACY_TAG_LEGS.get(leg_name, ())
         ]
         result, matched_tag = {}, tag
         for candidate_tag in [tag] + [t for t in legacy if t]:
@@ -3326,19 +4039,40 @@ class TradeManager:
             )
         return order_id
 
-    def _tagged_exit_state(self, trade: Trade) -> str:
-        """FOUND / ABSENT / UNKNOWN for this trade's exit order, by tag."""
+    def _tagged_exit_state(self, trade: Trade, leg: str = "EXIT") -> str:
+        """FOUND / AMBIGUOUS / ABSENT / UNKNOWN for this trade's exit order, by tag.
+
+        Takes the LEG, because the answer is only meaningful about the tag that was
+        actually written. Hardcoding "EXIT" while emergency_flatten_trade sends its order
+        under "RECOVERY_EXIT" did not fail closed: both are valid legs, so it built a
+        real tag string (U1X0<compact>) that nothing ever writes and asked the order book
+        about it. A successful read that does not find a never-written tag answers
+        ABSENT -- so a book positively holding the RECOVERY_EXIT order reported "nothing
+        reached the exchange, a retry is safe", the caller returned before latching, and
+        check_session_end re-dispatched a fresh MARKET exit on every pass.
+
+        ABSENT now requires EVERY candidate tag to be absent. Anything else -- FOUND,
+        AMBIGUOUS, or an unreadable book -- is returned as it stands, because only
+        "definitely not at the exchange" may license another exit.
+        """
         inspector = getattr(self.broker, "inspect_order_by_tag", None)
         if not callable(inspector):
             return "UNKNOWN"
-        tag = self._broker_order_tag(trade, "EXIT", 0)
-        if not tag:
-            return "UNKNOWN"
-        try:
-            return str((inspector(tag) or {}).get("state") or "UNKNOWN").upper()
-        except Exception as exc:
-            logger.warning(f"Tagged exit lookup failed for {trade.id}: {exc}")
-            return "UNKNOWN"
+        candidates = [str(leg or "").upper(), *self._LEGACY_TAG_LEGS.get(str(leg or "").upper(), ())]
+        verdict = "UNKNOWN"
+        for candidate in candidates:
+            tag = self._broker_order_tag(trade, candidate, 0)
+            if not tag:
+                continue
+            try:
+                state = str((inspector(tag) or {}).get("state") or "UNKNOWN").upper()
+            except Exception as exc:
+                logger.warning(f"Tagged exit lookup failed for {trade.id}: {exc}")
+                return "UNKNOWN"
+            if state != "ABSENT":
+                return state
+            verdict = "ABSENT"
+        return verdict
 
     # The states a Kite order can finish in having NOT filled the rest of its quantity.
     # COMPLETE is deliberately absent: it means the full quantity did fill, so a residual
@@ -3568,21 +4302,26 @@ class TradeManager:
                 trade.execution_error = reason
                 trade.exit_reason = "RECOVERY_AUTO_FLATTEN"
                 self._clear_flatten_block(trade)
-                self.save_state()
+                self._mark_dirty()
                 logger.warning(
                     f"Flatten acknowledgement was lost for {trade.trading_symbol}, but "
                     f"its exit tag resolved to order {recovered_exit} — adopted instead "
                     "of latching."
                 )
                 return True
-            if self._tagged_exit_state(trade) == "ABSENT":
+            # The leg this method SENDS (:RECOVERY_EXIT above), not the legacy "EXIT".
+            # _recover_order_id_from_tag has already returned "" by this point, and it
+            # does that for AMBIGUOUS and for FOUND-without-an-order-id as well as for a
+            # genuine absence -- so asking about the wrong tag here turned a POSITIVE
+            # sighting of the flatten order into "a retry is safe".
+            if self._tagged_exit_state(trade, "RECOVERY_EXIT") == "ABSENT":
                 self._mark_recovery(
                     trade,
                     f"{reason}; flatten acknowledgement was lost ({exc}), but the exit "
                     "tag is absent from the order book, so nothing reached the exchange. "
                     "A retry is safe.",
                 )
-                self.save_state()
+                self._mark_dirty()
                 return False
             if not hasattr(self, "_flatten_ambiguous_latched"):
                 self._flatten_ambiguous_latched = set()
@@ -3598,7 +4337,7 @@ class TradeManager:
                 "resting at the exchange. Further automatic exits are latched off for "
                 "this trade until reconciliation proves its net quantity."
             )
-            self.save_state()
+            self._mark_dirty()
             return False
         if not order_id:
             self._withhold_flatten(trade, f"{reason}; emergency flatten order failed")
@@ -3610,7 +4349,7 @@ class TradeManager:
         trade.execution_error = reason
         trade.exit_reason = "RECOVERY_AUTO_FLATTEN"
         self._clear_flatten_block(trade)
-        self.save_state()
+        self._mark_dirty()
         logger.critical(f"Recovery fallback flatten submitted for {trade.trading_symbol}: {order_id}")
         return True
 
@@ -3702,7 +4441,7 @@ class TradeManager:
             "been closed locally as worthless. Verify the realised amount against your "
             "Zerodha P&L — if it settled in the money, this row understates it."
         )
-        self.save_state()
+        self._mark_dirty()
         return True
 
     def reconcile_broker_positions(self, positions_resp: Optional[Dict] = None) -> Dict:
@@ -3721,11 +4460,44 @@ class TradeManager:
             return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
 
         allowed_prefixes = self._reconciliation_symbol_prefixes()
-        broker_pos = {
-            str(row.get("tradingsymbol") or ""): row
-            for row in rows
-            if str(row.get("tradingsymbol") or "") and str(row.get("tradingsymbol") or "").upper().startswith(allowed_prefixes)
-        }
+        # Keyed on tradingsymbol ALONE until 2026-08-16, with no product term, so when a
+        # contract carried more than one product row the comprehension silently kept
+        # whichever happened to come last. Not reachable from this system's own orders —
+        # they all go out under one product — but a manual MIS trade taken on the same
+        # strike from the Kite app puts a second row on that symbol, and reconciliation
+        # is the single authority allowed to close a position. Rank deterministically:
+        # our own product first, then a row that actually holds quantity.
+        wanted_product = ""
+        _mapper = getattr(getattr(self, "broker", None), "_product", None)
+        if callable(_mapper):
+            try:
+                from config.settings import get_settings as _get_settings
+
+                wanted_product = str(
+                    _mapper(getattr(_get_settings(), "trade_product_type", "")) or ""
+                ).upper()
+            except Exception:
+                wanted_product = ""
+
+        def _position_row_rank(row: Dict) -> Tuple[int, int]:
+            product = str(row.get("producttype") or row.get("product") or "").upper()
+            try:
+                held = abs(int(float(row.get("netqty") or row.get("quantity") or 0)))
+            except (TypeError, ValueError):
+                held = 0
+            return (
+                1 if wanted_product and product == wanted_product else 0,
+                1 if held else 0,
+            )
+
+        broker_pos: Dict[str, Dict] = {}
+        for row in rows:
+            symbol = str(row.get("tradingsymbol") or "")
+            if not symbol or not symbol.upper().startswith(allowed_prefixes):
+                continue
+            held_row = broker_pos.get(symbol)
+            if held_row is None or _position_row_rank(row) > _position_row_rank(held_row):
+                broker_pos[symbol] = row
         closed = 0
         confirmed = 0
         changed = False
@@ -3775,6 +4547,29 @@ class TradeManager:
                 and self._confirmed_broker_quantity(trade) <= 0
             ):
                 position = None
+            # Restart-safe entry recovery: a pre-upgrade pending row can have no order
+            # id even while its legacy-tagged order is still resting at Kite.  Recover
+            # the exact id before any status/cancel-replace logic.  This is read-only;
+            # an absent or unreadable book never manufactures a new entry.
+            entry_status = str(getattr(trade, "execution_status", "") or "").upper()
+            if (
+                not str(getattr(trade, "broker_order_id", "") or "").strip()
+                and not bool(getattr(trade, "pending_exit", False))
+                and not bool(getattr(trade, "is_ghost", False))
+                and entry_status in {
+                    "ENTRY_PENDING", "ENTRY_SUBMITTED", "PARTIAL", "RECOVERY_REQUIRED",
+                }
+            ):
+                recovered_entry_id = self._recover_order_id_from_tag(trade, "ENTRY")
+                if recovered_entry_id:
+                    trade.broker_order_id = recovered_entry_id
+                    trade.pending_execution = True
+                    trade.execution_status = "ENTRY_SUBMITTED"
+                    if getattr(trade, "entry_submitted_at", None) is None:
+                        trade.entry_submitted_at = datetime.now(IST)
+                    trade.execution_error = ""
+                    changed = True
+
             order_status = None
             if trade.execution_status == "ENTRY_SUBMITTED" and trade.broker_order_id:
                 getter = getattr(self.broker, "get_order_status", None)
@@ -4068,16 +4863,40 @@ class TradeManager:
                 )
                 realised = position.get("realised")
                 try:
-                    realised_pnl = float(realised) if realised not in (None, "") else None
+                    realised_total = float(realised) if realised not in (None, "") else None
                 except (TypeError, ValueError):
-                    realised_pnl = None
+                    realised_total = None
+                # Kite reports `realised` CUMULATIVELY per contract for the day, not per
+                # trade (2026-08-16). Booking it verbatim meant a second round trip on
+                # the same strike inherited the first trade's P&L on top of its own, and
+                # this figure feeds the daily-loss breaker. Book the DELTA against what
+                # this contract has already had attributed today.
+                realised_pnl = None
+                booked = None
+                key = ""
+                if realised_total is not None:
+                    booked = getattr(self, "_realised_booked_today", None)
+                    if booked is None:
+                        booked = self._realised_booked_today = {}
+                    key = str(getattr(trade, "trading_symbol", "") or "")
+                    realised_pnl = realised_total - float(booked.get(key, 0.0) or 0.0)
                 if self._finalize_closed_trade(
                     trade_id,
                     trade,
-                    self._position_exit_price(trade, position),
+                    self._reconciled_exit_price(trade, position),
                     reason,
                     realised_pnl=realised_pnl,
+                    broker_realised_cumulative=realised_total,
                 ):
+                    # Stamp the baseline ONLY after a close that actually happened. The
+                    # first cut of this advanced it BEFORE the call, and
+                    # _finalize_closed_trade returns False when the trade has already
+                    # left open_trades (line 1281) — so on that path the baseline moved
+                    # for a trade that never closed and the NEXT close on the same
+                    # contract booked a zero delta, losing its P&L entirely. That is
+                    # worse than the cumulative-double-count this delta exists to fix.
+                    if booked is not None and key:
+                        booked[key] = realised_total
                     closed += 1
                 continue
             if (
@@ -4228,7 +5047,7 @@ class TradeManager:
                     + ", ".join(sorted(orphans))
                 )
         if changed:
-            self.save_state()
+            self._mark_dirty()
         return {
             "checked": True,
             "orphans": len(orphans),
@@ -4248,7 +5067,7 @@ class TradeManager:
         # If we want to move EXISTING stops, we would loop through self.open_trades here.
         logger.info(f"🛡️ Risk Settings Synced: FUT SL={self.futures_sl_pct}%, OPT SL={self.options_sl_pct}%")
 
-    def save_state(self):
+    def save_state(self) -> bool:
         """Save active and recent closed trades to SQLite for crash recovery"""
         try:
             with self._lock:
@@ -4258,12 +5077,168 @@ class TradeManager:
                 snapshot = [t.to_dict() for t in open_tr + closed]
                 db.save_trades(snapshot)
         except Exception as e:
+            self._mark_dirty()
             logger.error(f"Failed to save trade state to DB: {e}")
+            raise
+        return True
+
+    @staticmethod
+    def _realised_baseline_from_closed_trades(
+        closed_trades: List[Trade], session_date: Optional[date] = None
+    ) -> Dict[str, float]:
+        """Rebuild Kite's consumed cumulative-realised totals for one session.
+
+        New rows carry the exact cumulative value observed after the close. For rows
+        written before that field existed, net P&L plus stored charges reconstructs the
+        gross broker delta. An exact observation supersedes earlier inference because its
+        cumulative total already includes those closes; later legacy rows advance it.
+        """
+        target_date = session_date or datetime.now(IST).date()
+        events: Dict[str, List[Tuple[datetime, Optional[float], float]]] = {}
+
+        for trade in closed_trades or []:
+            symbol = str(getattr(trade, "trading_symbol", "") or "").strip()
+            exited = getattr(trade, "exit_time", None)
+            if not symbol or exited is None or bool(getattr(trade, "is_ghost", False)):
+                continue
+            if isinstance(exited, str):
+                try:
+                    exited = datetime.fromisoformat(exited)
+                except (TypeError, ValueError):
+                    continue
+            if not isinstance(exited, datetime):
+                continue
+            exited_local = IST.localize(exited) if exited.tzinfo is None else exited.astimezone(IST)
+            if exited_local.date() != target_date:
+                continue
+
+            cumulative = getattr(trade, "broker_realised_cumulative", None)
+            if cumulative is not None:
+                try:
+                    measured = float(cumulative)
+                except (TypeError, ValueError):
+                    continue
+                events.setdefault(symbol, []).append((exited_local, measured, 0.0))
+                continue
+
+            # Backward compatibility for same-day rows created before the explicit
+            # cumulative field was deployed. Closed trade.pnl is net of charges.
+            try:
+                gross_delta = float(getattr(trade, "pnl", 0.0) or 0.0) + float(
+                    getattr(trade, "charges", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                continue
+            events.setdefault(symbol, []).append((exited_local, None, gross_delta))
+
+        restored: Dict[str, float] = {}
+        for symbol, rows in events.items():
+            consumed = 0.0
+            for _, measured, inferred_delta in sorted(rows, key=lambda row: row[0]):
+                # An exact cumulative observation supersedes every earlier inference;
+                # a later legacy/missing-realised row must still advance that baseline.
+                consumed = measured if measured is not None else consumed + inferred_delta
+            restored[symbol] = consumed
+        return restored
+
+    @staticmethod
+    def _drop_delisted_open_records(records):
+        """Refuse only the known persisted test-fixture signature.
+
+        2026-08-19: four rows sat OPEN across six restarts and produced a dashboard
+        reading of DAILY P&L Rs.199,081 on 4 trades with W/L 0/0 —
+
+            T-MIDCPNIFTY  MIDCPNIFTY25AUG12800CE   88.15 -> mark 1118.94  +Rs.123,180
+            T-BANKNIFTY   BANKNIFTY25AUG52000CE   213.30 -> mark 2795.64  + Rs.89,986
+            T-SENSEX      SENSEX25AUG81000CE      301.60 -> mark    0.05  -  Rs.6,129
+            T-NIFTY       NIFTY25AUG24500CE       104.75 -> mark    0.05  -  Rs.7,956
+
+        Fixtures, not trades: ids T-<INDEX>, broker ids O-<INDEX>, symbol_token '1' on
+        all four, all written inside 17ms at 01:57:35, no provenance. The live series
+        was 26AUG; these are 25AUG. Marked to today's spot, an expired deep-ITM call
+        invents six figures.
+
+        Deleting the rows does not hold — this process re-persists them from memory
+        within seconds, with byte-identical entry_filled_at stamps. They have to be
+        refused at LOAD.
+
+        Current-listing absence is necessary but not sufficient. A carried position can
+        temporarily be absent from a stale/incomplete instrument dump, and the broker's
+        position book is authoritative for exposure. Therefore a normal or legacy OPEN
+        row must survive for reconciliation even when its symbol is absent. The only rows
+        removed here are the four recorded fixtures whose synthetic id/order-id/token and
+        empty provenance jointly prove that they were never broker positions.
+
+        This lives here rather than in db.load_open_trades because that is a plain
+        accessor: "save a row then read it back" has to keep meaning exactly that.
+
+        Fails OPEN throughout — no listing, an unreadable or truncated one, a row with no
+        symbol, or any row without the complete fixture fingerprint is kept.
+        """
+        try:
+            tradable = db.__class__._tradable_symbols()
+        except Exception as exc:
+            logger.warning(f"Delisted-contract check skipped: {exc}")
+            return records
+        if not tradable:
+            return records
+
+        live = []
+        for record in records:
+            symbol = str((record or {}).get("trading_symbol") or "").strip()
+            trade_id = str((record or {}).get("id") or "").strip().upper()
+            fixture_index = trade_id[2:] if trade_id.startswith("T-") else ""
+            known_fixture = (
+                fixture_index in {"NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"}
+                and str((record or {}).get("broker_order_id") or "").strip().upper()
+                == f"O-{fixture_index}"
+                and str((record or {}).get("symbol_token") or "").strip() == "1"
+                and not str((record or {}).get("data_provenance") or "").strip()
+            )
+            if symbol and symbol not in tradable and known_fixture:
+                logger.warning(
+                    f"Refusing to restore known test fixture {(record or {}).get('id')} "
+                    f"{symbol}: its synthetic order/token fingerprint is not broker "
+                    f"exposure and its Rs.{float((record or {}).get('pnl') or 0.0):,.0f} "
+                    "would otherwise be marked to live spot and counted in the total."
+                )
+                continue
+            if symbol and symbol not in tradable:
+                logger.critical(
+                    f"Retaining unlisted OPEN recovery row {(record or {}).get('id')} "
+                    f"{symbol} until authoritative broker reconciliation; listing "
+                    "absence alone does not prove the position is flat."
+                )
+            live.append(record)
+        return live
 
     def load_state(self):
         """Load state from SQLite on startup"""
         try:
-            open_records = db.load_open_trades()
+            self._realised_booked_today = {}
+            stored_open_records = db.load_open_trades()
+            open_records = self._drop_delisted_open_records(stored_open_records)
+            kept_ids = {str((row or {}).get("id") or "") for row in open_records}
+            quarantined_ids = [
+                str((row or {}).get("id") or "")
+                for row in stored_open_records
+                if str((row or {}).get("id") or "") not in kept_ids
+            ]
+            if quarantined_ids:
+                try:
+                    changed = db.quarantine_open_trades(
+                        quarantined_ids,
+                        "Known synthetic fixture fingerprint; contract absent from current instrument listing",
+                    )
+                    logger.warning(
+                        f"Quarantined {changed} invalid OPEN recovery row(s); they cannot resurrect on restart."
+                    )
+                except Exception as exc:
+                    # Keep the proven-invalid rows out of this process even if the DB
+                    # update fails, but make the next-restart hazard impossible to miss.
+                    logger.critical(
+                        f"Failed to quarantine invalid OPEN recovery rows {quarantined_ids}: {exc}"
+                    )
             closed_records = db.load_closed_trades()
             
             stale_ghosts = 0
@@ -4357,7 +5332,7 @@ class TradeManager:
                     "STALE_SESSION_END on load (no broker reconciliation applies)."
                 )
                 try:
-                    self.save_state()
+                    self._mark_dirty()
                 except Exception:
                     pass
             if auto_closed_missing_contracts:
@@ -4365,7 +5340,7 @@ class TradeManager:
                     f"Closed {auto_closed_missing_contracts} trade(s) with missing broker contract metadata on load."
                 )
                 try:
-                    self.save_state()
+                    self._mark_dirty()
                 except Exception:
                     pass
 
@@ -4376,6 +5351,11 @@ class TradeManager:
                     self.closed_trades.append(t)
                 except Exception as e:
                     logger.warning(f"Failed to parse historical trade: {e}")
+
+            self._realised_booked_today = self._realised_baseline_from_closed_trades(
+                self.closed_trades,
+                datetime.now(IST).date(),
+            )
             
             self._recover_trade_counter()
             if self.open_trades or self.closed_trades:
@@ -4442,6 +5422,12 @@ class TradeManager:
         """
         stale_ghosts: List[Trade] = []
         with self._lock:
+            # Kite reports position `realised` cumulatively PER DAY, and the delta
+            # baseline that turns it into a per-trade figure is only valid within one
+            # session. Left standing across a rollover, day 2's first exit on a strike
+            # also traded on day 1 books (today - yesterday) and is wrong by the whole
+            # of yesterday's P&L on that contract.
+            self._realised_booked_today = {}
             closed = len(self.closed_trades)
             for tid, trade in list(self.open_trades.items()):
                 if bool(getattr(trade, "is_ghost", False)):
@@ -4464,7 +5450,7 @@ class TradeManager:
                     trade.execution_status = "RECOVERY_REQUIRED"
                     trade.execution_error = "Previous-session trade requires broker reconciliation"
             active = len(self.open_trades)
-        self.save_state()
+        self._mark_dirty()
         if stale_ghosts:
             logger.info(
                 f"Session rollover closed {len(stale_ghosts)} ghost/shadow trade(s) as "
@@ -4571,6 +5557,7 @@ class TradeManager:
         data_provenance: str = "",
         price_action_verdict: str = "",
         intelligence_score: float = 0.0,
+        entry_intelligence_score: Optional[float] = None,
         entry_momentum_urgency: float = 0.0,
         strategy_revision: str = "",
         strategy_direction_mode: str = "",
@@ -4609,14 +5596,32 @@ class TradeManager:
             # Is the price we are about to trade on real? Checked before anything sizes,
             # logs or reaches the broker, because a stale mark poisons the stop, the
             # target and every P&L reading derived from them.
+            require_usable_touch = (
+                self._live_orders_permitted()
+                and str(exec_type or "").upper() in {"A", "AUTO"}
+                and not is_ghost
+                and not bool(getattr(self, "is_warmup", False))
+            )
             mark_ok, mark_reason = self._entry_mark_admission(
                 inst_type=inst_type, price=price, signal_time=signal_time,
                 entry_time=now, touch_quote=execution_touch_quote,
                 trading_symbol=trading_symbol, is_recovery=is_recovery,
+                require_usable_touch=require_usable_touch,
             )
             if not mark_ok:
                 logger.warning(f"Entry refused on mark validation: {mark_reason}")
                 self._log_ui(f"Entry refused: {mark_reason}", "warning")
+                return None
+            liquid_ok, liquid_reason = self._option_contract_liquidity_admission(
+                inst_type=inst_type,
+                lot_size=lot_size,
+                touch_quote=execution_touch_quote,
+                trading_symbol=trading_symbol,
+                is_recovery=is_recovery,
+            )
+            if not liquid_ok:
+                logger.warning(f"Entry refused on option liquidity: {liquid_reason}")
+                self._log_ui(f"Entry refused: {liquid_reason}", "warning")
                 return None
             # Would accepting this candidate make the BOOK unsafe at its configured
             # stops? can_open_trade counts positions; the circuit breaker measures a book
@@ -4640,6 +5645,15 @@ class TradeManager:
                 trade_id = f"T{self._trade_counter:04d}_{instrument}_{now.strftime('%m%d%H%M')}"
                 if trade_id not in known_ids:
                     break
+
+        # intelligence_score was the historical entry-telemetry parameter.  Keep it
+        # as an alias for older callers and archives, but give the frozen entry value
+        # an explicit name so decision code cannot confuse it with fresh exit context.
+        resolved_entry_intelligence_score = (
+            intelligence_score
+            if entry_intelligence_score is None
+            else entry_intelligence_score
+        )
 
         trade = Trade(
             id=trade_id,
@@ -4685,7 +5699,8 @@ class TradeManager:
             market_regime=str(market_regime or ""),
             data_provenance=str(data_provenance or ""),
             price_action_verdict=str(price_action_verdict or ""),
-            intelligence_score=float(intelligence_score or 0.0),
+            entry_intelligence_score=float(resolved_entry_intelligence_score or 0.0),
+            intelligence_score=float(resolved_entry_intelligence_score or 0.0),
             strategy_revision=str(strategy_revision or ""),
             strategy_direction_mode=str(strategy_direction_mode or ""),
             market_wide_reversal_entry=market_wide_reversal_entry,
@@ -4718,7 +5733,10 @@ class TradeManager:
                 logger.warning(f"Cannot reserve trade after concurrent update: {reason}")
                 return None
             self.open_trades[trade_id] = trade
-        self.save_state()
+            # A new position exists; reconcile now instead of after the sync loop's
+            # remaining wait, which is the 30s IDLE interval before the day's first entry.
+            self.nudge_position_sync()
+        self._mark_dirty()
 
         qty = lots * lot_size
         logger.info(
@@ -4764,6 +5782,17 @@ class TradeManager:
                     reservation_id = str((preflight or {}).get("reservation_id") or "")
                     if reservation_id:
                         reservations.append(reservation_id)
+                    # Start the acknowledgement/fill clock BEFORE the first broker
+                    # submission. Stamping after place_order returned excluded the whole
+                    # API round trip and left no timestamp at all while a slow/ambiguous
+                    # request was in flight. Retries preserve the first attempt's time.
+                    stamped_submission = False
+                    with self._lock:
+                        if trade.entry_submitted_at is None:
+                            trade.entry_submitted_at = datetime.now(IST)
+                            stamped_submission = True
+                    if stamped_submission:
+                        self._mark_dirty()
                     try:
                         return self.broker.place_order(
                             symbol=trading_symbol,
@@ -4813,10 +5842,11 @@ class TradeManager:
                         if trade.id in self.open_trades:
                             trade.broker_order_id = order_id
                             trade.pending_execution = True
-                            trade.entry_submitted_at = datetime.now(IST)
+                            if trade.entry_submitted_at is None:
+                                trade.entry_submitted_at = datetime.now(IST)
                             trade.execution_status = "ENTRY_SUBMITTED"
                             trade.execution_error = ""
-                    self.save_state()
+                    self._mark_dirty()
                     if on_execution_result:
                         on_execution_result(trade, True)
                     msg = (
@@ -4838,10 +5868,11 @@ class TradeManager:
                     with self._lock:
                         if trade.id in self.open_trades:
                             trade.pending_execution = True
-                            trade.entry_submitted_at = datetime.now(IST)
+                            if trade.entry_submitted_at is None:
+                                trade.entry_submitted_at = datetime.now(IST)
                             trade.execution_status = "RECOVERY_REQUIRED"
                             trade.execution_error = error or "Broker entry acknowledgement ambiguous"
-                    self.save_state()
+                    self._mark_dirty()
                     if on_execution_result:
                         on_execution_result(trade, False)
                     return
@@ -4869,7 +5900,7 @@ class TradeManager:
                         trade.execution_error = error
                         self.closed_trades.append(trade)
                         del self.open_trades[trade.id]
-                self.save_state()
+                self._mark_dirty()
                 if on_execution_result:
                     on_execution_result(trade, False)
             
@@ -4930,7 +5961,7 @@ class TradeManager:
                         trade.execution_error = error
                         self.closed_trades.append(trade)
                         del self.open_trades[trade.id]
-                self.save_state()
+                self._mark_dirty()
                 if on_execution_result:
                     on_execution_result(trade, False)
         else:
@@ -4949,7 +5980,7 @@ class TradeManager:
                     trade.exit_price = trade.entry_price
                     self.closed_trades.append(trade)
                     self.open_trades.pop(trade.id, None)
-                self.save_state()
+                self._mark_dirty()
                 if on_execution_result:
                     on_execution_result(trade, False)
             else:
@@ -4968,6 +5999,7 @@ class TradeManager:
         current_time: Optional[datetime] = None,
         real_premium: Optional[float] = None,
         real_fut_price: Optional[float] = None,
+        quote_verified: Optional[bool] = None,
     ):
         """
         Update trade with latest price and trailing stop from 1-min data.
@@ -5039,7 +6071,7 @@ class TradeManager:
         #   * OPT: new_trailing_stop is PREMIUM space (scanner converts spot→prem)
         #   * FUT: new_trailing_stop is CONTRACT price space
         # Dual spot*delta math was removed; scanner owns spot→premium mapping.
-        if new_trailing_stop is not None:
+        if new_trailing_stop is not None and (not is_option or quote_verified is not False):
             try:
                 incoming_stop = float(new_trailing_stop)
             except (TypeError, ValueError):
@@ -5065,6 +6097,17 @@ class TradeManager:
                     "Broker protection unavailable",
                 )
 
+        if is_option and quote_verified is False:
+            # Synthetic delta/theta marks are useful for display continuity, but they
+            # are not executable prices. They must not ratchet persisted peaks/stops or
+            # trigger a real strategy close while the contract book is stale/missing.
+            setattr(trade, "quote_verified", False)
+            now = time.monotonic()
+            if now - float(getattr(self, "_last_mark_to_market_save", 0.0) or 0.0) >= 1.0:
+                self._last_mark_to_market_save = now
+                self._mark_dirty()
+            return
+
         # Keep open-trade mark-to-market consistent with risk-manager net P&L.
         trade.pnl = trade.unrealized_pnl
 
@@ -5077,7 +6120,7 @@ class TradeManager:
             now = time.monotonic()
             if now - self._last_mark_to_market_save >= 1.0:
                 self._last_mark_to_market_save = now
-                self.save_state()
+                self._mark_dirty()
             return
 
         # ── EXIT CHECKS (Stop Loss, Target, Early Loss-Guard) ──
@@ -5091,7 +6134,9 @@ class TradeManager:
         # Early loss-guard backstop (R2): use scanner-published loss_guard_cut_r
         # when present (intel-accelerated); else base 0.8R settings.
         cut_override = getattr(trade, "loss_guard_cut_r", None)
-        if self._early_loss_cut_hit(trade, cut_r_override=cut_override):
+        if self._early_loss_cut_min_hold_met(trade) and self._early_loss_cut_hit(
+            trade, cut_r_override=cut_override
+        ):
             self.close_trade(
                 trade_id, trade.current_price, "EARLY_LOSS_CUT", exit_time=current_time
             )
@@ -5120,7 +6165,7 @@ class TradeManager:
             now = time.monotonic()
             if now - self._last_mark_to_market_save >= checkpoint:
                 self._last_mark_to_market_save = now
-                self.save_state()
+                self._mark_dirty()
 
     @staticmethod
     def _option_premium_quote_plausible(trade: Trade, premium: float, current_spot: float = 0.0) -> bool:
@@ -5150,6 +6195,53 @@ class TradeManager:
             bounds.append(intrinsic + spot * 0.05)
             bounds.append(spot * 0.12)
         return premium <= max(bounds)
+
+    def _early_loss_cut_min_hold_met(self, trade: "Trade") -> bool:
+        """False while a live position is younger than the early-loss-cut hold.
+
+        `_early_loss_cut_hit` is pure arithmetic and has two callers. The scanner's
+        _loss_guard_decision (scanner.py:16658) has carried a 15s hold, a give-back
+        deferral and a cost floor since 2026-08-16 (scanner.py:16589-16601). This
+        backstop, reached from update_trade on every monitor tick, closes the trade
+        before that path is ever consulted — so without the same hold none of those
+        guards bind in the live lane.
+
+        Deliberately the short 15s hold and not LOSS_THREAT's 60s: this exit exists
+        to be fast, so the longer hold would disable it rather than guard it. The R
+        thresholds and the hard stop are untouched.
+
+        Absence never blocks — no entry stamp, an unreadable one, or a clock behind
+        the fill all return True, the same never-conclude-from-absence rule the
+        scanner-side holds follow. A replay keeps the old behaviour because "now"
+        is meaningless there.
+        """
+        try:
+            from config.settings import get_settings
+
+            min_hold = float(
+                getattr(get_settings(), "early_loss_cut_min_hold_seconds", 15.0) or 0.0
+            )
+        except Exception:
+            return True
+        if min_hold <= 0:
+            return True
+        if str(getattr(self, "mode", "HISTORICAL") or "").upper() != "REAL":
+            return True
+        entered = getattr(trade, "entry_filled_at", None) or getattr(
+            trade, "entry_time", None
+        )
+        if entered is None:
+            return True
+        try:
+            ref = entered if getattr(entered, "tzinfo", None) else IST.localize(entered)
+            held = (datetime.now(IST) - ref).total_seconds()
+        except Exception:
+            return True
+        # A negative age means the clock disagrees with the fill; direction-safety
+        # says an inconsistent clock may not manufacture a young position.
+        if held != held or held < 0:
+            return True
+        return held >= min_hold
 
     @staticmethod
     def _early_loss_cut_hit(trade: "Trade", cut_r_override: Optional[float] = None) -> bool:
@@ -5299,12 +6391,12 @@ class TradeManager:
                         "Protective stop cancellation unconfirmed; market exit withheld to avoid over-exit",
                     )
                     trade.pending_exit = False
-                    self.save_state()
+                    self._mark_dirty()
                     if on_exit_result:
                         on_exit_result(trade, False)
                     return
                 trade.protective_order_id = ""
-                self.save_state()
+                self._mark_dirty()
 
             exit_tag_kwargs = self._tag_kwargs(broker.close_order, trade, "FULL_EXIT")
 
@@ -5335,7 +6427,7 @@ class TradeManager:
                     trade.exit_order_id = order_id
                     trade.execution_status = "EXIT_PENDING"
                     trade.execution_error = ""
-                self.save_state()
+                self._mark_dirty()
                 if getattr(self, "mode", "HISTORICAL") != "REAL":
                     self._finalize_closed_trade(
                         trade.id,
@@ -5357,7 +6449,7 @@ class TradeManager:
                 trade.pending_exit = False
                 trade.execution_status = "EXIT_FAILED"
                 trade.execution_error = last_error or "Unknown broker exit failure"
-            self.save_state()
+            self._mark_dirty()
             logger.critical(
                 f"[BROKER CLOSE FAILED] Position remains active for "
                 f"{trade.trading_symbol} after {attempts} attempts: "
@@ -5407,7 +6499,7 @@ class TradeManager:
                 "Execution queue refused the exit task, so no exit order was ever sent. "
                 "The position is still open at the broker.",
             )
-            self.save_state()
+            self._mark_dirty()
             logger.critical(
                 f"[EXIT NEVER QUEUED] {trade.trading_symbol} still holds a live position: "
                 "the execution queue rejected the close task, so no order reached the "
@@ -5508,7 +6600,7 @@ class TradeManager:
                     "REAL position cannot be closed without broker access and symbol token"
                 )
                 trade.pending_exit = False
-                self.save_state()
+                self._mark_dirty()
                 if on_exit_result:
                     on_exit_result(trade, False)
                 return False
@@ -5538,7 +6630,7 @@ class TradeManager:
                     "REAL position cannot be closed without broker access and symbol token"
                 )
                 trade.pending_exit = False
-                self.save_state()
+                self._mark_dirty()
                 if on_exit_result:
                     on_exit_result(trade, False)
                 return False
@@ -5549,7 +6641,7 @@ class TradeManager:
             trade.pending_exit = True
             trade.execution_status = "EXIT_PENDING"
             trade.execution_error = ""
-        self.save_state()
+        self._mark_dirty()
 
         if (self._live_orders_permitted() and self.broker and trade.symbol_token
                 and not getattr(trade, 'is_ghost', False)):
@@ -5913,7 +7005,7 @@ class TradeManager:
                 if not already_marked:
                     marked += 1
         if marked:
-            self.save_state()
+            self._mark_dirty()
             try:
                 self.reconcile_broker_positions()
             except Exception as exc:

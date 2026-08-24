@@ -12,6 +12,13 @@ indices ever refreshing, and the other three carried zero all session.
 
 Two things fix it and both are asserted here: the in-flight guard is PER INDEX, and the
 throttle is stamped only once a dispatch is certain.
+
+The fixture below resolves the CASH feed. The refresh dispatch is what these tests are
+about and it is source-agnostic, but only cash volume lands in `_index_cum_volume` now —
+near-month futures are a different unit from the shares an index candle's volume column
+holds, so they are recorded for telemetry and never ticked. See
+test_futures_volume_never_ticks_into_index_candles_2026_08_14.py. The same race is
+asserted for the fallback store at the bottom of this file.
 """
 import threading
 import time
@@ -23,11 +30,12 @@ from data.market_data import MarketDataProvider
 NAMES = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
 
 
-def _provider(latency=0.0, source="kite_index_futures", volume=2_326_415.0):
+def _provider(latency=0.0, source="fyers_index", volume=409_196_200.0):
     p = MarketDataProvider.__new__(MarketDataProvider)
     p._index_cum_volume = {}
     p._index_cum_volume_source = {}
     p._index_cum_volume_at = {}
+    p._index_futures_fallback = {}
     p._index_futures_volume_at = {}
     p._index_volume_refresh_guard = threading.Lock()
     p._index_volume_refresh_inflight = set()
@@ -105,11 +113,31 @@ def test_the_throttle_still_applies_between_refreshes():
 
 
 def test_an_unusable_source_is_not_stored():
-    """A 'none' source must not be mistaken for real volume."""
+    """A 'none' source must not be mistaken for real volume — in either store."""
     provider = _provider(latency=0.0, source="none", volume=0.0)
     _tick_all(provider)
     time.sleep(0.4)
     assert all(not provider._index_cum_volume.get(n) for n in NAMES)
+    assert provider._index_futures_fallback == {}
+
+
+@pytest.mark.parametrize("latency", [0.0, 0.5])
+def test_the_fallback_store_refreshes_per_index_too(latency):
+    """The race this file exists for is in the dispatch, so it outlives the unit split.
+
+    Futures volume no longer reaches `_index_cum_volume`, but it is still resolved once
+    per index for the health endpoint and the OI read. If the per-index guard regressed,
+    three of four indices would report no fallback at all — the same 1-of-4 starvation,
+    just moved to the telemetry the operator uses to notice the outage.
+    """
+    provider = _provider(latency=latency, source="kite_index_futures", volume=2_326_415.0)
+    _tick_all(provider)
+    time.sleep(latency + 0.5)
+    recorded = sorted(n for n in NAMES if provider._index_futures_fallback.get(n))
+    assert recorded == sorted(NAMES), f"only {len(recorded)}/4 resolved the fallback"
+    assert all(not provider._index_cum_volume.get(n) for n in NAMES), (
+        "contracts reached the cash total that gets ticked into candles"
+    )
 
 
 def test_a_failing_refresh_releases_its_slot():

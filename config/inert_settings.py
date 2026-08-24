@@ -36,12 +36,6 @@ INERT: dict[str, str] = {
     # ── entry execution pricing ──────────────────────────────────────────────
     "option_limit_buffer_pct": "Entry limit pricing does not read it.",
     "option_limit_buffer_min_ticks": "Entry limit pricing does not read it.",
-    "option_touch_limit_extra_ticks": "Touch-quote pricing does not read it.",
-    "option_touch_quote_max_spread_pct": (
-        "No spread ceiling is applied to an ENTRY touch quote. spread_aware_exit_enabled "
-        "covers exits only."
-    ),
-    "option_touch_quote_max_spread_ticks": "Same: no entry-side spread ceiling exists.",
     "fut_entry_protection_limit_enabled": "No futures entry-protection limit path exists.",
     "fut_limit_buffer_bps": "Named in a settings.py comment describing a path that was never built.",
     "entry_pre_submit_lot_validation_timeout_seconds": "No pre-submit lot validation exists.",

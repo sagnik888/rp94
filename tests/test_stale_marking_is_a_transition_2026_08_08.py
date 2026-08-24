@@ -47,6 +47,9 @@ class _Manager:
     def save_state(self):
         self.saves += 1
 
+    def _mark_dirty(self):
+        self.saves += 1
+
     def reconcile_broker_positions(self):
         self.reconciles += 1
 

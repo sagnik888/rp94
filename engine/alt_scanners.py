@@ -1097,6 +1097,6 @@ def build_scanner_engine(tf_params: dict):
         auto_adx = float(getattr(_s, "scanner_auto_trend_adx", 25.0) or 25.0)
     except Exception:
         mode = "utbot"
-    if mode in {"consensus", "ema", "auto", "utbot_ema", "utbot_consensus", "quad_union", "utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}:
+    if mode in {"consensus", "ema", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual"}:
         return AltSignalEngine(signal_source=mode, auto_trend_adx=auto_adx, **tf_params)
     return UTBotEngine(**tf_params)

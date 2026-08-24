@@ -106,8 +106,6 @@ def test_engine_specific_chart_overlays():
         return [o["name"] for o in ov]
     assert names("ema") == ["EMA 9", "EMA 21"]
     assert any("Supertrend" in n for n in names("consensus")) and "EMA 21" in names("consensus")
-    auto = names("auto")
-    assert "EMA 9" in auto and "EMA 21" in auto and any("Supertrend" in n for n in auto)
     # utbot has no alt overlays (its trailing-stop line is its indicator)
     assert UTBotEngine(**_PARAMS).process(df=df, instrument="NIFTY", timeframe="5min",
         capital=600000, risk_pct=1.5, lots=1, lot_size=75).get("indicator_overlays") in (None, [])
@@ -123,7 +121,7 @@ def test_code_default_scanner_engine_is_quad_prime():
 
 
 def test_factory_returns_alt_for_ema_consensus_auto(settings_engine):
-    for mode in ("ema", "consensus", "auto", "quad_union", "utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"):
+    for mode in ("ema", "consensus", "quad_union", "quad_prime", "adaptive_dual"):
         settings_engine.scanner_engine = mode
         e = build_scanner_engine(dict(_PARAMS))
         assert isinstance(e, AltSignalEngine) and e.signal_source == mode
@@ -154,29 +152,13 @@ def test_alt_engine_fallback_logs_warning(monkeypatch):
     assert "timeframe=5min" in warnings[0]
 
 
-def test_auto_blends_consensus_on_trend_and_ema_on_chop(settings_engine):
-    df = _trending_df()
-    auto = AltSignalEngine(signal_source="auto", auto_trend_adx=25.0, **_PARAMS)
-    r = _process(auto, df)
-    assert "error" not in r and isinstance(r.get("signals"), list)
-    # Auto is a per-bar blend, so its signal count sits between consensus (fewest)
-    # and ema (more) — never noisier than ema, never sparser than consensus.
-    n_ema = len(_process(AltSignalEngine(signal_source="ema", **_PARAMS), df)["signals"])
-    n_con = len(_process(AltSignalEngine(signal_source="consensus", **_PARAMS), df)["signals"])
-    n_auto = len(r["signals"])
-    assert min(n_ema, n_con) <= n_auto <= max(n_ema, n_con) + 2  # +2 tolerance for boundary flips
-    for s in r["signals"]:
-        for k in ("open", "high", "low", "close"):
-            assert k in s.raw_candle
-
-
 def test_combo_engine_unions_utbot_and_partner_flips():
     # Combo modes run BOTH UT1 and the partner (ema/consensus) and feed the UNION of
     # their flips downstream — so the system gets UTBot's frequency PLUS the partner's
     # entries. The union is de-duped, so it sits between max(each) and the sum of both.
     df = _trending_df()
     n_ut = len(_process(UTBotEngine(**_PARAMS), df)["signals"])
-    for partner, combo in (("ema", "utbot_ema"), ("consensus", "utbot_consensus")):
+    for partner, combo in (("consensus", "utbot_consensus"),):
         n_p = len(_process(AltSignalEngine(signal_source=partner, **_PARAMS), df)["signals"])
         r = _process(AltSignalEngine(signal_source=combo, **_PARAMS), df)
         n_c = len(r["signals"])
@@ -199,7 +181,7 @@ def test_combo_engine_shows_partner_overlays_and_routes_via_factory(settings_eng
     names = [o["name"] for o in uc["indicator_overlays"]]
     assert any("Supertrend" in n for n in names) and "EMA 9" in names and "EMA 21" in names
     # factory + set_scanner_engine accept combo modes
-    for mode in ("utbot_ema", "utbot_consensus"):
+    for mode in ("utbot_consensus",):
         settings_engine.scanner_engine = mode
         e = build_scanner_engine(dict(_PARAMS))
         assert isinstance(e, AltSignalEngine) and e.signal_source == mode
@@ -282,87 +264,7 @@ def test_quad_prime_uses_all_raw_entry_sources_with_factory(settings_engine):
     assert isinstance(e, AltSignalEngine) and e.signal_source == "quad_prime"
 
 
-def test_utbot_prime_keeps_utbot_entries_and_adds_trend_agreement(settings_engine):
-    df = _swing_df()
-    ut = _process(UTBotEngine(**_PARAMS), df)
-    prime = _process(AltSignalEngine(signal_source="utbot_prime", **_PARAMS), df)
 
-    ut_keys = [(int(s.bar_index), s.signal_type) for s in ut["signals"]]
-    prime_keys = [(int(s.bar_index), s.signal_type) for s in prime["signals"]]
-    assert prime_keys == ut_keys
-    assert prime["signals"], "UT1 Prime should keep UT1 flip frequency"
-
-    for signal in prime["signals"]:
-        assert signal.source_engine == "utbot"
-        assert 0 <= int(getattr(signal, "trend_agreement", -1)) <= 3
-        assert (getattr(signal, "source_engines", []) or [""])[0] == "utbot"
-        assert "close" in signal.raw_candle
-
-    names = [o["name"] for o in prime["indicator_overlays"]]
-    assert "EMA 9" in names and "EMA 21" in names and any("Supertrend" in n for n in names)
-
-    settings_engine.scanner_engine = "utbot_prime"
-    e = build_scanner_engine(dict(_PARAMS))
-    assert isinstance(e, AltSignalEngine) and e.signal_source == "utbot_prime"
-
-
-def test_adaptive_hybrid_filters_union_and_annotates_route(settings_engine):
-    df = _swing_df()
-    quad = _process(AltSignalEngine(signal_source="quad_union", **_PARAMS), df)
-    hybrid = _process(AltSignalEngine(signal_source="adaptive_hybrid", **_PARAMS), df)
-
-    assert "error" not in hybrid
-    assert hybrid["signals"], "adaptive hybrid should emit vetted meta-routed flips"
-    assert len(hybrid["signals"]) <= len(quad["signals"])
-    for signal in hybrid["signals"]:
-        assert signal.source_engine == "adaptive_hybrid"
-        assert getattr(signal, "adaptive_hybrid_route", "")
-        assert 0 <= int(getattr(signal, "trend_agreement", -1)) <= 3
-        assert "close" in signal.raw_candle
-
-    names = [o["name"] for o in hybrid["indicator_overlays"]]
-    assert "EMA 9" in names and "EMA 21" in names and any("Supertrend" in n for n in names)
-
-    settings_engine.scanner_engine = "adaptive_hybrid"
-    e = build_scanner_engine(dict(_PARAMS))
-    assert isinstance(e, AltSignalEngine) and e.signal_source == "adaptive_hybrid"
-
-
-def test_utbot_prime_trend_agreement_boosts_confidence(settings_engine):
-    from datetime import datetime
-    from engine.signal_manager import SignalManager
-
-    settings_engine.scanner_engine = "utbot_prime"
-    settings_engine.utbot_prime_confidence_per_agreement = 0.03
-    settings_engine.utbot_prime_max_confidence_bonus = 0.09
-
-    def mk(agreement: int) -> UTBotSignal:
-        sig = UTBotSignal(
-            timestamp=datetime(2026, 6, 30, 10, 0),
-            signal_type="BUY",
-            price=100.0,
-            trailing_stop=98.5,
-            stop_distance=1.5,
-            atr_value=1.5,
-            adx_value=25.0,
-            position_state=1,
-            bar_index=20,
-            instrument="NIFTY",
-            timeframe="5min",
-            raw_candle={"open": 99.0, "high": 101.0, "low": 98.5, "close": 100.0},
-            source_engine="utbot",
-        )
-        setattr(sig, "trend_agreement", agreement)
-        setattr(sig, "trend_agreement_sources", ["ema", "supertrend", "consensus"][:agreement])
-        return sig
-
-    manager = SignalManager()
-    _, conf0, reasons0 = manager._grade_signal(mk(0), 0.0, 0.0, regime="UNKNOWN")
-    _, conf3, reasons3 = manager._grade_signal(mk(3), 0.0, 0.0, regime="UNKNOWN")
-
-    assert conf3 == pytest.approx(min(1.0, conf0 + 0.09), abs=1e-9)
-    assert not any("UT1 Prime agreement" in r for r in reasons0)
-    assert any("UT1 Prime agreement 3/3" in r for r in reasons3)
 
 
 def test_combo_solo_utbot_exit_is_blocked_partner_exit_allowed(settings_engine):
@@ -378,17 +280,14 @@ def test_combo_solo_utbot_exit_is_blocked_partner_exit_allowed(settings_engine):
                            stop_distance=1.0, atr_value=1.0, adx_value=20.0, position_state=-1,
                            bar_index=5, source_engine=src)
 
-    s.scanner_engine = "utbot_ema"
-    assert sc._combo_solo_utbot_exit_blocked(mk("utbot")) is True      # jumpy solo exit -> blocked
-    assert sc._combo_solo_utbot_exit_blocked(mk("ema")) is False       # partner exit -> allowed
-    assert sc._combo_solo_utbot_exit_blocked(mk("both")) is False      # both agree -> allowed
     s.scanner_engine = "utbot_consensus"
-    assert sc._combo_solo_utbot_exit_blocked(mk("utbot")) is True
-    assert sc._combo_solo_utbot_exit_blocked(mk("consensus")) is False
+    assert sc._combo_solo_utbot_exit_blocked(mk("utbot")) is True      # jumpy solo exit -> blocked
+    assert sc._combo_solo_utbot_exit_blocked(mk("consensus")) is False       # partner exit -> allowed
+    assert sc._combo_solo_utbot_exit_blocked(mk("both")) is False      # both agree -> allowed
 
     # toggle off -> raw union behaviour (utbot can solo-exit again)
     s.combo_partner_confirms_exit = False
-    s.scanner_engine = "utbot_ema"
+    s.scanner_engine = "utbot_consensus"
     assert sc._combo_solo_utbot_exit_blocked(mk("utbot")) is False
     s.combo_partner_confirms_exit = True
 
@@ -405,7 +304,7 @@ def test_opposite_exit_confirm_honors_partner_confirm_toggle(settings_engine):
     sc = Scanner.__new__(Scanner)
     sc.mode = "HISTORICAL"  # non-blocked path returns True immediately (clean isolation)
     s = settings_engine
-    s.scanner_engine = "utbot_ema"
+    s.scanner_engine = "utbot_consensus"
 
     def mk(src):
         return UTBotSignal(timestamp=datetime(2026, 6, 25, 11, 0), signal_type="SELL", price=100.0,
@@ -415,7 +314,7 @@ def test_opposite_exit_confirm_honors_partner_confirm_toggle(settings_engine):
     # ON: a solo UT1 opposite-flip never confirms an exit; the partner's does.
     s.combo_partner_confirms_exit = True
     assert sc._opposite_exit_confirm_ready("NIFTY", mk("utbot"), "5min") is False
-    assert sc._opposite_exit_confirm_ready("NIFTY", mk("ema"), "5min") is True
+    assert sc._opposite_exit_confirm_ready("NIFTY", mk("consensus"), "5min") is True
     assert sc._opposite_exit_confirm_ready("NIFTY", mk("both"), "5min") is True
 
     # OFF: raw union — UT1 can solo-exit again (gate returns to normal).
@@ -440,17 +339,11 @@ def test_invalid_engine_falls_back_to_utbot(settings_engine):
     assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
     assert mtf.set_scanner_engine("quad_union") == "quad_union"
     assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
-    assert mtf.set_scanner_engine("utbot_prime") == "utbot_prime"
-    assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
     assert mtf.set_scanner_engine("quad_prime") == "quad_prime"
-    assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
-    assert mtf.set_scanner_engine("adaptive_hybrid") == "adaptive_hybrid"
     assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
     assert mtf.set_scanner_engine("adaptive_dual") == "adaptive_dual"
     assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
-    assert mtf.set_scanner_engine("quality_hybrid") == "quality_hybrid"
-    assert isinstance(mtf.engines["NIFTY_5min"], AltSignalEngine)
-    assert mtf.engines["NIFTY_5min"].signal_source == "quality_hybrid"
+
 
 
 def test_historical_engine_switch_queues_full_backtest_rebuild(settings_engine):
@@ -1071,15 +964,10 @@ ALL_SCANNER_ENGINES = (
     "utbot",
     "ema",
     "consensus",
-    "auto",
-    "utbot_ema",
     "utbot_consensus",
     "quad_union",
-    "utbot_prime",
     "quad_prime",
-    "adaptive_hybrid",
     "adaptive_dual",
-    "quality_hybrid",
 )
 
 
@@ -1258,118 +1146,3 @@ def test_adaptive_dual_lane_a_is_tagged_but_not_raw_flagged(settings_engine):
     sig = SimpleNamespace(source_engine="adaptive_dual", source_lane="A")
     assert Scanner._is_quad_union_raw_historical_signal(settings_engine, sig) is False
     assert Scanner._is_quad_prime_raw_candidate(sig) is False
-
-
-def test_quality_hybrid_engine_12_is_independent_confluence(settings_engine):
-    from scanner import Scanner
-
-    settings_engine.scanner_engine = "quality_hybrid"
-    engine = build_scanner_engine(dict(_PARAMS))
-    assert isinstance(engine, AltSignalEngine)
-    assert engine.signal_source == "quality_hybrid"
-
-    result = _process(engine, _swing_df(220))
-    assert "error" not in result
-    assert result["signals"], "quality_hybrid should emit its own confluence flips"
-    assert all(sig.source_engine == "quality_hybrid" for sig in result["signals"])
-    assert all("utbot" not in (getattr(sig, "source_engines", []) or []) for sig in result["signals"])
-    assert all(hasattr(sig, "quality_hybrid_vote_score") for sig in result["signals"])
-    assert all(hasattr(sig, "quality_hybrid_route") for sig in result["signals"])
-    assert Scanner._is_quad_union_raw_historical_signal(settings_engine, result["signals"][0]) is False
-    assert Scanner._is_quad_prime_raw_candidate(result["signals"][0]) is False
-
-
-def test_quality_hybrid_routes_split_historical_lifecycles(settings_engine):
-    from datetime import datetime
-    from types import SimpleNamespace
-    from engine.signal_processor import SignalProcessor
-
-    settings_engine.scanner_engine = "quality_hybrid"
-    thrust = SimpleNamespace(
-        timestamp=datetime(2026, 7, 1, 10, 0),
-        quality_hybrid_route="quality_thrust",
-    )
-    pullback = SimpleNamespace(
-        timestamp=datetime(2026, 7, 1, 10, 5),
-        quality_hybrid_route="quality_pullback",
-    )
-
-    assert SignalProcessor._historical_replay_source_keys(thrust, "quality_hybrid") == ["quality_thrust"]
-    assert SignalProcessor._historical_replay_source_keys(pullback, "quality_hybrid") == ["quality_pullback"]
-    assert not SignalProcessor._historical_same_replay_stream(thrust, pullback, "quality_hybrid")
-    assert "_QUALITY_THRUST_" in SignalProcessor._historical_trade_id(
-        "H",
-        "NIFTY",
-        "5min",
-        thrust,
-        "quality_hybrid",
-    )
-
-
-def test_quality_hybrid_route_relief_is_proof_gated(settings_engine):
-    from types import SimpleNamespace
-    from scanner import Scanner
-
-    settings_engine.scanner_engine = "quality_hybrid"
-    strong_thrust = SimpleNamespace(
-        quality_hybrid_route="quality_thrust",
-        trend_agreement=5,
-        quality_hybrid_vote_score=4.0,
-        adx_value=24.0,
-    )
-    core_flip = SimpleNamespace(
-        quality_hybrid_route="quality_core",
-        trend_agreement=7,
-        quality_hybrid_vote_score=6.0,
-        adx_value=40.0,
-    )
-    weak_thrust = SimpleNamespace(
-        quality_hybrid_route="quality_thrust",
-        trend_agreement=2,
-        quality_hybrid_vote_score=1.0,
-        adx_value=12.0,
-    )
-    pullback_without_15m = SimpleNamespace(
-        quality_hybrid_route="quality_pullback",
-        trend_agreement=6,
-        quality_hybrid_vote_score=4.0,
-        adx_value=28.0,
-    )
-
-    assert Scanner._is_quality_hybrid_route_entry(
-        settings_engine,
-        strong_thrust,
-        confidence=0.61,
-        grade_rank=1,
-        timeframe="5min",
-    )
-    assert not Scanner._is_quality_hybrid_route_entry(
-        settings_engine,
-        core_flip,
-        confidence=0.80,
-        grade_rank=4,
-        timeframe="5min",
-    )
-    assert not Scanner._is_quality_hybrid_route_entry(
-        settings_engine,
-        weak_thrust,
-        confidence=0.61,
-        grade_rank=1,
-        timeframe="5min",
-    )
-    assert not Scanner._is_quality_hybrid_route_entry(
-        settings_engine,
-        pullback_without_15m,
-        confidence=0.90,
-        grade_rank=4,
-        timeframe="5min",
-        trend_15m_agrees=False,
-    )
-    assert Scanner._is_quality_hybrid_route_entry(
-        settings_engine,
-        pullback_without_15m,
-        confidence=0.61,
-        grade_rank=1,
-        timeframe="5min",
-        trend_15m_agrees=True,
-    )

@@ -90,6 +90,34 @@ class RiskManager:
             "SIM", "SIMULATION", "PAPER_HIST",
         }
 
+    @staticmethod
+    def _closed_trade_cache_fingerprint(closed_trades) -> Optional[tuple]:
+        """Snapshot every field that can change a closed row's risk contribution.
+
+        Closed history is capped by replacing the oldest row with the newest one, so
+        its length is not a mutation counter.  Storing scalar representations also
+        catches an in-place P&L correction without retaining a reference to the mutable
+        Trade object.  If an unusual row cannot be fingerprinted, bypass the cache and
+        let the fail-closed accounting path evaluate it on every pass.
+        """
+        try:
+            return tuple(
+                (
+                    repr(getattr(trade, "id", "")),
+                    bool(getattr(trade, "is_ghost", False)),
+                    repr(getattr(trade, "trading_symbol", "")),
+                    repr(getattr(trade, "grade", "")),
+                    repr(getattr(trade, "data_provenance", "")),
+                    repr(getattr(trade, "entry_time", None)),
+                    repr(getattr(trade, "inst_type", "OPT")),
+                    repr(getattr(trade, "pnl", None)),
+                )
+                for trade in closed_trades
+            )
+        except Exception as exc:
+            logger.warning(f"Closed-trade risk cache bypassed: {exc}")
+            return None
+
     def _projected_stop_risk(self, trade) -> Optional[float]:
         """Return the worst remaining loss at the configured/protective stop.
 
@@ -260,22 +288,54 @@ class RiskManager:
                 "RISK_SNAPSHOT_UNKNOWN_CE": {"instrumenttype": "OPT"},
             }
 
-        # 1. Closed Trades for today
-        for t in closed_snapshot:
-            if self._is_non_live_trade(t):
-                continue
-            try:
-                et = t.entry_time.astimezone(IST) if t.entry_time.tzinfo else IST.localize(t.entry_time)
-                if et.date() == today:
-                    if t.inst_type == "FUT":
-                        fut_pnl += t.pnl
-                        fut_projected_pnl += t.pnl
-                    else:
-                        opt_pnl += t.pnl
-                        opt_projected_pnl += t.pnl
-            except Exception as exc:
-                _charge_fail_closed(getattr(t, "inst_type", "OPT"), f"closed trade: {exc}")
-                
+        # 1. Closed Trades for today (Cached)
+        current_count = len(closed_snapshot)
+        closed_fingerprint = self._closed_trade_cache_fingerprint(closed_snapshot)
+        cache_valid = (
+            closed_fingerprint is not None
+            and getattr(self, "_cached_cb_date", None) == today
+            and getattr(self, "_cached_cb_count", -1) == current_count
+            and getattr(self, "_cached_cb_fingerprint", None) == closed_fingerprint
+        )
+        if cache_valid:
+            fut_pnl += self._cached_cb_fut
+            fut_projected_pnl += self._cached_cb_fut
+            opt_pnl += self._cached_cb_opt
+            opt_projected_pnl += self._cached_cb_opt
+        else:
+            cached_fut = 0.0
+            cached_opt = 0.0
+            cacheable = closed_fingerprint is not None
+            for t in closed_snapshot:
+                if self._is_non_live_trade(t):
+                    continue
+                try:
+                    et = t.entry_time.astimezone(IST) if t.entry_time.tzinfo else IST.localize(t.entry_time)
+                    if et.date() == today:
+                        if t.inst_type == "FUT":
+                            cached_fut += t.pnl
+                        else:
+                            cached_opt += t.pnl
+                except Exception as exc:
+                    cacheable = False
+                    _charge_fail_closed(getattr(t, "inst_type", "OPT"), f"closed trade: {exc}")
+
+            if cacheable:
+                self._cached_cb_date = today
+                self._cached_cb_count = current_count
+                self._cached_cb_fingerprint = closed_fingerprint
+                self._cached_cb_fut = cached_fut
+                self._cached_cb_opt = cached_opt
+            else:
+                # Never reuse a partial sum after fail-closed parsing was required.
+                self._cached_cb_date = None
+                self._cached_cb_count = -1
+                self._cached_cb_fingerprint = None
+
+            fut_pnl += cached_fut
+            fut_projected_pnl += cached_fut
+            opt_pnl += cached_opt
+            opt_projected_pnl += cached_opt
         # 2. Open Trades (Unrealized)
         for t in open_snapshot:
             if getattr(t, "is_ghost", False):

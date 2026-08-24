@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sys
 import urllib.request
 from pathlib import Path
@@ -76,8 +77,24 @@ async def postback(request: Request):
     order_id = str(payload.get("order_id") or "")
     stamp = str(payload.get("order_timestamp") or "")
     received = str(payload.get("checksum") or "")
-    expected = hashlib.sha256(f"{order_id}{stamp}{_api_secret()}".encode("utf-8")).hexdigest()
-    if not received or received != expected:
+    # Hardened to match the dashboard route (2026-08-16). THIS is the process actually
+    # exposed to the internet — the dashboard route sits behind it — so it had the
+    # weaker of the two checks, which is backwards.
+    secret = _api_secret()
+    if not secret:
+        # With no secret the expected digest is sha256(order_id + stamp + "") which any
+        # caller can compute, so every forgery would verify. Refuse to serve rather than
+        # authenticate against a secret we do not have. The __main__ guard below is not
+        # enough: it is bypassed entirely when served as `uvicorn scripts...:app`.
+        logger.error(
+            "Postback refused: no api_secret configured, so no payload can be "
+            "authenticated. The route stays closed until a Kite session exists."
+        )
+        return JSONResponse({"status": "error"}, status_code=503)
+    expected = hashlib.sha256(f"{order_id}{stamp}{secret}".encode("utf-8")).hexdigest()
+    # compare_digest, not != : a plain comparison short-circuits on the first differing
+    # byte and leaks the matched prefix length through timing.
+    if not received or not secrets.compare_digest(received, expected):
         # Reject before relaying. This endpoint is public by necessity, and a forged
         # "COMPLETE" reaching the trade manager would invent a position that is not
         # there. The dashboard verifies again — belt and braces.

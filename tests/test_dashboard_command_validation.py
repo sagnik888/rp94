@@ -178,7 +178,7 @@ def test_configure_rejects_invalid_advanced_setting_types():
 
 
 def test_set_scanner_engine_accepts_new_engine_command_shapes():
-    for engine in ("utbot_prime", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"):
+    for engine in ("quad_prime", "adaptive_dual"):
         assert (
             _valid_command_payload({"cmd": "set_scanner_engine", "state": engine})
             is None
