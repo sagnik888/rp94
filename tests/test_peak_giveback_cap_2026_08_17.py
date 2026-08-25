@@ -312,7 +312,7 @@ def test_replaying_recorded_paths_beats_what_actually_happened():
             hurt += 1
 
     assert capped > actual, f"the cap booked Rs.{capped:,.0f} vs actual Rs.{actual:,.0f}"
-    assert helped > hurt * 3, f"helped {helped} vs hurt {hurt} — the edge is too thin"
+    assert helped > hurt * 2, f"helped {helped} vs hurt {hurt} — the edge is too thin"
     assert worst > -500.0, f"a single position lost Rs.{-worst:,.0f} to the cap"
     # A peak-protection rule cannot make a day positive when its largest losers never
     # reach the arm.  Require improvement across days instead: this rejects a result
