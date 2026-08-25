@@ -158,7 +158,24 @@ class RegimeTracker:
             event["timestamp"] = ts.isoformat()
             event["date"] = event.get("date") or ts.date().isoformat()
             event.setdefault("schema", "rtracker.v1")
-            event_id = str(event.get("id") or self._event_id(event))
+            # Lifecycle identity is deliberately additive.  Existing readers can
+            # continue to use ``id``/``signal_id`` while new readers can group every
+            # funnel row belonging to one materialised trade.  EXIT rows are terminal
+            # outcomes, so their id is derived from the lifecycle rather than from the
+            # exit timestamp/reason.  This makes the first terminal outcome immutable
+            # across repeated calls and process restarts (the durable day-id recovery
+            # below then suppresses the same canonical id).
+            if not _first_non_empty(event.get("lifecycle_id"), event.get("trade_id")):
+                event["lifecycle_id"] = self._lifecycle_id(event)
+            else:
+                event["lifecycle_id"] = _first_non_empty(
+                    event.get("lifecycle_id"), event.get("trade_id")
+                )
+            is_exit = str(event.get("decision") or "").upper() == "EXIT"
+            if is_exit:
+                event_id = self._terminal_event_id(str(event["lifecycle_id"]))
+            else:
+                event_id = str(event.get("id") or self._event_id(event))
             event["id"] = event_id
             # Identity of the SIGNAL, independent of which gate spoke about it, so a
             # day's funnel can be counted per signal rather than per row without
@@ -283,9 +300,20 @@ class RegimeTracker:
         source: str,
         extra: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        signal_ts = _candidate_value(candidate, "signal_timestamp") or _candidate_value(candidate, "source_signal_timestamp")
-        entry_ts = _candidate_value(candidate, "entry_timestamp") or signal_ts
-        exit_ts = _candidate_value(candidate, "exit_timestamp")
+        signal_ts = (
+            _candidate_value(candidate, "signal_timestamp")
+            or _candidate_value(candidate, "source_signal_timestamp")
+            or _candidate_value(candidate, "signal_time")
+        )
+        entry_ts = (
+            _candidate_value(candidate, "entry_timestamp")
+            or _candidate_value(candidate, "entry_time")
+            or signal_ts
+        )
+        exit_ts = (
+            _candidate_value(candidate, "exit_timestamp")
+            or _candidate_value(candidate, "exit_time")
+        )
         event_ts = _parse_dt(exit_ts) or _parse_dt(entry_ts) or _parse_dt(signal_ts) or _now()
         direction = str(_candidate_value(candidate, "direction", "") or "").upper()
         signal_type = str(_candidate_value(candidate, "source_signal_type", "") or "")
@@ -354,10 +382,23 @@ class RegimeTracker:
             "status": status,
             "reason": str(rejection_reason or ""),
             "source": source,
+            "source_lane": str(_candidate_value(candidate, "source_lane", "") or ""),
             "grade": str(_candidate_value(candidate, "grade", "") or ""),
             "confidence": _safe_float(_candidate_value(candidate, "confidence", 0.0)),
-            "price": _safe_float(_candidate_value(candidate, "price", 0.0)),
-            "stop": _safe_float(_candidate_value(candidate, "stop", 0.0)),
+            "price": _safe_float(
+                _candidate_value(
+                    candidate,
+                    "price",
+                    _candidate_value(candidate, "entry_price", 0.0),
+                )
+            ),
+            "stop": _safe_float(
+                _candidate_value(
+                    candidate,
+                    "stop",
+                    _candidate_value(candidate, "current_stop", 0.0),
+                )
+            ),
             "target": _safe_float(_candidate_value(candidate, "target", 0.0)),
             "current_price": _safe_float(_candidate_value(candidate, "current_price", 0.0)),
             "pnl": _safe_float(_candidate_value(candidate, "pnl", 0.0)),
@@ -415,6 +456,48 @@ class RegimeTracker:
                 # confidence before anything is recorded, so without this a rejected B+
                 # and a taken A+ are indistinguishable beyond the score itself.
                 "pillars": _candidate_value(candidate, "grade_pillars", {}) or {},
+            },
+            # Strategy/data and quote provenance are separate from the score.  This
+            # makes outcomes attributable to the exact deployed logic and prevents
+            # an inherited entry quote flag from being mistaken for EXIT evidence.
+            "strategy": {
+                "revision": str(_candidate_value(candidate, "strategy_revision", "") or ""),
+                "direction_mode": str(
+                    _candidate_value(candidate, "strategy_direction_mode", "") or ""
+                ),
+                "data_provenance": str(
+                    _candidate_value(candidate, "data_provenance", "") or ""
+                ),
+            },
+            "quote": {
+                "decision_verified": _optional_bool(candidate, "quote_verified"),
+                "decision_source": str(
+                    _candidate_value(candidate, "quote_source", "") or ""
+                ),
+                "entry_verified": _optional_bool(candidate, "entry_quote_verified"),
+                "entry_source": str(
+                    _candidate_value(candidate, "entry_quote_source", "") or ""
+                ),
+                # Only explicit exit-time fields qualify.  quote_verified belongs
+                # to the decision/current holder and is intentionally not reused.
+                "exit_verified": _optional_bool(candidate, "exit_quote_verified"),
+                "exit_source": str(
+                    _candidate_value(candidate, "exit_quote_source", "") or ""
+                ),
+                "execution_bid": _measured_candidate_float(candidate, "execution_bid_price"),
+                "execution_ask": _measured_candidate_float(candidate, "execution_ask_price"),
+                "execution_touch_source": str(
+                    _candidate_value(candidate, "execution_touch_source", "") or ""
+                ),
+                "execution_touch_age_seconds": _measured_candidate_float(
+                    candidate, "execution_touch_age_seconds"
+                ),
+                "execution_touch_usable": _optional_bool(
+                    candidate, "execution_touch_usable"
+                ),
+                "execution_touch_reason": str(
+                    _candidate_value(candidate, "execution_touch_reason", "") or ""
+                ),
             },
             "contract": {
                 "trading_symbol": str(_candidate_value(candidate, "trading_symbol", "") or ""),
@@ -504,8 +587,20 @@ class RegimeTracker:
                 "fifteen_min_choppy_scalp_entry": bool(_candidate_value(candidate, "fifteen_min_choppy_scalp_entry", False)),
                 "scalp_lock_mode": bool(_candidate_value(candidate, "scalp_lock_mode", False)),
                 "power_move": bool(_candidate_value(candidate, "power_move", False)),
+                "risk_geometry_source": str(
+                    _candidate_value(candidate, "risk_geometry_source", "") or ""
+                ),
             },
         }
+        # Prefer an explicitly assigned lifecycle on the candidate.  ``trade_id`` is
+        # accepted as a compatibility bridge for Trade-like objects until callers can
+        # populate lifecycle_id directly.  The fallback is deterministic and uses the
+        # entry/signal clock plus the event identity fields, never the exit clock.
+        explicit_lifecycle = _first_non_empty(
+            _candidate_value(candidate, "lifecycle_id", ""),
+            _candidate_value(candidate, "trade_id", ""),
+        )
+        event["lifecycle_id"] = explicit_lifecycle or self._lifecycle_id(event)
         if final_decision == "EXIT":
             # Additive fields keep rtracker.v1 readers compatible while making every
             # newly-written exit self-describing.  TradeCandidate paths are gross;
@@ -518,6 +613,9 @@ class RegimeTracker:
                     "round_trip_cost": _candidate_round_trip_cost(candidate),
                 }
             )
+            exit_provenance = _exit_provenance(candidate)
+            if exit_provenance:
+                event["exit_provenance"] = exit_provenance
         if extra:
             event["extra"] = _compact(extra)
         return event
@@ -600,6 +698,48 @@ class RegimeTracker:
             )
         )
         return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+    @staticmethod
+    def _lifecycle_id(event: Dict[str, Any]) -> str:
+        """Return the stable identity shared by a signal's lifecycle rows.
+
+        Explicit lifecycle/trade ids are preserved by ``record_event`` callers.  For
+        legacy candidates and direct event producers, the fallback is deterministic
+        from the event date, entry/signal clock, and market identity.  If no entry or
+        signal clock exists, the normalised row timestamp is included as a last-resort
+        guard so unrelated ad-hoc events are not merged accidentally.
+        """
+        explicit = _first_non_empty(event.get("lifecycle_id"), event.get("trade_id"))
+        if explicit:
+            return explicit
+        date_text = str(event.get("date") or "")
+        clock = _first_non_empty(
+            _iso_or_empty(event.get("entry_timestamp")),
+            _iso_or_empty(event.get("signal_timestamp")),
+        )
+        if not clock:
+            clock = _iso_or_empty(event.get("timestamp")) or str(event.get("timestamp") or "")
+        contract = event.get("contract") if isinstance(event.get("contract"), dict) else {}
+        key = "|".join(
+            (
+                date_text,
+                clock,
+                str(event.get("instrument", "") or ""),
+                str(event.get("timeframe", "") or ""),
+                str(event.get("direction", "") or ""),
+                # Multiple accepted lanes/contracts can legitimately share a source
+                # candle.  They are separate positions and must not lose one terminal
+                # outcome merely because the older coarse audit key grouped them.
+                str(event.get("source_lane", "") or ""),
+                str((contract or {}).get("trading_symbol", "") or ""),
+            )
+        )
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rtracker-lifecycle|{key}"))
+
+    @staticmethod
+    def _terminal_event_id(lifecycle_id: str) -> str:
+        """Stable canonical id for the one terminal EXIT outcome of a lifecycle."""
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rtracker-terminal|{lifecycle_id}|EXIT"))
 
     def _weekly_summary(self, week_key: str, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         by_instrument: Dict[str, Dict[str, Any]] = defaultdict(_blank_stats)
@@ -923,6 +1063,59 @@ def _candidate_has(candidate: Any, name: str) -> bool:
     if isinstance(candidate, dict):
         return name in candidate
     return hasattr(candidate, name)
+
+
+def _optional_bool(candidate: Any, name: str) -> Optional[bool]:
+    """Return a recorded boolean without turning absence into False."""
+    if not _candidate_has(candidate, name):
+        return None
+    value = _candidate_value(candidate, name, None)
+    if value is None:
+        return None
+    return bool(_truthy(value))
+
+
+def _measured_candidate_float(candidate: Any, name: str) -> Optional[float]:
+    """Return a finite candidate measurement, preserving missing as None."""
+    if not _candidate_has(candidate, name):
+        return None
+    return _number_or_none(_candidate_value(candidate, name, None))
+
+
+def _exit_provenance(candidate: Any) -> dict:
+    """Return optional runner/stop provenance without inventing missing state."""
+    runner_present = _candidate_has(candidate, "runner_active") or _candidate_has(candidate, "runner_mode")
+    stop_present = _candidate_has(candidate, "stop_provenance")
+    activation_present = _candidate_has(candidate, "runner_activation_timestamp")
+    locked_stop_present = _candidate_has(candidate, "runner_stop_at_exit") or _candidate_has(candidate, "runner_stop")
+    basis_present = _candidate_has(candidate, "runner_stop_basis")
+    if not any((runner_present, stop_present, activation_present, locked_stop_present, basis_present)):
+        return {}
+
+    active_value = _candidate_value(candidate, "runner_active", None)
+    if active_value is None:
+        active_value = _candidate_value(candidate, "runner_mode", None)
+    provenance = {
+        "runner_active": None if active_value is None else bool(_truthy(active_value)),
+        "stop_provenance": str(_candidate_value(candidate, "stop_provenance", "") or ""),
+    }
+    if basis_present:
+        provenance["runner_stop_basis"] = str(
+            _candidate_value(candidate, "runner_stop_basis", "") or ""
+        )
+    if activation_present:
+        provenance["runner_activation_timestamp"] = _iso_or_empty(
+            _candidate_value(candidate, "runner_activation_timestamp", None)
+        )
+    if locked_stop_present:
+        provenance["runner_stop_at_exit"] = _safe_float(
+            _candidate_value(
+                candidate,
+                "runner_stop_at_exit",
+                _candidate_value(candidate, "runner_stop", 0.0),
+            )
+        )
+    return provenance
 
 
 def _number_or_none(value: Any) -> Optional[float]:

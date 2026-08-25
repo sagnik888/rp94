@@ -250,6 +250,29 @@ def test_the_inherited_snapshot_is_a_copy():
     assert exit_row.entry_intel["pcr"] == 1.2
 
 
+def test_exit_inherits_runner_and_lifecycle_provenance():
+    entry = SimpleNamespace(
+        runner_mode=True,
+        runner_activation_timestamp="2026-08-25T10:00:00",
+        runner_activation_reason="TARGET 1 HIT",
+        runner_stop=123.45,
+        stop_provenance="runner",
+        lifecycle_id="L-1",
+        trade_id="T-1",
+    )
+    exit_row = SimpleNamespace()
+    Scanner._inherit_exit_entry_metadata(Scanner.__new__(Scanner), exit_row, entry)
+
+    assert exit_row.runner_mode is True
+    assert exit_row.runner_activation_timestamp == "2026-08-25T10:00:00"
+    assert exit_row.runner_activation_reason == "TARGET 1 HIT"
+    assert exit_row.runner_stop == 123.45
+    assert exit_row.runner_stop_at_exit == 123.45
+    assert exit_row.stop_provenance == "runner"
+    assert exit_row.lifecycle_id == "L-1"
+    assert exit_row.trade_id == "T-1"
+
+
 def test_the_toggle_switches_it_off():
     from config.settings import Settings, get_settings
 

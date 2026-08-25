@@ -1847,6 +1847,42 @@ class MarketDataProvider:
         except Exception as exc:
             logger.warning(f"Kite token subscription failed: {exc}")
 
+    def resubscribe_kite_tokens(self) -> bool:
+        """Replay the subscription for every active token on a live socket.
+
+        Recovery for the connected-but-silent stall. on_close/on_error never fire on a
+        socket that is open but delivering nothing, so kiteconnect's own reconnect never
+        runs and on_connect never gets to replay the tokens — the stream simply stops.
+        Observed 2026-08-21: connected 10:23:05, no error until 15:30:19 (after the
+        close), kite_ws age 38s -> 1,672s in between.
+
+        subscribe_tokens() cannot do this: it filters to tokens NOT already active, so
+        for an existing subscription it is a no-op by design.
+
+        Re-issuing subscribe + set_mode is idempotent and does not disturb a healthy
+        stream, which is what makes it safe for a watchdog to call speculatively.
+        Returns True only when a request actually went out.
+        """
+        tokens = sorted(
+            int(token) for token in (self._active_kite_tokens or set())
+            if str(token).strip().isdigit()
+        )
+        if not tokens:
+            return False
+        ticker = getattr(self, "kws", None)
+        if ticker is None or not getattr(self, "_kite_ws_connected", False):
+            # A dead socket is on_connect's problem; it replays the tokens itself.
+            return False
+        try:
+            ticker.subscribe(tokens)
+            ticker.set_mode(ticker.MODE_FULL, tokens)
+        except Exception as exc:
+            # Never raise: the watchdog thread calls this and must survive.
+            logger.warning(f"Kite resubscribe failed for {len(tokens)} token(s): {exc}")
+            return False
+        logger.info(f"Kite stream stalled; resubscribed {len(tokens)} token(s) in FULL mode.")
+        return True
+
     def get_source_health(self) -> Dict[str, Any]:
         """Check each provider independently; Yahoo is an idle emergency source."""
         health = build_source_health(self)
@@ -3973,6 +4009,13 @@ class MarketDataProvider:
                     # archiver cannot see the day it just fetched.
                     kite_df = kite_df.copy()
                     kite_df.index.name = "timestamp"
+                    # Defence in depth: _save_and_merge_candles normalises too, but
+                    # `df` is also returned to the live caller below without passing
+                    # through it when the merge is skipped, and a tz-aware frame there
+                    # is the mixed-dtype precondition that froze the scan loop on
+                    # 2026-08-19 ("Invalid comparison between dtype=datetime64[us,
+                    # tzoffset(None, 19800)] and Timestamp").
+                    kite_df = self._naive_kolkata_index(kite_df)
                     # Explicit None test: `merged or kite_df` would evaluate the truth
                     # value of a DataFrame, which raises.
                     merged = self._save_and_merge_candles(kite_df, cache_file)
@@ -4249,13 +4292,30 @@ class MarketDataProvider:
         """Merge new candles with existing cache to prevent data loss and fill gaps"""
         if df.empty:
             return
-            
+
+        # Normalise BEFORE branching. This used to sit inside `if cache_file.exists()`,
+        # on the premise recorded in _naive_kolkata_index's docstring -- "every live
+        # producer already ends in .tz_localize(None)". fc0bf19 added a producer that
+        # does not: kite_source.get_historical returns a tz-aware index (kiteconnect
+        # hands back +0530 datetimes and data/kite_market_data.py never strips the
+        # zone, unlike every Fyers path). A contract fetched through it for the FIRST
+        # time skipped the only normalising branch and was written to CSV as
+        # "2026-08-19 09:15:00+05:30".
+        #
+        # Those rows do not stay merely cosmetic. OptionHistoryStore concatenates every
+        # contract into one bundle, and pd.concat over mixed naive/aware frames coerces
+        # to UTC and drops the zone, so the loader returns 03:45:00 for a bar the CSV
+        # records at 09:15:00 -- the whole series shifted 5h30m earlier.
+        # engine/signal_processor.py:2098 and :2153 read option premium history through
+        # exactly that loader, and it is the evidence base the exit-rule calibrations
+        # are drawn from. 56 of 139 contract files were in this state when it was found.
+        df = self._naive_kolkata_index(df)
+
         try:
             if cache_file.exists():
                 existing_df = self._naive_kolkata_index(
                     pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 )
-                df = self._naive_kolkata_index(df)
                 if not existing_df.empty:
                     for frame in (existing_df, df):
                         frame.columns = [c.lower() for c in frame.columns]

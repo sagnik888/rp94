@@ -33,33 +33,34 @@ def test_per_strike_delta_falls_back_on_error():
 
 
 # ── H1: modeled slippage in charges (sim/backtest realism) ──────────
-def test_charges_include_option_slippage():
+def test_charges_include_option_slippage(monkeypatch):
     s = get_settings()
-    s.opt_cost = 80.0
-    s.slippage_opt_pct = 0.30
-    s.slippage_auto_calibration_enabled = False  # pin statics: live fills must not flip this test
+    monkeypatch.setattr(s, "opt_cost", 80.0)
+    monkeypatch.setattr(s, "slippage_opt_pct", 0.30)
+    # pin statics: live fills must not flip this test
+    monkeypatch.setattr(s, "slippage_auto_calibration_enabled", False)
     charge = estimate_trade_charges(140.0, 150.0, 75, "OPT", s, 0.5)
     # base 80 + (140+150)*75*0.003 = 80 + 65.25
     assert charge == pytest.approx(145.25, abs=0.5)
     assert charge > 80.0
 
 
-def test_charges_include_futures_slippage():
+def test_charges_include_futures_slippage(monkeypatch):
     s = get_settings()
-    s.fut_cost = 200.0
-    s.slippage_fut_bps = 2.0
-    s.slippage_auto_calibration_enabled = False
+    monkeypatch.setattr(s, "fut_cost", 200.0)
+    monkeypatch.setattr(s, "slippage_fut_bps", 2.0)
+    monkeypatch.setattr(s, "slippage_auto_calibration_enabled", False)
     charge = estimate_trade_charges(24000.0, 24100.0, 65, "FUT", s, 1.0)
     # base 200 + (24000+24100)*65*0.0002 = 200 + 625.3
     assert charge == pytest.approx(825.3, abs=1.0)
     assert charge > 200.0
 
 
-def test_zero_slippage_setting_returns_flat_base():
+def test_zero_slippage_setting_returns_flat_base(monkeypatch):
     s = get_settings()
-    s.opt_cost = 80.0
-    s.slippage_opt_pct = 0.0
-    s.slippage_auto_calibration_enabled = False
+    monkeypatch.setattr(s, "opt_cost", 80.0)
+    monkeypatch.setattr(s, "slippage_opt_pct", 0.0)
+    monkeypatch.setattr(s, "slippage_auto_calibration_enabled", False)
     assert estimate_trade_charges(140.0, 150.0, 75, "OPT", s, 0.5) == 80.0
 
 

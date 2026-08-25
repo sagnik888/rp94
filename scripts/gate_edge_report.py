@@ -44,6 +44,8 @@ EVENTS_DIR = Path("data_store/rtracker/events")
 CANDLE_DIR = Path("data_store/candles")
 INDICES = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
 MIN_N = 8          # below this a family is reported but never called actionable
+MIN_SESSIONS = 3   # one session is one observation wearing a disguise
+MAX_SESSION_SHARE = 0.5   # nor is a family half of which fired on a single day
 WINDOW_MINUTES = 30
 
 
@@ -64,6 +66,15 @@ def reason_family(reason: Any) -> str:
     and "Confidence below 50%" / "below 58%" are two gates whose floors are the
     whole point. Stripping every number would merge them and hide which floor did
     the work.
+
+    "X below Y" is the exception, and it IS structural: whatever is below a
+    threshold is the reading, and what it is below is the threshold. That is what
+    the word means. Without this rule "B+ 55.983% below 58.000% confidence gate"
+    minted a family of one per signal — 71 rows over 20 sessions became ~50
+    families, every one of them n=1 and therefore stamped "not actionable", so the
+    confidence gates disappeared from the ranking entirely. This keeps the grade and
+    the floor, which are the two things that distinguish one confidence gate from
+    another, and drops only the per-signal reading.
     """
     text = str(reason or "").strip()
     if not text:
@@ -72,6 +83,11 @@ def reason_family(reason: Any) -> str:
         text = text.split(":")[0]
     text = re.sub(r"[\[\(][^\]\)]*[\]\)]?", " ", text)      # bracketed readings
     text = re.sub(r",?\s*got\s+\S+.*$", "", text, flags=re.I)  # ", got 27%"
+    # "<reading>% below <floor>%" -> "below <floor>%": drop the measurement, keep
+    # the configured floor. Trailing zeros are normalised too, so one gate does not
+    # split into "58%" and "58.000%" families over a formatting change.
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*%\s+below\b", "below", text)
+    text = re.sub(r"\b(\d+)\.0+\s*%", lambda m: f"{m.group(1)}%", text)
     text = re.sub(r"\s+", " ", text).strip(" -,;")
     return text[:52] or "(unstated)"
 
@@ -141,6 +157,36 @@ def excursion(candles, index: str, day: str, signal_ts, direction: str) -> Optio
     return max(0.0, mae), max(0.0, mfe)
 
 
+FULL_WINDOW_BARS = WINDOW_MINUTES // 5   # the candles are 5-minute
+
+
+def window_bars(candles, index: str, day: str, signal_ts) -> int:
+    """How many bars the excursion window actually got.
+
+    A gate that fires near 15:30 is measured over a window the close cuts short.
+    Fewer bars is less opportunity to move against the signal, so MAE collapses
+    toward zero and the ratio explodes on arithmetic alone. The three families that
+    topped this report at 17.21, 8.57 and 6.25 have median windows of 5, 2 and 4
+    bars against 6 everywhere else, and MAEs of 0.010%, 0.009% and 0.017% against
+    0.060-0.100% for full-window families. That is the clock, not gate quality.
+    """
+    import pandas as pd
+
+    frame = candles.get((index, day))
+    if frame is None or not signal_ts:
+        return 0
+    try:
+        start_at = pd.Timestamp(signal_ts)
+    except Exception:
+        return 0
+    return int(
+        (
+            (frame.timestamp > start_at)
+            & (frame.timestamp <= start_at + pd.Timedelta(minutes=WINDOW_MINUTES))
+        ).sum()
+    )
+
+
 def distinct_signals(rows: List[Dict[str, Any]], decision: str) -> List[Dict[str, Any]]:
     """One row per (signal, gate). Rows predating signal_id fall back to the key
     it is derived from, so historical archives are counted the same way."""
@@ -160,17 +206,22 @@ def build(days: List[str]) -> Dict[str, Any]:
     rows = load_events(days)
     candles = load_candles(days)
     families: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    family_days: Dict[str, List[str]] = defaultdict(list)
+    family_bars: Dict[str, List[int]] = defaultdict(list)
 
     for row in distinct_signals(rows, "REJECTED"):
         index = str(row.get("instrument") or "").split()[0].upper()
         day = str(row.get("date") or "")
+        signal_ts = row.get("signal_timestamp") or row.get("timestamp")
         moved = excursion(
-            candles, index, day,
-            row.get("signal_timestamp") or row.get("timestamp"),
+            candles, index, day, signal_ts,
             row.get("direction") or row.get("signal_type"),
         )
         if moved:
-            families[reason_family(row.get("reason"))].append(moved)
+            name = reason_family(row.get("reason"))
+            families[name].append(moved)
+            family_days[name].append(day)
+            family_bars[name].append(window_bars(candles, index, day, signal_ts))
 
     summary = []
     for name, points in families.items():
@@ -178,13 +229,31 @@ def build(days: List[str]) -> Dict[str, Any]:
         mfes = [p[1] for p in points]
         mae = statistics.median(maes)
         mfe = statistics.median(mfes)
+        days_seen = family_days[name]
+        sessions = len(set(days_seen))
+        top_share = (
+            max(days_seen.count(d) for d in set(days_seen)) / len(days_seen)
+            if days_seen else 1.0
+        )
+        bars = statistics.median(family_bars[name]) if family_bars[name] else 0
         summary.append({
             "family": name,
             "n": len(points),
+            "sessions": sessions,
+            "top_session_share": round(top_share, 3),
+            "median_window_bars": bars,
             "median_mae_pct": round(mae, 4),
             "median_mfe_pct": round(mfe, 4),
             "edge_ratio": round(mfe / mae, 2) if mae > 0 else None,
-            "actionable": len(points) >= MIN_N,
+            # n alone was never enough. A family can clear MIN_N inside a single
+            # session -- 8 rows on 2026-08-05 reached rank 4 of this table -- and a
+            # family whose window the close truncated gets its ratio from the clock.
+            "actionable": (
+                len(points) >= MIN_N
+                and sessions >= MIN_SESSIONS
+                and top_share <= MAX_SESSION_SHARE
+                and bars >= FULL_WINDOW_BARS
+            ),
         })
     summary.sort(key=lambda r: (r["edge_ratio"] is None, -(r["edge_ratio"] or 0)))
 
@@ -210,16 +279,37 @@ def render(report: Dict[str, Any]) -> str:
         "  edge_ratio = median MFE / median MAE of what the gate REFUSED.",
         "  >1 it refused signals with more upside than heat; <1 it earned its place.",
         "",
-        f"  {'n':>4} {'MAE%':>7} {'MFE%':>7} {'ratio':>7}  family",
+        "  W = median window bars; 6.0 is a full 30 minutes. Fewer means the 15:30",
+        "  close truncated it, which drives MAE to zero and inflates the ratio.",
+        "  Shown to one decimal: an even-n family can median to 5.5, and rounding that",
+        "  to \"6\" printed a full window next to a note saying it was truncated.",
+        "",
+        f"  {'n':>4} {'sess':>4} {'top%':>5} {'W':>4} {'MAE%':>7} {'MFE%':>7} {'ratio':>7}  family",
     ]
     for row in report["families"]:
         ratio = "  n/a" if row["edge_ratio"] is None else f"{row['edge_ratio']:>7.2f}"
-        mark = "" if row["actionable"] else f"   (n<{MIN_N}, not actionable)"
+        mark = "" if row["actionable"] else f"   ({_why_not_actionable(row)})"
         lines.append(
-            f"  {row['n']:>4} {row['median_mae_pct']:>7.3f} {row['median_mfe_pct']:>7.3f} "
+            f"  {row['n']:>4} {row['sessions']:>4} {row['top_session_share']:>5.0%} "
+            f"{row['median_window_bars']:>4.1f} "
+            f"{row['median_mae_pct']:>7.3f} {row['median_mfe_pct']:>7.3f} "
             f"{ratio}  {row['family']}{mark}"
         )
     return "\n".join(lines)
+
+
+def _why_not_actionable(row: Dict[str, Any]) -> str:
+    """Name the failing test, so a reader need not guess which one it was."""
+    why = []
+    if row["n"] < MIN_N:
+        why.append(f"n<{MIN_N}")
+    if row["sessions"] < MIN_SESSIONS:
+        why.append(f"{row['sessions']} session{'s' if row['sessions'] != 1 else ''}")
+    if row["top_session_share"] > MAX_SESSION_SHARE:
+        why.append(f"{row['top_session_share']:.0%} in one session")
+    if row["median_window_bars"] < FULL_WINDOW_BARS:
+        why.append(f"window truncated to {row['median_window_bars']:.1f} bars")
+    return ", ".join(why) + ", not actionable"
 
 
 def recent_days(limit: int) -> List[str]:

@@ -148,6 +148,75 @@ def unreachable_intel_gates(settings) -> list[tuple[str, float]]:
     return found
 
 
+# The RR ladder in engine/signal_quality_policy.dynamic_rr is
+#   min_rr + confidence_runway + grade_bonus + intel_adjustment
+# whose terms are bounded by 1.6 + 1.44 + 1.15 + 0.833. confidence is clamped to [0,1]
+# before the 3.2 multiplier, A+ is the largest grade bonus, and intel_adjustment divides
+# normalize_intelligence_score (clamped to [-1,1]) by 1.20 — so its own upper clamp of
+# 1.25 is unreachable too.
+DYNAMIC_RR_LADDER_CEILING = 5.02
+
+
+def inert_guard_warnings(settings) -> list[tuple[str, str]]:
+    """Guards whose consumer runs but whose configured values make it do nothing.
+
+    Distinct from config/inert_settings.INERT (nothing reads the setting) and from
+    unreachable_intel_gates (a threshold above what the score can reach). Here the code
+    executes on every trade and the arithmetic is empty — the quietest of the three,
+    because nothing looks wrong at the call site.
+
+    Reporting only. Retuning any of these changes live exit behaviour and is the
+    operator's decision, exactly as config/inert_settings.py says of its own list.
+    """
+    found: list[tuple[str, str]] = []
+
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(getattr(settings, name, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    # engine/signal_processor.py:1842 — `if is_choppy_regime(...): opt_sl_pct =
+    # max(opt_sl_pct, 15.0)`. The literal is the same 15.0 that options_sl_pct already
+    # ships, so the chop branch cannot widen anything. On 1min/5min it could not anyway:
+    # the band ceiling is min(option_stop_5min_max_pct, opt_sl_pct) = 10.0.
+    options_sl_pct = _f("options_sl_pct", 15.0)
+    if options_sl_pct >= 15.0:
+        found.append((
+            "chop stop widening",
+            f"options_sl_pct is already {options_sl_pct:.1f}%, and the choppy branch only "
+            f"does max(opt_sl_pct, 15.0), so a choppy regime widens the option stop by "
+            f"nothing. The 5min band ceiling of 10% binds first in any case.",
+        ))
+
+    # Scanner._dynamic_runner_lock_pct returns min(base, loose). A LOWER lock_pct leaves
+    # more of the gain unlocked, i.e. more room, so `loose` must be strictly below the
+    # base for the volatile-tape branch to mean anything.
+    base_lock = _f("dynamic_rr_runner_lock_pct", 0.85)
+    loose_lock = _f("trend_runner_lock_pct_high_vol", 0.85)
+    if loose_lock >= base_lock:
+        found.append((
+            "trend_runner_lock_pct_high_vol",
+            f"it is {loose_lock:.2f} against a base lock of {base_lock:.2f}, and the "
+            f"function returns min(base, loose) — so the documented 'give the runner more "
+            f"room in fast/volatile tape' branch returns the base unchanged in every "
+            f"regime. Runners are trailed identically in calm and volatile tape.",
+        ))
+
+    # dynamic_rr_max caps a sum that cannot reach it.
+    max_rr = _f("dynamic_rr_max", 12.0)
+    if max_rr > DYNAMIC_RR_LADDER_CEILING:
+        five_min_max = _f("dynamic_rr_5min_max", 2.5)
+        found.append((
+            "dynamic_rr_max",
+            f"it is {max_rr:.1f} but the RR ladder cannot exceed "
+            f"{DYNAMIC_RR_LADDER_CEILING:.2f}, so it never binds. What actually caps RR "
+            f"on every 1min/5min entry is dynamic_rr_5min_max={five_min_max:.1f}.",
+        ))
+
+    return found
+
+
 def calendar_coverage_status(data_provider, now) -> dict:
     """Which years the exchange calendar actually covers, and how long that lasts.
 
@@ -573,6 +642,13 @@ def validate_real_mode_readiness(
             f"MEAN of votes whose magnitudes are all <= 0.35, so its absolute ceiling is "
             f"{INTEL_SCORE_CEILING} and its typical value is ~0.25-0.30. This gate is inert."
         )
+
+    # Third class, next to the two above: the consumer EXISTS and runs on every trade,
+    # but the shipped values make the operation a no-op, so a protection the operator
+    # believes is active does nothing. Silent, because the code path is exercised — only
+    # the arithmetic is empty.
+    for name, why in inert_guard_warnings(settings):
+        warnings.append(f"{name} is INERT at current values: {why}")
 
     try:
         from config.inert_settings import configured_but_inert, env_keys_from_file

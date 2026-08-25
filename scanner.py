@@ -137,6 +137,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.trades.scanner = self
         self.trades.mode = trading_mode
         self.trades.ui_logger = self.log_event
+        # One broker-boundary authority for every AUTO exposure mutation, including a
+        # scale-in or stale-limit replacement on a trade restored after restart. Manual
+        # and recovery entries are bypassed by TradeManager before this is evaluated.
+        self.trades.entry_submission_guard = self._queued_auto_entry_submission_guard
+        self.trades.on_trade_closed = self._record_trade_manager_terminal
+        self.trades.on_delayed_entry_result = self._record_delayed_entry_result
         # Route Kite's WebSocket order-update feed into the same handler that serves
         # HTTP postbacks (2026-08-16). Both carry the same order payload, and the
         # handler is idempotent and ordering-guarded, so receiving a state on BOTH
@@ -495,6 +501,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         initial_stop=float(getattr(entry_cand, "initial_stop", getattr(entry_cand, "stop", 0.0)) or 0.0),
                         scalp_lock_mode=bool(getattr(entry_cand, "scalp_lock_mode", False)),
                         source_lane=str(getattr(entry_cand, "source_lane", "") or ""),
+                        lifecycle_id=str(
+                            getattr(entry_cand, "lifecycle_id", "") or cand_id
+                        ),
+                        runner_mode=bool(getattr(entry_cand, "runner_mode", False)),
+                        runner_activation_timestamp=getattr(
+                            entry_cand, "runner_activation_timestamp", None
+                        ),
+                        runner_activation_reason=str(
+                            getattr(entry_cand, "runner_activation_reason", "") or ""
+                        ),
+                        runner_stop=float(getattr(entry_cand, "runner_stop", 0.0) or 0.0),
+                        stop_provenance=str(
+                            getattr(entry_cand, "stop_provenance", "") or "signal"
+                        ),
                         charges=(
                             float(get_settings().fut_cost)
                             if getattr(entry_cand, 'inst_type') == 'FUT'
@@ -1173,6 +1193,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def _record_accepted_entry(self, candidate: TradeCandidate, trade=None) -> None:
         """Count each accepted live/manual entry exactly once."""
         self._reset_daily_counters()
+        # Assign the lifecycle before any ACCEPTED event is written.  The Trade
+        # manager creates its own execution id, but rtracker must join the signal
+        # admission and the eventual exit to one immutable signal lifecycle.
+        lifecycle_id = self._candidate_lifecycle_key(candidate)
+        setattr(candidate, "lifecycle_id", lifecycle_id)
+        if trade is not None:
+            try:
+                setattr(trade, "lifecycle_id", lifecycle_id)
+            except Exception:
+                pass
         # Every acceptance route reaches here, so the snapshot is taken once, at the
         # moment of acceptance, from the intel that actually produced the decision.
         if not getattr(candidate, "entry_intel", None) and self._setting_enabled(
@@ -1203,6 +1233,78 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._trades_today[instrument] = self._trades_today.get(instrument, 0) + 1
         self._log_opposing_exposure_telemetry(candidate)
         # Immediately refresh the dashboard signal/trade panel on a fresh entry.
+        self._notify_trade_event()
+
+    def _record_trade_manager_terminal(self, trade) -> None:
+        """Write one authoritative EXIT after final fill/reconciliation accounting."""
+        if str(getattr(trade, "status", "") or "").upper() != "CLOSED":
+            return
+        # The generic tracker hook records a decision-intel snapshot for every
+        # lifecycle stage. This callback can run on the broker/reconciliation thread,
+        # where recomputing live market intelligence is neither safe nor meaningful;
+        # mark the terminal source explicitly instead of touching scanner engines.
+        if not getattr(trade, "decision_intel", None):
+            setattr(trade, "decision_intel", {"terminal_fill_event": True})
+        if hasattr(trade, "runner_stop"):
+            setattr(
+                trade,
+                "runner_stop_at_exit",
+                float(getattr(trade, "runner_stop", 0.0) or 0.0),
+            )
+        self._rtracker_record_candidate(
+            trade,
+            decision="EXIT",
+            reason=str(getattr(trade, "exit_reason", "") or ""),
+            source="trade_manager_terminal_fill",
+        )
+
+    def _record_delayed_entry_result(self, trade, accepted: bool) -> None:
+        """Rejoin a post-ACK entry rejection to its original signal lifecycle."""
+        if accepted:
+            return
+        lifecycle_id = self._trade_lifecycle_key(trade)
+        candidate = self._find_manual_entry_signal_candidate(
+            lifecycle_id=lifecycle_id
+        )
+        loop = getattr(self, "_event_loop", None)
+        if candidate is not None and loop is not None and not loop.is_closed():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._handle_broker_entry_result(candidate, trade, False),
+                    loop,
+                )
+                future.add_done_callback(
+                    lambda result: logger.error(
+                        f"Delayed entry-result publish failed for {lifecycle_id}: "
+                        f"{result.exception()}"
+                    )
+                    if result.exception() is not None
+                    else None
+                )
+                return
+            except Exception as exc:
+                logger.error(f"Could not schedule delayed entry rejection: {exc}")
+
+        # A restart can legitimately leave no in-memory dashboard candidate. Preserve
+        # the rejected outcome on the immutable lifecycle instead of silently retaining
+        # the earlier ACK as an accepted trade.
+        exit_reason = str(getattr(trade, "exit_reason", "") or "").upper()
+        source = (
+            "entry_submission_guard"
+            if exit_reason == "ENTRY_SUBMISSION_GUARD"
+            else (
+                "stale_entry_invalidated"
+                if exit_reason == "SIGNAL_INVALIDATED"
+                else "broker_entry_result"
+            )
+        )
+        self._rtracker_record_candidate(
+            trade,
+            decision="REJECTED",
+            reason=str(getattr(trade, "execution_error", "") or exit_reason),
+            source=source,
+            extra={"delayed_after_ack": True},
+        )
         self._notify_trade_event()
 
     def _log_opposing_exposure_telemetry(self, candidate: TradeCandidate) -> None:
@@ -1304,8 +1406,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             setattr(candidate, "accepted_by_gate", True)
             self._mark_candidate_accepted_time(candidate, getattr(trade, "entry_time", None))
             candidate.status = "TRADE SIGNAL"
-            self._remember_trade_candidates([candidate])
             self._record_accepted_entry(candidate, trade)
+            self._remember_trade_candidates([candidate])
             
             # Repaint protection belongs only to positions that actually entered
             # from a forming candle. Confirmed candle-close entries are already final.
@@ -1325,19 +1427,47 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
         else:
             setattr(candidate, "accepted_by_gate", False)
-            candidate.status = "REJECTED - BROKER"
+            guard_blocked = (
+                str(getattr(trade, "exit_reason", "") or "").upper()
+                == "ENTRY_SUBMISSION_GUARD"
+            )
+            guard_reason = str(getattr(trade, "execution_error", "") or "").strip()
+            if guard_blocked:
+                candidate.status = "REJECTED - AUTO SUBMISSION GUARD"
+                setattr(candidate, "exit_reason", "ENTRY_SUBMISSION_GUARD")
+                rejection_reason = guard_reason or "Automated entry submission guard blocked exposure"
+                rejection_source = "entry_submission_guard"
+                log_message = (
+                    f"Auto submission guard blocked {candidate.instrument} "
+                    f"{candidate.direction}: {rejection_reason}. Signal was not counted "
+                    "as an accepted trade."
+                )
+            elif str(getattr(trade, "exit_reason", "") or "").upper() == "SIGNAL_INVALIDATED":
+                candidate.status = "REJECTED - SIGNAL INVALIDATED"
+                setattr(candidate, "exit_reason", "SIGNAL_INVALIDATED")
+                rejection_reason = guard_reason or "Stale entry invalidated before fill"
+                rejection_source = "stale_entry_invalidated"
+                log_message = (
+                    f"Stale entry invalidated for {candidate.instrument} "
+                    f"{candidate.direction}: {rejection_reason}. Signal was not counted "
+                    "as an accepted trade."
+                )
+            else:
+                candidate.status = "REJECTED - BROKER"
+                rejection_reason = guard_reason or "Broker rejected entry acknowledgement"
+                rejection_source = "broker_entry_result"
+                log_message = (
+                    f"Broker rejected {candidate.instrument} {candidate.direction}; "
+                    "signal was not counted as an accepted trade."
+                )
             self._rtracker_record_candidate(
                 candidate,
                 decision="REJECTED",
-                reason="Broker rejected entry acknowledgement",
-                source="broker_entry_result",
+                reason=rejection_reason,
+                source=rejection_source,
             )
             self._forget_signal_display_rows(candidate)
-            self.log_event(
-                f"Broker rejected {candidate.instrument} {candidate.direction}; "
-                "signal was not counted as an accepted trade.",
-                "trade",
-            )
+            self.log_event(log_message, "trade")
         await self._publish_trade_payload_now()
 
     def _iter_manual_entry_signal_candidates(self):
@@ -1423,6 +1553,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         return str(value or "").split()[0].upper()
 
     def _trade_lifecycle_key(self, trade) -> str:
+        explicit = str(getattr(trade, "lifecycle_id", "") or "").strip()
+        if explicit:
+            return explicit
         signal_time = self._manual_lifecycle_time(
             getattr(trade, "signal_time", None)
             or getattr(trade, "signal_timestamp", None)
@@ -1435,6 +1568,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             str(getattr(trade, "timeframe", "") or ""),
             str(getattr(trade, "direction", "") or ""),
             signal_time.isoformat(),
+            str(getattr(trade, "source_lane", "") or ""),
+            str(getattr(trade, "trading_symbol", "") or ""),
         ])
 
     def _open_trade_matches_signal_candidate(
@@ -1728,6 +1863,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             scalp_lock_mode=bool(getattr(candidate, "scalp_lock_mode", False)),
             execution_touch_quote=execution_touch_quote,
             on_execution_result=on_execution_result,
+            lifecycle_id=self._candidate_lifecycle_key(candidate),
         )
         if not trade:
             return {"status": "blocked", "reason": "trade_manager_rejected"}
@@ -4026,6 +4162,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     require_option_chains=True,
                 )
                 morning_blockers = self._auto_execution_morning_readiness_blockers()
+                resource_blocker_fn = getattr(self, "_auto_execution_resource_blockers", None)
+                resource_blockers = list(resource_blocker_fn() or []) if callable(resource_blocker_fn) else []
+                morning_blockers = list(morning_blockers or []) + resource_blockers
                 if morning_blockers:
                     readiness = dict(readiness or {})
                     readiness["blockers"] = list(readiness.get("blockers") or []) + morning_blockers
@@ -6021,18 +6160,45 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception as exc:
             logger.debug(f"Signal decision persistence skipped: {exc}")
 
-    def log_signal_decision_once(self, key: str, message: str, type: str = "trade"):
-        """Log live signal decisions without spamming the activity panel every scan."""
-        seen = getattr(self, "_activity_signal_decision_keys", None)
-        if seen is None:
-            self._activity_signal_decision_keys = set()
-            seen = self._activity_signal_decision_keys
-        if key in seen:
-            return
-        seen.add(key)
-        if len(seen) > 1000:
-            self._activity_signal_decision_keys = set(list(seen)[-500:])
+    def log_signal_decision_once(self, key: str, message: str, type: str = "trade") -> bool:
+        """Log live signal decisions without spamming the activity panel every scan.
+
+        Returns True when this call actually emitted, False when the key had already
+        been seen. A live gate is re-evaluated every scan cycle, so any second sink
+        hung off a rejection has to share THIS dedup or it writes the same refusal
+        hundreds of times a session. See _gate_block.
+        """
+        # Locked because this is reached from several threads at once:
+        # _process_instrument runs one task per index on a ThreadPoolExecutor
+        # (scanner.py:6996) and calls this, while the main loop calls it through
+        # _gate_block. Unlocked, the check-and-insert is not atomic, so two threads
+        # can both be told "first emission" for one key and both write -- duplicating
+        # the tape row and the archive row hung off it, which inflates exactly the
+        # counts gate_edge_report takes medians over. The prune is inside the lock
+        # too: list(seen.items()) during a concurrent insert raises
+        # "dictionary changed size during iteration" (a set had the same exposure).
+        lock = getattr(self, "_activity_signal_decision_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._activity_signal_decision_lock = lock
+        with lock:
+            seen = getattr(self, "_activity_signal_decision_keys", None)
+            if not isinstance(seen, dict):
+                # A set has no order, so pruning it with list(seen)[-500:] evicted an
+                # ARBITRARY half of the keys rather than the oldest. An evicted key
+                # re-emits, which duplicates the tape row and every sink hung off it.
+                # A dict is insertion-ordered, so the prune drops the genuinely oldest.
+                seen = dict.fromkeys(seen or ())
+                self._activity_signal_decision_keys = seen
+            if key in seen:
+                return False
+            seen[key] = None
+            if len(seen) > 1000:
+                self._activity_signal_decision_keys = dict(list(seen.items())[-500:])
+        # Outside the lock: log_event fans out to the dashboard and must not hold a
+        # lock the scan threads are contending for.
         self.log_event(message, type)
+        return True
 
     def _notify_trade_event(self) -> None:
         """Request an immediate dashboard trade/signal-panel refresh on entry/exit.
@@ -10924,15 +11090,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 f"/{src.get('age_seconds')}s]"
                 for src in (source_snapshot.get("sources") or [])
             ) or "none"
+            # "No source is fresh" was false and misleading. Only a source with ORDER
+            # AUTHORITY — one named kite*, the broker we actually route through
+            # (market_source_health.py:167) — may authorise an entry, so a sub-second
+            # Fyers tick is context-only BY DESIGN, not by failure. On 2026-08-21 this
+            # line refused 13 entries reading "no entry-eligible broker source is fresh"
+            # while fyers_ws sat at 0.03s on the very same line, which sends the reader
+            # hunting a feed outage that is not happening. Name the missing authority.
             logger.warning(
                 f"Blocked live entry for {instrument} {getattr(candidate, 'timeframe', '')} "
-                f"{getattr(candidate, 'direction', '')}: no entry-eligible broker source "
-                f"is fresh; delayed data remains context-only. Sources seen: {observed}"
+                f"{getattr(candidate, 'direction', '')}: no order-authority (Kite) source "
+                f"is fresh; other feeds may be live but remain context-only and cannot "
+                f"authorise an entry. Sources seen: {observed}"
             )
             self._rtracker_record_candidate(
                 candidate,
                 decision="REJECTED",
-                reason="No entry-eligible broker source is fresh",
+                reason="No order-authority (Kite) source is fresh",
                 source="source_freshness_gate",
             )
         return allowed
@@ -10948,6 +11122,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         signal_ts = getattr(candidate, "signal_timestamp", None)
         entry_ts = getattr(candidate, "entry_timestamp", None) or signal_ts
         lifecycle_id = self._candidate_lifecycle_key(candidate)
+        setattr(candidate, "lifecycle_id", lifecycle_id)
         is_entry = str(getattr(candidate, "action", "ENTRY") or "ENTRY").upper() != "EXIT"
         if is_entry:
             self._ensure_trade_like_initial_stop(candidate)
@@ -11015,6 +11190,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # visited levels it did visit, which is worse than no path at all.
             "pnl_path": [[float(t), float(p)] for t, p in (getattr(candidate, "pnl_path", None) or [])],
             "runner_mode": bool(getattr(candidate, "runner_mode", False)),
+            "runner_activation_timestamp": (
+                getattr(candidate, "runner_activation_timestamp").isoformat()
+                if isinstance(getattr(candidate, "runner_activation_timestamp", None), datetime)
+                else str(getattr(candidate, "runner_activation_timestamp", "") or "")
+            ),
+            "runner_activation_reason": str(
+                getattr(candidate, "runner_activation_reason", "") or ""
+            ),
+            "runner_stop": float(getattr(candidate, "runner_stop", 0.0) or 0.0),
+            "runner_stop_basis": str(
+                getattr(candidate, "runner_stop_basis", "") or ""
+            ),
+            "stop_provenance": str(getattr(candidate, "stop_provenance", "") or ""),
+            "risk_geometry_source": str(
+                getattr(candidate, "risk_geometry_source", "") or ""
+            ),
             "initial_stop": float(getattr(candidate, "initial_stop", getattr(candidate, "stop", 0.0)) or 0.0),
             "entry_spot": float(getattr(candidate, "entry_spot", 0.0) or 0.0),
             "scalp_lock_mode": bool(getattr(candidate, "scalp_lock_mode", False)),
@@ -13303,6 +13494,42 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         window = float(getattr(settings, "eod_protect_window_minutes", 30.0) or 30.0)
         mins = self._minutes_to_force_exit(now)
         return 0.0 <= mins <= window
+
+    @staticmethod
+    def _breakeven_peak_gross(trade_like, current_gross_pnl_rs: float) -> float:
+        """Gross high-water mark for the breakeven stop, kept on the trade.
+
+        The live lane fed this rule a GROSS mark against a NET peak: current_pnl_rs is
+        (current_price - entry) * qty, but trade.peak_pnl tracks trade.pnl, which is
+        trade.unrealized_pnl — "Net P&L including estimated charges"
+        (trading/trade_manager.py:6112-6115). On a BANKNIFTY 1x35 at 200 -> 210 that is
+        gross 350.0 against peak_pnl 226.9, so a rule configured to arm at Rs.150 did
+        not arm until roughly Rs.273 gross while still firing on the gross floor of 80.
+
+        GROSS is the right unit for both halves: the floor is 80 and opt_cost is 80, so
+        "gross has fallen back to the round trip" IS the breakeven statement, and every
+        calibration of this rule was replayed over pnl_path, which is gross.
+
+        Mirrors what the session lane already does inline at scanner.py:22267-22269 —
+        take the running max and write it back — rather than adding a persisted column.
+        Not persisted on purpose: it is an intraday high-water mark, and after a restart
+        it re-derives from the next tick exactly as peak_pnl does.
+        """
+        try:
+            current = float(current_gross_pnl_rs or 0.0)
+        except (TypeError, ValueError):
+            current = 0.0
+        try:
+            stored = float(getattr(trade_like, "peak_gross_pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stored = 0.0
+        # A peak is a high-water mark: it never starts below flat and never falls.
+        peak = max(0.0, stored, current)
+        try:
+            setattr(trade_like, "peak_gross_pnl", peak)
+        except Exception:
+            pass
+        return peak
 
     def _peak_giveback_cap_exit(
         self, trade_like, *, current_pnl_rs: float, peak_pnl_rs: float,
@@ -17137,6 +17364,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         settings = get_settings()
         if not self._setting_enabled(getattr(settings, "rupee_loss_band_enabled", True), True):
             return False, "", "disabled"
+
+        # This was the only exit family in the system with no clock anywhere, and its
+        # CATASTROPHE branch short-circuits ahead of every freefall and slow-bleed test —
+        # so it fired the moment the rupee threshold was crossed, however old the trade.
+        # On 2026-08-18 that booked -Rs.4,695 2.59s after entry on a premium that had
+        # "collapsed" 46.6%, which was a stale entry mark and not a move. Same 15s hold
+        # and same shape as the early loss cut (this exit exists to be fast, so
+        # LOSS_THREAT's 60s would disable rather than guard it). Rupee thresholds
+        # untouched. Live only: in a replay "now" is meaningless. Absence never blocks.
+        _min_hold = float(getattr(settings, "rupee_loss_band_min_hold_seconds", 15.0) or 0.0)
+        if _min_hold > 0:
+            _held = self._trade_like_age_seconds(trade_like, latest_time)
+            if _held is None and str(getattr(self, "mode", "") or "").upper() != "HISTORICAL":
+                # latest_time is the CANDLE clock in the live loop and an intracandle
+                # fill is stamped after its bar, so the helper refuses to invent an age.
+                _held = self._trade_like_age_seconds(trade_like, datetime.now(IST))
+            if _held is not None and _held < _min_hold:
+                return False, "", (
+                    f"held {_held:.0f}s, under the {_min_hold:.0f}s minimum before a "
+                    "rupee-loss-band exit may fire"
+                )
         inst = str(getattr(trade_like, "inst_type", "FUT") or "FUT").upper()
         is_opt = inst in {"OPT", "CE", "PE"}
         if self._setting_enabled(getattr(settings, "rupee_loss_band_opt_only", False), False) and not is_opt:
@@ -17826,7 +18074,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ])
 
     def _candidate_lifecycle_key(self, candidate: TradeCandidate) -> str:
-        """Pair one accepted entry with its later exit without using execution time."""
+        """Pair one accepted entry with its later exit without merging parallel lanes."""
+        explicit = str(getattr(candidate, "lifecycle_id", "") or "").strip()
+        if explicit:
+            return explicit
         source_ts = (
             getattr(candidate, "source_signal_timestamp", None)
             or getattr(candidate, "signal_timestamp", None)
@@ -17840,6 +18091,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             str(getattr(candidate, "timeframe", "") or ""),
             str(getattr(candidate, "direction", "") or ""),
             source_ts.isoformat(),
+            # Parallel source lanes/contracts can legitimately share the same source
+            # candle. They are separate positions and require separate terminal rows.
+            str(getattr(candidate, "source_lane", "") or ""),
+            str(getattr(candidate, "trading_symbol", "") or ""),
         ])
 
     @staticmethod
@@ -18059,6 +18314,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "strategy_revision",
             "strategy_direction_mode",
             "data_provenance",
+            "runner_mode",
+            "runner_activation_timestamp",
+            "runner_activation_reason",
+            "runner_stop_at_exit",
+            "runner_stop",
+            "runner_stop_basis",
+            "stop_provenance",
+            "risk_geometry_source",
+            "lifecycle_id",
+            "trade_id",
             "price_action_verdict",
             "price_action_score",
             "adx_value",
@@ -18083,6 +18348,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # and the conditions that preceded it land in the same record.
         if getattr(entry_candidate, "entry_intel", None):
             setattr(exit_candidate, "entry_intel", dict(getattr(entry_candidate, "entry_intel") or {}))
+        if hasattr(entry_candidate, "runner_stop"):
+            setattr(exit_candidate, "runner_stop_at_exit", getattr(entry_candidate, "runner_stop"))
 
     def _get_current_session_day(self) -> str:
         now_ist = datetime.now(IST)
@@ -18207,7 +18474,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if isinstance(row, (list, tuple)) and len(row) >= 2
             ])
             setattr(candidate, "trade_id", str(payload.get("id") or payload.get("trade_id") or ""))
+            setattr(candidate, "lifecycle_id", str(payload.get("lifecycle_id") or ""))
             setattr(candidate, "runner_mode", bool(payload.get("runner_mode") or False))
+            runner_activated = payload.get("runner_activation_timestamp")
+            if runner_activated:
+                try:
+                    runner_activated = datetime.fromisoformat(str(runner_activated))
+                except (TypeError, ValueError):
+                    runner_activated = None
+            setattr(candidate, "runner_activation_timestamp", runner_activated)
+            setattr(
+                candidate,
+                "runner_activation_reason",
+                str(payload.get("runner_activation_reason") or ""),
+            )
+            setattr(candidate, "runner_stop", float(payload.get("runner_stop") or 0.0))
+            setattr(
+                candidate,
+                "runner_stop_basis",
+                str(payload.get("runner_stop_basis") or ""),
+            )
+            setattr(candidate, "stop_provenance", str(payload.get("stop_provenance") or ""))
+            setattr(
+                candidate,
+                "risk_geometry_source",
+                str(payload.get("risk_geometry_source") or ""),
+            )
             setattr(candidate, "initial_stop", float(payload.get("initial_stop") or 0.0))
             self._ensure_trade_like_initial_stop(candidate)
             setattr(candidate, "display_stop", float(payload.get("display_stop") or payload.get("stop") or candidate.stop or 0.0))
@@ -18835,6 +19127,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tracker = getattr(self, "rtracker", None)
         if tracker is None:
             return
+        # Freeze identity on the first telemetry touch.  Without this, an early
+        # CANDIDATE/REJECTED row can receive rtracker's fallback UUID while the
+        # later session serializer assigns a different id, orphaning the EXIT.
+        try:
+            lifecycle_id = self._candidate_lifecycle_key(candidate)
+            setattr(candidate, "lifecycle_id", lifecycle_id)
+        except Exception as exc:
+            logger.debug(f"Candidate lifecycle assignment skipped: {exc}")
         # Record what the gate actually judged. Measured over the 66,027-row
         # archive: volume.volume_ratio populated on 19 rows (0.0%), regime.adx
         # 5.1%, aggregate.score_norm 1.0%, and entry_intel on 0 of 65,423 REJECTED
@@ -18854,16 +19154,86 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(candidate, "decision_intel", self._entry_intel_snapshot(candidate))
         except Exception as exc:
             logger.debug(f"Decision intel snapshot skipped: {exc}")
+        record_candidate = candidate
+        record_decision = str(decision or "")
+        record_extra = dict(extra or {})
+        # Session candidates describe the *decision to request* an exit.  In REAL
+        # mode the broker-managed Trade remains open until a confirmed fill is
+        # reconciled, and only that final Trade contains authoritative price, charges
+        # and net P&L.  Letting the advisory row claim rtracker's canonical EXIT id
+        # makes the later fill immutable-but-invisible.  Keep the advisory event for
+        # timing/debugging, but make it explicitly non-terminal and zero its synthetic
+        # outcome; _record_trade_manager_terminal writes the sole canonical EXIT.
+        if (
+            record_decision.upper() == "EXIT"
+            and source != "trade_manager_terminal_fill"
+            and self._broker_managed_lifecycle_is_open(candidate)
+        ):
+            record_decision = "EXIT_DECISION"
+            record_extra.update(
+                {
+                    "requested_decision": "EXIT",
+                    "terminal_authoritative": False,
+                    "advisory_exit_price": float(
+                        getattr(candidate, "exit_price", 0.0) or 0.0
+                    ),
+                    "advisory_pnl": float(getattr(candidate, "pnl", 0.0) or 0.0),
+                }
+            )
+            try:
+                record_candidate = copy.copy(candidate)
+                setattr(record_candidate, "pnl", 0.0)
+                setattr(record_candidate, "pnl_path", [])
+            except Exception as exc:
+                # If a third-party candidate cannot be copied, omitting the advisory
+                # row is safer than publishing synthetic realised P&L or stealing the
+                # canonical terminal identity from the eventual broker fill.
+                logger.debug(f"Advisory EXIT telemetry copy skipped: {exc}")
+                return
         try:
             tracker.record_candidate(
-                candidate,
-                decision=decision,
+                record_candidate,
+                decision=record_decision,
                 reason=reason,
                 source=source,
-                extra=extra,
+                extra=record_extra or None,
             )
         except Exception as exc:
             logger.debug(f"rtracker candidate record skipped: {exc}")
+
+    def _broker_managed_lifecycle_is_open(self, candidate) -> bool:
+        """Whether REAL broker exposure still owns this candidate's lifecycle."""
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return False
+        manager = getattr(self, "trades", None)
+        try:
+            lifecycle_id = self._candidate_lifecycle_key(candidate)
+        except Exception:
+            lifecycle_id = str(getattr(candidate, "lifecycle_id", "") or "").strip()
+        if not lifecycle_id:
+            return False
+        terminal_owners = (
+            getattr(manager, "_terminal_callback_lifecycles", set())
+            if manager is not None
+            else set()
+        )
+        if isinstance(terminal_owners, set) and lifecycle_id in terminal_owners:
+            return True
+        open_trades = getattr(manager, "open_trades", {}) if manager is not None else {}
+        if not isinstance(open_trades, dict):
+            return False
+        for trade in list(open_trades.values()):
+            if trade is None or bool(getattr(trade, "is_ghost", False)):
+                continue
+            if str(getattr(trade, "status", "OPEN") or "OPEN").upper() == "CLOSED":
+                continue
+            try:
+                trade_lifecycle = self._trade_lifecycle_key(trade)
+            except Exception:
+                trade_lifecycle = str(getattr(trade, "lifecycle_id", "") or "").strip()
+            if trade_lifecycle and trade_lifecycle == lifecycle_id:
+                return True
+        return False
 
     @staticmethod
     def _rtracker_candidate_decision(candidate: TradeCandidate) -> str:
@@ -21384,10 +21754,72 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         reason = f"Low Grade: {raw_grade}" if sig_rank < 1 else f"Below Grade Pref ({grade_pref})"
         return False, reason
 
+    @staticmethod
+    def _gate_block_reason(message: str) -> str:
+        """The gate's own reason, without the "who and what" preamble.
+
+        Every _gate_block caller builds "Live Gate: blocked <inst> <tf> <dir>; <reason>",
+        so the reason is what follows the first "; ". The preamble is per-signal
+        identity and would mint a distinct reason family for every signal that ever
+        hit the gate, which is precisely the failure gate_edge_report.reason_family
+        exists to avoid.
+        """
+        text = str(message or "")
+        reason = text.split("; ", 1)[1] if "; " in text else text
+        return reason.strip().rstrip(".") or text
+
+    @staticmethod
+    def _gate_block_family(message: str) -> str:
+        """The gate's identity, with its live readings removed.
+
+        Same structural rule gate_edge_report.reason_family applies: a reading is
+        what follows a colon or sits inside brackets. It has to be the FAMILY and
+        not the raw reason, because the reason embeds per-cycle measurements
+        ("conf=66%, adx=13.0") that change between scans -- keying on those would
+        defeat the dedup and write the same refusal on every cycle.
+        """
+        reason = Scanner._gate_block_reason(message)
+        return re.split(r"[(\[:]", reason)[0].strip().lower()
+
+    def _note_gate_archived(self, key: str) -> bool:
+        """True the first time this (signal, gate) pair is seen. Bounded like the tape."""
+        lock = getattr(self, "_gate_block_archived_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._gate_block_archived_lock = lock
+        with lock:
+            seen = getattr(self, "_gate_block_archived_keys", None)
+            if not isinstance(seen, dict):
+                seen = dict.fromkeys(seen or ())
+                self._gate_block_archived_keys = seen
+            if key in seen:
+                return False
+            seen[key] = None
+            if len(seen) > 2000:
+                self._gate_block_archived_keys = dict(list(seen.items())[-1000:])
+        return True
+
     def _gate_block(self, candidate: TradeCandidate, message: str) -> bool:
         """Reject a candidate at a live entry gate, logging the reason to BOTH the
         file log and the dashboard live tape (deduped once per signal) so a
-        detected signal never disappears from the tape without a verdict."""
+        detected signal never disappears from the tape without a verdict.
+
+        It also has to reach the rtracker EVENTS ARCHIVE, which it did not until
+        2026-08-25. The tape lands in sqlite signal_decisions; the archive under
+        data_store/rtracker/events/ is the sole input to scripts/gate_edge_report.py,
+        the tool this project uses to decide whether a gate earns its place. All 13
+        live-entry gates reject through here, so all 13 were unmeasurable: on
+        2026-08-25 that hid 20 of the session's 54 refusals (37%), including the
+        quad-prime raw quality floor, which is the single most common rejection
+        reason in the decision log and appears NOWHERE in the published ranking.
+        A gate that cannot be measured cannot be argued about from evidence, which
+        is how these thresholds came to be argued from anecdote instead.
+
+        The archive write shares the tape's dedup deliberately. This runs on every
+        scan cycle for as long as a refused signal keeps re-presenting itself; an
+        unconditional record would write the same refusal hundreds of times per
+        session and inflate exactly the counts the report medians over.
+        """
         logger.info(message)
         # Tape logging must never alter the gate's decision (e.g. bare test
         # instances without an activity log). Fail closed to the file log only.
@@ -21402,7 +21834,107 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self.log_signal_decision_once(key, tape_msg, "trade")
         except Exception as exc:
             logger.debug(f"Live-gate tape log skipped: {exc}")
+            key = ""
+        # The archive is deduped per (signal, GATE), not per signal. The tape's key
+        # carries no gate identity, so sharing it would record only the FIRST of the
+        # 13 gates to refuse a given signal and silently drop every later one -- the
+        # gates deepest in the chain would look rare because they are checked last,
+        # not because they fire less. gate_edge_report.distinct_signals() keys on
+        # (signal, reason family) and expects one row per gate; this matches it.
+        #
+        # Wrapped, like the tape write above, because the verdict is already decided
+        # and telemetry may never change it. Not hypothetical: the live-gate parity
+        # golden drives these gates through a SimpleNamespace carrying only the
+        # methods under test, and an unguarded call turned every one of its 115,200
+        # cells into ERR:AttributeError.
+        try:
+            if key and self._note_gate_archived(
+                f"{key}|{self._gate_block_family(message)}"
+            ):
+                self._rtracker_record_candidate(
+                    candidate,
+                    decision="REJECTED",
+                    reason=self._gate_block_reason(message),
+                    source="live_entry_gate",
+                )
+        except Exception as exc:
+            logger.debug(f"Live-gate archive record skipped: {exc}")
         return False
+
+    def _session_bias_standaside(self, candidate) -> Tuple[bool, str]:
+        """(block, why) — refuse BOTH directions while the session bias reads BEARISH.
+
+        Measured over 320 advisory round-trips (2026-07-08..08-20): entries taken under a
+        BEARISH session bias lost in all three time-thirds (n=40, -Rs.7,079), and dropping
+        them lifts the book from +Rs.5,961 to +Rs.18,240 net of a Rs.130 round trip.
+
+        Blanket, not direction-aware, because every narrower form was tested and refuted
+        on the same corpus — see the settings comment on
+        session_bearish_standaside_enabled. The short half of a bearish session is the
+        worse half, which is why standing aside beats picking a side: on an options book
+        both directions are long premium.
+
+        Absence never blocks. No intel, no bias string, or a context that raises are all
+        "cannot tell", and a rule that fires on missing data would refuse the whole
+        session the moment the intel feed hiccupped.
+        """
+        try:
+            settings = get_settings()
+            if not self._setting_enabled(
+                getattr(settings, "session_bearish_standaside_enabled", False), False
+            ):
+                return False, ""
+            intel_ctx = self._candidate_market_intelligence_context(candidate) or {}
+            session_ctx = (
+                intel_ctx.get("session_context", {})
+                if isinstance(intel_ctx.get("session_context"), dict)
+                else {}
+            )
+            bias = str(session_ctx.get("bias") or "").strip().upper()
+        except Exception:
+            # Includes a caller that cannot answer at all (test stubs bind Scanner
+            # methods one by one). Cannot tell is not BEARISH.
+            return False, ""
+        if bias != "BEARISH":
+            return False, ""
+        return True, (
+            "session bias is BEARISH — standing aside in both directions "
+            "(measured: n=40, -Rs.7,079, negative in every time-third)"
+        )
+
+    def _auto_entry_resource_blockers(self) -> List[str]:
+        """Return fail-closed blockers for REAL Auto exposure only.
+
+        This is deliberately separate from ``auto_mode``. That flag also selects the
+        automatic exit path, so resource pressure must never turn it off while an open
+        position still depends on software stops, targets, or profit locks.
+        """
+        if (
+            str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or not bool(getattr(self, "auto_mode", False))
+        ):
+            return []
+        try:
+            blocker_fn = getattr(self, "_auto_execution_resource_blockers", None)
+            if not callable(blocker_fn):
+                return ["Auto resource guard unavailable; new exposure is fail-closed"]
+            return list(blocker_fn() or [])
+        except Exception as exc:
+            return [
+                f"Auto resource guard failed to obtain a fresh sample ({exc}); "
+                "new exposure is fail-closed"
+            ]
+
+    def _queued_auto_entry_submission_guard(self, _trade) -> Tuple[bool, str]:
+        """Revalidate Auto authority inside the queued broker worker."""
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return True, ""
+        if not bool(getattr(self, "auto_mode", False)):
+            return False, "Auto mode was disabled before broker submission"
+        blockers = Scanner._auto_entry_resource_blockers(self)
+        if blockers:
+            return False, "; ".join(str(item) for item in blockers)
+        return True, ""
 
     def _passes_live_trade_ready_gate(self, candidate: TradeCandidate) -> bool:
         """Final live/manual gate before a signal is allowed into the session ledger."""
@@ -21410,6 +21942,46 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return True
 
         settings = get_settings()
+
+        # Resource pressure is a live Auto ENTRY blocker, but must not interrupt
+        # exit/reconciliation or manual lifecycle handling. The periodic runtime
+        # watchdog also latches entry inhibition; this immediate check closes the scan-cycle
+        # gap between watchdog polls.
+        if str(getattr(candidate, "action", "ENTRY") or "ENTRY").upper() == "ENTRY":
+            # Unbound call keeps the gate usable by lightweight scanner facades;
+            # the helper itself reads attributes safely.
+            resource_blockers = Scanner._auto_entry_resource_blockers(self)
+            if resource_blockers:
+                reason = "; ".join(str(item) for item in resource_blockers)
+                try:
+                    self.log_signal_decision_once(
+                        f"resource-pressure|{getattr(candidate, 'instrument', '')}|"
+                        f"{getattr(candidate, 'timeframe', '')}|{getattr(candidate, 'direction', '')}",
+                        f"Entry blocked: Auto resource pressure ({reason})",
+                        "trade",
+                    )
+                except Exception:
+                    pass
+                return False
+
+        # A BEARISH session is a stand-aside, not a side to pick. 2026-08-24 is the
+        # illustration: NIFTY fell 148 points and this gate passed five LONG entries for
+        # -Rs.572, the two worst of them graded A+ at 0.93-0.94 with the session bias
+        # already reading BEARISH.
+        # Unbound so a caller that binds Scanner methods individually still reaches it.
+        standaside, standaside_why = Scanner._session_bias_standaside(self, candidate)
+        if standaside:
+            try:
+                self.log_signal_decision_once(
+                    f"standaside|{getattr(candidate, 'instrument', '')}|"
+                    f"{getattr(candidate, 'timeframe', '')}|{getattr(candidate, 'direction', '')}",
+                    f"Entry blocked: {getattr(candidate, 'instrument', '')} "
+                    f"{getattr(candidate, 'direction', '')} — {standaside_why}",
+                    "trade",
+                )
+            except Exception:
+                pass
+            return False
 
         # Macro-event blackout (RBI/budget etc.) — user-maintained windows in
         # data_store/event_blackouts.json; gated DEFAULT OFF. Blocks fresh
@@ -21630,10 +22202,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if confidence < risky_min_conf or not (trend_15m_agrees or impulse_confirmed):
                     return self._gate_block(
                         candidate,
+                        # regime sits INSIDE the brackets with the other readings.
+                        # It is re-derived every scan cycle, and both _gate_block_family
+                        # and gate_edge_report.reason_family cut the identity at the
+                        # first bracket -- so a label that drifts CHOPPY -> VOLATILE
+                        # mid-signal (both are choppy_regimes, so this gate keeps
+                        # firing) would mint a second family for one gate and split its
+                        # n. Readings go in brackets; the gate's name does not.
                         f"Live Gate: blocked {candidate.instrument} {timeframe} option; "
-                        f"{regime} requires >= {risky_min_conf:.0%} plus 15min agreement "
-                        f"or confirmed impulse ({candidate.grade}, {confidence:.0%}, "
-                        f"agree={trend_15m_agrees}, impulse={impulse_confirmed}).",
+                        f"risky regime requires >= {risky_min_conf:.0%} plus 15min "
+                        f"agreement or confirmed impulse ({regime}, {candidate.grade}, "
+                        f"{confidence:.0%}, agree={trend_15m_agrees}, "
+                        f"impulse={impulse_confirmed}).",
                     )
             if not (grade_conf_ok or trend_15m_agrees):
                 return self._gate_block(
@@ -21663,8 +22243,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if is_choppy and confidence < min(SignalProcessor._grade_min_confidence("A"), SignalProcessor._relaxed_threshold(SignalProcessor._choppy_confidence_gate(settings), settings)):
             return self._gate_block(
                 candidate,
+                # Same reason as the message above: grade and regime are both
+                # per-signal readings, so they belong inside the brackets.
                 f"Live Gate: blocked {candidate.instrument} {candidate.direction}; "
-                f"grade {candidate.grade} is too weak for {regime}.",
+                f"grade is too weak for this regime ({candidate.grade}, {regime}).",
             )
 
         return True
@@ -22133,6 +22715,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(previous, "scalp_lock_mode", False)
                 if not bool(getattr(previous, "runner_mode", False)):
                     setattr(previous, "runner_mode", True)
+                    setattr(previous, "stop_provenance", "runner")
+                    setattr(previous, "runner_activation_timestamp", latest_time)
+                    setattr(
+                        previous,
+                        "runner_activation_reason",
+                        str(cascade_ctx.get("reason", "broad directional cascade")),
+                    )
                     previous.target = 0.0
                     changed = True
                     marker = f"{latest_time:%H:%M}:{previous.instrument}:{previous.timeframe}"
@@ -22194,6 +22783,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
                     if reached_t1 or big_move_ok:
                         setattr(previous, "runner_mode", True)
+                        setattr(previous, "stop_provenance", "runner")
+                        setattr(previous, "runner_activation_timestamp", latest_time)
+                        setattr(
+                            previous,
+                            "runner_activation_reason",
+                            "Target 1 reached" if reached_t1 else str(big_reason or "big-move ride"),
+                        )
                         previous.target = 0.0
                         changed = True
                         self.log_event(
@@ -22225,6 +22821,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         new_stop = max(new_stop, new_runner_stop)
                     else:
                         new_stop = min(new_stop, new_runner_stop)
+                    setattr(previous, "runner_stop", float(new_runner_stop))
+                    setattr(
+                        previous,
+                        "runner_stop_basis",
+                        "OPTION_PREMIUM"
+                        if str(getattr(previous, "inst_type", "") or "").upper() == "OPT"
+                        else "FUTURES_CONTRACT",
+                    )
 
             if new_stop > 0:
                 adjusted_stop, breathing, clamped = self._apply_option_stop_breathing_room(
@@ -24023,6 +24627,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         and returns its refusal so the operator can see why in the decision log.
         """
         try:
+            resource_blockers = Scanner._auto_entry_resource_blockers(self)
+            if resource_blockers:
+                return False, "new Auto exposure blocked: " + "; ".join(resource_blockers)
             adder = getattr(getattr(self, "trades", None), "scale_in_trade", None)
             if not callable(adder):
                 return False, ""
@@ -25207,8 +25814,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not symbol_token:
             return False
 
+        candidate_inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
         premium = float(getattr(candidate, "price", 0.0) or 0.0)
-        if str(getattr(candidate, "inst_type", "") or "").upper() != "OPT" or premium <= 0 or premium > spot * 0.15:
+        premium_replaced = False
+        if candidate_inst_type != "OPT" or premium <= 0 or premium > spot * 0.15:
             # Re-mark premium from live LTP
             try:
                 exchange = "BFO" if instrument == "SENSEX" else "NFO"
@@ -25217,6 +25826,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 )
                 if ltp > 0:
                     premium = ltp
+                    premium_replaced = True
             except Exception:
                 pass
         if premium <= 0:
@@ -25226,10 +25836,49 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         opt_sl = float(getattr(self, "options_sl_pct", 15.0) or 15.0)
         if bool(getattr(candidate, "one_way_cascade_entry", False)):
             opt_sl = float(getattr(settings, "one_way_cascade_options_sl_pct", opt_sl) or opt_sl)
+        # A signal processor candidate may already be a verified option whose
+        # premium stop was derived from timeframe/ATR/delta.  Mixed-book routing
+        # still calls this converter for selection, but must not replace that
+        # geometry with the flat options_sl_pct stop.  Preserve only a complete,
+        # fresh, internally consistent option risk tuple and only when it remains
+        # inside the configured hard cap; malformed/unverified candidates continue
+        # through the normal conversion/rebuild path below.
+        existing_stop = float(getattr(candidate, "stop", 0.0) or 0.0)
+        existing_target = float(getattr(candidate, "target", 0.0) or 0.0)
+        existing_initial_stop = float(
+            getattr(candidate, "initial_stop", existing_stop) or 0.0
+        )
+        existing_quote_verified = bool(getattr(candidate, "quote_verified", False))
+        entry_quote_verified = bool(getattr(candidate, "entry_quote_verified", True))
+        existing_symbol = str(getattr(candidate, "trading_symbol", "") or "").upper()
+        existing_risk_pct = (
+            ((premium - existing_stop) / premium) * 100.0
+            if premium > 0 and existing_stop > 0
+            else float("inf")
+        )
+        preserve_risk_geometry = bool(
+            candidate_inst_type == "OPT"
+            and not need_lookup
+            and not premium_replaced
+            and existing_quote_verified
+            and entry_quote_verified
+            and existing_symbol.endswith(option_type)
+            and math.isfinite(existing_stop)
+            and math.isfinite(existing_target)
+            and math.isfinite(existing_initial_stop)
+            and 0.0 < existing_stop < premium
+            and existing_target > premium
+            and abs(existing_initial_stop - existing_stop) <= 1e-6
+            and existing_risk_pct <= float(opt_sl) + 1e-6
+        )
         max_sl = max(0.5, premium * (opt_sl / 100.0))
         rr = float(getattr(candidate, "rr", 1.5) or 1.5)
-        stop = max(0.05, premium - max_sl)
-        target = premium + max_sl * rr
+        if preserve_risk_geometry:
+            stop = existing_stop
+            target = existing_target
+        else:
+            stop = max(0.05, premium - max_sl)
+            target = premium + max_sl * rr
 
         # Lots: 1× settings default; cascade OPT 2–3×; heavy-trend OPT 2× only
         base_lots = max(1, int((getattr(self, "user_lots", {}) or {}).get(instrument, 1) or 1))
@@ -25319,6 +25968,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             pass
         setattr(candidate, "multi_signal_mixed_book_role", "OPT")
         setattr(candidate, "quote_verified", bool(premium > 0 and symbol_token))
+        setattr(
+            candidate,
+            "risk_geometry_source",
+            "candidate_atr_preserved" if preserve_risk_geometry else "option_cap_rebuilt",
+        )
         return True
 
     def _wave_has_cascade(self, candidates: List[TradeCandidate]) -> bool:
@@ -27093,9 +27747,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._latest_trade_candidates[sig.instrument] = [sig]
                         setattr(sig, "accepted_by_gate", True)
                         self._mark_candidate_accepted_time(sig, datetime.now(IST))
-                        self._remember_trade_candidates([sig])
                         accepted_candidates.append(sig)
                         self._record_accepted_entry(sig)
+                        self._remember_trade_candidates([sig])
                         await self._publish_trade_payload_now()
                         if i == 0: # Only notify for the primary candidate
                             logger.info(f"📣 MANUAL SIGNAL: {sig.direction} {sig.instrument} @ {sig.price} (Auto Mode: Manual)")
@@ -27173,6 +27827,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             scalp_lock_mode=bool(getattr(candidate_sig, "scalp_lock_mode", False)),
                                             execution_touch_quote=execution_touch_quote,
                                             on_execution_result=on_execution_result,
+                                            lifecycle_id=self._candidate_lifecycle_key(candidate_sig),
                                         )
                                         if trade:
                                             trade.is_live = (self.mode == "REAL")
@@ -27248,6 +27903,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             execution_loop,
                         )
 
+                    # Final, fresh check at the broker-execution boundary. Earlier
+                    # readiness checks may be seconds old after buffering, quote refresh,
+                    # and concurrency work; memory pressure can cross the line meanwhile.
+                    resource_blockers = Scanner._auto_entry_resource_blockers(self)
+                    if resource_blockers:
+                        reason = "; ".join(resource_blockers)
+                        sig.status = "BLOCKED - HOST RESOURCE PRESSURE"
+                        self.log_event(
+                            f"Auto entry blocked at execution boundary for {sig.instrument}: {reason}",
+                            "warning",
+                        )
+                        self._rtracker_record_candidate(
+                            sig,
+                            decision="REJECTED",
+                            reason=reason,
+                            source="final_resource_pressure_gate",
+                        )
+                        continue
+
                     trade = self.trades.open_trade(
                         instrument=sig.instrument, timeframe=sig.timeframe, direction=sig.direction,
                         price=exec_price, trailing_stop=exec_stop,
@@ -27298,6 +27972,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         scalp_lock_mode=bool(getattr(sig, "scalp_lock_mode", False)),
                         execution_touch_quote=execution_touch_quote,
                         on_execution_result=on_execution_result,
+                        lifecycle_id=self._candidate_lifecycle_key(sig),
+                        entry_submission_guard=self._queued_auto_entry_submission_guard,
                     )
 
                     if trade:
@@ -27314,9 +27990,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._latest_trade_candidates[sig.instrument] = [sig]
                         setattr(sig, "accepted_by_gate", True)
                         self._mark_candidate_accepted_time(sig, getattr(trade, "entry_time", None))
-                        self._remember_trade_candidates([sig])
                         accepted_candidates.append(sig)
                         self._record_accepted_entry(sig, trade)
+                        self._remember_trade_candidates([sig])
                         await self._publish_trade_payload_now()
                         open_count += 1
 
@@ -28158,6 +28834,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         trade = self.trades.open_trades.get(tid)
         if not trade: return
         instrument = str(trade.instrument or "").split()[0]
+        exit_quote_verified = (
+            bool(getattr(trade, "quote_verified"))
+            if hasattr(trade, "quote_verified")
+            else None
+        )
+        exit_quote_source = str(getattr(trade, "quote_source", "") or "")
+        if exit_quote_verified is not None:
+            setattr(trade, "exit_quote_verified", exit_quote_verified)
+        setattr(trade, "exit_quote_source", exit_quote_source)
+        if hasattr(trade, "runner_stop"):
+            setattr(
+                trade,
+                "runner_stop_at_exit",
+                float(getattr(trade, "runner_stop", 0.0) or 0.0),
+            )
         
         # Close the trade
         self.trades.close_trade(tid, exit_price, reason, exit_time=exit_time)
@@ -28167,6 +28858,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Track outcome
         closed_trade = next((t for t in self.trades.closed_trades if t.id == tid), None)
         if closed_trade:
+            # Simulated/ghost closes finalize synchronously and already invoke the
+            # TradeManager callback above. Calling it again is safe because rtracker's
+            # terminal id is immutable, and also supports lightweight test managers
+            # that do not expose the callback hook.
+            self._record_trade_manager_terminal(closed_trade)
             counted_outcomes = getattr(self, "_counted_outcome_signatures", None)
             if not isinstance(counted_outcomes, set):
                 self._counted_outcome_signatures = set()
@@ -28555,6 +29251,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(trade, "scalp_lock_mode", False)
                 if not bool(getattr(trade, "runner_mode", False)):
                     trade.runner_mode = True
+                    setattr(trade, "stop_provenance", "runner")
+                    setattr(trade, "runner_activation_timestamp", latest_time)
+                    setattr(
+                        trade,
+                        "runner_activation_reason",
+                        str(cascade_ctx.get("reason", "broad directional cascade")),
+                    )
                     trade.original_target_distance = abs(float(trade.target or 0.0) - float(trade.entry_price or 0.0))
                     trade.target = 0
                     marker = f"{latest_time:%H:%M}:{trade.instrument}:{trade.timeframe}"
@@ -28630,6 +29333,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
                     if reached_t1 or big_move_ok:
                         trade.runner_mode = True
+                        setattr(trade, "stop_provenance", "runner")
+                        setattr(trade, "runner_activation_timestamp", latest_time)
+                        setattr(
+                            trade,
+                            "runner_activation_reason",
+                            "TARGET 1 HIT" if reached_t1 else str(big_reason or "big-move ride"),
+                        )
                         trade.original_target_distance = target_distance
                         trade.target = 0 # Remove hard target to let it run to T2/T3
                         lock_label = f"{runner_lock_pct * 100:.0f}%"
@@ -28670,6 +29380,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         new_stop = max(new_stop, new_runner_stop)
                     else:
                         new_stop = min(new_stop, new_runner_stop)
+                    setattr(trade, "runner_stop", float(new_runner_stop))
+                    setattr(
+                        trade,
+                        "runner_stop_basis",
+                        "INDEX_SPOT"
+                        if str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
+                        else "FUTURES_CONTRACT",
+                    )
 
             # ── 5. SMART PROFIT LOCK & REVERSAL GUARD ──
             # Calculate absolute PnL in Rupees for institutional exit rules
@@ -28875,10 +29593,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # 0.55R / 0.35R when intel + price action confirm a BIG reversal
             # (not a small pullback). Mirrors profit-lock on the downside.
             try:
+                # peak_pnl is NET (it tracks trade.unrealized_pnl) while current_pnl_rs
+                # above is GROSS, so passing it here compared two different units and
+                # left the arm ~Rs.123 out of reach. Keep a gross high-water mark
+                # instead, matching the session lane at scanner.py:22267-22269.
                 cap_verdict = self._peak_giveback_cap_exit(
                     trade,
                     current_pnl_rs=current_pnl_rs,
-                    peak_pnl_rs=float(getattr(trade, "peak_pnl", 0.0) or 0.0),
+                    peak_pnl_rs=self._breakeven_peak_gross(trade, current_pnl_rs),
                 )
                 cap_exit, cap_reason = cap_verdict
                 # The method hosts two rules; log the one that actually fired.

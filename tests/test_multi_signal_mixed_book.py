@@ -123,6 +123,59 @@ def test_mixed_book_one_fut_rest_opt():
     assert all(c.option_type in {"CE", "PE"} for c in opt)
 
 
+def test_verified_option_risk_geometry_survives_conversion():
+    """Mixed-book conversion must not replace an ATR-aware option stop with 15%."""
+    sc = _scanner()
+    candidate = _cand("NIFTY", inst_type="OPT", conf=0.70)
+    candidate.quote_verified = True
+    candidate.initial_stop = candidate.stop = 96.0
+    candidate.target = 110.0
+
+    assert sc._force_candidate_to_options(candidate) is True
+    assert candidate.price == pytest.approx(100.0)
+    assert candidate.stop == pytest.approx(96.0)
+    assert candidate.initial_stop == pytest.approx(96.0)
+    assert candidate.target == pytest.approx(110.0)
+    assert candidate.risk_geometry_source == "candidate_atr_preserved"
+    assert sc._candidate_projected_risk_rs(candidate) == pytest.approx(200.0)
+
+
+def test_invalid_option_risk_geometry_is_rebuilt_under_configured_cap():
+    sc = _scanner()
+    candidate = _cand("NIFTY", inst_type="OPT", conf=0.70)
+    candidate.quote_verified = True
+    candidate.initial_stop = candidate.stop = 80.0  # 20% risk exceeds the 15% cap
+    candidate.target = 120.0
+
+    assert sc._force_candidate_to_options(candidate) is True
+    assert candidate.stop == pytest.approx(85.0)
+    assert candidate.initial_stop == pytest.approx(85.0)
+    assert candidate.target == pytest.approx(122.5)
+    assert candidate.risk_geometry_source == "option_cap_rebuilt"
+
+
+def test_mixed_book_selection_preserves_option_risk_and_order_risk():
+    """The preservation survives the actual one-FUT/rest-OPT selection wave."""
+    sc = _scanner()
+    option = _cand("NIFTY", inst_type="OPT", conf=0.70)
+    option.quote_verified = True
+    option.initial_stop = option.stop = 96.0
+    option.target = 110.0
+    futures = [
+        _cand("BANKNIFTY", conf=0.95, timeframe="15min"),
+        _cand("SENSEX", conf=0.90, timeframe="15min"),
+    ]
+
+    out = sc._apply_multi_signal_mixed_book([option, *futures])
+    selected = next(c for c in out if c.instrument == "NIFTY")
+    assert selected.inst_type == "OPT"
+    assert selected.stop == pytest.approx(96.0)
+    assert selected.initial_stop == pytest.approx(96.0)
+    assert selected.target == pytest.approx(110.0)
+    expected_risk = abs(selected.price - selected.initial_stop) * selected.lots * selected.lot_size
+    assert sc._candidate_projected_risk_rs(selected) == pytest.approx(expected_risk)
+
+
 def test_mixed_book_fut_slot_equity_not_nifty_only():
     """BankNifty can take the sole FUT slot when it ranks highest (same rule for all)."""
     sc = _scanner()

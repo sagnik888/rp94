@@ -69,6 +69,47 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _restore_settings_singleton_after_each_test():
+    """Undo any mutation a test leaves on the process-wide settings object.
+
+    get_settings() is a singleton, and a bare `s.field = x` (no monkeypatch) survives
+    the test that wrote it and every test after it. That is not hypothetical: until
+    2026-08-24 tests/test_audit_trading_fixes.py left slippage_opt_pct at 0.0 and
+    slippage_auto_calibration_enabled at False, so every later test in a full run priced
+    trades with NO slippage at all — estimate_trade_charges returned the flat Rs.80
+    instead of ~Rs.123 — silently weakening every cost floor, profit lock and breakeven
+    assertion downstream of it. The tell is always the same: passes alone, fails in the
+    full run, or worse, passes in both while asserting against a fiction.
+
+    test_loss_threat_churn_2026_08_10.py had already grown its own save/restore fixture
+    naming that exact file as the culprit. One test defending itself is a workaround;
+    the leak belongs here, once, for everyone.
+
+    Snapshot/restore of the instance __dict__ only — this neither prevents nor replaces
+    monkeypatch, it just guarantees the object each test starts from is the one .env
+    describes.
+    """
+    from config.settings import get_settings
+
+    try:
+        settings = get_settings()
+        before = dict(vars(settings))
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            current = vars(settings)
+            if current != before:
+                current.clear()
+                current.update(before)
+        except Exception:
+            pass
+
+
+@pytest.fixture(autouse=True)
 def _disable_real_env_persistence_during_tests(monkeypatch):
     """Tests may mutate the singleton settings object; never persist that to .env."""
     import engine.settings_persistence as persistence

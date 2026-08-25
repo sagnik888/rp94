@@ -13,6 +13,15 @@ _worker_lock = threading.Lock()
 _notifications_available = True
 
 
+def _toast_event(kind: str):
+    """A quiet callback for win11toast, whose defaults print to stdout."""
+
+    def _handler(*args):
+        logger.debug(f"Toast {kind}: {args}")
+
+    return _handler
+
+
 def _notification_worker():
     """Single background thread that processes all desktop notifications sequentially."""
     global _notifications_available
@@ -60,10 +69,19 @@ def _notification_worker():
                     "content": "View Dashboard",
                 }
 
+            # win11toast defaults on_click/on_dismissed/on_failed to the builtin
+            # print(). Every toast that simply times out then writes
+            # "(<ToastDismissalReason.TIMED_OUT: 2>,)" straight to STDOUT, which is
+            # the launcher console. Route those callbacks to the log instead.
+            kwargs = {
+                "audio": {"silent": "true"},
+                "on_click": _toast_event("click"),
+                "on_dismissed": _toast_event("dismissed"),
+                "on_failed": _toast_event("failed"),
+            }
             if button_config:
-                win11toast.toast(title, message[:256], audio={"silent": "true"}, button=button_config)
-            else:
-                win11toast.toast(title, message[:256], audio={"silent": "true"})
+                kwargs["button"] = button_config
+            win11toast.toast(title, message[:256], **kwargs)
         except Exception as e:
             logger.debug(f"Notification error: {e}")
         finally:

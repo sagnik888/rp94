@@ -261,6 +261,19 @@ class Trade:
     raw_union_entry: bool = False
     initial_stop: float = 0.0
     scalp_lock_mode: bool = False
+    # Runner state changes exit semantics: while armed, the fixed target is no longer
+    # allowed to close the trade (see _check_exit_conditions).  These therefore cannot
+    # remain dynamic setattrs that disappear on a process restart.
+    lifecycle_id: str = ""
+    runner_mode: bool = False
+    runner_activation_timestamp: Optional[datetime] = None
+    runner_activation_reason: str = ""
+    runner_stop: float = 0.0
+    # Unit/price-space discriminator for runner_stop.  Options use different
+    # spaces in the session-candidate and live-Trade managers, so the number is
+    # not auditable without this field.
+    runner_stop_basis: str = ""
+    stop_provenance: str = ""
     # ═══ Realized slippage (REAL broker fills only) ═══
     signal_entry_price: float = 0.0  # pre-fill signal/decision price (slippage reference)
     entry_slippage: float = 0.0      # adverse ₹/unit paid vs signal at entry fill
@@ -460,6 +473,17 @@ class Trade:
             "raw_union_entry": self.raw_union_entry,
             "initial_stop": self.initial_stop if self.initial_stop is not None else 0.0,
             "scalp_lock_mode": bool(self.scalp_lock_mode),
+            "lifecycle_id": str(self.lifecycle_id or self.id or ""),
+            "runner_mode": bool(self.runner_mode),
+            "runner_activation_timestamp": (
+                self.runner_activation_timestamp.isoformat()
+                if self.runner_activation_timestamp
+                else ""
+            ),
+            "runner_activation_reason": str(self.runner_activation_reason or ""),
+            "runner_stop": float(self.runner_stop or 0.0),
+            "runner_stop_basis": str(self.runner_stop_basis or ""),
+            "stop_provenance": str(self.stop_provenance or ""),
             "signal_entry_price": self.signal_entry_price,
             "entry_slippage": self.entry_slippage,
             "exit_slippage": self.exit_slippage,
@@ -642,6 +666,15 @@ class Trade:
             raw_union_entry=bool(data.get("raw_union_entry", False)),
             initial_stop=float(data.get("initial_stop") or data.get("trailing_stop") or 0.0),
             scalp_lock_mode=bool(data.get("scalp_lock_mode", False)),
+            lifecycle_id=str(data.get("lifecycle_id") or data.get("id") or ""),
+            runner_mode=bool(data.get("runner_mode", False)),
+            runner_activation_timestamp=parse_ist_datetime(
+                data.get("runner_activation_timestamp")
+            ),
+            runner_activation_reason=str(data.get("runner_activation_reason") or ""),
+            runner_stop=float(data.get("runner_stop") or 0.0),
+            runner_stop_basis=str(data.get("runner_stop_basis") or ""),
+            stop_provenance=str(data.get("stop_provenance") or ""),
             signal_entry_price=float(data.get("signal_entry_price") or 0.0),
             entry_slippage=float(data.get("entry_slippage") or 0.0),
             exit_slippage=float(data.get("exit_slippage") or 0.0),
@@ -747,6 +780,7 @@ class TradeManager:
         session_end: str = "15:25",
         product_type: str = "CARRYFORWARD",
         on_notification=None,
+        entry_submission_guard: Optional[Callable[[Trade], Any]] = None,
     ):
         self.broker = broker
         # Write-behind DB persistence event — initialised first so that any
@@ -756,11 +790,21 @@ class TradeManager:
         # Injected desktop notifier (main.py passes send_desktop_notification). Falls
         # back to importing it directly, so behaviour is unchanged when not supplied.
         self.on_notification = on_notification
+        # Optional last-moment AUTO-entry admission hook.  Unlike the scanner's signal
+        # gates, this runs inside the queued worker immediately before each broker
+        # submission (including retries), so a decision that became stale while waiting
+        # in the queue cannot leak through.  Manual entries deliberately bypass it.
+        self.entry_submission_guard = entry_submission_guard
         self.max_positions = max_positions
         self.session_end = self._parse_time(session_end)
         self.product_type = str(product_type or "CARRYFORWARD").upper()
         self.open_trades: Dict[str, Trade] = {}
         self.closed_trades: List[Trade] = []
+        # A final fill is fully accounted before the Trade is removed from
+        # open_trades, but terminal telemetry is emitted immediately afterwards.
+        # This ownership bridge closes that tiny removal-to-callback interval so a
+        # scanner/session advisory cannot publish the canonical EXIT first.
+        self._terminal_callback_lifecycles: set[str] = set()
         self._trade_counter = 0
         self._lock = threading.RLock()
         # Serialises exchange-side protective-stop placement so two callers
@@ -1360,6 +1404,15 @@ class TradeManager:
         from config.settings import get_settings
         from engine.trade_accounting import estimate_trade_charges
 
+        on_trade_closed = getattr(self, "on_trade_closed", None)
+        terminal_lifecycle = str(
+            getattr(trade, "lifecycle_id", "") or getattr(trade, "id", "") or trade_id
+        )
+        terminal_owners = getattr(self, "_terminal_callback_lifecycles", None)
+        if not isinstance(terminal_owners, set):
+            terminal_owners = set()
+            self._terminal_callback_lifecycles = terminal_owners
+
         with self._lock:
             if trade_id not in self.open_trades:
                 return False
@@ -1413,6 +1466,10 @@ class TradeManager:
                 if realised_pnl is not None
                 else gross - trade.charges
             )
+            if callable(on_trade_closed) and terminal_lifecycle:
+                # Add before removing from open_trades. At every observable instant
+                # either the live row or this bridge owns the lifecycle.
+                terminal_owners.add(terminal_lifecycle)
             self.closed_trades.append(trade)
             del self.open_trades[trade_id]
         self._mark_dirty()
@@ -1421,6 +1478,18 @@ class TradeManager:
         msg = f"✅ Trade Closed: {trade.instrument} @ {trade.exit_price:.2f} (Reason: {reason}) | PnL: {profit_str}"
         logger.info(msg)
         self._log_ui(msg, "trade")
+        # Notify only after broker reconciliation/final accounting has made the
+        # terminal state authoritative. An exit-order acknowledgement is not a
+        # fill, so callers must not write terminal telemetry from the ACK path.
+        if callable(on_trade_closed):
+            try:
+                on_trade_closed(trade)
+            except Exception as exc:
+                # Observability must never unwind a completed broker lifecycle.
+                logger.error(f"Trade-closed callback failed for {trade.id}: {exc}")
+            finally:
+                with self._lock:
+                    terminal_owners.discard(terminal_lifecycle)
         
         return True
 
@@ -3376,6 +3445,26 @@ class TradeManager:
         reservations = [str((preflight or {}).get("reservation_id") or "")]
         reservations = [r for r in reservations if r]
 
+        # This worker may have waited behind another broker task after the Scanner
+        # decided to add exposure. Re-ask at the same last-moment boundary used by a
+        # first entry. A refusal leaves the parent position and its existing protective
+        # stop untouched, and the just-created margin reservation is returned.
+        allowed, guard_reason = self._entry_submission_guard_verdict(
+            trade,
+            getattr(trade, "_entry_submission_guard", None),
+            # A cascade add is automated new exposure even when the parent trade
+            # was originally opened manually, so the parent's exec_type must not
+            # bypass the final Auto/resource authority.
+            force_auto_exposure=True,
+        )
+        if not allowed:
+            self._release_margin_reservations(reservations)
+            logger.warning(
+                f"Scale-in submission guard rejected {trade.trading_symbol}: "
+                f"{guard_reason}. Existing position is unchanged and remains protected."
+            )
+            return
+
         # The existing stop is NOT cancelled first. It covers the quantity currently held,
         # so leaving it armed means a failed add changes nothing and a filled add is
         # merely under-protected on the new lots until the re-arm below — never naked, and
@@ -3782,6 +3871,28 @@ class TradeManager:
             f"Abandoned stale entry for {trade.trading_symbol}: price moved past the "
             "stop while the limit rested, so it was not force-filled at market."
         )
+        self._notify_delayed_entry_result(trade, False)
+
+    def _notify_delayed_entry_result(self, trade: Trade, accepted: bool) -> None:
+        """Deliver an entry result discovered after the initial broker ACK.
+
+        The per-entry callback preserves the exact signal object during the normal
+        process lifetime.  The manager-level callback is a restart fallback that lets
+        Scanner resolve the signal by immutable lifecycle id.
+        """
+        callback = getattr(trade, "_entry_execution_result_callback", None)
+        if callable(callback):
+            try:
+                callback(trade, bool(accepted))
+                return
+            except Exception as exc:
+                logger.error(f"Delayed entry-result callback failed for {trade.id}: {exc}")
+        fallback = getattr(self, "on_delayed_entry_result", None)
+        if callable(fallback):
+            try:
+                fallback(trade, bool(accepted))
+            except Exception as exc:
+                logger.error(f"Global delayed entry-result callback failed for {trade.id}: {exc}")
 
     def _release_margin_reservations(self, reservation_ids) -> None:
         """Hand back margin an entry definitively did not consume.
@@ -4651,6 +4762,7 @@ class TradeManager:
                         with self._lock:
                             if self.open_trades.pop(trade_id, None) is trade:
                                 self.closed_trades.append(trade)
+                        self._notify_delayed_entry_result(trade, False)
                         changed = True
                         continue
 
@@ -4725,6 +4837,33 @@ class TradeManager:
                                 if trade.inst_type == "OPT" or trade.direction in {"LONG", "BUY"}
                                 else "SELL"
                             )
+                            # The original limit is now proven cancelled, so this is a
+                            # fresh broker mutation rather than a harmless bookkeeping
+                            # retry. Re-ask the queued-entry authority immediately before
+                            # sending the MARKET replacement. A refusal can be closed
+                            # cleanly because the cancel proved that no original order is
+                            # still resting or filled.
+                            allowed, guard_reason = self._entry_submission_guard_verdict(
+                                trade, getattr(trade, "_entry_submission_guard", None)
+                            )
+                            if not allowed:
+                                trade.status = "CLOSED"
+                                trade.pending_execution = False
+                                trade.execution_status = "REJECTED"
+                                trade.exit_reason = "ENTRY_SUBMISSION_GUARD"
+                                trade.exit_time = datetime.now(IST)
+                                trade.exit_price = trade.entry_price
+                                trade.execution_error = str(guard_reason)
+                                with self._lock:
+                                    if self.open_trades.pop(trade.id, None) is trade:
+                                        self.closed_trades.append(trade)
+                                logger.warning(
+                                    f"Stale-entry replacement rejected by submission guard "
+                                    f"for {trade.trading_symbol}: {guard_reason}"
+                                )
+                                self._notify_delayed_entry_result(trade, False)
+                                changed = True
+                                continue
                             try:
                                 replacement = self.broker.place_order(
                                     trade.trading_symbol,
@@ -5522,6 +5661,73 @@ class TradeManager:
             return str(data or "")
         return str(result)
 
+    def _entry_submission_guard_verdict(
+        self,
+        trade: Trade,
+        per_entry_guard: Optional[Callable[[Trade], Any]] = None,
+        *,
+        force_auto_exposure: bool = False,
+    ) -> Tuple[bool, str]:
+        """Evaluate the optional queued AUTO-entry guard on a strict, fail-closed API.
+
+        A guard may return ``bool``, ``(allowed, reason)``, or a mapping with
+        ``allowed``/``ok`` and ``reason``.  It is intentionally skipped for manual
+        entries: an operator-approved order must not acquire a new automated veto merely
+        because both paths share ``open_trade``.  Exceptions and malformed verdicts are
+        clean rejections because allowing an entry after its final safety check crashed
+        would defeat the purpose of placing that check at the broker boundary.
+        """
+        # Recovery reconstructs exposure that already exists, so its one-time
+        # bookkeeping path may bypass a *new exposure* guard.  That exemption must
+        # not follow the recovered Trade into a later automated scale-in: the add is
+        # fresh broker exposure and callers mark it with force_auto_exposure=True.
+        if (
+            bool(getattr(trade, "_entry_submission_guard_bypass", False))
+            and not force_auto_exposure
+        ):
+            return True, ""
+        if (
+            not force_auto_exposure
+            and str(getattr(trade, "exec_type", "A") or "A").upper()
+            not in {"A", "AUTO"}
+        ):
+            return True, ""
+        guard = per_entry_guard
+        if guard is None:
+            guard = getattr(self, "entry_submission_guard", None)
+        if guard is None:
+            return True, ""
+        if not callable(guard):
+            return False, "entry submission guard is not callable"
+        try:
+            verdict = guard(trade)
+        except Exception as exc:
+            return False, f"entry submission guard raised {type(exc).__name__}: {exc}"
+        reason = ""
+        if isinstance(verdict, dict):
+            if "allowed" in verdict:
+                allowed = bool(verdict.get("allowed"))
+            elif "ok" in verdict:
+                allowed = bool(verdict.get("ok"))
+            else:
+                return False, "entry submission guard returned a mapping without allowed/ok"
+            reason = str(verdict.get("reason") or verdict.get("limitation") or "")
+        elif isinstance(verdict, tuple):
+            if not verdict:
+                return False, "entry submission guard returned an empty tuple"
+            allowed = bool(verdict[0])
+            reason = str(verdict[1] if len(verdict) > 1 else "")
+        elif isinstance(verdict, bool):
+            allowed = verdict
+        else:
+            return False, (
+                "entry submission guard returned an unsupported verdict "
+                f"({type(verdict).__name__})"
+            )
+        if allowed:
+            return True, reason
+        return False, reason or "entry submission guard rejected the queued entry"
+
     def open_trade(
         self,
         instrument: str,
@@ -5573,6 +5779,8 @@ class TradeManager:
         scalp_lock_mode: bool = False,
         execution_touch_quote: Optional[Dict[str, Any]] = None,
         on_execution_result: Optional[Callable[[Trade, bool], None]] = None,
+        lifecycle_id: str = "",
+        entry_submission_guard: Optional[Callable[[Trade], Any]] = None,
     ) -> Optional[Trade]:
         """Open a new trade and execute via broker"""
         if entry_time is not None:
@@ -5713,6 +5921,11 @@ class TradeManager:
             raw_union_entry=bool(raw_union_entry),
             initial_stop=float(initial_stop or trailing_stop or 0.0),
             scalp_lock_mode=bool(scalp_lock_mode),
+            # Generated trade ids contain only MMDDHHMM and can repeat in a later
+            # calendar year. Prefix the full session date so terminal telemetry stays
+            # globally unambiguous while remaining deterministic across a restart.
+            lifecycle_id=str(lifecycle_id or f"{now.date().isoformat()}|{trade_id}"),
+            stop_provenance="signal",
             signal_entry_price=float(price or 0.0),
             execution_bid_price=float((execution_touch_quote or {}).get("bid") or 0.0),
             execution_ask_price=float((execution_touch_quote or {}).get("ask") or 0.0),
@@ -5724,6 +5937,13 @@ class TradeManager:
         # Not a Trade field: it matters only at the instant the entry order is placed,
         # so it never needs to persist or survive a restart.
         setattr(trade, "entry_momentum_urgency", float(entry_momentum_urgency or 0.0))
+        # Runtime-only admission state. Recovery rows re-establish bookkeeping for
+        # exposure that already exists and must never be blocked by a *new exposure*
+        # guard. The callable is retained on fresh AUTO trades so later scale-ins and a
+        # stale-limit replacement use the same last-moment authority as the first order.
+        setattr(trade, "_entry_submission_guard_bypass", bool(is_recovery))
+        setattr(trade, "_entry_submission_guard", entry_submission_guard)
+        setattr(trade, "_entry_execution_result_callback", on_execution_result)
 
         trade.pending_execution = not is_recovery
         trade.execution_status = "OPEN" if (is_recovery or is_ghost) else "ENTRY_PENDING"
@@ -5754,8 +5974,10 @@ class TradeManager:
                 # Every retry runs the preflight again and takes its own reservation.
                 # Collected so a definitive rejection can hand all of them back at once.
                 reservations: List[str] = []
+                guard_rejection_reason = ""
 
                 def place_order():
+                    nonlocal guard_rejection_reason
                     # Ask the broker whether this order can be funded BEFORE sending it.
                     # preflight_entry_margin was written for exactly this and had no
                     # caller, so an underfunded account fired a doomed order per signal
@@ -5782,6 +6004,26 @@ class TradeManager:
                     reservation_id = str((preflight or {}).get("reservation_id") or "")
                     if reservation_id:
                         reservations.append(reservation_id)
+
+                    def require_submission_guard() -> None:
+                        nonlocal guard_rejection_reason
+                        allowed, reason = self._entry_submission_guard_verdict(
+                            trade, entry_submission_guard
+                        )
+                        if allowed:
+                            return
+                        guard_rejection_reason = str(reason or "queued entry no longer allowed")
+                        raise BrokerOrderRejected(
+                            guard_rejection_reason,
+                            code="ENTRY_SUBMISSION_GUARD",
+                            terminal=True,
+                        )
+
+                    # This is deliberately after margin reservation and immediately
+                    # before broker mutation.  A retry can spend seconds in the queue;
+                    # re-evaluate every attempt and let the definitive-rejection cleanup
+                    # below release every reservation accumulated by earlier attempts.
+                    require_submission_guard()
                     # Start the acknowledgement/fill clock BEFORE the first broker
                     # submission. Stamping after place_order returned excluded the whole
                     # API round trip and left no timestamp at all while a slow/ambiguous
@@ -5823,6 +6065,10 @@ class TradeManager:
                             for arg in ("touch_quote", "trade_id", "confidence", "momentum_urgency")
                         ):
                             raise
+                        # The compatibility fallback is another actual broker call.  Run
+                        # the guard again in case its state changed after the first call
+                        # failed on unsupported keyword arguments.
+                        require_submission_guard()
                         return self.broker.place_order(
                             symbol=trading_symbol,
                             token=symbol_token,
@@ -5882,17 +6128,26 @@ class TradeManager:
                 # blocking the next signal on money nobody is spending. The ambiguous
                 # branch above deliberately does NOT reach here.
                 self._release_margin_reservations(reservations)
+                guard_blocked = bool(guard_rejection_reason)
                 msg = (
-                    f"❌ Broker entry failed for {trading_symbol} after "
-                    f"{attempts} attempts: {error}"
+                    f"❌ Entry submission guard rejected {trading_symbol}: "
+                    f"{guard_rejection_reason}"
+                    if guard_blocked
+                    else (
+                        f"❌ Broker entry failed for {trading_symbol} after "
+                        f"{attempts} attempts: {error}"
+                    )
                 )
                 logger.error(msg)
                 self._log_ui(msg, "error")
-                self._alert_blocking_broker_condition(error)
+                if not guard_blocked:
+                    self._alert_blocking_broker_condition(error)
                 with self._lock:
                     if trade.id in self.open_trades:
                         trade.status = "CLOSED"
-                        trade.exit_reason = "BROKER_ERROR"
+                        trade.exit_reason = (
+                            "ENTRY_SUBMISSION_GUARD" if guard_blocked else "BROKER_ERROR"
+                        )
                         trade.exit_time = datetime.now(IST)
                         trade.exit_price = trade.entry_price
                         trade.pending_execution = False

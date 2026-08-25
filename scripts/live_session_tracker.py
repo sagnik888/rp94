@@ -29,7 +29,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytz
 
@@ -37,7 +37,77 @@ IST = pytz.timezone("Asia/Kolkata")
 ROOT = Path(__file__).resolve().parents[1]
 LOG_FILE = ROOT / "logs" / "ut1.log"
 OUT_DIR = ROOT / "runtime_logs" / "session_tracker"
-API = "http://127.0.0.1:8001"
+def _resolve_api_base() -> str:
+    """The dashboard THIS build serves, not a hardcoded port.
+
+    Was `http://127.0.0.1:8001`. rp46-3 serves DASHBOARD_PORT=8500, and 8001 belongs to
+    a different build on this machine. Both outcomes were wrong: with 8001 down every
+    poll failed (2026-08-20: "Dashboard API unreachable polls: 316/316", every health
+    field `n/a`), and with 8001 UP the tracker reported the OTHER build's state under
+    this build's filename — the 2026-08-21 report claims "FUT budget 18000.0 · max trade
+    loss 5000.0 · warnings 0" against this build's Rs.0.015, 0, and one warning.
+
+    SESSION_TRACKER_API still wins, so a build can be pointed somewhere else on purpose.
+    """
+    override = (os.getenv("SESSION_TRACKER_API") or "").strip()
+    if override:
+        return override.rstrip("/")
+    host: str = "127.0.0.1"
+    port: Optional[int] = None
+
+    # ROOT/.env FIRST, and deliberately not via config.settings. Two traps stack here:
+    #
+    #   1. This module is RUN AS A SCRIPT, so sys.path[0] is scripts/ and `config` is
+    #      not importable at all. Importing the module in a test DOES put the repo root
+    #      on the path, so a settings-based resolver passes its tests and still fails in
+    #      the only context that runs.
+    #   2. Even with the import fixed, get_settings() reads `.env` relative to the CWD.
+    #      The tracker is launched from scripts/, where there is no .env, so settings
+    #      hand back the CODE DEFAULT — `dashboard_port: int = 8001`
+    #      (config/settings.py:1664). That default is precisely the wrong port, and it
+    #      is why the original hardcoded 8001 looked reasonable.
+    #
+    # .env is the real settings store in this build, and ROOT is absolute, so reading it
+    # directly is both cwd-independent and the actual source of truth.
+    def _from_env_file(key: str) -> str:
+        try:
+            for raw in (ROOT / ".env").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                name, sep, value = raw.partition("=")
+                if sep and name.strip() == key:
+                    return value.strip().strip("'\"").strip()
+        except Exception:
+            return ""
+        return ""
+
+    try:
+        port = int(_from_env_file("DASHBOARD_PORT") or 0) or None
+    except (TypeError, ValueError):
+        port = None
+    host = _from_env_file("DASHBOARD_HOST") or host
+
+    if port is None:
+        # No .env (a fresh checkout, or a build that configures settings another way).
+        try:
+            import sys
+
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            from config.settings import get_settings
+
+            settings = get_settings()
+            port = int(getattr(settings, "dashboard_port", 0) or 0) or None
+            host = str(getattr(settings, "dashboard_host", host) or host).strip()
+        except Exception:
+            port = None
+    if host in ("", "0.0.0.0", "::"):
+        # A bind-all address is not something you can dial.
+        host = "127.0.0.1"
+    return f"http://{host}:{port or 8001}".rstrip("/")
+
+
+API = _resolve_api_base()
 PID_FILE_NAME = "tracker.pid"
 LOCK_FILE_NAME = "tracker.lock"
 MARKET_START_MINUTES = 9 * 60 + 15

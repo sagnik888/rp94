@@ -3,6 +3,10 @@ setlocal EnableDelayedExpansion
 title UT1 Index Trading System - Advanced Launcher
 color 0B
 
+:: Console log lines carry emoji. Without UTF-8 they arrive as mojibake or as
+:: backslash escapes.
+chcp 65001 >nul
+
 echo ========================================================
 echo        UT1 INDEX TRADING SYSTEM - STARTUP SCRIPT
 echo ========================================================
@@ -93,11 +97,24 @@ echo ========================================================
 start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "http://127.0.0.1:8500/" -Port 8500
 
 :: Start the python process
-"%PY%" main.py
+:: stderr is TEED to a file, not just the console. On 2026-08-24 the process died at
+:: 10:59:58 mid-scan-cycle with nothing in logs/ut1.log -- no error, no traceback, no
+:: shutdown line -- because Windows killed it for memory (System log, event 26:
+:: "Out of Virtual Memory", with three python.exe holding 2.41 / 2.01 / 1.54 GB). A
+:: MemoryError traceback or a Windows fatal message goes to STDERR, which was being
+:: written to a console window that is gone by the time anyone looks. Keep it.
+for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value 2^>nul') do set "_LDT=%%I"
+set "_STAMP=%_LDT:~0,8%_%_LDT:~8,6%"
+if not exist "logs" mkdir "logs"
+echo [INFO] stderr -> logs\startup_stderr_%_STAMP%.log
+"%PY%" main.py 2> "logs\startup_stderr_%_STAMP%.log"
 
 :: 8. Error Handling
 echo.
 echo ========================================================
 echo [WARNING] The server process has terminated or crashed.
+echo [WARNING] Exit code: %ERRORLEVEL%
+echo [WARNING] Check logs\startup_stderr_%_STAMP%.log for anything the
+echo [WARNING] logger never got to write (MemoryError, fatal, OOM kill).
 echo ========================================================
 pause

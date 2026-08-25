@@ -53,9 +53,20 @@ FILE_LOG_ENABLED = (
         or os.getenv("UT1_ENABLE_TEST_FILE_LOGS", "").strip().lower() in _TRUTHY_ENV
     )
 )
+# The launcher tees STDERR to a file so a MemoryError traceback or a Windows fatal
+# message outlives the console window. That redirect also swallowed every log line:
+# the console went silent right after "Starting Backend Server" while the system was
+# in fact scanning normally. Console logging goes to STDOUT, so the operator sees it;
+# raw interpreter stderr still lands in the file for the post-mortem.
+for _console_stream in (sys.stdout, sys.stderr):
+    try:
+        _console_stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        # Not a real console (pytest capture, pipe wrapper). Nothing to widen.
+        pass
 logger.remove()
 logger.add(
-    sys.stderr,
+    sys.stdout,
     format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | <level>{message}</level>",
     level=app_log_level,
 )
@@ -352,6 +363,32 @@ def _scanner_liveness_alert_due(
     return bool(seen_running or elapsed >= grace)
 
 
+def _apply_runtime_resource_guard(scanner) -> tuple[bool, str]:
+    """Latch an entry-only inhibition without changing Auto exit semantics."""
+    if (
+        str(getattr(scanner, "mode", "") or "").upper() != "REAL"
+        or not bool(getattr(scanner, "auto_mode", False))
+    ):
+        scanner._auto_resource_entry_inhibited = False
+        scanner._auto_resource_entry_inhibit_reason = ""
+        return False, ""
+    try:
+        blockers = list(scanner._auto_execution_resource_blockers() or [])
+    except Exception as exc:
+        blockers = [
+            f"Auto resource guard failed to obtain a fresh sample ({exc}); "
+            "new exposure is fail-closed"
+        ]
+    if not blockers:
+        scanner._auto_resource_entry_inhibited = False
+        scanner._auto_resource_entry_inhibit_reason = ""
+        return False, ""
+
+    scanner._auto_resource_entry_inhibited = True
+    scanner._auto_resource_entry_inhibit_reason = str(blockers[0])
+    return True, "New Auto entries inhibited; " + str(blockers[0])
+
+
 def start_runtime_watchdog(scanner: Scanner, settings) -> None:
     """Alert on the silent failure modes that unattended operation cannot tolerate.
 
@@ -364,7 +401,9 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
         returns code -16, "disabled to comply with SEBI regulations"), so the option
         chain quietly disappears and OI/PCR/Greeks go blank.
 
-    Detection only — it never changes trading state, it just makes the failure loud.
+    Most checks are detection-only. Critical host memory/commit pressure is the narrow
+    exception: it inhibits new Auto exposure while deliberately preserving the Auto
+    flag used by software stops, targets, profit locks, and reconciliation.
     """
     if str(os.getenv("RUNTIME_WATCHDOG_ENABLED", "1")).strip().lower() in _FALSEY_ENV:
         logger.info("Runtime watchdog disabled by RUNTIME_WATCHDOG_ENABLED.")
@@ -504,6 +543,46 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 else:
                     state.pop("kite_token", None)
 
+                # 2c. Kite TICKS — a separate question from the Kite SESSION above. A
+                # socket can stay open and simply stop delivering: on_close/on_error
+                # never fire, so kiteconnect's reconnect never runs and nothing replays
+                # the subscription. 2026-08-21: connected 10:23:05, silent from ~14:35,
+                # no error until 15:30:19 (after the close), kite_ws age reaching 1,672s.
+                #
+                # kite_stream_stalled already existed and was already read twice — a
+                # readiness warning (engine/safe_mode.py:276) and a dashboard issue
+                # (engine/scanner_telemetry.py:757) — but neither writes a CRITICAL nor
+                # attempts recovery, so 28 minutes of a dead feed left no line in the log
+                # of its own. It surfaced only because a signal happened to arrive and hit
+                # the entry gate, which correctly refuses entries without an
+                # order-authority source. That gate is the safety response; this is the
+                # alarm and the repair.
+                try:
+                    health = scanner.data.get_source_health()
+                except Exception:
+                    health = {}
+                if health.get("kite_stream_stalled"):
+                    if not state.get("kite_stream_resubscribed"):
+                        state["kite_stream_resubscribed"] = True
+                        try:
+                            scanner.data.resubscribe_kite_tokens()
+                        except Exception as exc:
+                            logger.debug(f"Kite resubscribe attempt failed: {exc}")
+                    age = health.get("kite_tick_age_seconds")
+                    _alert(
+                        "kite_stream",
+                        "Kite tick stream is silent while the socket reports connected"
+                        + (f" ({age:.0f}s since the last tick)" if isinstance(age, (int, float)) else " (no ticks yet)")
+                        + (" - REST prices still serving" if health.get("kite_data_fresh")
+                           else " - REST prices are stale too")
+                        + ". Entries are refused while no order-authority source is fresh; "
+                          "a resubscribe has been attempted",
+                        state,
+                    )
+                else:
+                    state.pop("kite_stream", None)
+                    state.pop("kite_stream_resubscribed", None)
+
                 # 3. Fyers auth — expires daily and cannot auto-refresh.
                 try:
                     status = scanner.data.get_fyers_auth_status()
@@ -519,6 +598,20 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                     )
                 else:
                     state.pop("fyers", None)
+
+                # 4. Host memory / Windows commit pressure.  Fail closed only for NEW
+                # exposure. Do not change scanner.auto_mode: that same flag controls
+                # software exits, so switching it off would strand them behind manual
+                # confirmation while the machine is already under stress.
+                pressured, pressure_message = _apply_runtime_resource_guard(scanner)
+                if pressured:
+                    _alert(
+                        "resource_pressure",
+                        pressure_message,
+                        state,
+                    )
+                else:
+                    state.pop("resource_pressure", None)
             except Exception as exc:
                 logger.debug(f"Runtime watchdog iteration failed: {exc}")
             time.sleep(max(15.0, check_every))

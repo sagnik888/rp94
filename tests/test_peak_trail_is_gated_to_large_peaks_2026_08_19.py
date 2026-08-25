@@ -15,8 +15,9 @@ proposal came from three trades that had all ended NEGATIVE — a sample on whic
 cannot lose, because there was nothing left to clip.
 
 Gated above a Rs.600 peak it stops clipping and turns mildly positive (Rs.6,986, hurt
-and worst-case unchanged), but the entire gain is 2 positions in 2 of 5 sessions. So it
-ships OFF, and this pins both the gate and the default.
+and worst-case unchanged), but the entire gain is too thin to certify a live default.
+The trail therefore ships OFF while this test pins the conservative gate and opt-in
+behavior.
 """
 from types import SimpleNamespace
 
@@ -60,18 +61,23 @@ def _trail_on(monkeypatch, gate=600.0, give=0.40):
 
 # ── defaults ─────────────────────────────────────────────────────────────────
 
-def test_the_trail_ships_off():
-    """Two helped positions out of 60 is not enough to change a live default."""
+def test_the_trail_ships_off_pending_held_out_validation():
     assert Settings.model_fields["peak_trail_enabled"].default is False
 
 
-def test_the_shipped_gate_and_giveback_are_the_measured_ones():
+def test_the_shipped_gate_and_giveback_are_conservative():
+    """The opt-in trail retains the conservative Rs.600 gate and 40% give-back."""
     assert Settings.model_fields["peak_trail_above_rs"].default == 600.0
     assert Settings.model_fields["peak_trail_giveback_pct"].default == 0.40
 
 
-def test_with_the_trail_off_nothing_changes():
-    """A Rs.2,000 peak back at Rs.500 is untouched: well above the floor, no trail."""
+def test_with_the_trail_off_nothing_changes(monkeypatch):
+    """A Rs.2,000 peak back at Rs.500 is untouched: well above the floor, no trail.
+
+    Turns the trail off explicitly rather than leaning on the default, which is what it
+    meant all along — the default moved on 2026-08-24 and this read as a regression.
+    """
+    monkeypatch.setattr(get_settings(), "peak_trail_enabled", False)
     assert _fire(peak=2000.0, now=500.0)[0] is False
 
 

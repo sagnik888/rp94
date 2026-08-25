@@ -38,9 +38,32 @@ from scripts.gate_edge_report import (
      "Counter-session-bias LONG needs >= 60%"),
     ("Choppy market blocked", "Choppy market blocked"),
     ("C grade blocked", "C grade blocked"),
+    # "X below Y": the reading is what is below, the floor is what it is below.
+    # Left unstripped these minted a family per signal -- 71 rows over 20 sessions
+    # became ~50 families, all n=1, all "not actionable", so the confidence gates
+    # vanished from the ranking entirely.
+    ("B+ 55.983% below 58.000% confidence gate", "B+ below 58% confidence gate"),
+    ("B+ 57.534% below 58.000% confidence gate", "B+ below 58% confidence gate"),
+    ("B 48.024% below 58.000% confidence gate", "B below 58% confidence gate"),
 ])
 def test_a_gate_gets_one_name_whatever_it_measured(reason, expected):
     assert reason_family(reason) == expected
+
+
+def test_the_grade_and_the_floor_both_still_identify_the_gate():
+    """Collapsing the reading must not collapse the two things that are NOT readings."""
+    b_plus_58 = reason_family("B+ 55.983% below 58.000% confidence gate")
+    b_plus_62 = reason_family("B+ 61.326% below 62.000% confidence gate")
+    b_58 = reason_family("B 48.024% below 58.000% confidence gate")
+
+    assert b_plus_58 != b_plus_62, "different floors are different gates"
+    assert b_plus_58 != b_58, "different grades are different gates"
+
+
+def test_a_floor_is_the_same_floor_however_it_was_formatted():
+    assert reason_family("B+ 55.9% below 58.000% confidence gate") == reason_family(
+        "B+ 55.9% below 58% confidence gate"
+    )
 
 
 def test_distinct_thresholds_stay_distinct():
@@ -152,3 +175,122 @@ def test_a_small_family_is_reported_but_never_called_actionable(tmp_path, monkey
 
     assert report["distinct_rejected_signals"] == 2
     assert all(f["actionable"] is False for f in report["families"])
+
+
+# ── the actionable test ──────────────────────────────────────────────────────
+#
+# n alone was never enough, and the report's own top rows proved it. Ranks 1-3
+# (17.21, 8.57, 6.25) were gates that fire near 15:30: the close truncates their
+# 30-minute window to a median 5, 2 and 4 bars against 6 everywhere else, so
+# there is less room to move against the signal, MAE collapses to 0.009-0.017%
+# against 0.060-0.100% elsewhere, and the ratio explodes on arithmetic alone.
+# Rank 4 was 8 rows that all fired on 2026-08-05 -- one session wearing a
+# disguise, which MIN_N passed because the tool never counted sessions.
+
+def _points(n, day="2026-08-12", bars=6):
+    import pandas as pd
+
+    rows = []
+    for i in range(n):
+        rows.append({
+            "signal_id": f"s{i}", "decision": "REJECTED", "reason": "Choppy market blocked",
+            "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
+            "date": day, "signal_timestamp": f"{day} 09:15:00",
+        })
+    return rows
+
+
+def test_a_truncated_window_is_never_actionable(monkeypatch):
+    """MAE has nowhere to go in a 2-bar window, so the ratio is the clock."""
+    import scripts.gate_edge_report as ger
+
+    monkeypatch.setattr(ger, "load_events", lambda days: _points(20))
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+    monkeypatch.setattr(ger, "excursion", lambda *a, **k: (0.01, 0.17))
+    monkeypatch.setattr(ger, "window_bars", lambda *a, **k: 2)
+
+    family = ger.build(["2026-08-12"])["families"][0]
+
+    assert family["n"] == 20
+    assert family["median_window_bars"] == 2
+    assert family["actionable"] is False
+
+
+def test_one_session_is_never_actionable_however_many_rows(monkeypatch):
+    """The regression: 8 rows on 2026-08-05 reached rank 4 of the table."""
+    import scripts.gate_edge_report as ger
+
+    monkeypatch.setattr(ger, "load_events", lambda days: _points(40))
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+    monkeypatch.setattr(ger, "excursion", lambda *a, **k: (0.05, 0.19))
+    monkeypatch.setattr(ger, "window_bars", lambda *a, **k: 6)
+
+    family = ger.build(["2026-08-05"])["families"][0]
+
+    assert family["n"] == 40 and family["sessions"] == 1
+    assert family["actionable"] is False
+
+
+def test_a_family_that_clears_every_test_is_actionable(monkeypatch):
+    import scripts.gate_edge_report as ger
+
+    rows = []
+    for day in ("2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13"):
+        rows.extend(
+            dict(r, signal_id=f"{day}-{r['signal_id']}") for r in _points(5, day=day)
+        )
+    monkeypatch.setattr(ger, "load_events", lambda days: rows)
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+    monkeypatch.setattr(ger, "excursion", lambda *a, **k: (0.06, 0.09))
+    monkeypatch.setattr(ger, "window_bars", lambda *a, **k: 6)
+
+    family = ger.build(["x"])["families"][0]
+
+    assert family["n"] == 20 and family["sessions"] == 4
+    assert family["top_session_share"] == 0.25
+    assert family["actionable"] is True
+
+
+def test_the_render_names_which_test_a_family_failed():
+    from scripts.gate_edge_report import _why_not_actionable
+
+    why = _why_not_actionable({
+        "n": 8, "sessions": 1, "top_session_share": 1.0, "median_window_bars": 2,
+    })
+
+    assert "1 session" in why
+    assert "100% in one session" in why
+    assert "window truncated to 2.0 bars" in why
+
+
+def test_a_half_bar_median_is_not_rounded_into_a_contradiction():
+    """An even-n family medians to x.5. Rounded to "6" the row printed a FULL window
+    in the W column and "window truncated to 6 bars" in the note beside it -- the
+    report denying, in the same line, the reason it excluded the family. Python's
+    round-half-even makes 5.5 the only value that collides with the full-window
+    number (4.5 -> 4, 2.5 -> 2), which is exactly the boundary that matters."""
+    from scripts.gate_edge_report import _why_not_actionable
+
+    why = _why_not_actionable({
+        "n": 12, "sessions": 4, "top_session_share": 0.3, "median_window_bars": 5.5,
+    })
+
+    assert "window truncated to 5.5 bars" in why
+    assert "6 bars" not in why
+
+
+def test_window_bars_counts_only_what_the_close_left():
+    import pandas as pd
+    from scripts.gate_edge_report import window_bars
+
+    # Session ends 15:30; a signal at 15:15 gets three bars, not six.
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range("2026-08-12 15:00", "2026-08-12 15:30", freq="5min"),
+        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1,
+    })
+    candles = {("NIFTY", "2026-08-12"): frame}
+
+    assert window_bars(candles, "NIFTY", "2026-08-12", "2026-08-12 15:15") == 3
+    assert window_bars(candles, "NIFTY", "2026-08-12", "2026-08-12 15:00") == 6
+    assert window_bars(candles, "NIFTY", "2026-08-12", None) == 0
+    assert window_bars({}, "NIFTY", "2026-08-12", "2026-08-12 15:00") == 0

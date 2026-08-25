@@ -86,6 +86,10 @@ def test_with_the_toggle_on_the_live_guard_fires(monkeypatch):
     monkeypatch.setattr(settings, "breakeven_stop_enabled", True)
     monkeypatch.setattr(settings, "breakeven_stop_arm_rs", 150.0)
     monkeypatch.setattr(settings, "breakeven_stop_floor_rs", 0.0)
+    # Isolate the rule this test names. peak_trail ships ON from 2026-08-24 and a
+    # Rs.3,000 peak clears its Rs.600 gate, so without this it is PEAK_TRAIL that
+    # fires and the assertion below would be testing a different guard.
+    monkeypatch.setattr(settings, "peak_trail_enabled", False)
     out = _run([100, 130, 140, 120, 95, 90], qty=75)   # peak +Rs.3000, back below entry
     # Named for the rule that fired, not for the method that hosts it. This assertion
     # used to read PEAK_GIVEBACK_CAP while the docstring above said "breakeven stop";

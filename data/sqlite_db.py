@@ -96,6 +96,15 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "frozen_initial_risk_rs",
     "scale_in_order_id",
     "scale_in_requested_quantity",
+    # Runner mode suppresses the fixed-target exit. Losing it on restart changes how
+    # a live position is managed, so its state and provenance are operational data.
+    "lifecycle_id",
+    "runner_mode",
+    "runner_activation_timestamp",
+    "runner_activation_reason",
+    "runner_stop",
+    "runner_stop_basis",
+    "stop_provenance",
 })
 
 
@@ -405,7 +414,14 @@ class DatabaseManager:
                     market_wide_reversal_entry INTEGER,
                     volume_spike_entry INTEGER,
                     power_move INTEGER,
-                    source_lane TEXT
+                    source_lane TEXT,
+                    lifecycle_id TEXT,
+                    runner_mode INTEGER,
+                    runner_activation_timestamp TEXT,
+                    runner_activation_reason TEXT,
+                    runner_stop REAL,
+                    runner_stop_basis TEXT,
+                    stop_provenance TEXT
                 )
             ''')
             
@@ -472,6 +488,13 @@ class DatabaseManager:
                     "frozen_initial_risk_rs": "REAL",
                     "scale_in_order_id": "TEXT",
                     "scale_in_requested_quantity": "INTEGER",
+                    "lifecycle_id": "TEXT",
+                    "runner_mode": "INTEGER",
+                    "runner_activation_timestamp": "TEXT",
+                    "runner_activation_reason": "TEXT",
+                    "runner_stop": "REAL",
+                    "runner_stop_basis": "TEXT",
+                    "stop_provenance": "TEXT",
                 },
             )
             

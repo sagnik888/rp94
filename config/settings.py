@@ -293,6 +293,13 @@ class Settings(BaseSettings):
     risk_opt_pct: float = 8.0        # OPT daily loss budget on option capital (%) — circuit breaker ONLY (single source of truth with .env)
     options_sl_pct: float = 15.0    # OPT per-trade premium stop cap (%)
 
+    # EXPERIMENT ONLY: stand aside entirely while the session bias reads BEARISH.
+    # The measured cohort is advisory candidate-mark data without an authoritative
+    # broker fill join, and this blanket gate conflicts with the confirmed-trend-day
+    # census waiver that admits bearish SHORTs. Keep it opt-in until held-out,
+    # executable option outcomes and live/replay parity support a default.
+    session_bearish_standaside_enabled: bool = False
+
     # ─── Lot sizing policy ───────────────────────────────────
     # DEFAULT OFF: always trade the configured dashboard/user lot size for both
     # FUT and OPT. Daily risk % and max_trade_loss_abs do NOT shrink lots.
@@ -828,6 +835,10 @@ class Settings(BaseSettings):
     # of trades that ended NEGATIVE will always flatter it, because a trail cannot
     # lose money on a trade that already lost money. It has to be measured on the
     # whole book, winners included, or it will look like free money and is not.
+    # The dirty worktree's ON/500 experiment is not a certified live default: only a
+    # handful of path-covered positions changed and the report calls for a frozen,
+    # basis-normalized held-out window first. Keep the conservative shipped behavior
+    # until that validation is complete.
     peak_trail_enabled: bool = False
     peak_trail_above_rs: float = 600.0
     peak_trail_giveback_pct: float = 0.40
@@ -868,6 +879,17 @@ class Settings(BaseSettings):
     #    the other. Deferring inside the decision fixes both paths at once.
     #  - cost floor: a loss smaller than the round trip cannot be worth a round trip.
     early_loss_cut_min_hold_seconds: float = 15.0
+
+    # The rupee-loss-band guard was the last exit in the system with no clock at all —
+    # its CATASTROPHE branch short-circuits ahead of every freefall and slow-bleed test,
+    # so it fired the instant the rupee threshold was crossed. On 2026-08-18 that booked
+    # -Rs.4,695 two and a half SECONDS after entry on a premium that had "fallen" 46.6%,
+    # which was a stale entry mark rather than a move: the single largest loss in the
+    # post-2026-08-12 book, 20.6% of that period's loser pot, from one trade.
+    # Same 15s as the early loss cut, and for the same reason — this exit exists to be
+    # fast, so LOSS_THREAT's 60s would disable it rather than guard it. The rupee
+    # thresholds are untouched.
+    rupee_loss_band_min_hold_seconds: float = 15.0
     early_loss_cut_defer_to_profit_lock_enabled: bool = True
     early_loss_cut_cost_floor_enabled: bool = True
     # Intel-accelerated loss-guard: when OI/PCR/volume/order-flow + price action
@@ -1024,6 +1046,17 @@ class Settings(BaseSettings):
     directional_census_enabled: bool = True
     directional_census_ratio: float = 1.5
     directional_census_min_signals: int = 12
+    # A confirmed trend day outranks the scanner's own signal census. The census counts
+    # directions THIS SCANNER emitted and never looks at price, so it goes stale: on
+    # 2026-08-24 every index fell (BANKNIFTY -582) and 53 shorts were generated against
+    # 45 longs, but a long-heavy morning left it 18L/9S and shorts were refused as
+    # "counter-bias" at 14:40/14:45/15:05/15:10 while session context simultaneously read
+    # day_type=TREND_DAY_DOWN, bias=BEARISH at 0.92. Mirror of
+    # session_trend_guard_census_yield, which handles the same clash the other way round.
+    # Only TREND_DAY_UP/TREND_DAY_DOWN agreeing with the signal waives it, and only when
+    # the label itself is confident. RANGE_DAY and UNDECIDED change nothing.
+    directional_census_trend_day_yield_enabled: bool = True
+    directional_census_trend_day_min_confidence: float = 0.60
     directional_census_penalty: float = 0.05
 
     # ─── Repaint intra-candle lockout ────────────────────────
@@ -1670,6 +1703,18 @@ class Settings(BaseSettings):
     settings_persistence_debounce_seconds: float = 0.75
     recalculation_worker_enabled: bool = True
     recalculation_worker_timeout_seconds: float = 120.0
+
+    # Machine-wide resource guard for unattended REAL Auto.  These thresholds
+    # block only new Auto exposure; exit monitoring, broker reconciliation, and
+    # manual lifecycle handling remain active.  The guard is conservative because
+    # host commit exhaustion can kill the whole service before Python reports it.
+    auto_resource_guard_enabled: bool = True
+    auto_resource_ram_block_pct: float = 94.0
+    auto_resource_commit_block_pct: float = 92.0
+    auto_resource_commit_min_available_mb: float = 1024.0
+    auto_resource_clear_hysteresis_pct: float = 4.0
+    auto_resource_clear_consecutive_samples: int = 2
+    auto_resource_sample_max_age_seconds: float = 5.0
     # Keep repeated backtests deterministic by default. Set this true only when
     # a recalculation should also refresh broker candle files before replay.
     backtest_refresh_data_on_recalc: bool = False

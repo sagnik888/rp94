@@ -296,6 +296,49 @@ def test_fill_confirmation_arms_protection_and_trailing_tightens_it():
     assert broker.modified[-1] == ("SL1", 97.0)
 
 
+def test_rupee_hold_never_delays_hard_stop_or_broker_protection():
+    """The 15s stale-mark hold applies only to the secondary rupee-band exit.
+
+    A confirmed two-second-old position is protected at the broker and the immediate
+    premium/contract hard stop still closes it.  This is the combined protection-stack
+    invariant missing from the isolated rupee-band test.
+    """
+    from scanner import Scanner
+
+    broker = LifecycleBroker()
+    manager = make_manager(broker)
+    trade = make_trade()
+    trade.pending_execution = False
+    trade.execution_status = "OPEN"
+    trade.broker_quantity = trade.quantity
+    trade.entry_time = datetime.now(IST) - timedelta(seconds=2)
+    manager.open_trades[trade.id] = trade
+
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    held = scanner._rupee_loss_band_guard_decision(
+        trade,
+        current_pnl_rs=-9000.0,
+        latest_time=datetime.now(IST),
+        regime="VOLATILE",
+        current_price=94.0,
+    )
+    assert held[0] is False, "secondary rupee-band guard should honor the stale-mark hold"
+
+    manager.update_trade(
+        trade.id,
+        current_spot=94.0,
+        real_fut_price=94.0,
+    )
+    from engine.async_queue import execution_queue
+
+    execution_queue.task_queue.join()
+
+    assert broker.protective, "confirmed quantity must receive broker-side protection"
+    assert broker.exits == [("NIFTYTESTFUT", 10, "SELL")]
+    assert trade.exit_reason == "TRAILING_STOP"
+
+
 def test_unprotected_recovery_position_auto_flattens_after_grace():
     settings = get_settings()
     old_grace = settings.recovery_auto_flatten_seconds

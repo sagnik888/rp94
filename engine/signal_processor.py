@@ -155,16 +155,47 @@ def directional_census_block(
     grade_floor: float,
     power_move: bool = False,
     reversal_context: Optional[dict] = None,
+    day_type: str = "",
+    day_type_confidence: float = 0.0,
 ) -> str:
     """Return a rejection reason if a counter-session-bias entry is too weak, else "".
 
     When the session strongly favours one side, counter-direction entries must
     clear an elevated confidence floor. Shared by live and replay paths.
+
+    The census counts the directions THIS SCANNER emitted, never price, so it can go
+    stale against the tape. A CONFIRMED trend day agreeing with the signal outranks it —
+    the mirror of session_trend_guard_census_yield above, which exists because a stale
+    LABEL once vetoed signals the census had already turned against.
     """
     if power_move:
         return ""
     if not _setting_enabled(getattr(settings, "directional_census_enabled", True), True):
         return ""
+    # 2026-08-24: every index fell (BANKNIFTY -582) and the scanner emitted 53 shorts
+    # against 45 longs, but a long-heavy morning left the census at 18L/9S, so shorts
+    # were refused as "counter-bias" while session context simultaneously read
+    # day_type=TREND_DAY_DOWN, bias=BEARISH at 0.92 confidence. Both cannot be right;
+    # the label is the one that looks at price.
+    if _setting_enabled(
+        getattr(settings, "directional_census_trend_day_yield_enabled", True), True
+    ):
+        _label = str(day_type or "").strip().upper()
+        _agrees = (
+            (_label == "TREND_DAY_UP" and str(signal_direction or "").upper() == "LONG")
+            or (_label == "TREND_DAY_DOWN" and str(signal_direction or "").upper() == "SHORT")
+        )
+        if _agrees:
+            try:
+                _floor = float(
+                    getattr(settings, "directional_census_trend_day_min_confidence", 0.60)
+                    or 0.60
+                )
+            except (TypeError, ValueError):
+                _floor = 0.60
+            # A hesitant label must not be able to switch the guard off.
+            if float(day_type_confidence or 0.0) >= _floor:
+                return ""
     longs = int((census or {}).get("LONG", 0))
     shorts = int((census or {}).get("SHORT", 0))
     total = longs + shorts
@@ -1161,6 +1192,14 @@ class SignalProcessor:
             # NEXT cycle re-evaluates it (the existing trade now gone) and the
             # reversal entry can fire — otherwise the dedup lock orphans it forever.
             "REJECTED - Opposite Signal Wait",
+            # Same statement, other path. quad_prime — the SHIPPED engine — refuses the
+            # reverse entry while a live-book trade is open on the far side, and it did
+            # so with a bare _emit_signal_decision + `return []`, which arms nothing. The
+            # dedup lock is already advanced by then, so the flip was presented once and
+            # dropped. 56 flips died that way on four sessions (2026-07-09 x24,
+            # 07-31 x16, 08-19 x13, 07-10 x3); on 2026-07-09 one NIFTY trade refused
+            # every SELL flip from 10:35 onward and no reversal was ever taken.
+            "REJECTED - Existing Opposite Trade",
         } or status.startswith("REJECTED - 5Min ")
 
     @staticmethod
@@ -3289,6 +3328,8 @@ class SignalProcessor:
                             grade_floor=self._grade_min_confidence("B+"),
                             power_move=power_move_hist,
                             reversal_context=_hist_reversal_relief,
+                            day_type=_hist_day_type,
+                            day_type_confidence=_hist_day_conf,
                         )
                         if _hc:
                             record_reject(_hc, sim_inst)
@@ -5228,18 +5269,37 @@ class SignalProcessor:
                 if quad_prime_entry:
                     trade_direction = str(getattr(trade, "direction", "") or "").upper()
                     if trade_direction != best_direction:
-                        _emit_signal_decision(
+                        # _build_rejected_from_raw, not the bare emitter: this is a FLIP
+                        # being refused only because the far-side trade has not closed
+                        # yet, so it must stay recheck-eligible for the cycle after it
+                        # does. The bare _emit_signal_decision only logs and counts, and
+                        # the dedup lock (advanced when the raw signal was collected)
+                        # then orphans the arrow permanently. The sibling refusal at
+                        # "REJECTED - Opposite Signal Wait" has always done it this way.
+                        # dedup_key/signal_identity are what the recheck is armed under,
+                        # so they are carried through exactly as that path carries them.
+                        _best_raw = next(
+                            (
+                                c for c in entry_candidates_raw
+                                if c.get("sig") is best_sig
+                            ),
+                            {},
+                        )
+                        return _build_rejected_from_raw(
                             {
                                 "sig": best_sig,
                                 "tf": best_tf,
                                 "grade": best_grade,
                                 "confidence": best_conf,
                                 "reasons": best_reasons,
+                                "dedup_key": _best_raw.get(
+                                    "dedup_key", f"{instrument}_{best_tf}"
+                                ),
+                                "signal_identity": _best_raw.get("signal_identity"),
                             },
                             f"Opposite {getattr(trade, 'timeframe', '')} {trade_direction} trade {tid} still active",
                             "REJECTED - Existing Opposite Trade",
                         )
-                        return []
 
                     candidate_sources = scanner._quad_union_sources(best_sig)
                     trade_sources = scanner._quad_union_sources(trade)
@@ -5901,6 +5961,40 @@ class SignalProcessor:
         except Exception as _flip_exc:
             logger.debug(f"Pre-candle flip veto check skipped for {instrument}: {_flip_exc}")
 
+        # Day-type label for the census yield. Derived here rather than reusing the
+        # trend-guard's _day_type, which is computed inside a conditional above and is
+        # not guaranteed to be bound on this path. Same MOOD_* normalisation, so both
+        # read the label the same way.
+        _cs_day_type, _cs_day_conf = "", 0.0
+        try:
+            _cs_dyn = _setting_enabled(
+                getattr(settings, "session_mood_dynamic_enabled", True), True
+            )
+            _cs_day_type = str(
+                (
+                    _session_ctx.get("effective_day_type")
+                    or _session_ctx.get("market_phase")
+                    or _session_ctx.get("day_type")
+                )
+                if _cs_dyn
+                else _session_ctx.get("day_type")
+                or ""
+            ).upper()
+            if _cs_day_type == "MOOD_DUMP":
+                _cs_day_type = "TREND_DAY_DOWN"
+            elif _cs_day_type == "MOOD_RALLY":
+                _cs_day_type = "TREND_DAY_UP"
+            elif _cs_day_type == "MOOD_TRANSITION":
+                _cs_day_type = ""
+            _cs_raw = (
+                _session_ctx.get("phase_confidence")
+                if _cs_dyn and _session_ctx.get("phase_confidence") is not None
+                else _session_ctx.get("confidence")
+            )
+            _cs_day_conf = float(_cs_raw or 0.0)
+        except Exception as _cs_exc:
+            logger.debug(f"Census day-type context unavailable for {instrument}: {_cs_exc}")
+
         _census_block = directional_census_block(
             settings,
             getattr(scanner, "_dir_census", {}) or {},
@@ -5909,6 +6003,8 @@ class SignalProcessor:
             grade_floor=self._grade_min_confidence("B+"),
             power_move=fast_thrust_override or is_reversion_scalp,
             reversal_context=_reversal_relief_context,
+            day_type=_cs_day_type,
+            day_type_confidence=_cs_day_conf,
         )
         if _census_block and not is_reversion_scalp:
             return _build_rejected_candidate(_census_block, "REJECTED - Counter Census")

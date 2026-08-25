@@ -308,6 +308,29 @@ def test_a_trade_the_ledger_never_knew_writes_nothing(ledger):
     )
 
 
+def test_final_fill_not_ack_invokes_authoritative_terminal_callback(ledger):
+    trade = _closed_trade()
+    trade.broker_quantity = 0
+    manager = _ledger_manager(trade)
+    terminals = []
+
+    def terminal_callback(closed_trade):
+        # The Trade has left open_trades, but Scanner must still be able to see that
+        # its lifecycle is broker-owned until this authoritative callback returns.
+        assert closed_trade.id not in manager.open_trades
+        assert closed_trade.id in manager._terminal_callback_lifecycles
+        terminals.append(closed_trade)
+
+    manager.on_trade_closed = terminal_callback
+
+    assert manager._finalize_closed_trade("T1", trade, 120.0, "TARGET") is True
+
+    assert terminals == [trade]
+    assert manager._terminal_callback_lifecycles == set()
+    assert trade.status == "CLOSED"
+    assert trade.execution_status == "CLOSED"
+
+
 def test_closing_twice_does_not_double_count(ledger):
     trade = _closed_trade()
     trade.broker_quantity = 0

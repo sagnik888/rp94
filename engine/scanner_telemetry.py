@@ -25,10 +25,144 @@ _EMPTY_SYSTEM_METRICS: Dict[str, Any] = {
     "logical_cpu_count": 0.0,
     "threads": 0,
     "ram": {"total_mb": 0.0, "used_mb": 0.0, "used_pct": 0.0},
+    # Windows commit is physical RAM plus the page-file-backed commit limit.  The two
+    # confirmed process losses were commit-exhaustion events, so physical-RAM pressure
+    # alone is not enough to predict them.
+    "commit": {
+        "total_mb": 0.0,
+        "used_mb": 0.0,
+        "available_mb": 0.0,
+        "used_pct": 0.0,
+    },
     "disk": {"total_gb": 0.0, "free_gb": 0.0, "used_pct": 0.0},
     "gpu": {"available": False, "label": "Warming up"},
     "warming_up": True,
 }
+
+
+def _fresh_system_memory_probe() -> Dict[str, Any]:
+    """Return a fresh, validity-stamped RAM/commit sample.
+
+    ``GlobalMemoryStatusEx.ullTotalPageFile`` is not a reliable machine-wide commit
+    charge.  On Windows, GetPerformanceInfo is the authoritative source: CommitTotal
+    and CommitLimit are page counts and PageSize converts them to bytes.  This helper
+    is intentionally cheap enough to run at the final Auto-entry boundary.
+    """
+    sampled_at = time.time()
+    empty: Dict[str, Any] = {
+        "ram": {"total_mb": 0.0, "used_mb": 0.0, "used_pct": 0.0},
+        "commit": {
+            "total_mb": 0.0,
+            "used_mb": 0.0,
+            "available_mb": 0.0,
+            "used_pct": 0.0,
+        },
+        "_valid": False,
+        "_sampled_at": sampled_at,
+        "_source": "unavailable",
+    }
+    if os.name != "nt":
+        try:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            total = float(vm.total or 0.0)
+            available = float(vm.available or 0.0)
+            if total <= 0.0:
+                return empty
+            return {
+                "ram": {
+                    "total_mb": round(total / (1024 * 1024), 0),
+                    "used_mb": round((total - available) / (1024 * 1024), 0),
+                    "used_pct": round(((total - available) / total) * 100.0, 1),
+                },
+                # Linux has no direct equivalent in this engine. RAM remains usable as
+                # a guard there; Windows requires the commit fields below to validate.
+                "commit": dict(empty["commit"]),
+                "_valid": True,
+                "_sampled_at": sampled_at,
+                "_source": "psutil",
+            }
+        except Exception:
+            return empty
+
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        class PERFORMANCE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("CommitTotal", ctypes.c_size_t),
+                ("CommitLimit", ctypes.c_size_t),
+                ("CommitPeak", ctypes.c_size_t),
+                ("PhysicalTotal", ctypes.c_size_t),
+                ("PhysicalAvailable", ctypes.c_size_t),
+                ("SystemCache", ctypes.c_size_t),
+                ("KernelTotal", ctypes.c_size_t),
+                ("KernelPaged", ctypes.c_size_t),
+                ("KernelNonpaged", ctypes.c_size_t),
+                ("PageSize", ctypes.c_size_t),
+                ("HandleCount", ctypes.c_ulong),
+                ("ProcessCount", ctypes.c_ulong),
+                ("ThreadCount", ctypes.c_ulong),
+            ]
+
+        memory = MEMORYSTATUSEX()
+        memory.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not bool(ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory))):
+            return empty
+
+        performance = PERFORMANCE_INFORMATION()
+        performance.cb = ctypes.sizeof(PERFORMANCE_INFORMATION)
+        if not bool(
+            ctypes.windll.psapi.GetPerformanceInfo(
+                ctypes.byref(performance), performance.cb
+            )
+        ):
+            return empty
+
+        physical_total = float(memory.ullTotalPhys)
+        physical_available = float(memory.ullAvailPhys)
+        page_size = float(performance.PageSize or 0)
+        commit_used = float(performance.CommitTotal) * page_size
+        commit_limit = float(performance.CommitLimit) * page_size
+        if physical_total <= 0.0 or page_size <= 0.0 or commit_limit <= 0.0:
+            return empty
+        commit_available = max(0.0, commit_limit - commit_used)
+        return {
+            "ram": {
+                "total_mb": round(physical_total / (1024 * 1024), 0),
+                "used_mb": round(
+                    (physical_total - physical_available) / (1024 * 1024), 0
+                ),
+                "used_pct": round(
+                    ((physical_total - physical_available) / physical_total) * 100.0,
+                    1,
+                ),
+            },
+            "commit": {
+                "total_mb": round(commit_limit / (1024 * 1024), 0),
+                "used_mb": round(commit_used / (1024 * 1024), 0),
+                "available_mb": round(commit_available / (1024 * 1024), 0),
+                "used_pct": round((commit_used / commit_limit) * 100.0, 1),
+            },
+            "_valid": True,
+            "_sampled_at": sampled_at,
+            "_source": "windows:GetPerformanceInfo+GlobalMemoryStatusEx",
+        }
+    except Exception:
+        return empty
 
 
 from config.settings import get_settings
@@ -252,35 +386,12 @@ class ScannerTelemetryMixin:
             except Exception:
                 return 0.0
 
-        def system_memory() -> Dict[str, float]:
-            if os.name != "nt":
-                return {"total_mb": 0.0, "used_mb": 0.0, "used_pct": 0.0}
-            try:
-                class MEMORYSTATUSEX(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                    ]
-
-                stat = MEMORYSTATUSEX()
-                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-                total = float(stat.ullTotalPhys)
-                used = total - float(stat.ullAvailPhys)
-                return {
-                    "total_mb": round(total / (1024 * 1024), 0),
-                    "used_mb": round(used / (1024 * 1024), 0),
-                    "used_pct": round(float(stat.dwMemoryLoad), 1),
-                }
-            except Exception:
-                return {"total_mb": 0.0, "used_mb": 0.0, "used_pct": 0.0}
+        def system_memory() -> Dict[str, Dict[str, float]]:
+            sample = _fresh_system_memory_probe()
+            return {
+                "ram": dict(sample.get("ram") or {}),
+                "commit": dict(sample.get("commit") or {}),
+            }
 
         def process_cpu_metrics() -> Dict[str, float]:
             cpu_now = time.process_time()
@@ -373,17 +484,144 @@ class ScannerTelemetryMixin:
             return payload
 
         cpu_metrics = process_cpu_metrics()
+        memory = system_memory()
         payload = {
             "pid": os.getpid(),
             "process_ram_mb": process_rss_mb(),
             **cpu_metrics,
             "threads": threading.active_count(),
-            "ram": system_memory(),
+            "ram": memory["ram"],
+            "commit": memory["commit"],
             "disk": disk_metrics(),
             "gpu": gpu_metrics(),
         }
         self._system_metrics_cache = {**payload, "_sampled_at": now}
         return payload
+
+    def _fresh_resource_memory_payload(self) -> Dict[str, Any]:
+        """Fresh sampling seam used by the final Auto-entry safety boundary."""
+        return _fresh_system_memory_probe()
+
+    def _auto_execution_resource_blockers(self) -> List[str]:
+        """Fail closed for *new* Auto entries under critical host memory pressure.
+
+        This deliberately does not stop the scanner, broker reconciliation, protective
+        orders, or exit management.  A dying process is most dangerous when it keeps
+        admitting new exposure; existing exposure must continue to be managed while the
+        operator frees memory and deliberately re-arms Auto.
+        """
+        settings = get_settings()
+        if not bool(getattr(settings, "auto_resource_guard_enabled", True)):
+            self._auto_resource_pressure_latched = False
+            self._auto_resource_pressure_reasons = []
+            self._auto_resource_clear_samples = 0
+            return []
+
+        def setting_float(name: str, default: float) -> float:
+            try:
+                value = getattr(settings, name, default)
+                return float(default if value is None else value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        metrics = self._fresh_resource_memory_payload() or {}
+        ram = metrics.get("ram") if isinstance(metrics.get("ram"), dict) else {}
+        commit = metrics.get("commit") if isinstance(metrics.get("commit"), dict) else {}
+        try:
+            ram_total = float((ram or {}).get("total_mb") or 0.0)
+            ram_pct = float((ram or {}).get("used_pct") or 0.0)
+            commit_pct = float((commit or {}).get("used_pct") or 0.0)
+            commit_total = float((commit or {}).get("total_mb") or 0.0)
+            commit_available = float((commit or {}).get("available_mb") or 0.0)
+            sampled_at = float(metrics.get("_sampled_at") or 0.0)
+        except (TypeError, ValueError):
+            ram_total = ram_pct = commit_pct = commit_total = commit_available = 0.0
+            sampled_at = 0.0
+
+        ram_limit = max(1.0, min(100.0, setting_float("auto_resource_ram_block_pct", 94.0)))
+        commit_limit = max(
+            1.0, min(100.0, setting_float("auto_resource_commit_block_pct", 92.0))
+        )
+        min_commit_available = max(
+            0.0, setting_float("auto_resource_commit_min_available_mb", 1024.0)
+        )
+        hysteresis = max(
+            0.0, min(20.0, setting_float("auto_resource_clear_hysteresis_pct", 4.0))
+        )
+        max_age = max(
+            0.1, setting_float("auto_resource_sample_max_age_seconds", 5.0)
+        )
+        clear_samples_required = max(
+            1,
+            int(setting_float("auto_resource_clear_consecutive_samples", 2.0)),
+        )
+
+        sample_age = max(0.0, time.time() - sampled_at) if sampled_at > 0.0 else float("inf")
+        valid = bool(metrics.get("_valid")) and ram_total > 0.0 and sample_age <= max_age
+        if os.name == "nt":
+            # A RAM-only sample cannot protect the Windows failure mode that killed the
+            # service: system commit exhaustion.
+            valid = valid and commit_total > 0.0
+
+        reasons: List[str] = []
+        if not valid:
+            reasons.append(
+                "fresh host RAM/commit sample unavailable or stale; fail-closed for new exposure"
+            )
+        if valid and ram_pct >= ram_limit:
+            reasons.append(f"system RAM {ram_pct:.1f}% >= {ram_limit:.1f}%")
+        if valid and commit_total > 0.0 and commit_pct >= commit_limit:
+            reasons.append(f"Windows commit {commit_pct:.1f}% >= {commit_limit:.1f}%")
+        if (
+            valid
+            and
+            commit_total > 0.0
+            and commit_available <= min_commit_available
+        ):
+            reasons.append(
+                f"Windows commit available {commit_available:.0f} MB <= "
+                f"{min_commit_available:.0f} MB"
+            )
+
+        if reasons:
+            self._auto_resource_pressure_latched = True
+            self._auto_resource_pressure_reasons = list(reasons)
+            self._auto_resource_clear_samples = 0
+        elif bool(getattr(self, "_auto_resource_pressure_latched", False)):
+            ram_clear = valid and ram_pct < max(0.0, ram_limit - hysteresis)
+            commit_pct_clear = (
+                valid
+                and (
+                    commit_total <= 0.0
+                    or commit_pct < max(0.0, commit_limit - hysteresis)
+                )
+            )
+            commit_available_clear = (
+                valid
+                and (
+                    commit_total <= 0.0
+                    or commit_available > min_commit_available + 512.0
+                )
+            )
+            if ram_clear and commit_pct_clear and commit_available_clear:
+                clear_count = int(getattr(self, "_auto_resource_clear_samples", 0) or 0) + 1
+                self._auto_resource_clear_samples = clear_count
+                if clear_count >= clear_samples_required:
+                    self._auto_resource_pressure_latched = False
+                    self._auto_resource_pressure_reasons = []
+                    self._auto_resource_clear_samples = 0
+            else:
+                self._auto_resource_clear_samples = 0
+
+        if bool(getattr(self, "_auto_resource_pressure_latched", False)):
+            latched = list(getattr(self, "_auto_resource_pressure_reasons", []) or [])
+            if not latched:
+                latched = ["host memory pressure has not cleared its safety hysteresis"]
+            return [
+                "Auto resource guard: " + "; ".join(latched)
+                + ". New Auto entries are blocked; open-position management remains active."
+            ]
+        return []
 
     @staticmethod
     def shutdown_telemetry_executor(wait: bool = False) -> None:
@@ -712,6 +950,15 @@ class ScannerTelemetryMixin:
         freshness = self._scanner_freshness_payload()
         recalculation = self._recalculation_status_payload()
         metrics = self._get_system_metrics_payload()
+        settings = get_settings()
+
+        def configured_float(name: str, default: float) -> float:
+            try:
+                value = getattr(settings, name, default)
+                return float(default if value is None else value)
+            except (TypeError, ValueError):
+                return float(default)
+
         sources = {}
         try:
             sources = self.data.get_source_health()
@@ -768,11 +1015,56 @@ class ScannerTelemetryMixin:
             add_issue("brokers_down", "All brokers unavailable", "critical")
 
         ram_pct = float(((metrics.get("ram") or {}).get("used_pct")) or 0.0)
+        commit = metrics.get("commit") if isinstance(metrics.get("commit"), dict) else {}
+        commit_pct = float((commit or {}).get("used_pct") or 0.0)
+        commit_total = float((commit or {}).get("total_mb") or 0.0)
+        commit_available = float((commit or {}).get("available_mb") or 0.0)
         disk_pct = float(((metrics.get("disk") or {}).get("used_pct")) or 0.0)
         cpu_pct = float(metrics.get("process_cpu_pct") or 0.0)
         single_core_cpu_pct = float(metrics.get("process_cpu_single_core_pct") or 0.0)
-        if ram_pct >= 88.0:
+        ram_critical = max(
+            1.0,
+            min(100.0, configured_float("auto_resource_ram_block_pct", 94.0)),
+        )
+        commit_critical = max(
+            1.0,
+            min(100.0, configured_float("auto_resource_commit_block_pct", 92.0)),
+        )
+        commit_available_critical = max(
+            0.0,
+            configured_float("auto_resource_commit_min_available_mb", 1024.0),
+        )
+        resource_hysteresis = max(
+            0.0,
+            configured_float("auto_resource_clear_hysteresis_pct", 4.0),
+        )
+        ram_warn = max(0.0, ram_critical - resource_hysteresis)
+        commit_warn = max(0.0, commit_critical - resource_hysteresis)
+        commit_available_warn = commit_available_critical + 1024.0
+        if ram_pct >= ram_critical:
+            add_issue("ram_pressure", "System RAM pressure", "critical", round(ram_pct, 1))
+        elif ram_pct >= ram_warn:
             add_issue("ram_pressure", "System RAM pressure", "warn", round(ram_pct, 1))
+        if commit_total > 0.0 and (
+            commit_pct >= commit_critical
+            or commit_available <= commit_available_critical
+        ):
+            add_issue(
+                "commit_pressure",
+                f"Windows commit pressure ({commit_available:.0f} MB available)",
+                "critical",
+                round(commit_pct, 1),
+            )
+        elif commit_total > 0.0 and (
+            commit_pct >= commit_warn
+            or commit_available <= commit_available_warn
+        ):
+            add_issue(
+                "commit_pressure",
+                f"Windows commit pressure ({commit_available:.0f} MB available)",
+                "warn",
+                round(commit_pct, 1),
+            )
         if disk_pct >= 92.0:
             add_issue("disk_pressure", "Storage pressure", "warn", round(disk_pct, 1))
         if cpu_pct >= 70.0 or (single_core_cpu_pct >= 180.0 and last_latency >= 2000):
