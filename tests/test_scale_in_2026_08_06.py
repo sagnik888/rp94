@@ -185,6 +185,28 @@ def test_a_working_trade_qualifies(settings):
     assert _manager(t).scale_in_trade("T1", 1, 240.0)[0] is True
 
 
+def test_a_simulated_add_is_blocked_before_booking_when_final_policy_rejects(settings):
+    t = _trade(lots=2, entry_price=200.0, current_price=240.0)
+    manager = _manager(t)
+    seen = {}
+
+    def policy(trade):
+        seen["phase"] = trade._entry_policy_phase
+        seen["levels"] = tuple(trade._entry_policy_execution_levels)
+        return False, "expected move below floor"
+
+    manager.fresh_entry_policy_guard = policy
+
+    ok, why = manager.scale_in_trade("T1", 1, 240.0)
+
+    assert ok is False
+    assert "expected move below floor" in why
+    assert seen["phase"] == "scale_in_actual_fill"
+    assert seen["levels"] == pytest.approx((213.3333333333, 170.0, 0.0))
+    assert t.lots == 2
+    assert t.entry_price == pytest.approx(200.0)
+
+
 def test_a_counter_trend_regime_blocks_the_add(settings):
     t = _trade(lots=2, entry_price=200.0, current_price=240.0, regime="STRONG_DOWNTREND")
     ok, why = _manager(t).scale_in_trade("T1", 1, 240.0)

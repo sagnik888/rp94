@@ -207,6 +207,107 @@ def test_historical_failure_returns_empty_never_partial():
     assert isinstance(frame, pd.DataFrame) and frame.empty
 
 
+def test_input_auth_failure_invalidates_shared_session():
+    class InputException(Exception):
+        pass
+
+    invalidated = []
+    auth = type("Auth", (), {
+        "kite": _Kite(historical=InputException("Invalid access token")),
+        "invalidate": lambda self, reason: invalidated.append(reason),
+    })()
+    src = KiteDataSource(auth=auth)
+    assert src.get_historical(12345, "5min").empty
+    assert invalidated and "Invalid access token" in invalidated[0]
+
+
+def test_historical_rest_health_is_separate_from_quote_health():
+    src = _source(_Kite(historical=[{"date": datetime(2026, 7, 31), "close": 1}]))
+    src.get_historical(12345, "5min")
+    status = src.historical_rest_status()
+    assert status["kite_historical_rest_healthy"] is True
+    assert status["kite_historical_rest_failure"] == ""
+
+
+def test_historical_rest_health_expires_and_reports_full_provenance():
+    src = KiteDataSource(auth=None, kite=object())
+    seq = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(seq, ok=True, observed_at=100.0)
+
+    fresh = src.historical_rest_status(now_ts=120.0, max_age_seconds=30.0)
+    assert fresh["kite_historical_rest_healthy"] is True
+    assert fresh["kite_historical_rest_source"] == "kite_historical_rest"
+    assert fresh["kite_historical_rest_last_success_at"] == 100.0
+    assert fresh["kite_historical_rest_age_seconds"] == 20.0
+
+    stale = src.historical_rest_status(now_ts=131.0, max_age_seconds=30.0)
+    assert stale["kite_historical_rest_healthy"] is False
+    assert stale["kite_historical_rest_stale"] is True
+
+
+def test_historical_failure_after_success_is_not_reported_healthy():
+    src = KiteDataSource(auth=None, kite=object())
+    first = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(first, ok=True, observed_at=100.0)
+    second = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(
+        second, ok=False, reason="RuntimeError: down", observed_at=101.0
+    )
+
+    status = src.historical_rest_status(now_ts=102.0, max_age_seconds=30.0)
+    assert status["kite_historical_rest_healthy"] is False
+    assert status["kite_historical_rest_last_call_ok"] is False
+    assert status["kite_historical_rest_failure"] == "RuntimeError: down"
+    assert status["kite_historical_rest_last_error_age_seconds"] == 1.0
+
+
+def test_older_inflight_history_completion_cannot_erase_newer_failure():
+    src = KiteDataSource(auth=None, kite=object())
+    older = src._begin_historical_rest_call("historical_data")
+    newer = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(
+        newer, ok=False, reason="newer call failed", observed_at=101.0
+    )
+    src._record_historical_rest_result(older, ok=True, observed_at=102.0)
+
+    status = src.historical_rest_status(now_ts=103.0, max_age_seconds=30.0)
+    assert status["kite_historical_rest_healthy"] is False
+    assert status["kite_historical_rest_failure"] == "newer call failed"
+
+
+def test_recent_history_is_not_healthy_after_shared_auth_disconnects():
+    client = object()
+    auth = type("Auth", (), {"kite": client})()
+    src = KiteDataSource(auth=auth, kite=client)
+    seq = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(seq, ok=True, observed_at=100.0)
+    auth.kite = None
+
+    status = src.historical_rest_status(now_ts=101.0, max_age_seconds=30.0)
+    assert status["kite_historical_rest_available"] is False
+    assert status["kite_historical_rest_healthy"] is False
+    assert status["kite_historical_rest_fresh"] is False
+    assert src.kite is None
+
+
+def test_out_of_order_failure_keeps_last_error_timestamp_and_reason_together():
+    src = KiteDataSource(auth=None, kite=object())
+    older = src._begin_historical_rest_call("historical_data")
+    newer = src._begin_historical_rest_call("historical_data")
+    src._record_historical_rest_result(
+        newer, ok=True, observed_at=101.0
+    )
+    src._record_historical_rest_result(
+        older, ok=False, reason="older request failed late", observed_at=102.0
+    )
+
+    status = src.historical_rest_status(now_ts=103.0, max_age_seconds=30.0)
+    assert status["kite_historical_rest_healthy"] is True
+    assert status["kite_historical_rest_failure"] == ""
+    assert status["kite_historical_rest_last_error_at"] == 102.0
+    assert status["kite_historical_rest_last_error"] == "older request failed late"
+
+
 def test_unsupported_interval_is_refused():
     assert _source(_Kite(historical=[])).get_historical(12345, "7min").empty
 

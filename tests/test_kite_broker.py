@@ -17,6 +17,7 @@ protective-stop modify must both report False, never True.
 import threading
 
 import pytest
+import trading.kite_broker as kite_broker_module
 
 from trading.kite_broker import (
     DataException,
@@ -103,6 +104,15 @@ def test_rms_rejection_is_retryable():
 def test_unknown_failures_default_to_ambiguous():
     """Assuming 'not placed' is the assumption that duplicates a live order."""
     assert classify_kite_exception(RuntimeError("who knows")) == "AMBIGUOUS"
+
+
+def test_internal_pre_send_rejections_are_never_ambiguous():
+    assert classify_kite_exception(BrokerOrderRejected("changed")) == "RETRYABLE"
+    assert (
+        classify_kite_exception(BrokerOrderRejected("dead", terminal=True))
+        == "TERMINAL"
+    )
+    assert classify_kite_exception(BrokerOrderAmbiguous("unknown")) == "AMBIGUOUS"
 
 
 # ── entry ────────────────────────────────────────────────────────────────────
@@ -202,6 +212,74 @@ def test_no_session_refuses_instead_of_crashing():
         _broker(None).place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45)
     assert err.value.terminal is True
     assert "kite_login" in err.value.reason
+
+
+def test_queued_old_client_call_cannot_invalidate_or_execute_after_relogin():
+    old = _Kite(place=TokenException("invalid token"))
+    new = _Kite(place="NEW-OID")
+    invalidations = []
+    auth = type(
+        "Auth",
+        (),
+        {
+            "kite": new,
+            "invalidate": lambda self, reason, **kwargs: invalidations.append(
+                (reason, kwargs.get("failed_client"))
+            ),
+        },
+    )()
+    broker = KiteBroker(kite=old, auth=auth)
+    broker._execution_lease = None
+    broker._min_call_interval = 0.0
+
+    with pytest.raises(BrokerOrderRejected) as exc:
+        broker._api_call(
+            "queued old request",
+            lambda: old.place_order(symbol="OLD"),
+            client=old,
+        )
+
+    assert exc.value.terminal is False
+    assert old.placed == []
+    assert broker.api is new
+    assert auth.kite is new
+    assert invalidations == []
+
+
+def test_session_swap_during_pacing_never_dispatches_or_leaks_entry_slot(
+    monkeypatch,
+):
+    old = _Kite(place="OLD-OID")
+    new = _Kite(place="NEW-OID")
+
+    class _Auth:
+        def __init__(self):
+            self.kite = old
+
+        def invalidate(self, *_args, **_kwargs):
+            pytest.fail("a pre-dispatch session change must not invalidate either client")
+
+    auth = _Auth()
+    broker = KiteBroker(kite=old, auth=auth)
+    broker._execution_lease = None
+    broker._min_call_interval = 1.0
+    broker._last_call_at = kite_broker_module.time.monotonic()
+
+    def swap_during_pacing(_seconds):
+        auth.kite = new
+
+    monkeypatch.setattr(kite_broker_module.time, "sleep", swap_during_pacing)
+
+    with pytest.raises(BrokerOrderRejected) as exc:
+        broker.place_order(
+            "NIFTY2680424350CE", "1", 65, "BUY", price=124.45
+        )
+
+    assert exc.value.terminal is False
+    assert old.placed == []
+    assert new.placed == []
+    assert broker.api is new
+    assert list(broker._entry_order_times) == []
 
 
 # ── polarity rules ───────────────────────────────────────────────────────────
@@ -375,6 +453,49 @@ def test_dead_token_invalidates_the_session_for_the_watchdog():
     with pytest.raises(BrokerOrderRejected):
         b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45)
     assert "Invalid access token" in auth.reason
+    assert b.api is None
+
+
+def test_invalid_session_input_exception_also_clears_broker_reference():
+    class _Auth:
+        def __init__(self): self.reasons = []
+        def invalidate(self, reason): self.reasons.append(reason)
+
+    auth = _Auth()
+    b = _broker(_Kite(place=InputException("session expired; invalid access token")))
+    b._auth = auth
+    with pytest.raises(BrokerOrderRejected):
+        b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45)
+    assert b.api is None
+    assert len(auth.reasons) == 1
+
+
+def test_non_auth_input_rejection_keeps_live_broker_reference():
+    auth = type("Auth", (), {"invalidate": lambda self, reason: (_ for _ in ()).throw(AssertionError(reason))})()
+    api = _Kite(place=InputException("invalid trigger price"))
+    b = _broker(api)
+    b._auth = auth
+    with pytest.raises(BrokerOrderRejected):
+        b.place_order("NIFTY2680424350CE", "1", 65, "BUY", price=124.45)
+    assert b.api is api
+
+
+def test_shared_auth_invalidation_clears_broker_before_next_request():
+    api = _Kite()
+    auth = type(
+        "Auth",
+        (),
+        {
+            "kite": None,
+            "status": lambda self: {"auth_required": True},
+        },
+    )()
+    b = _broker(api)
+    b._auth = auth
+
+    with pytest.raises(BrokerOrderRejected, match="no authenticated Kite session"):
+        b._require_api("place order")
+    assert b.api is None
 
 
 # ── every account write needs the lease ──────────────────────────────────────

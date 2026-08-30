@@ -16,6 +16,7 @@ class _Broker:
     def __init__(self, outcomes=None):
         self.outcomes = list(outcomes or [])
         self.place_calls = []
+        self.place_payloads = []
         self.close_calls = []
         self.reservations = []
         self.released = []
@@ -32,6 +33,7 @@ class _Broker:
     def place_order(self, *args, **kwargs):
         symbol = kwargs.get("symbol") or (args[0] if args else "")
         self.place_calls.append(str(symbol))
+        self.place_payloads.append({"args": args, "kwargs": dict(kwargs)})
         if self.outcomes:
             outcome = self.outcomes.pop(0)
             if isinstance(outcome, BaseException):
@@ -141,6 +143,35 @@ def test_guard_blocks_before_first_broker_call_releases_margin_and_keeps_lifecyc
     assert callbacks == [False]
 
 
+def test_recovery_reconstructs_existing_exposure_without_submitting_a_duplicate_order():
+    broker = _Broker()
+    manager = _manager(broker)
+
+    trade = manager.open_trade(
+        instrument="NIFTY",
+        timeframe="5min",
+        direction="LONG",
+        price=100.0,
+        trailing_stop=95.0,
+        lots=1,
+        lot_size=10,
+        grade="A",
+        target=110.0,
+        trading_symbol="NIFTYTESTFUT",
+        symbol_token="TOKEN-NIFTY",
+        inst_type="FUT",
+        is_recovery=True,
+        entry_time=IST.localize(datetime(2026, 8, 25, 10, 0)),
+    )
+
+    assert trade is not None
+    assert trade.is_recovery is True
+    assert trade.pending_execution is False
+    assert trade.execution_status == "OPEN"
+    assert broker.place_calls == []
+    assert broker.reservations == []
+
+
 def test_guard_is_rechecked_on_retry_and_all_attempt_reservations_are_released():
     broker = _Broker([BrokerOrderRejected("temporary refusal", terminal=False)])
     guard_calls = 0
@@ -161,6 +192,38 @@ def test_guard_is_rechecked_on_retry_and_all_attempt_reservations_are_released()
     assert trade.execution_status == "REJECTED"
 
 
+def test_each_retry_submits_the_same_fresh_levels_that_passed_final_policy():
+    broker = _Broker([BrokerOrderRejected("temporary refusal", terminal=False), "ENTRY-2"])
+    manager = _manager(broker)
+    calls = 0
+
+    def final_policy(trade):
+        nonlocal calls
+        calls += 1
+        entry = 100.0 + calls
+        trade._entry_policy_submission_levels = (entry, entry - 4.0, entry + 6.0)
+        trade._entry_policy_submission_touch_quote = {
+            "bid": entry - 0.5,
+            "ask": entry,
+            "age_seconds": 0.1,
+            "usable": True,
+            "source": "test_touch",
+        }
+        return True, ""
+
+    manager.fresh_entry_policy_guard = final_policy
+    trade = _open(manager)
+
+    assert calls == 2
+    assert [row["kwargs"]["price"] for row in broker.place_payloads] == [101.0, 102.0]
+    assert [row["kwargs"]["touch_quote"]["ask"] for row in broker.place_payloads] == [
+        101.0,
+        102.0,
+    ]
+    assert trade.entry_price == pytest.approx(100.0)
+    assert trade.execution_status == "ENTRY_SUBMITTED"
+
+
 def test_manual_entry_bypasses_even_a_fail_closed_global_guard():
     broker = _Broker()
     guard_calls = 0
@@ -177,6 +240,37 @@ def test_manual_entry_bypasses_even_a_fail_closed_global_guard():
     assert broker.place_calls == ["NIFTYTESTFUT"]
     assert trade in manager.open_trades.values()
     assert trade.execution_status == "ENTRY_SUBMITTED"
+
+
+def test_manual_entry_cannot_bypass_the_immutable_fresh_entry_policy():
+    broker = _Broker()
+    policy_calls = 0
+    global_guard_calls = 0
+
+    def final_policy(_trade):
+        nonlocal policy_calls
+        policy_calls += 1
+        return False, "actual execution RR is below 1.50R"
+
+    def global_guard(_trade):
+        nonlocal global_guard_calls
+        global_guard_calls += 1
+        return True, ""
+
+    manager = _manager(broker, guard=global_guard)
+    manager.fresh_entry_policy_guard = final_policy
+
+    trade = _open(manager, exec_type="M")
+
+    assert policy_calls == 1
+    # Manual authority still bypasses only the operational AUTO/resource guard.
+    assert global_guard_calls == 0
+    assert broker.place_calls == []
+    assert trade not in manager.open_trades.values()
+    assert trade in manager.closed_trades
+    assert trade.execution_status == "REJECTED"
+    assert trade.exit_reason == "ENTRY_SUBMISSION_GUARD"
+    assert "below 1.50R" in trade.execution_error
 
 
 def test_exit_submission_never_reuses_the_entry_guard():
@@ -231,6 +325,54 @@ def test_scale_in_guard_blocks_before_place_order_and_releases_its_reservation()
     assert broker.reservations == broker.released == ["R1"]
     assert trade.lots == 1
     assert trade.execution_status == "OPEN"
+
+
+def test_futures_scale_in_policy_uses_a_fresh_marketable_touch_not_the_offer_price():
+    broker = _Broker()
+    manager = _manager(broker)
+    seen = {}
+
+    def final_policy(trade):
+        seen["levels"] = tuple(trade._entry_policy_execution_levels)
+        return False, "test stop after measuring"
+
+    manager.fresh_entry_policy_guard = final_policy
+    manager.scanner = SimpleNamespace(
+        _candidate_execution_touch_quote=lambda trade: {
+            "bid": 104.0,
+            "ask": 105.0,
+            "age_seconds": 0.1,
+            "usable": True,
+            "source": "kite_depth",
+        }
+    )
+    trade = Trade(
+        id="T-SCALE-FRESH-FUT",
+        instrument="NIFTY",
+        timeframe="5min",
+        direction="LONG",
+        entry_price=100.0,
+        entry_time=datetime.now(IST),
+        trailing_stop=95.0,
+        current_stop=95.0,
+        lots=1,
+        lot_size=10,
+        grade="A",
+        target=112.0,
+        inst_type="FUT",
+        trading_symbol="NIFTYTESTFUT",
+        symbol_token="TOKEN-NIFTY",
+        exec_type="A",
+        broker_quantity=10,
+        current_price=104.0,
+        execution_status="OPEN",
+    )
+
+    manager._run_scale_in(trade, add_lots=1, quantity=10, price=110.0, reason="TEST")
+
+    assert seen["levels"] == pytest.approx((102.5, 95.0, 112.0))
+    assert broker.place_calls == []
+    assert broker.reservations == broker.released == ["R1"]
 
 
 def test_automated_scale_in_on_manual_origin_trade_does_not_bypass_guard():
@@ -370,6 +512,57 @@ def test_cancelled_stale_entry_is_not_market_replaced_when_guard_turns_false():
     assert trade in manager.closed_trades
     assert trade.exit_reason == "ENTRY_SUBMISSION_GUARD"
     assert trade.execution_status == "REJECTED"
+
+
+def test_stale_market_replacement_gets_its_own_fresh_policy_phase_and_touch():
+    broker = _Broker()
+    manager = _manager(broker)
+    phases = []
+
+    def final_policy(trade):
+        phases.append(str(getattr(trade, "_entry_policy_phase", "") or "broker_queue"))
+        trade._entry_policy_submission_levels = (106.0, 100.0, 115.0)
+        trade._entry_policy_submission_touch_quote = {
+            "bid": 105.5,
+            "ask": 106.0,
+            "age_seconds": 0.1,
+            "usable": True,
+            "source": "test_touch",
+        }
+        return True, ""
+
+    manager.fresh_entry_policy_guard = final_policy
+    trade = Trade(
+        id="T-REPLACE-FRESH",
+        instrument="NIFTY",
+        timeframe="5min",
+        direction="LONG",
+        entry_price=100.0,
+        entry_time=datetime.now(IST),
+        trailing_stop=95.0,
+        current_stop=95.0,
+        lots=1,
+        lot_size=10,
+        grade="A",
+        target=110.0,
+        inst_type="FUT",
+        trading_symbol="NIFTYTESTFUT",
+        symbol_token="TOKEN-NIFTY",
+        exec_type="A",
+        broker_order_id="ORIGINAL-LIMIT",
+        pending_execution=True,
+        execution_status="ENTRY_SUBMITTED",
+        current_price=101.0,
+    )
+    trade.entry_submitted_at = datetime.now(IST) - timedelta(minutes=2)
+    manager.open_trades[trade.id] = trade
+
+    manager.reconcile_broker_positions({"data": []})
+
+    assert phases == ["stale_entry_replacement_pre_submit"]
+    assert broker.place_calls == ["NIFTYTESTFUT"]
+    assert broker.place_payloads[0]["kwargs"]["touch_quote"]["ask"] == 106.0
+    assert trade.entry_replace_count == 1
 
 
 def test_acknowledged_stale_entry_emits_a_second_result_when_replacement_guard_blocks():

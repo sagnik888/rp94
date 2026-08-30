@@ -63,12 +63,11 @@ def test_disabled_by_default_setting(monkeypatch):
     assert ok is False and why == "disabled"
 
 
-def test_ships_enabled_with_conservative_caps():
-    """Enabled on backtest evidence (73% win rate, +Rs 3,560 over 8 archived sessions),
-    but only with caps that keep it a genuine second chance rather than churn."""
+def test_ships_disabled_after_cost_correct_replay():
+    """A positive gross result may not enable a retry with negative net expectancy."""
     from config.settings import Settings
     s = Settings(_env_file=None)
-    assert s.stop_out_reentry_enabled is True
+    assert s.stop_out_reentry_enabled is False
     assert s.stop_out_reentry_max_per_index == 1      # one second chance per index/day
     assert s.stop_out_reentry_window_minutes <= 30.0  # same move, not a new phase
     assert s.stop_out_reentry_min_adx >= 25.0         # confirmed strong trend only
@@ -113,11 +112,12 @@ def test_trend_must_agree_with_direction(monkeypatch):
     assert ok is False and "does not agree" in why
 
 
-def test_weak_adx_rejected_but_unknown_adx_does_not_veto(monkeypatch):
+def test_weak_or_unknown_adx_fails_closed(monkeypatch):
     sc = _scanner(monkeypatch, [_closed(now=NOW)])
     assert sc._stop_out_reentry_allowed("NIFTY", "LONG", NOW, adx_value=18.0)[0] is False
-    # ADX unavailable (0) must not silently disable the gate nor block everything.
-    assert sc._stop_out_reentry_allowed("NIFTY", "LONG", NOW, adx_value=0.0)[0] is True
+    ok, why = sc._stop_out_reentry_allowed("NIFTY", "LONG", NOW, adx_value=0.0)
+    assert ok is False
+    assert "ADX unavailable" in why
 
 
 def test_per_index_cap_limits_second_chances(monkeypatch):
@@ -160,7 +160,69 @@ def test_reentry_bypasses_cooldown_only(monkeypatch):
     sc = _budget_scanner(monkeypatch, trades_today={"NIFTY": 1}, losses_today={"NIFTY": 1})
     allowed, why = sc._can_trade_instrument("NIFTY", NOW, direction="LONG", adx_value=32.0)
     assert allowed is True, why          # cooldown bypassed
-    assert sc._stop_out_reentries["NIFTY"] == 1
+    assert "stop-out re-entry:" in why
+    # Eligibility is not an entry. Readiness, quote, policy, resource and broker
+    # acknowledgement can all still refuse this candidate.
+    assert sc._stop_out_reentries == {}
+
+
+def test_reentry_allowance_is_committed_once_only_with_real_trade(monkeypatch):
+    sc = _budget_scanner(monkeypatch, trades_today={"NIFTY": 1}, losses_today={"NIFTY": 1})
+    allowed, why = sc._can_trade_instrument("NIFTY", NOW, direction="LONG", adx_value=32.0)
+    assert allowed is True and "stop-out re-entry:" in why
+
+    candidate = SimpleNamespace(
+        instrument="NIFTY",
+        stop_out_reentry=True,
+        entry_intel={"captured": True},
+        quote_verified=True,
+    )
+    sc._counted_entry_keys = set()
+    sc._candidate_lifecycle_key = lambda _candidate: "retry-lifecycle"
+    sc._candidate_history_key = lambda _candidate: "retry-history"
+    sc._rtracker_record_candidate = lambda *args, **kwargs: None
+    sc._log_opposing_exposure_telemetry = lambda *_args, **_kwargs: None
+    sc._notify_trade_event = lambda: None
+
+    # Displaying a manual signal is not fresh exposure and must not spend the retry.
+    sc._record_accepted_entry(candidate)
+    assert sc._stop_out_reentries == {}
+
+    trade = SimpleNamespace(is_ghost=False)
+    assert sc._commit_stop_out_reentry(candidate, trade) is True
+    assert sc._stop_out_reentries == {"NIFTY": 1}
+    assert trade.stop_out_reentry is True
+    # Redelivered broker acknowledgement is idempotent.
+    assert sc._commit_stop_out_reentry(candidate, trade) is False
+    assert sc._stop_out_reentries == {"NIFTY": 1}
+
+
+def test_ghost_retry_never_consumes_allowance(monkeypatch):
+    sc = _budget_scanner(monkeypatch, trades_today={"NIFTY": 1}, losses_today={"NIFTY": 1})
+    candidate = SimpleNamespace(instrument="NIFTY", stop_out_reentry=True)
+
+    assert sc._commit_stop_out_reentry(candidate, SimpleNamespace(is_ghost=True)) is False
+    assert sc._stop_out_reentries == {}
+
+
+def test_live_reentry_uses_the_same_wall_clock_as_cooldown(monkeypatch):
+    sc = _budget_scanner(monkeypatch, trades_today={"NIFTY": 1}, losses_today={})
+    live_now = datetime.now()
+    forming_bar_time = live_now - timedelta(minutes=10)
+    sc.mode = "REAL"
+    sc._last_exit_time = {"NIFTY": live_now - timedelta(minutes=1)}
+    seen = {}
+
+    def eligibility(_instrument, _direction, clock, adx_value=0.0):
+        seen["clock"] = clock
+        return False, "test refusal"
+
+    sc._stop_out_reentry_allowed = eligibility
+    allowed, why = sc._can_trade_instrument(
+        "NIFTY", forming_bar_time, direction="LONG", adx_value=32.0
+    )
+    assert allowed is False and "Cooldown active" in why
+    assert seen["clock"] > forming_bar_time + timedelta(minutes=5)
 
 
 def test_daily_trade_budget_is_never_bypassed(monkeypatch):

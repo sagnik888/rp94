@@ -16,12 +16,35 @@ from config.settings import get_settings
 IST = pytz.timezone("Asia/Kolkata")
 
 
-def trade_row_id(row: Dict[str, Any]) -> str:
-    return str(row.get("id") or row.get("trade_id") or "")
+def trade_row_id(row: Any) -> str:
+    if isinstance(row, dict):
+        return str(row.get("id") or row.get("trade_id") or "")
+    return str(getattr(row, "id", "") or getattr(row, "trade_id", "") or "")
 
 
 def is_simulated_history_row(row: Dict[str, Any]) -> bool:
     return trade_row_id(row).startswith(("H_", "EOD_"))
+
+
+def is_engine_replay_row(row: Any) -> bool:
+    """True only for mutable/rebuildable historical engine output.
+
+    The trades table contains two different kinds of records: session/live ledger
+    rows and historical replay fixtures.  Exact outcomes from independent replay
+    streams may be identical, but two real fills that happen to share the same
+    prices and P&L are still two trades.  Keep that distinction in one place so an
+    accounting caller can never silently collapse live history.
+
+    Modern replay producers persist ``data_provenance=BACKTEST``.  The id prefixes
+    remain the compatibility signal for rows created before that field existed.
+    ``HISTORICAL`` is deliberately *not* sufficient: imported SESSION candidates
+    use it too and are part of the session ledger, not an engine sweep.
+    """
+    provenance = _normalized_text(_row_attr(row, "data_provenance", ""), upper=True)
+    return trade_row_id(row).startswith(("H_", "EOD_")) or provenance in {
+        "BACKTEST",
+        "ENGINE_REPLAY",
+    }
 
 
 def is_futures_shadow_row(row: Any) -> bool:
@@ -75,8 +98,8 @@ def replay_dedup_key(row: Any) -> Tuple:
     stamp = (
         _row_attr(row, "signal_time")
         or _row_attr(row, "signal_timestamp")
-        or _row_attr(row, "entry_time")
         or _row_attr(row, "entry_timestamp")
+        or _row_attr(row, "entry_time")
         or _row_attr(row, "timestamp")
     )
     instrument = _normalized_text(_row_attr(row, "instrument", ""), upper=True)
@@ -102,17 +125,37 @@ def replay_dedup_key(row: Any) -> Tuple:
 def hygiene_closed_rows(
     rows: Iterable[Any],
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """Shadow-free + exact-dedup closed set for dashboard/TM headline accounting.
+    """Shadow-free + replay-deduped set for dashboard/TM headline accounting.
+
+    Deduplication is intentionally restricted to mutable engine-replay rows.  The
+    former implementation applied the signature to every row, so two independent
+    LIVE trades with identical prices, size, reason and timestamp were silently
+    counted once.  Replay variants are rebuildable experiments; broker/session rows
+    are ledger facts and may never be removed by a heuristic key.
 
     Returns (headline_rows, telemetry). Telemetry keeps shadow/replay counts for UI.
     """
     closed = list(rows or [])
     shadow_rows = [r for r in closed if is_futures_shadow_row(r)]
-    real_rows = [r for r in closed if not is_futures_shadow_row(r)]
-    seen: Dict[Tuple, Any] = {}
-    for r in real_rows:
-        seen.setdefault(replay_dedup_key(r), r)
-    headline = list(seen.values())
+    non_shadow_rows = [r for r in closed if not is_futures_shadow_row(r)]
+    replay_rows = [r for r in non_shadow_rows if is_engine_replay_row(r)]
+    non_replay_rows = [r for r in non_shadow_rows if not is_engine_replay_row(r)]
+
+    seen_replay: Dict[Tuple, Any] = {}
+    headline: List[Any] = []
+    replay_variant_rows: List[Any] = []
+    # Preserve source order.  Several dashboard paths already present newest-first
+    # rows and grouping all replay output at one end would reshuffle that display.
+    for row in non_shadow_rows:
+        if not is_engine_replay_row(row):
+            headline.append(row)
+            continue
+        key = replay_dedup_key(row)
+        if key in seen_replay:
+            replay_variant_rows.append(row)
+            continue
+        seen_replay[key] = row
+        headline.append(row)
 
     def _pnl(r: Any) -> float:
         try:
@@ -121,7 +164,8 @@ def hygiene_closed_rows(
             return 0.0
 
     shadow_pnl = sum(_pnl(r) for r in shadow_rows)
-    real_pnl = sum(_pnl(r) for r in real_rows)
+    replay_pnl = sum(_pnl(r) for r in replay_rows)
+    distinct_replay_pnl = sum(_pnl(r) for r in seen_replay.values())
     head_pnl = sum(_pnl(r) for r in headline)
     telemetry = {
         "futures_shadow": {
@@ -129,10 +173,17 @@ def hygiene_closed_rows(
             "pnl": round(shadow_pnl, 2),
         },
         "engine_replay": {
-            "raw_rows": len(real_rows) + len(shadow_rows),
+            # Compatibility fields consumed by the dashboard summary.
+            "raw_rows": len(non_shadow_rows) + len(shadow_rows),
             "unique_rows": len(headline),
-            "excess_rows": max(0, len(real_rows) - len(headline)),
-            "excess_pnl": round(real_pnl - head_pnl, 2),
+            "excess_rows": len(replay_variant_rows),
+            "excess_pnl": round(replay_pnl - distinct_replay_pnl, 2),
+            # Unambiguous fields for auditors: these are equivalent outcomes from
+            # replay streams, not duplicate session-ledger records.
+            "candidate_rows": len(replay_rows),
+            "distinct_outcomes": len(seen_replay),
+            "stream_variant_rows": len(replay_variant_rows),
+            "non_replay_rows": len(non_replay_rows),
         },
     }
     return headline, telemetry

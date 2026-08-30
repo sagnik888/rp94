@@ -131,6 +131,53 @@ def test_protective_stop_state_survives_save_and_load():
     assert restored.protective_quantity == 65
 
 
+def test_entry_policy_and_dual_geometry_evidence_survive_save_and_load():
+    """A restart must not erase the evidence that authorised fresh exposure."""
+    trade = _trade()
+    trade.underlying_entry = 24383.6
+    trade.underlying_stop = 24340.0
+    trade.underlying_target = 24449.0
+    trade.premium_entry = 124.45
+    trade.premium_stop = 111.20
+    trade.premium_target = 144.33
+    trade.geometry_observed_at = "2026-08-29T10:11:12+05:30"
+    trade.geometry_source = "actual_fill"
+    trade.geometry_verified = True
+    trade.expected_move_pct = 0.31
+    trade.expected_move_floor_pct = 0.15
+    trade.expected_move_probability = 0.72
+    trade.expected_move_sample_count = 240
+    trade.expected_move_horizon_minutes = 15
+    trade.expected_move_generated_at = "2026-08-29T10:11:10+05:30"
+    trade.expected_move_data_as_of = "2026-08-29T10:10:00+05:30"
+    trade.expected_move_model_version = "mfe_quantile.v1"
+    trade.expected_move_source = "fyers_history"
+    trade.entry_policy_allowed = True
+    trade.entry_policy_phase = "actual_broker_fill"
+    trade.entry_policy_checked_at = "2026-08-29T10:11:12+05:30"
+    trade.entry_policy_reason = "allowed"
+    trade.entry_policy_actual_rr = 1.5004
+    trade.entry_policy_underlying_stop_pct = 0.1788
+    trade.entry_policy_version = "final_entry_policy.v1"
+
+    with db.write_lock:
+        db.conn.execute("DELETE FROM trades WHERE id = ?", (trade.id,))
+        db.conn.commit()
+    db.save_trades([trade.to_dict()])
+
+    restored = Trade.from_dict(
+        next(r for r in db.load_open_trades() if r["id"] == trade.id)
+    )
+    assert restored.underlying_entry == pytest.approx(24383.6)
+    assert restored.premium_stop == pytest.approx(111.20)
+    assert restored.geometry_verified is True
+    assert restored.expected_move_probability == pytest.approx(0.72)
+    assert restored.expected_move_model_version == "mfe_quantile.v1"
+    assert restored.entry_policy_allowed is True
+    assert restored.entry_policy_actual_rr == pytest.approx(1.5004)
+    assert restored.entry_policy_version == "final_entry_policy.v1"
+
+
 # ── phantom P&L on trades that never reached the market ──────────────────────
 def _rejected(**over):
     t = _trade()

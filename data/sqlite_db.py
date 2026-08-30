@@ -51,6 +51,19 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "entry_intelligence_score", "intelligence_score", "strategy_revision", "strategy_direction_mode",
     "initial_stop", "scalp_lock_mode", "market_wide_reversal_entry",
     "volume_spike_entry", "power_move", "source_lane",
+    # Immutable entry-decision evidence.  These fields are needed after a restart
+    # to distinguish the two price domains and to audit the exact forecast/policy
+    # verdict that authorised fresh exposure.
+    "underlying_entry", "underlying_stop", "underlying_target",
+    "premium_entry", "premium_stop", "premium_target",
+    "geometry_observed_at", "geometry_source", "geometry_verified", "geometry_schema",
+    "expected_move_pct", "expected_move_floor_pct", "expected_move_uncertainty_pct",
+    "expected_move_probability", "expected_move_sample_count",
+    "expected_move_horizon_minutes", "expected_move_generated_at",
+    "expected_move_data_as_of", "expected_move_model_version", "expected_move_source",
+    "entry_policy_allowed", "entry_policy_phase", "entry_policy_checked_at",
+    "entry_policy_reason", "entry_policy_actual_rr",
+    "entry_policy_underlying_stop_pct", "entry_policy_version", "is_recovery",
     # Exchange-side protection + recovery state: read by from_dict(), so it has to
     # be written or every restart silently resets it.
     "protective_order_id", "protective_trigger", "protective_quantity",
@@ -453,6 +466,34 @@ class DatabaseManager:
                     "volume_spike_entry": "INTEGER",
                     "power_move": "INTEGER",
                     "source_lane": "TEXT",
+                    "underlying_entry": "REAL",
+                    "underlying_stop": "REAL",
+                    "underlying_target": "REAL",
+                    "premium_entry": "REAL",
+                    "premium_stop": "REAL",
+                    "premium_target": "REAL",
+                    "geometry_observed_at": "TEXT",
+                    "geometry_source": "TEXT",
+                    "geometry_verified": "INTEGER",
+                    "geometry_schema": "TEXT",
+                    "expected_move_pct": "REAL",
+                    "expected_move_floor_pct": "REAL",
+                    "expected_move_uncertainty_pct": "REAL",
+                    "expected_move_probability": "REAL",
+                    "expected_move_sample_count": "INTEGER",
+                    "expected_move_horizon_minutes": "INTEGER",
+                    "expected_move_generated_at": "TEXT",
+                    "expected_move_data_as_of": "TEXT",
+                    "expected_move_model_version": "TEXT",
+                    "expected_move_source": "TEXT",
+                    "entry_policy_allowed": "INTEGER",
+                    "entry_policy_phase": "TEXT",
+                    "entry_policy_checked_at": "TEXT",
+                    "entry_policy_reason": "TEXT",
+                    "entry_policy_actual_rr": "REAL",
+                    "entry_policy_underlying_stop_pct": "REAL",
+                    "entry_policy_version": "TEXT",
+                    "is_recovery": "INTEGER",
                     # Exchange-side protection state. Trade.from_dict() has always read
                     # these back, but nothing ever wrote them, so a restart forgot that a
                     # live SL-M order existed — emergency_flatten_trade() would then market
@@ -569,6 +610,56 @@ class DatabaseManager:
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_order_fills_symbol ON order_fills(tradingsymbol)"
+            )
+
+            # ── SIGNAL FORENSICS / FLIGHT RECORDER TABLE ─────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS signal_lifecycle_events (
+                    event_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_date        TEXT NOT NULL,
+                    event_ts            TEXT NOT NULL,
+                    lifecycle_id        TEXT NOT NULL,
+                    signal_id           TEXT,
+                    instrument          TEXT NOT NULL,
+                    contract            TEXT,
+                    symbol_token        TEXT,
+                    timeframe           TEXT,
+                    direction           TEXT,
+                    phase               TEXT NOT NULL,
+                    decision            TEXT NOT NULL,
+                    reason_code         TEXT,
+                    reason_text         TEXT,
+                    source              TEXT,
+                    grade               TEXT,
+                    confidence          REAL,
+                    engine              TEXT,
+                    lane                TEXT,
+                    ltp                 REAL,
+                    entry_price         REAL,
+                    initial_stop        REAL,
+                    current_stop        REAL,
+                    initial_target      REAL,
+                    current_target      REAL,
+                    pnl                 REAL,
+                    peak_pnl            REAL,
+                    drawdown            REAL,
+                    quote_source        TEXT,
+                    quote_verified      INTEGER,
+                    payload_json        TEXT,
+                    state_fingerprint   TEXT
+                )
+            ''')
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forensics_session "
+                "ON signal_lifecycle_events(session_date, event_id DESC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forensics_lifecycle "
+                "ON signal_lifecycle_events(lifecycle_id, event_ts ASC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forensics_instrument_tf "
+                "ON signal_lifecycle_events(session_date, instrument, timeframe)"
             )
 
             self.conn.commit()
@@ -1030,6 +1121,279 @@ class DatabaseManager:
         if ts.tzinfo is not None:
             return ts.astimezone(IST).date().isoformat()
         return ts.date().isoformat()
+
+    # ── signal forensics / flight recorder CRUD ──────────────────────────────
+
+    _last_forensic_fingerprints: Dict[str, str] = {}
+
+    @staticmethod
+    def _forensic_fingerprint(event: Dict[str, Any]) -> str:
+        """SHA-256 based fingerprint for deduplication of identical consecutive states."""
+        import hashlib
+        key_props = (
+            str(event.get("lifecycle_id") or ""),
+            str(event.get("phase") or ""),
+            str(event.get("decision") or ""),
+            str(event.get("reason_code") or ""),
+            str(event.get("reason_text") or ""),
+            f"{float(event.get('current_stop') or 0.0):.2f}",
+            f"{float(event.get('current_target') or 0.0):.2f}",
+            f"{float(event.get('pnl') or 0.0):.2f}",
+        )
+        raw = "|".join(key_props)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def append_signal_lifecycle_event(self, event: Dict[str, Any]) -> Optional[int]:
+        """Append one signal lifecycle event with fingerprint deduplication."""
+        fp = self._forensic_fingerprint(event)
+        lifecycle_id = str(event.get("lifecycle_id") or "")
+        payload = event.get("payload")
+        payload_json = json.dumps(payload, separators=(",", ":")) if isinstance(payload, (dict, list)) else (payload or "")
+        with self.write_lock:
+            # Suppress identical consecutive state for the same lifecycle
+            last_fp = self._last_forensic_fingerprints.get(lifecycle_id)
+            if last_fp == fp:
+                return None
+            self._last_forensic_fingerprints[lifecycle_id] = fp
+            try:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO signal_lifecycle_events (
+                        session_date, event_ts, lifecycle_id, signal_id, instrument,
+                        contract, symbol_token, timeframe, direction, phase, decision,
+                        reason_code, reason_text, source, grade, confidence, engine,
+                        lane, ltp, entry_price, initial_stop, current_stop, initial_target,
+                        current_target, pnl, peak_pnl, drawdown, quote_source,
+                        quote_verified, payload_json, state_fingerprint
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(event.get("session_date") or ""),
+                        str(event.get("event_ts") or ""),
+                        lifecycle_id,
+                        event.get("signal_id"),
+                        str(event.get("instrument") or ""),
+                        event.get("contract"),
+                        event.get("symbol_token"),
+                        event.get("timeframe"),
+                        event.get("direction"),
+                        str(event.get("phase") or "DETECTED"),
+                        str(event.get("decision") or "PENDING"),
+                        event.get("reason_code"),
+                        event.get("reason_text"),
+                        event.get("source"),
+                        event.get("grade"),
+                        event.get("confidence"),
+                        event.get("engine"),
+                        event.get("lane"),
+                        event.get("ltp"),
+                        event.get("entry_price"),
+                        event.get("initial_stop"),
+                        event.get("current_stop"),
+                        event.get("initial_target"),
+                        event.get("current_target"),
+                        event.get("pnl"),
+                        event.get("peak_pnl"),
+                        event.get("drawdown"),
+                        event.get("quote_source"),
+                        1 if event.get("quote_verified") else 0,
+                        payload_json,
+                        fp,
+                    ),
+                )
+                self.conn.commit()
+                return cur.lastrowid
+            except Exception as exc:
+                logger.debug(f"Signal forensics insert failed: {exc}")
+                return None
+
+    def append_signal_lifecycle_events(self, events: List[Dict[str, Any]]) -> int:
+        """Batch append signal lifecycle events with in-memory deduplication."""
+        if not events:
+            return 0
+        to_insert = []
+        with self.write_lock:
+            for event in events:
+                fp = self._forensic_fingerprint(event)
+                lifecycle_id = str(event.get("lifecycle_id") or "")
+                last_fp = self._last_forensic_fingerprints.get(lifecycle_id)
+                if last_fp == fp:
+                    continue
+                self._last_forensic_fingerprints[lifecycle_id] = fp
+                payload = event.get("payload")
+                payload_json = json.dumps(payload, separators=(",", ":")) if isinstance(payload, (dict, list)) else (payload or "")
+                to_insert.append((
+                    str(event.get("session_date") or ""),
+                    str(event.get("event_ts") or ""),
+                    lifecycle_id,
+                    event.get("signal_id"),
+                    str(event.get("instrument") or ""),
+                    event.get("contract"), event.get("symbol_token"),
+                    event.get("timeframe"), event.get("direction"),
+                    str(event.get("phase") or "DETECTED"),
+                    str(event.get("decision") or "PENDING"),
+                    event.get("reason_code"), event.get("reason_text"),
+                    event.get("source"), event.get("grade"),
+                    event.get("confidence"), event.get("engine"),
+                    event.get("lane"), event.get("ltp"),
+                    event.get("entry_price"), event.get("initial_stop"),
+                    event.get("current_stop"), event.get("initial_target"),
+                    event.get("current_target"), event.get("pnl"),
+                    event.get("peak_pnl"), event.get("drawdown"),
+                    event.get("quote_source"),
+                    1 if event.get("quote_verified") else 0,
+                    payload_json, fp,
+                ))
+            if not to_insert:
+                return 0
+            try:
+                self.conn.executemany(
+                    """
+                    INSERT INTO signal_lifecycle_events (
+                        session_date, event_ts, lifecycle_id, signal_id, instrument,
+                        contract, symbol_token, timeframe, direction, phase, decision,
+                        reason_code, reason_text, source, grade, confidence, engine,
+                        lane, ltp, entry_price, initial_stop, current_stop, initial_target,
+                        current_target, pnl, peak_pnl, drawdown, quote_source,
+                        quote_verified, payload_json, state_fingerprint
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    to_insert,
+                )
+                self.conn.commit()
+                return len(to_insert)
+            except Exception as exc:
+                logger.debug(f"Signal forensics batch insert failed: {exc}")
+                return 0
+
+    @staticmethod
+    def _decode_forensic_row(row: sqlite3.Row) -> Dict[str, Any]:
+        """Convert a sqlite3.Row to a dict, parsing payload_json."""
+        item = dict(row)
+        raw_payload = item.pop("payload_json", None)
+        if raw_payload:
+            try:
+                item["payload"] = json.loads(raw_payload)
+            except Exception:
+                item["payload"] = raw_payload
+        else:
+            item["payload"] = {}
+        item["quote_verified"] = bool(item.get("quote_verified"))
+        return item
+
+    def query_signal_lifecycle_events(
+        self,
+        *,
+        session_date: Optional[str] = None,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+        lifecycle_id: Optional[str] = None,
+        instrument: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        phase: Optional[str] = None,
+        decision: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Keyset-cursor paginated query for signal forensics events."""
+        where = []
+        params: List[Any] = []
+        if session_date:
+            where.append("session_date = ?")
+            params.append(session_date)
+        if lifecycle_id:
+            where.append("lifecycle_id = ?")
+            params.append(lifecycle_id)
+        if instrument:
+            where.append("instrument = ?")
+            params.append(instrument)
+        if timeframe:
+            where.append("timeframe = ?")
+            params.append(timeframe)
+        if phase:
+            where.append("phase = ?")
+            params.append(phase)
+        if decision:
+            where.append("decision = ?")
+            params.append(decision)
+        if search:
+            where.append("(reason_code LIKE ? OR reason_text LIKE ? OR source LIKE ? OR contract LIKE ?)")
+            pattern = f"%{search}%"
+            params.extend([pattern, pattern, pattern, pattern])
+
+        where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+        # Totals
+        count_sql = f"SELECT COUNT(*), COUNT(DISTINCT lifecycle_id) FROM signal_lifecycle_events {where_clause}"
+        total, signal_total = self.conn.execute(count_sql, params).fetchone()
+
+        latest_row = self.conn.execute(
+            f"SELECT MAX(event_id) FROM signal_lifecycle_events {where_clause}",
+            params,
+        ).fetchone()
+        latest_event_id = latest_row[0] if latest_row and latest_row[0] else 0
+
+        # Cursor-based pagination
+        page_params = list(params)
+        page_where = list(where) if where else []
+        if cursor:
+            page_where.append("event_id < ?")
+            page_params.append(int(cursor))
+
+        page_clause = f"WHERE {' AND '.join(page_where)}" if page_where else ""
+        clamped_limit = max(1, min(int(limit), 500))
+        sql = f"""
+            SELECT * FROM signal_lifecycle_events
+            {page_clause}
+            ORDER BY event_id DESC
+            LIMIT ?
+        """
+        page_params.append(clamped_limit)
+        rows = self.conn.execute(sql, page_params).fetchall()
+        items = [self._decode_forensic_row(r) for r in rows]
+
+        next_cursor = str(items[-1]["event_id"]) if len(items) == clamped_limit else None
+        return {
+            "items": items,
+            "next_cursor": next_cursor,
+            "total": total,
+            "signal_total": signal_total,
+            "latest_event_id": latest_event_id,
+        }
+
+    def load_signal_lifecycle(self, lifecycle_id: str) -> List[Dict[str, Any]]:
+        """Load full chronological timeline for a single lifecycle."""
+        rows = self.conn.execute(
+            "SELECT * FROM signal_lifecycle_events WHERE lifecycle_id = ? ORDER BY event_id ASC",
+            (lifecycle_id,),
+        ).fetchall()
+        return [self._decode_forensic_row(r) for r in rows]
+
+    def list_signal_forensics_dates(self) -> List[str]:
+        """Return distinct session dates, newest first."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT session_date FROM signal_lifecycle_events ORDER BY session_date DESC"
+        ).fetchall()
+        return [row[0] for row in rows if row[0]]
+
+    def purge_old_signal_lifecycle_events(self) -> int:
+        """Retain only the 2 most recent session dates."""
+        dates = self.list_signal_forensics_dates()
+        if len(dates) <= 2:
+            return 0
+        cutoff_dates = dates[2:]
+        with self.write_lock:
+            cur = self.conn.execute(
+                f"DELETE FROM signal_lifecycle_events WHERE session_date IN ({','.join(['?'] * len(cutoff_dates))})",
+                cutoff_dates,
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
 
 # Global instance
 db = DatabaseManager()

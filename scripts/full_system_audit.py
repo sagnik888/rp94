@@ -14,6 +14,76 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.market_data import FYERS_INDEX_SYMBOLS, INDEX_SPOT_TOKENS, MarketDataProvider
 from config.settings import get_settings
+from trading.secure_logging import redact_sensitive_text
+
+
+def _provider_auth_status(provider):
+    """Credential-free auth diagnostics for the two live capabilities."""
+    kite_status = {}
+    try:
+        source = getattr(provider, "kite", None)
+        auth = getattr(source, "_auth", None)
+        status_fn = getattr(auth, "status", None)
+        if callable(status_fn):
+            kite_status = dict(status_fn() or {})
+    except Exception as exc:
+        kite_status = {"connected": False, "reason": f"status unavailable: {exc}"}
+
+    fyers_status = {}
+    try:
+        status_fn = getattr(provider, "get_fyers_auth_status", None)
+        if callable(status_fn):
+            fyers_status = dict(status_fn() or {})
+    except Exception as exc:
+        fyers_status = {"connected": False, "reason": f"status unavailable: {exc}"}
+    return kite_status, fyers_status
+
+
+def _external_session_blocker(component, status, fallback_reason):
+    """A structured operator action, without credentials or token contents."""
+    reason = redact_sensitive_text(str((status or {}).get("reason") or fallback_reason))
+    component = str(component).lower()
+    login_path = "/api/kite_login" if component == "kite" else "/api/fyers_login"
+    return {
+        "component": component,
+        "classification": "external_session_required",
+        "reason": reason,
+        "action": f"complete the broker login at {login_path}",
+        "code_fixable": False,
+    }
+
+
+def _status_requires_login(status):
+    """Only call a failure external when the auth layer actually says so."""
+    if bool((status or {}).get("auth_required")):
+        return True
+    reason = str((status or {}).get("reason") or "").lower()
+    return any(
+        marker in reason
+        for marker in (
+            "no cached",
+            "token expired",
+            "invalid token",
+            "login required",
+            "manual login",
+            "authentication required",
+        )
+    )
+
+
+def _public_status(status):
+    """Return only log/report-safe scalar status fields."""
+    public = {}
+    for key, value in dict(status or {}).items():
+        lowered = str(key).lower()
+        if any(secret in lowered for secret in ("access_token", "refresh_token", "public_token")):
+            continue
+        if isinstance(value, str):
+            public[key] = redact_sensitive_text(value)
+        elif value is None or isinstance(value, (bool, int, float)):
+            public[key] = value
+    return public
+
 
 def run_with_timeout(_runner, label, fn, timeout=20, default=None):
     result_queue = queue.Queue(maxsize=1)
@@ -34,8 +104,9 @@ def run_with_timeout(_runner, label, fn, timeout=20, default=None):
     ok, result = result_queue.get()
     if ok:
         return result
-    logger.error(f"    - {label}: {result}")
+    logger.error(f"    - {label}: {redact_sensitive_text(result)}")
     return default
+
 
 def run_end_to_end_audit(days=7):
     logger.info(f"🚀 Starting Full System Audit (A-Z) for last {days} days")
@@ -44,10 +115,18 @@ def run_end_to_end_audit(days=7):
         api_key=settings.angelone_api_key,
         client_id=settings.angelone_client_id,
         password=settings.angelone_password,
-        totp_secret=settings.angelone_totp_secret
+        totp_secret=settings.angelone_totp_secret,
+        # This audit promises not to mutate broker auth state.  Validate cached
+        # sessions, but do not exchange refresh tokens or start background sockets.
+        start_streams=False,
+        allow_auth_refresh=False,
     )
 
     failures = []
+    external_blockers = []
+    software_failures = []
+    chain_status = {}
+    certification_limitations = []
 
     # 1. TEST CONNECTIVITY (read-only: authentication + market-data streams only)
     logger.info("Step 1: Connectivity Handshake...")
@@ -59,12 +138,42 @@ def run_end_to_end_audit(days=7):
         default=False,
     )
     fyers_conn = provider.fyers is not None
+    kite_status, fyers_status = _provider_auth_status(provider)
     logger.info(f"  - Kite: {'🟢 Connected' if kite_conn else '🔴 Failed'}")
     logger.info(f"  - Fyers: {'🟢 Connected' if fyers_conn else '🔴 Failed'}")
     if not kite_conn:
         failures.append("Kite connectivity")
+        if _status_requires_login(kite_status):
+            external_blockers.append(
+                _external_session_blocker(
+                    "kite", kite_status, "no authenticated Kite session"
+                )
+            )
+            logger.error(
+                "    - Kite blocker: "
+                f"{external_blockers[-1]['reason']}; {external_blockers[-1]['action']}"
+            )
+        else:
+            reason = redact_sensitive_text(
+                str(kite_status.get("reason") or "connection failed without an auth diagnosis")
+            )
+            software_failures.append(f"Kite connectivity: {reason}")
     if not fyers_conn:
         failures.append("Fyers connectivity")
+        if _status_requires_login(fyers_status):
+            external_blockers.append(
+                _external_session_blocker(
+                    "fyers", fyers_status, "no authenticated Fyers session"
+                )
+            )
+            logger.error(
+                "    - Fyers blocker: "
+                f"{external_blockers[-1]['reason']}; {external_blockers[-1]['action']}"
+            )
+        else:
+            software_failures.append(
+                "Fyers client unavailable without an authentication diagnosis"
+            )
 
     executor = None
 
@@ -143,6 +252,7 @@ def run_end_to_end_audit(days=7):
 
     # 3. TEST LIVE PRICE & FAILOVER
     logger.info("Step 3: Live Price & Failover Logic...")
+    observed_open_session = False
     for symbol in indices:
         quote = run_with_timeout(
             executor,
@@ -167,6 +277,7 @@ def run_end_to_end_audit(days=7):
             market_open = bool(provider.is_market_open())
         except Exception:
             market_open = quote_session in {"LIVE", "OPEN"}
+        observed_open_session = observed_open_session or market_open
         entry_ok = bool(
             market_open
             and quote_session in {"LIVE", "OPEN"}
@@ -193,6 +304,42 @@ def run_end_to_end_audit(days=7):
         )
         if chain is not None and not chain.empty:
             meta = getattr(provider, "_option_chain_meta", {}).get(symbol, {})
+            usable_pairs = 0
+            if {"call_ltp", "put_ltp"}.issubset(chain.columns):
+                calls = pd.to_numeric(chain["call_ltp"], errors="coerce").fillna(0.0)
+                puts = pd.to_numeric(chain["put_ltp"], errors="coerce").fillna(0.0)
+                usable_pairs = int(((calls > 0.0) & (puts > 0.0)).sum())
+            min_strikes = max(
+                3,
+                int(getattr(settings, "auto_option_chain_min_strikes", 3) or 3),
+            )
+            expiry_aligned = bool(meta.get("expiry_aligned"))
+            active_expiry = str(meta.get("active_expiry") or "")
+            fallback = bool(meta.get("fallback"))
+            auto_certified = bool(
+                len(chain) >= min_strikes
+                and usable_pairs >= min_strikes
+                and not fallback
+                and expiry_aligned
+                and active_expiry
+            )
+            chain_status[symbol] = {
+                "available": True,
+                "rows": int(len(chain)),
+                "usable_pair_rows": usable_pairs,
+                "source": str(meta.get("source") or "unknown"),
+                "fallback": fallback,
+                "active_expiry": active_expiry,
+                "expiry_aligned": expiry_aligned,
+                "auto_certified": auto_certified,
+                "classification": "available",
+            }
+            if not auto_certified:
+                certification_limitations.append(
+                    f"{symbol} chain is present but not Auto-ready "
+                    f"(rows={len(chain)}, usable_pairs={usable_pairs}, "
+                    f"fallback={fallback}, expiry_aligned={expiry_aligned})"
+                )
             logger.info(f"    - Option-chain source: {meta.get('source', 'unknown')}, fallback={bool(meta.get('fallback'))}")
             spot = provider.get_latest_price(symbol) or 0
             if "strike" in chain.columns and spot:
@@ -205,8 +352,40 @@ def run_end_to_end_audit(days=7):
                 f"ATM/nearest LTP: CE {atm_row.get('call_ltp')}, PE {atm_row.get('put_ltp')}"
             )
         else:
-            logger.error(f"  - {symbol} Chain: 🔴 Failed to fetch!")
+            if not fyers_conn and _status_requires_login(fyers_status):
+                reason = str(
+                    fyers_status.get("reason")
+                    or "Fyers authenticated session unavailable"
+                )
+                classification = "external_session_required"
+            else:
+                meta = getattr(provider, "_option_chain_meta", {}).get(symbol, {}) or {}
+                reason = str(meta.get("reason") or "authenticated provider returned no usable chain")
+                classification = "provider_or_software_failure"
+                software_failures.append(f"{symbol} option chain: {reason}")
+            reason = redact_sensitive_text(reason)
+            chain_status[symbol] = {
+                "available": False,
+                "rows": 0,
+                "source": "none",
+                "fallback": False,
+                "active_expiry": "",
+                "expiry_aligned": False,
+                "auto_certified": False,
+                "classification": classification,
+                "reason": reason,
+            }
+            logger.error(
+                f"  - {symbol} Chain: 🔴 Unavailable [{classification}] - {reason}"
+            )
             failures.append(f"{symbol} option chain")
+
+    session_limitations = []
+    if not observed_open_session:
+        session_limitations.append(
+            "market is closed; live tick freshness and executable-session readiness "
+            "cannot be certified by this run"
+        )
 
     result = {
         "ok": not failures,
@@ -214,7 +393,38 @@ def run_end_to_end_audit(days=7):
         "indices": indices,
         "days": int(days),
         "read_only": True,
+        "live_ready": bool(
+            not failures
+            and observed_open_session
+            and chain_status
+            and all(item.get("auto_certified") for item in chain_status.values())
+        ),
+        "auth": {
+            "kite": _public_status(kite_status),
+            "fyers": _public_status(fyers_status),
+        },
+        "option_chains": chain_status,
+        "external_blockers": external_blockers,
+        "software_failures": sorted(set(software_failures)),
+        "session_limitations": session_limitations,
+        "certification_limitations": certification_limitations,
     }
+    for limitation in session_limitations:
+        logger.warning(f"Live-certification limitation: {limitation}")
+    if external_blockers:
+        logger.error(
+            "External session blocker(s): "
+            + "; ".join(
+                f"{item['component']}: {item['reason']} ({item['action']})"
+                for item in external_blockers
+            )
+        )
+    if software_failures:
+        logger.error(
+            "Provider/software failure(s): " + "; ".join(sorted(set(software_failures)))
+        )
+    for limitation in certification_limitations:
+        logger.warning(f"Live-certification limitation: {limitation}")
     if failures:
         logger.error("🔚 Audit FAILED: " + "; ".join(result["failures"]))
     else:

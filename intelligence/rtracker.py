@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
 
+from intelligence.entry_policy_evaluation import evaluate_entry_shadow_walk_forward
+
 try:
     from trading.trade_manager import IST
 except Exception:  # pragma: no cover - import fallback for isolated scripts
@@ -222,6 +224,25 @@ class RegimeTracker:
             rendered.append((week_key, summary, self._weekly_markdown(summary)))
         eight_week = self._multi_week_summary(events, weeks)
         eight_week_md = self._multi_week_markdown(eight_week)
+        # Executable entry-policy evidence is evaluated alongside the normal weekly
+        # study, but remains advisory. Build it outside both locks: the evaluator is
+        # pure and may scan the archive several times for the configured horizons.
+        entry_policy_expectancy = {
+            "schema": "entry-policy-expectancy.v1",
+            "generated_at": as_of_dt.isoformat(),
+            "weeks_requested": weeks,
+            "mode": "ADVISORY_ONLY",
+            "live_settings_changed": False,
+            "horizons": {
+                str(horizon): evaluate_entry_shadow_walk_forward(
+                    events,
+                    horizon_minutes=horizon,
+                    min_train_sessions=5,
+                    test_sessions=1,
+                )
+                for horizon in (15, 30, 60)
+            },
+        }
 
         with _RTRACKER_REPORT_LOCK:
             self.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +265,11 @@ class RegimeTracker:
             summary_json = self.reports_dir / f"rtracker_{weeks}_week_summary.json"
             summary_path.write_text(eight_week_md, encoding="utf-8")
             summary_json.write_text(json.dumps(_json_safe(eight_week), indent=2, sort_keys=True), encoding="utf-8")
+            expectancy_json = self.reports_dir / "entry_policy_expectancy.json"
+            expectancy_json.write_text(
+                json.dumps(_json_safe(entry_policy_expectancy), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
         return {
             "weeks_requested": weeks,
             "events": len(events),
@@ -251,6 +277,7 @@ class RegimeTracker:
             "weekly_reports": week_reports,
             "summary_markdown": str(summary_path),
             "summary_json": str(summary_json),
+            "entry_policy_expectancy_json": str(expectancy_json),
         }
 
     def load_events(self, *, weeks: int, as_of: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -371,6 +398,15 @@ class RegimeTracker:
             _last_reason(_candidate_value(candidate, "reasons", [])),
             status,
         )
+        conversion_ratio = _measured_candidate_float(
+            candidate,
+            "geometry_conversion_ratio",
+        )
+        if conversion_ratio is None:
+            # Candidates created before dual geometry was stamped still expose the
+            # contract conversion through multiplier; retain that measured value
+            # rather than dropping the option cross-geometry dimension on replay.
+            conversion_ratio = _measured_candidate_float(candidate, "multiplier")
         vector = dict(regime_ctx.get("conviction_vector", {}) or {})
         event = {
             "timestamp": event_ts.isoformat(),
@@ -498,6 +534,9 @@ class RegimeTracker:
                 "execution_touch_reason": str(
                     _candidate_value(candidate, "execution_touch_reason", "") or ""
                 ),
+                "actual_fill_price": _measured_candidate_float(
+                    candidate, "actual_fill_price"
+                ),
             },
             "contract": {
                 "trading_symbol": str(_candidate_value(candidate, "trading_symbol", "") or ""),
@@ -508,6 +547,50 @@ class RegimeTracker:
                 "lots": _safe_int(_candidate_value(candidate, "lots", 0)),
                 "lot_size": _safe_int(_candidate_value(candidate, "lot_size", 0)),
             },
+            "geometry": {
+                "schema": str(_candidate_value(candidate, "geometry_schema", "") or ""),
+                "verified": _optional_bool(candidate, "geometry_verified"),
+                "source": str(_candidate_value(candidate, "geometry_source", "") or ""),
+                "observed_at": str(_candidate_value(candidate, "geometry_observed_at", "") or ""),
+                "underlying_entry": _measured_candidate_float(candidate, "underlying_entry"),
+                "underlying_stop": _measured_candidate_float(candidate, "underlying_stop"),
+                "underlying_target": _measured_candidate_float(candidate, "underlying_target"),
+                "premium_entry": _measured_candidate_float(candidate, "premium_entry"),
+                "premium_stop": _measured_candidate_float(candidate, "premium_stop"),
+                "premium_target": _measured_candidate_float(candidate, "premium_target"),
+                "conversion_ratio": conversion_ratio,
+            },
+            "expected_move": (
+                dict(_candidate_value(candidate, "expected_move_forecast", {}) or {})
+                if isinstance(_candidate_value(candidate, "expected_move_forecast", {}), dict)
+                and bool(_candidate_value(candidate, "expected_move_forecast", {}))
+                else {
+                    "expected_favorable_move_pct": _measured_candidate_float(candidate, "expected_move_pct"),
+                    "floor_pct": _measured_candidate_float(candidate, "expected_move_floor_pct"),
+                    "uncertainty_pct": _measured_candidate_float(candidate, "expected_move_uncertainty_pct"),
+                    "probability_meeting_floor": _measured_candidate_float(candidate, "expected_move_probability"),
+                    "sample_count": _measured_candidate_float(candidate, "expected_move_sample_count"),
+                    "horizon_minutes": _measured_candidate_float(candidate, "expected_move_horizon_minutes"),
+                    "generated_at": str(_candidate_value(candidate, "expected_move_generated_at", "") or ""),
+                    "data_as_of": str(_candidate_value(candidate, "expected_move_data_as_of", "") or ""),
+                    "model_version": str(_candidate_value(candidate, "expected_move_model_version", "") or ""),
+                    "source": str(_candidate_value(candidate, "expected_move_source", "") or ""),
+                }
+            ),
+            "entry_policy": (
+                dict(_candidate_value(candidate, "entry_policy_verdict", {}) or {})
+                if isinstance(_candidate_value(candidate, "entry_policy_verdict", {}), dict)
+                and bool(_candidate_value(candidate, "entry_policy_verdict", {}))
+                else {
+                    "allowed": _optional_bool(candidate, "entry_policy_allowed"),
+                    "phase": str(_candidate_value(candidate, "entry_policy_phase", "") or ""),
+                    "checked_at": str(_candidate_value(candidate, "entry_policy_checked_at", "") or ""),
+                    "reason": str(_candidate_value(candidate, "entry_policy_reason", "") or ""),
+                    "actual_rr": _measured_candidate_float(candidate, "entry_policy_actual_rr"),
+                    "underlying_stop_pct": _measured_candidate_float(candidate, "entry_policy_underlying_stop_pct"),
+                    "policy_version": str(_candidate_value(candidate, "entry_policy_version", "") or ""),
+                }
+            ),
             "regime": {
                 "raw_regime": str(regime_ctx.get("raw_regime") or ""),
                 "guarded_regime": str(regime_ctx.get("guarded_regime") or ""),
@@ -544,6 +627,49 @@ class RegimeTracker:
             },
             "volume": {
                 "signal": str(volume_ctx.get("signal") or ""),
+                "available": (
+                    bool(_truthy(volume_ctx.get("available")))
+                    if volume_ctx.get("available") is not None
+                    else (
+                        bool(_truthy(volume_ctx.get("volume_available")))
+                        if volume_ctx.get("volume_available") is not None
+                        else _optional_bool(candidate, "volume_available")
+                    )
+                ),
+                "source": str(
+                    volume_ctx.get("source")
+                    or volume_ctx.get("volume_source")
+                    or _candidate_value(candidate, "volume_source", "")
+                    or ""
+                ),
+                "basis": str(
+                    volume_ctx.get("basis")
+                    or volume_ctx.get("volume_basis")
+                    or volume_ctx.get("metric_kind")
+                    or _candidate_value(candidate, "volume_basis", "")
+                    or ""
+                ),
+                "unit": str(
+                    volume_ctx.get("unit")
+                    or volume_ctx.get("volume_unit")
+                    or _candidate_value(candidate, "volume_unit", "")
+                    or ""
+                ),
+                "comparable": (
+                    bool(_truthy(volume_ctx.get("comparable")))
+                    if volume_ctx.get("comparable") is not None
+                    else (
+                        bool(_truthy(volume_ctx.get("volume_comparable")))
+                        if volume_ctx.get("volume_comparable") is not None
+                        else _optional_bool(candidate, "volume_comparable")
+                    )
+                ),
+                "unavailable_reason": str(
+                    volume_ctx.get("unavailable_reason")
+                    or volume_ctx.get("volume_unavailable_reason")
+                    or _candidate_value(candidate, "volume_unavailable_reason", "")
+                    or ""
+                ),
                 "volume_ratio": _measured_float(volume_ctx, "volume_ratio", _candidate_value(candidate, "volume_ratio", None)),
                 "current_volume": _measured_float(volume_ctx, "current_volume"),
                 "buy_sell_ratio": _measured_float(volume_ctx, "buy_sell_ratio"),
@@ -1008,11 +1134,7 @@ def _measured_float(mapping: Any, key: str, fallback: Any = None) -> Optional[fl
         value = fallback
     if value is None:
         return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if number != number else number
+    return _number_or_none(value)
 
 
 def _entry_intel_block(value: Any) -> dict:

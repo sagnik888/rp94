@@ -1196,3 +1196,38 @@ class ScannerTelemetryMixin:
             status["queue_reason"] = getattr(queue, "last_reason", "")
             status["queue_superseded_count"] = int(getattr(queue, "superseded_count", 0) or 0)
         return status
+
+    def _emit_forensic_event(self, **event) -> None:
+        """Best-effort structured flight-recorder write; never delay a scan.
+
+        Only records in REAL mode outside warmup.  DB writes are pushed off
+        the event loop so a slow commit cannot stall the scan cycle.
+        """
+        if str(getattr(self, "mode", "") or "").upper() != "REAL" or bool(
+            getattr(self, "is_warmup", False)
+        ):
+            return
+        now = datetime.now(IST)
+        event.setdefault("event_ts", now.isoformat(timespec="milliseconds"))
+        event.setdefault("session_date", now.date().isoformat())
+        event.setdefault("source", "scanner")
+
+        def _write() -> None:
+            try:
+                from data.sqlite_db import db
+                db.append_signal_lifecycle_event(event)
+                last_day = getattr(self, "_forensic_retention_day", "")
+                if last_day != event["session_date"]:
+                    db.purge_old_signal_lifecycle_events()
+                    self._forensic_retention_day = event["session_date"]
+            except Exception:
+                # Forensics is observability only. Trading must never fail.
+                return
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_write))
+        except RuntimeError:
+            threading.Thread(
+                target=_write, name="signal-forensics", daemon=True
+            ).start()

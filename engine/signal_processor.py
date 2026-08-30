@@ -1,4 +1,5 @@
 import pandas as pd
+import time
 import copy
 import re
 from datetime import date, datetime, time as dtime, timedelta
@@ -30,12 +31,14 @@ from engine.signal_quality_policy import (
     power_move_confirmed,
     relaxed_threshold,
     volume_spike_entry_confirmed,
+    volume_spike_min_ratio,
 )
 from engine.market_regime import (
     futures_stop_tolerance_pct,
     is_trending_regime,
     regime_aligns,
 )
+from engine.entry_policy import effective_underlying_stop_cap_pct
 from engine.position_sizing import resolve_trade_lots, size_lots_for_trade
 from engine.trade_accounting import estimate_trade_charges
 from engine.signal_manager import GradedSignal
@@ -454,8 +457,24 @@ class TradeCandidate:
     rr: float = 1.5
     score: float = 0.0
     reasons: list[str] = field(default_factory=list)
+    # Explicit, non-interchangeable price spaces. ``price/stop/target`` remain the
+    # operational traded-contract tuple for compatibility; these fields make the
+    # underlying risk and option-premium risk independently auditable.
+    entry_spot: float = 0.0
     spot_stop: float = 0.0
     spot_target: float = 0.0
+    underlying_entry: float = 0.0
+    underlying_stop: float = 0.0
+    underlying_target: float = 0.0
+    premium_entry: float = 0.0
+    premium_stop: float = 0.0
+    premium_target: float = 0.0
+    geometry_observed_at: str = ""
+    geometry_source: str = ""
+    geometry_verified: bool = False
+    geometry_schema: str = "dual_price_geometry.v1"
+    expected_move_forecast: dict[str, Any] = field(default_factory=dict)
+    entry_policy_verdict: dict[str, Any] = field(default_factory=dict)
     signal_timestamp: Optional[datetime] = None
     current_price: float = 0.0
     pnl: float = 0.0
@@ -833,16 +852,16 @@ class SignalProcessor:
     def _build_timeframe_contexts(scanner, instrument: str, settings) -> Optional[Dict[str, Dict]]:
         """Collect each timeframe's own cached intelligence snapshot.
 
-        Returns None when the feature is disabled (the default), which makes
-        _candidate_timeframe_context fall back to the caller's 5-minute values and keeps
-        grading byte-identical to the previous behaviour.
+        Returns None only when the feature is disabled. With the live default enabled,
+        callers can distinguish a genuinely missing own-timeframe snapshot from a
+        deliberate legacy/fallback mode.
         """
         enabled = getattr(settings, "per_timeframe_grading_enabled", False)
         if not (enabled is True or str(enabled).strip().lower() in {"1", "true", "yes", "on"}):
             return None
         getter = getattr(scanner, "_cached_timeframe_intel", None)
         if not callable(getter):
-            return None
+            return {}
         contexts: Dict[str, Dict] = {}
         for tf in ("1min", "5min", "15min"):
             try:
@@ -851,6 +870,30 @@ class SignalProcessor:
                 intel = None
             if not isinstance(intel, dict):
                 continue
+            # Production cache entries carry a timeframe-qualified capture epoch.
+            # Do not let an old exact-timeframe bundle grade a new candidate. Small
+            # unit-test stubs without cache clocks remain usable; the live Scanner
+            # always initializes _intel_cache_time and therefore fails closed.
+            cache_times = getattr(scanner, "_intel_cache_time", None)
+            if isinstance(cache_times, dict):
+                key_builder = getattr(scanner, "_timeframe_intel_key", None)
+                key = (
+                    key_builder(instrument, tf)
+                    if callable(key_builder)
+                    else f"{str(instrument or '').upper()}_{tf}"
+                )
+                captured = cache_times.get(key)
+                if captured is None:
+                    captured = intel.get("as_of")
+                try:
+                    captured_ts = float(captured)
+                    ttl_getter = getattr(scanner, "_intel_analysis_ttl_seconds", None)
+                    ttl = float(ttl_getter() if callable(ttl_getter) else getattr(settings, "intelligence_analysis_ttl_seconds", 30.0))
+                    age = time.time() - captured_ts
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not (0.0 <= age <= max(0.0, ttl)):
+                    continue
             aggregate = intel.get("aggregate") if isinstance(intel.get("aggregate"), dict) else {}
             regime_block = intel.get("regime") if isinstance(intel.get("regime"), dict) else {}
             contexts[tf] = {
@@ -877,7 +920,10 @@ class SignalProcessor:
                 "intel_score": aggregate_intelligence_score(aggregate),
                 "regime": regime_block.get("regime") or regime_block.get("hard_label") or "",
             }
-        return contexts or None
+        # Empty means "feature enabled, but no own-timeframe evidence". Returning None
+        # here made the grading loop interpret a total cache miss as legacy mode and
+        # silently borrow the caller's 5m bundle, defeating fail-closed semantics.
+        return contexts
 
     @staticmethod
     def _direction_mode_allows(direction: str, settings) -> Tuple[bool, str]:
@@ -1176,6 +1222,66 @@ class SignalProcessor:
         )
 
     @staticmethod
+    def _volume_spike_requirement_text(settings, instrument: str = "") -> str:
+        """Human-readable fast-entry threshold using the unit actually measured."""
+        traded_floor = float(volume_spike_min_ratio(settings, instrument) or 0.0)
+        if _setting_enabled(
+            getattr(settings, "one_min_scalping_high_burst_only", True), True
+        ):
+            traded_floor = max(
+                traded_floor,
+                float(
+                    getattr(
+                        settings,
+                        "volume_spike_entry_strong_1min_min_volume_ratio",
+                        traded_floor,
+                    )
+                    or traded_floor
+                ),
+            )
+        tick_floor = float(
+            getattr(settings, "surge_tick_percentile_floor", 97.0) or 97.0
+        )
+        return (
+            f"traded volume >= {traded_floor:.2f}x or "
+            f"tick activity >= p{tick_floor:g} (with range/close and burst context)"
+        )
+
+    @staticmethod
+    def _volume_spike_metric_text(
+        metrics: Optional[Dict[str, Any]],
+        settings,
+        instrument: str = "",
+        timeframe: str = "",
+    ) -> str:
+        """Describe spike evidence without calling tick activity traded volume."""
+        evidence = dict(metrics or {})
+        basis = str(evidence.get("volume_basis") or "TRADED").upper()
+        if basis == "TICK_ACTIVITY":
+            percentile = float(evidence.get("surge_percentile", -1.0) or -1.0)
+            floor = float(
+                getattr(settings, "surge_tick_percentile_floor", 97.0) or 97.0
+            )
+            return f"tick activity p{percentile:.1f} (floor p{floor:g})"
+        ratio = float(evidence.get("volume_ratio", 0.0) or 0.0)
+        floor = float(volume_spike_min_ratio(settings, instrument) or 0.0)
+        if str(timeframe or "").lower() == "1min" and _setting_enabled(
+            getattr(settings, "one_min_scalping_high_burst_only", True), True
+        ):
+            floor = max(
+                floor,
+                float(
+                    getattr(
+                        settings,
+                        "volume_spike_entry_strong_1min_min_volume_ratio",
+                        floor,
+                    )
+                    or floor
+                ),
+            )
+        return f"traded volume {ratio:.2f}x (floor {floor:.2f}x)"
+
+    @staticmethod
     def _recheckable_rejection_status(status_msg: str) -> bool:
         """Return whether a forming rejection may improve before candle close."""
         status = str(status_msg or "")
@@ -1231,7 +1337,7 @@ class SignalProcessor:
     @staticmethod
     def _suppress_1min_no_spike_tape(tf, volume_spike_entry, settings) -> bool:
         """Whether to keep a 1min signal off the live tape because it never cleared
-        the 2.5x volume-surge first filter (the only way a 1min signal can enter)."""
+        its configured traded-volume or tick-percentile first filter."""
         return bool(
             str(tf or "") == "1min"
             and not bool(volume_spike_entry)
@@ -1284,7 +1390,7 @@ class SignalProcessor:
         """Decide POST-WIN 3M SNAPBACK eligibility for this 1min candidate.
 
         Window arms only after 5min/15min exits (not 1min scalps). Pure snapback
-        does not require full SPIKE (2.5x) but MUST pass bare-min tape data
+        does not require the full configured spike threshold but MUST pass bare-min tape data
         (volume/range/close) so entries are data-backed, not hunch-only.
 
         Returns (is_reversion_scalp: bool, meta: dict).
@@ -1392,7 +1498,7 @@ class SignalProcessor:
             return False, meta
 
         # Bare-min tape confirm: full SPIKE already qualifies; pure SNAPBACK needs
-        # directional thrust floors (configurable, below SPIKE 2.5x) so we do not
+        # directional thrust floors (configurable, below the full spike gate) so we do not
         # fire on a naked UT1 flip with zero volume/range evidence.
         if bool(getattr(best_sig, "volume_spike_entry", False)):
             meta["tape_ok"] = True
@@ -4808,7 +4914,7 @@ class SignalProcessor:
                             if len(seen_raw) > 500:
                                 scanner._raw_utbot_activity_keys = set(list(seen_raw)[-250:])
                             # Keep no-spike 1min raw detections off the live tape: they
-                            # cannot enter without the 2.5x surge, so logging them only
+                            # cannot enter without its configured surge gate, so logging them only
                             # floods the tape.
                             suppress_1min_raw = self._suppress_1min_no_spike_tape(
                                 tf, getattr(sig, "volume_spike_entry", False), settings
@@ -4822,6 +4928,29 @@ class SignalProcessor:
                     # Grade each candidate with its OWN timeframe's intelligence when
                     # per-timeframe grading is enabled; otherwise these resolve to the
                     # caller's 5-minute values and grading is unchanged.
+                    if (
+                        _timeframe_contexts is not None
+                        and _setting_enabled(
+                            getattr(settings, "own_timeframe_intel_fail_closed", True), True
+                        )
+                        and tf not in _timeframe_contexts
+                    ):
+                        # An own-timeframe rule may wait for its own evidence; it may not
+                        # quietly rename the caller's 5m bundle as 1m/15m intelligence.
+                        try:
+                            scanner.log_signal_decision_once(
+                                f"{instrument}|{tf}|{sig.signal_type}|own-tf-intel-missing",
+                                f"Signal held: {instrument} {tf} {sig.signal_type} has no fresh "
+                                "own-timeframe intelligence; fail-closed grading is active.",
+                                "trade",
+                            )
+                        except Exception:
+                            pass
+                        self._remember_live_signal_identity(
+                            scanner, dedup_key, s_ts, signal_identity
+                        )
+                        continue
+
                     _tf_intel_result, _tf_intel_score, _tf_regime = self._candidate_timeframe_context(
                         tf, intel_result, intel_score, regime, _timeframe_contexts
                     )
@@ -4894,7 +5023,7 @@ class SignalProcessor:
         def _emit_signal_decision(raw: Dict, reason_msg: str, status_msg: str) -> None:
             sig = raw["sig"]
             tf = raw["tf"]
-            # Tape hygiene: a 1min signal that never cleared the 2.5x volume-surge
+            # Tape hygiene: a 1min signal that never cleared its basis-aware surge
             # first filter can't enter, so its rejections only flood the live tape.
             # Suppress them (debug file log only); reject diagnostics still count.
             if self._suppress_1min_no_spike_tape(
@@ -5734,8 +5863,11 @@ class SignalProcessor:
                         f"(window open; spike not required)"
                     )
                 else:
+                    spike_requirement = self._volume_spike_requirement_text(
+                        settings, instrument
+                    )
                     return _build_rejected_candidate(
-                        "1min entry requires confirmed >=2.5x directional volume spike "
+                        f"1min entry requires confirmed directional burst: {spike_requirement}; "
                         "or an open POST-WIN SNAPBACK window with bare-min tape confirm",
                         "REJECTED - Weak 1min",
                     )
@@ -5745,7 +5877,7 @@ class SignalProcessor:
                     path = "volume-spike + SNAPBACK"
                 logger.info(
                     f"🚀 Confirmed 1min {path} entry for {instrument}: "
-                    f"{volume_spike_metrics.get('volume_ratio', 0.0):.2f}x volume"
+                    f"{self._volume_spike_metric_text(volume_spike_metrics, settings, instrument, best_tf)}"
                 )
 
         can_open, _ = scanner.trades.can_open_trade()
@@ -6303,7 +6435,7 @@ class SignalProcessor:
             
             quality_factor = min(1.0, (best_conf + (0.1 if best_grade in ["A", "A+"] else 0.0)))
             # RR-scaled sizing. The legacy `1.0 if final_rr >= 1.5 else final_rr/1.5`
-            # was dead code — dynamic_rr floors at 1.6, so it was always 1.0 and never
+            # was dead code — dynamic_rr already floors at 1.5R, so it was always 1.0 and never
             # shrank size. Gate a real implementation behind an explicit setting
             # (default OFF = full size, preserving live behavior); when enabled, size
             # scales down for low-RR setups toward rr_size_floor and reaches full size
@@ -6403,7 +6535,32 @@ class SignalProcessor:
                 )
                 max_premium_sl_pts = est_premium * (option_stop_pct / 100.0)
                 hard_cap_index_sl = max_premium_sl_pts / max(0.1, abs(instrument_multiplier))
-                index_stop_distance = min(best_sig.stop_distance, hard_cap_index_sl)
+                # Option premium risk and underlying index risk are separate ceilings.
+                # The 15% premium cap used to permit roughly 0.36% of NIFTY spot at
+                # ATM delta, even though the approved underlying regime ceiling is
+                # 0.10-0.15%. Clamp the underlying geometry independently before it is
+                # converted into premium space.
+                policy_caps = getattr(
+                    settings, "entry_policy_underlying_stop_max_pct_by_index", {}
+                )
+                try:
+                    configured_index_cap = effective_underlying_stop_cap_pct(
+                        instrument,
+                        (policy_caps or {}).get(instrument, scanner.futures_sl_pct),
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    configured_index_cap = float(scanner.futures_sl_pct or 0.0)
+                regime_index_cap = futures_stop_tolerance_pct(
+                    configured_index_cap, regime
+                )
+                policy_index_sl = max(0.0, float(spot or 0.0)) * (
+                    regime_index_cap / 100.0
+                )
+                index_stop_distance = min(
+                    best_sig.stop_distance,
+                    hard_cap_index_sl,
+                    policy_index_sl,
+                )
 
             if direction == "LONG":
                 entry_stop = spot - index_stop_distance
@@ -6591,8 +6748,11 @@ class SignalProcessor:
                         f"⚡ Fast-thrust override: late entry allowed past {no_entry_label} cutoff"
                     )
                 if volume_spike_entry:
+                    volume_evidence = self._volume_spike_metric_text(
+                        volume_spike_metrics, settings, instrument, best_tf
+                    )
                     candidate_reasons.append(
-                        f"⚡ Volume spike entry: {volume_spike_metrics.get('volume_ratio', 0.0):.2f}x volume, "
+                        f"⚡ Volume spike entry: {volume_evidence}, "
                         f"{volume_spike_metrics.get('range_atr_ratio', 0.0):.2f}x range, "
                         f"{volume_spike_metrics.get('close_location', 0.0):.0%} directional close"
                     )
@@ -6739,6 +6899,22 @@ class SignalProcessor:
                     atm_strike=strike_local, multiplier=instrument_multiplier, trading_symbol=trading_symbol,
                     symbol_token=symbol_token, rr=round(final_rr, 2), score=final_strike_score,
                     reasons=candidate_reasons, signal_timestamp=best_sig.timestamp,
+                    entry_spot=float(spot or 0.0),
+                    spot_stop=float(entry_stop or 0.0),
+                    spot_target=float(target or 0.0),
+                    underlying_entry=float(spot or 0.0),
+                    underlying_stop=float(entry_stop or 0.0),
+                    underlying_target=float(target or 0.0),
+                    premium_entry=float(live_trade_price or 0.0) if inst_type == "OPT" else 0.0,
+                    premium_stop=float(candidate_stop or 0.0) if inst_type == "OPT" else 0.0,
+                    premium_target=float(candidate_target or 0.0) if inst_type == "OPT" else 0.0,
+                    geometry_observed_at=(
+                        best_sig.timestamp.isoformat()
+                        if isinstance(best_sig.timestamp, datetime)
+                        else str(best_sig.timestamp or "")
+                    ),
+                    geometry_source="signal_processor.dual_geometry",
+                    geometry_verified=True,
                     status=candidate_status,
                     action=candidate_action,
                     volume_spike_entry=volume_spike_entry,

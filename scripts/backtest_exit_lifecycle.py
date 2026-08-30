@@ -6,7 +6,7 @@ exit logic, and A/B-compares:
 
   * BASELINE  — "take profit at target, else stop"  (no ride)
   * RUNNER    — the trend-runner: engage early on a proven big move, ride the
-                volatility-adjusted 85-90% trailing lock  (Phase 1 + Phase 2)
+                current runtime-configured trailing lock  (Phase 1 + Phase 2)
 
 Both are simulated on the SAME real premium bars, so the delta is purely the
 exit-logic change. Trades are taken from the rtracker ACCEPTED events; the regime
@@ -27,16 +27,92 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config.settings import get_settings  # noqa: E402
+from engine.trade_accounting import estimate_trade_charges  # noqa: E402
 from scanner import Scanner  # noqa: E402  (real helpers, for fidelity)
 
 ROOT = Path(__file__).resolve().parents[1]
 CANDLES = ROOT / "data_store" / "candles"
 LOT_SIZE = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "MIDCPNIFTY": 120}
-RUNNER_UNLOCK_RATIO = 0.95  # dynamic_rr_runner_unlock_ratio default
+MARKET_TIMEZONE = "Asia/Kolkata"
+
+
+def _market_timestamp(value) -> pd.Timestamp:
+    """Return one archived timestamp as a timezone-naive IST wall clock.
+
+    Session archives contain a historical mix of naïve local timestamps,
+    ``+05:30`` offsets, and UTC ``Z`` timestamps.  The live candle cache uses
+    naïve IST, so that is the comparison invariant for this replay too.  Aware
+    values must be converted before dropping their timezone; merely stripping
+    ``Z`` would move the represented market time by 5h30m.
+    """
+    try:
+        ts = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return pd.NaT
+    if pd.isna(ts):
+        return pd.NaT
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(MARKET_TIMEZONE).tz_localize(None)
+    return ts
+
+
+def _market_timestamp_series(values: pd.Series) -> pd.Series:
+    """Normalize even a single column containing mixed timestamp formats."""
+    return pd.Series(
+        (_market_timestamp(value) for value in values),
+        index=values.index,
+        dtype="datetime64[ns]",
+    )
 
 
 def _sc() -> Scanner:
     return Scanner.__new__(Scanner)
+
+
+def _runner_execution_parameters() -> tuple[float, float]:
+    """Return the exact production unlock ratio and base runner lock."""
+    settings = get_settings()
+    unlock = min(
+        1.0,
+        max(
+            0.50,
+            float(getattr(settings, "dynamic_rr_runner_unlock_ratio", 0.85) or 0.85),
+        ),
+    )
+    lock = min(
+        0.98,
+        max(
+            0.25,
+            float(getattr(settings, "dynamic_rr_runner_lock_pct", 0.85) or 0.85),
+        ),
+    )
+    return unlock, lock
+
+
+def option_replay_pnl(
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    instrument: str,
+    settings=None,
+) -> tuple[float, float, float]:
+    """Return gross, shared modeled round-trip costs/slippage, and net P&L."""
+    accounting_settings = settings if settings is not None else get_settings()
+    gross = round(
+        (float(exit_price) - float(entry_price)) * max(0, int(quantity)), 2
+    )
+    costs = float(
+        estimate_trade_charges(
+            entry_price,
+            exit_price,
+            quantity,
+            "OPT",
+            accounting_settings,
+            instrument=instrument,
+        )
+    )
+    return gross, costs, round(gross - costs, 2)
 
 
 def _candle_sources(day: str) -> list[str]:
@@ -61,7 +137,8 @@ def load_today_contracts(day: str) -> dict[str, pd.DataFrame]:
             df = pd.read_csv(f)
             if "timestamp" not in df or not len(df):
                 continue
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["timestamp"] = _market_timestamp_series(df["timestamp"])
+            df = df[df["timestamp"].notna()].copy()
             day_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == day].copy()
             if len(day_df) < 5:
                 continue
@@ -100,6 +177,9 @@ def load_trades(day: str) -> list[dict]:
         reg = r.get("regime")
         raw_regime = (reg.get("raw_regime") if isinstance(reg, dict) else "") or ""
         adx = float(reg.get("adx") if isinstance(reg, dict) else 0.0) or 0.0
+        entry_ts = _market_timestamp(r.get("signal_timestamp") or r.get("entry_timestamp"))
+        if pd.isna(entry_ts):
+            continue
         trades.append({
             "instrument": str(r.get("instrument") or "").split()[0],
             "direction": str(r.get("direction") or "").upper(),
@@ -107,7 +187,7 @@ def load_trades(day: str) -> list[dict]:
             "entry": float(r.get("price") or 0.0),
             "stop": float(r.get("stop") or 0.0),
             "target": float(r.get("target") or 0.0),
-            "entry_ts": pd.to_datetime(r.get("signal_timestamp") or r.get("entry_timestamp")),
+            "entry_ts": entry_ts,
             "raw_regime": str(raw_regime).upper(),
             "adx": adx,
             "option_type": "CE" if str(r.get("direction") or "").upper() == "LONG" else "PE",
@@ -179,7 +259,8 @@ def sim_runner(trade: dict, bars: pd.DataFrame, sc: Scanner, qty: int) -> tuple[
     tl = type("T", (), {"inst_type": "OPT", "option_type": trade["option_type"],
                         "direction": trade["direction"], "adx_value": trade["adx"],
                         "entry_price": entry, "initial_stop": stop, "trailing_stop": stop})()
-    lock_pct = sc._dynamic_runner_lock_pct(0.90, regime)
+    runner_unlock_ratio, base_lock_pct = _runner_execution_parameters()
+    lock_pct = sc._dynamic_runner_lock_pct(base_lock_pct, regime)
     target_dist = max(0.0, target - entry)
     arm_pts = max(0.40 * risk, 500.0 / max(1, qty))
     gb_ratio = 0.50
@@ -206,7 +287,7 @@ def sim_runner(trade: dict, bars: pd.DataFrame, sc: Scanner, qty: int) -> tuple[
         peak_gain = peak - entry
         gain_r = peak_gain / risk
         if not runner:
-            reached_t1 = target_dist > 0 and peak_gain >= target_dist * RUNNER_UNLOCK_RATIO
+            reached_t1 = target_dist > 0 and peak_gain >= target_dist * runner_unlock_ratio
             big_ok, _ = sc._big_move_expected(tl, gain_r=gain_r, regime=regime)
             if reached_t1 or big_ok:
                 runner = True
@@ -249,7 +330,8 @@ def sim_runner_hedged(trade: dict, bars: pd.DataFrame, sc: Scanner, qty: int,
     tl = type("T", (), {"inst_type": "OPT", "option_type": trade["option_type"],
                         "direction": trade["direction"], "adx_value": trade["adx"],
                         "entry_price": entry, "initial_stop": stop, "trailing_stop": stop})()
-    lock_pct = sc._dynamic_runner_lock_pct(0.90, regime)
+    runner_unlock_ratio, base_lock_pct = _runner_execution_parameters()
+    lock_pct = sc._dynamic_runner_lock_pct(base_lock_pct, regime)
     target_dist = max(0.0, target - entry)
     arm_pts = max(0.40 * risk, 500.0 / max(1, qty))
     gb_ratio = 0.50
@@ -322,7 +404,7 @@ def sim_runner_hedged(trade: dict, bars: pd.DataFrame, sc: Scanner, qty: int,
         peak = max(peak, hi)
         peak_gain = peak - entry
         if not runner:
-            reached_t1 = target_dist > 0 and peak_gain >= target_dist * RUNNER_UNLOCK_RATIO
+            reached_t1 = target_dist > 0 and peak_gain >= target_dist * runner_unlock_ratio
             big_ok, _ = sc._big_move_expected(tl, gain_r=peak_gain / risk, regime=regime)
             if reached_t1 or big_ok:
                 runner = True
@@ -340,7 +422,9 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
     contracts = load_today_contracts(day)
     trades = load_trades(day)
     sc = _sc()
-    tot_base = tot_run = tot_hedged = 0.0
+    settings = get_settings()
+    tot_base_gross = tot_run_gross = tot_hedged_gross = 0.0
+    tot_base_costs = tot_run_costs = 0.0
     matched = 0
     hedges = 0
     for t in trades:
@@ -355,19 +439,43 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
         qty = LOT_SIZE.get(t["instrument"], 1)
         bx, _ = sim_old(t, bars, qty)
         rx, _ = sim_runner(t, bars, sc, qty)
-        tot_base += (bx - t["entry"]) * qty
-        tot_run += (rx - t["entry"]) * qty
+        base_gross, base_costs, _ = option_replay_pnl(
+            t["entry"], bx, qty, t["instrument"], settings
+        )
+        run_gross, run_costs, _ = option_replay_pnl(
+            t["entry"], rx, qty, t["instrument"], settings
+        )
+        tot_base_gross += base_gross
+        tot_base_costs += base_costs
+        tot_run_gross += run_gross
+        tot_run_costs += run_costs
         hx, _, hpnl, hcount = sim_runner_hedged(t, bars, sc, qty, contracts)
-        tot_hedged += (hx - t["entry"]) * qty + hpnl
+        tot_hedged_gross += (hx - t["entry"]) * qty + hpnl
         hedges += hcount
-    res = {"date": day, "trades": len(trades), "matched": matched,
-           "old": tot_base, "runner": tot_run, "hedged": tot_hedged,
-           "hedges": hedges, "delta": tot_run - tot_base,
-           "hedge_delta": tot_hedged - tot_run}
+    tot_base = tot_base_gross - tot_base_costs
+    tot_run = tot_run_gross - tot_run_costs
+    res = {
+        "date": day,
+        "trades": len(trades),
+        "matched": matched,
+        "old": tot_base,
+        "runner": tot_run,
+        "old_gross": tot_base_gross,
+        "runner_gross": tot_run_gross,
+        "old_costs": tot_base_costs,
+        "runner_costs": tot_run_costs,
+        # Hedge legs lack archived executable bid/ask fills, so this remains an
+        # explicitly gross exploratory number and never drives certification.
+        "hedged_gross": tot_hedged_gross,
+        "hedges": hedges,
+        "delta": tot_run - tot_base,
+        "gross_delta": tot_run_gross - tot_base_gross,
+        "hedge_delta_gross": tot_hedged_gross - tot_run_gross,
+    }
     if not quiet:
         print(f"{day}  trades={len(trades):3} matched={matched:3}  "
-              f"OLD={tot_base:10,.0f}  RUNNER={tot_run:10,.0f}  DELTA={res['delta']:+9,.0f}"
-              f"  | HEDGED={tot_hedged:10,.0f} (n={hedges:2}) HDELTA={res['hedge_delta']:+8,.0f}")
+              f"OLDnet={tot_base:9,.0f}  RUNnet={tot_run:9,.0f}  NDELTA={res['delta']:+9,.0f}"
+              f"  | HEDGEDgross={tot_hedged_gross:9,.0f} (n={hedges:2})")
     return res
 
 
@@ -382,20 +490,24 @@ def run_all(min_r_label: str = "") -> None:
         return
     tb = sum(r["old"] for r in rows)
     tr = sum(r["runner"] for r in rows)
-    th = sum(r["hedged"] for r in rows)
+    tbg = sum(r["old_gross"] for r in rows)
+    trg = sum(r["runner_gross"] for r in rows)
+    tbc = sum(r["old_costs"] for r in rows)
+    trc = sum(r["runner_costs"] for r in rows)
+    thg = sum(r["hedged_gross"] for r in rows)
     nh = sum(r["hedges"] for r in rows)
-    wins = sum(1 for r in rows if r["delta"] > 0)
-    losses = sum(1 for r in rows if r["delta"] < 0)
+    wins = sum(1 for r in rows if r["delta"] > 0.005)
+    losses = sum(1 for r in rows if r["delta"] < -0.005)
     print("\n" + "=" * 78)
     print(f"SESSIONS replayed: {len(rows)}   better: {wins}   worse: {losses}   "
           f"neutral: {len(rows) - wins - losses}")
-    print(f"OLD    total: Rs {tb:,.0f}")
-    print(f"RUNNER total: Rs {tr:,.0f}")
-    print(f"DELTA  total: Rs {tr - tb:+,.0f}   (avg {(tr - tb) / len(rows):+,.0f}/session)")
-    hwin = sum(1 for r in rows if r["hedge_delta"] > 0)
-    hlose = sum(1 for r in rows if r["hedge_delta"] < 0)
-    print(f"HEDGED total: Rs {th:,.0f}   ({nh} hedges armed; better {hwin} / worse {hlose} sessions)")
-    print(f"HEDGE  delta: Rs {th - tr:+,.0f}   (vs runner-only)")
+    print(f"OLD    gross: Rs {tbg:,.0f}   costs/slippage: Rs {tbc:,.0f}   NET: Rs {tb:,.0f}")
+    print(f"RUNNER gross: Rs {trg:,.0f}   costs/slippage: Rs {trc:,.0f}   NET: Rs {tr:,.0f}")
+    print(f"NET DELTA (runner-old): Rs {tr - tb:+,.0f}   (avg {(tr - tb) / len(rows):+,.0f}/session)")
+    hwin = sum(1 for r in rows if r["hedge_delta_gross"] > 0.005)
+    hlose = sum(1 for r in rows if r["hedge_delta_gross"] < -0.005)
+    print(f"HEDGED exploratory GROSS: Rs {thg:,.0f}   ({nh} hedges armed; better {hwin} / worse {hlose} sessions)")
+    print(f"HEDGE gross delta: Rs {thg - trg:+,.0f}   (not certification-grade without executable hedge costs)")
 
 
 def main() -> None:
@@ -421,7 +533,8 @@ def main() -> None:
     sc = _sc()
     print(f"Session {day}: {len(trades)} accepted trades, {len(contracts)} option contracts with intraday data\n")
     rows = []
-    tot_base = tot_run = tot_hedged = 0.0
+    settings = get_settings()
+    tot_base = tot_run = 0.0
     matched = 0
     hedges = 0
     for t in trades:
@@ -438,8 +551,12 @@ def main() -> None:
         qty = LOT_SIZE.get(t["instrument"], 1)
         bx, br = sim_old(t, bars, qty)
         rx, rr = sim_runner(t, bars, sc, qty)
-        base_pnl = (bx - t["entry"]) * qty
-        run_pnl = (rx - t["entry"]) * qty
+        _, _, base_pnl = option_replay_pnl(
+            t["entry"], bx, qty, t["instrument"], settings
+        )
+        _, _, run_pnl = option_replay_pnl(
+            t["entry"], rx, qty, t["instrument"], settings
+        )
         tot_base += base_pnl
         tot_run += run_pnl
         rows.append((t, name, base_pnl, br, run_pnl, rr))

@@ -20,6 +20,8 @@ import json
 import os
 import socket
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -126,6 +128,46 @@ _SHARED: Optional["KiteAuth"] = None
 _SHARED_GUARD = __import__("threading").Lock()
 
 
+_AUTH_FAILURE_MARKERS = (
+    "invalid access token",
+    "incorrect api key or access token",
+    "invalid api key",
+    "invalid token",
+    "token expired",
+    "token is invalid or has expired",
+    "access token has expired",
+    "expired access token",
+    "session expired",
+    "invalid session",
+    "authentication failed",
+    "unauthorized",
+    "login required",
+)
+
+
+def is_kite_auth_failure(exc: Exception) -> bool:
+    """Return true only when a Kite error proves the session is unusable.
+
+    Kite's SDK has emitted both TokenException and InputException for dead sessions.
+    InputException alone is not enough: malformed orders and unknown order IDs are
+    ordinary terminal rejections and must not tear down a healthy session.
+    """
+    name = type(exc).__name__
+    if name == "TokenException":
+        return True
+    if name != "InputException":
+        return False
+    message = str(exc or "").strip().lower()
+    for character in ("`", "_", "-"):
+        message = message.replace(character, " ")
+    message = " ".join(message.split())
+    return any(marker in message for marker in _AUTH_FAILURE_MARKERS)
+
+
+def kite_auth_failure_reason(context: str, exc: Exception) -> str:
+    return f"{context}: {type(exc).__name__}: {exc}"
+
+
 def get_kite_auth(settings=None) -> "KiteAuth":
     """Process-wide Kite session.
 
@@ -180,6 +222,16 @@ class KiteAuth:
         except Exception as exc:
             logger.debug(f"Could not pin Kite to IPv4: {exc}")
         self._kite = None
+        self._auth_lock = threading.RLock()
+        # Disk parsing and broker verification form one cache-restore attempt.  A
+        # second verifier must wait: otherwise a provisional network result can win
+        # first and make a later broker-proven invalid verdict look stale.
+        self._cache_load_lock = threading.Lock()
+        # Monotonic authority epoch.  Cached-token verification happens over the
+        # network, outside the lock; this generation prevents its late result from
+        # overwriting (or clearing) a browser login completed in the meantime.
+        self._auth_generation = 0
+        self._auth_failure_latched = False
         self._auth_required = True
         self._auth_reason = "no Kite session yet"
         self._token_issued_at: Optional[datetime] = None
@@ -241,9 +293,40 @@ class KiteAuth:
         return missing
 
     def _mark_auth_required(self, reason: str) -> None:
-        self._auth_required = True
-        self._auth_reason = str(reason or "Kite login required")
-        self._kite = None
+        with self._auth_lock:
+            self._auth_generation += 1
+            self._auth_required = True
+            self._auth_reason = str(reason or "Kite login required")
+            self._kite = None
+
+    def _discard_cached_token_locked(self) -> None:
+        """Remove a token Kite has proved unusable (caller holds ``_auth_lock``)."""
+        try:
+            self.token_file.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(f"Could not remove invalid Kite token cache: {exc}")
+
+    def _finish_cached_load_failure(
+        self,
+        generation: int,
+        reason: str,
+        *,
+        discard_cache: bool = False,
+        latch_failure: bool = False,
+    ) -> bool:
+        """Apply a cache-load failure only if no newer authority event won the race."""
+        with self._auth_lock:
+            if self._auth_generation != generation:
+                return bool(self._kite is not None and not self._auth_required)
+            if discard_cache:
+                self._discard_cached_token_locked()
+            self._auth_generation += 1
+            self._auth_required = True
+            self._auth_reason = str(reason or "Kite login required")
+            self._kite = None
+            if latch_failure:
+                self._auth_failure_latched = True
+            return False
 
     # ── login ────────────────────────────────────────────────────────────────
     def login_url(self) -> str:
@@ -277,16 +360,21 @@ class KiteAuth:
             raise RuntimeError(f"Kite returned no access_token: {session}")
 
         client.set_access_token(access_token)
-        self._kite = client
-        self._user_id = str(session.get("user_id") or "")
-        self._token_issued_at = datetime.now(IST)
-        self._auth_required = False
-        self._auth_reason = ""
-        self._persist(access_token, session)
-        logger.success(f"Kite session established for {self._user_id or 'user'}")
+        with self._auth_lock:
+            self._auth_generation += 1
+            self._kite = client
+            self._user_id = str(session.get("user_id") or "")
+            self._token_issued_at = datetime.now(IST)
+            self._auth_required = False
+            self._auth_failure_latched = False
+            self._auth_reason = ""
+            self._persist(access_token, session)
+            user_id = self._user_id
+            issued_at = self._token_issued_at
+        logger.success(f"Kite session established for {user_id or 'user'}")
         return {
-            "user_id": self._user_id,
-            "issued_at": self._token_issued_at.isoformat(),
+            "user_id": user_id,
+            "issued_at": issued_at.isoformat(),
         }
 
     def _persist(self, access_token: str, session: Dict[str, Any]) -> None:
@@ -312,30 +400,56 @@ class KiteAuth:
             logger.error(f"Failed to cache the Kite token: {exc}")
 
     def load_cached_session(self) -> bool:
+        """Single-flight wrapper for restoring one still-valid cached session."""
+        with self._cache_load_lock:
+            return self._load_cached_session_once()
+
+    def _load_cached_session_once(self) -> bool:
         """Restore a still-valid token from disk. False when a login is required."""
+        with self._auth_lock:
+            if self._kite is not None and not self._auth_required:
+                return True
+            if self._auth_failure_latched:
+                # invalidate() removed the proven-dead token.  Do not let a later
+                # connect() re-read/reinstall it provisionally after a network error.
+                return False
+            generation = self._auth_generation
         if not self.token_file.exists():
-            self._mark_auth_required("no cached Kite token")
-            return False
+            return self._finish_cached_load_failure(
+                generation, "no cached Kite token"
+            )
         try:
             payload = json.loads(self.token_file.read_text(encoding="utf-8"))
         except Exception as exc:
-            self._mark_auth_required(f"unreadable Kite token cache: {exc}")
-            return False
+            return self._finish_cached_load_failure(
+                generation,
+                f"unreadable Kite token cache: {exc}",
+                discard_cache=True,
+            )
 
         access_token = str(payload.get("access_token") or "")
         if not access_token:
-            self._mark_auth_required("cached Kite token has no access_token")
-            return False
+            return self._finish_cached_load_failure(
+                generation,
+                "cached Kite token has no access_token",
+                discard_cache=True,
+            )
         if str(payload.get("api_key") or "") != self.api_key:
             # A regenerated app or a swapped key leaves a token that authenticates as
             # nothing. Say so plainly instead of failing later inside an order.
-            self._mark_auth_required("cached Kite token belongs to a different api_key")
-            return False
+            return self._finish_cached_load_failure(
+                generation,
+                "cached Kite token belongs to a different api_key",
+                discard_cache=True,
+            )
 
         issued_at = self._parse_ist(payload.get("issued_at"))
         if issued_at is None:
-            self._mark_auth_required("cached Kite token has no issue time")
-            return False
+            return self._finish_cached_load_failure(
+                generation,
+                "cached Kite token has no issue time",
+                discard_cache=True,
+            )
 
         from kiteconnect import KiteConnect
 
@@ -349,39 +463,45 @@ class KiteAuth:
         # sit on the right side of the cutoff. One cheap call settles it.
         verdict, reason = self._verify_live(client)
         if verdict is False:
-            self._mark_auth_required(reason)
-            return False
+            return self._finish_cached_load_failure(
+                generation,
+                reason,
+                discard_cache=True,
+                latch_failure=True,
+            )
         if verdict is None:
             # Could not reach Kite. Fall back to the cutoff so an obviously stale token
             # is still refused offline, but do not fail a plausibly-good one.
             if issued_at < most_recent_token_cutoff():
-                self._mark_auth_required(
+                return self._finish_cached_load_failure(
+                    generation,
                     f"Kite unreachable and the cached token from {issued_at:%Y-%m-%d %H:%M} "
-                    f"predates the {TOKEN_CUTOFF:%H:%M} IST daily cutoff"
+                    f"predates the {TOKEN_CUTOFF:%H:%M} IST daily cutoff",
+                    discard_cache=True,
                 )
-                return False
             logger.warning(f"Could not verify the Kite token ({reason}); using it provisionally.")
 
-        self._kite = client
-        self._user_id = str(payload.get("user_id") or "")
-        self._token_issued_at = issued_at
-        self._auth_required = False
-        self._auth_reason = ""
+        with self._auth_lock:
+            if self._auth_generation != generation or self._auth_failure_latched:
+                return bool(self._kite is not None and not self._auth_required)
+            self._auth_generation += 1
+            self._kite = client
+            self._user_id = str(payload.get("user_id") or "")
+            self._token_issued_at = issued_at
+            self._auth_required = False
+            self._auth_failure_latched = False
+            self._auth_reason = ""
         return True
 
     @staticmethod
     def _verify_live(client):
         """(True|False|None, reason). None means 'could not tell', not 'invalid'."""
         try:
-            from kiteconnect.exceptions import TokenException
-        except ImportError:
-            return None, "kiteconnect exceptions unavailable"
-        try:
             client.profile()
             return True, ""
-        except TokenException as exc:
-            return False, f"Kite rejected the cached token: {exc}"
         except Exception as exc:
+            if is_kite_auth_failure(exc):
+                return False, f"Kite rejected the cached token: {exc}"
             # A network blip must not force a browser login the operator cannot do
             # from a headless start.
             return None, f"{type(exc).__name__}: {exc}"
@@ -398,20 +518,53 @@ class KiteAuth:
     @property
     def kite(self):
         """The authenticated client, or None when a login is required."""
-        return self._kite
+        with self._auth_lock:
+            return self._kite
 
-    def invalidate(self, reason: str) -> None:
-        """Drop the session after Kite reports the token is dead (TokenException)."""
-        logger.error(f"Kite session invalidated: {reason}")
-        self._mark_auth_required(reason)
+    @contextmanager
+    def current_client_guard(self, expected_client):
+        """Linearize a client-bound SDK call against session replacement.
+
+        The caller may hold this context through the network dispatch.  A browser
+        login can perform its token exchange concurrently, but cannot install the new
+        client between this final identity check and the old client's SDK call.
+        """
+        with self._auth_lock:
+            yield bool(
+                expected_client is not None
+                and self._kite is expected_client
+                and not self._auth_required
+                and not self._auth_failure_latched
+            )
+
+    def invalidate(self, reason: str, failed_client=None) -> bool:
+        """Drop the failed session once, without invalidating a newer login.
+
+        ``failed_client`` is the exact SDK client whose request failed. An old request
+        may return after a browser re-login installed a new client; identity checking
+        prevents that late response from clearing the replacement session.
+        """
+        with self._auth_lock:
+            if failed_client is not None and self._kite is not failed_client:
+                return False
+            if self._auth_failure_latched:
+                return False
+            self._auth_failure_latched = True
+            logger.error(f"Kite session invalidated: {reason}")
+            self._mark_auth_required(reason)
+            # A token that just produced a terminal auth error must not survive a
+            # reconnect/restart path and be accepted provisionally on network doubt.
+            self._discard_cached_token_locked()
+            return True
 
     def status(self) -> Dict[str, Any]:
-        return {
-            "connected": self._kite is not None,
-            "auth_required": self._auth_required,
-            "reason": self._auth_reason,
-            "user_id": self._user_id,
-            "token_updated_at": (
-                self._token_issued_at.isoformat() if self._token_issued_at else None
-            ),
-        }
+        with self._auth_lock:
+            return {
+                "connected": self._kite is not None,
+                "auth_required": self._auth_required,
+                "reason": self._auth_reason,
+                "user_id": self._user_id,
+                "token_updated_at": (
+                    self._token_issued_at.isoformat() if self._token_issued_at else None
+                ),
+            }

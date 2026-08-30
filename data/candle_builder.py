@@ -46,6 +46,11 @@ class CandleBuilder:
         
         # Real-time LTP tracking
         self._latest_prices: Dict[str, float] = {}
+        # Receipt clocks for candle data.  These are deliberately separate from
+        # quote/LTP clocks: a fresh quote must never make a stale OHLC frame appear
+        # fresh to analytical consumers.
+        self._last_candle_receipt: Dict[str, Dict[str, datetime]] = {}
+        self._last_quote_receipt: Dict[str, datetime] = {}
         # Which feed last supplied the cumulative volume total, per instrument. A change
         # means the unit changed and the running baseline must be rebased, not subtracted.
         self._volume_source: Dict[str, str] = {}
@@ -65,27 +70,20 @@ class CandleBuilder:
         return True
 
     def update_latest_price(self, instrument: str, price: float):
-        """Update the real-time LTP and inject it into the latest candle for zero-lag charts"""
+        """Update quote-only LTP state.
+
+        Quotes are not candle observations.  In particular, do not rewrite the
+        latest OHLC row here: doing so let a stalled candle feed masquerade as fresh
+        analytical data merely because the quote lane was alive.
+        """
         if not self._price_plausible(instrument, price):
             if price and price > 0:
                 logger.warning(f"⚠️ Ignoring implausible price {price} for {instrument} (>{int(self._MAX_PRICE_DEVIATION*100)}% from last; likely cross-index leak)")
             return
 
-        self._latest_prices[instrument] = price
-        
-        # Inject LTP into the 'current' candle row of all timeframes
-        # This makes the dashboard feel ALIVE and ensures analysis uses latest tick
         with self._lock:
-            for tf_dict in [self._candles_1min, self._candles_5min, self._candles_15min]:
-                if instrument in tf_dict and not tf_dict[instrument].empty:
-                    df = tf_dict[instrument]
-                    # Update the last row's close, high, and low
-                    last_idx = df.index[-1]
-                    df.at[last_idx, 'close'] = price
-                    if price > df.at[last_idx, 'high']:
-                        df.at[last_idx, 'high'] = price
-                    if price < df.at[last_idx, 'low']:
-                        df.at[last_idx, 'low'] = price
+            self._latest_prices[instrument] = price
+            self._last_quote_receipt[instrument] = datetime.now()
 
     def get_latest_price(self, instrument: str) -> float:
         """Get the latest real-time LTP for an instrument"""
@@ -115,7 +113,12 @@ class CandleBuilder:
                                f"(>{int(self._MAX_PRICE_DEVIATION*100)}% from last; likely cross-index leak)")
             return
 
-        self._latest_prices[instrument] = price
+        # The tick is also a quote observation. Keep its receipt clock separate from
+        # the OHLC mutation below; the candle receipt is stamped only after the store
+        # accepts the bar, while this clock records the arrival of the market tick.
+        with self._lock:
+            self._latest_prices[instrument] = price
+            self._last_quote_receipt[instrument] = datetime.now()
         candle_time = timestamp.replace(second=0, microsecond=0)
         source = str(volume_source or "")
         source_changed = bool(
@@ -125,6 +128,7 @@ class CandleBuilder:
             self._volume_source[instrument] = source
         finalized = None
         partial = None
+        receipt_at = datetime.now()
 
         with self._lock:
             current = self._current_candle.get(instrument)
@@ -149,6 +153,7 @@ class CandleBuilder:
                     # bar's delta.
                     "start_volume": volume if volume > 0 else None,
                     "volume_basis": source if (source and volume > 0) else "",
+                    "source": "live_tick",
                     "volume": float(existing_row["volume"]) if existing_row is not None else 0,
                     "tick_count": existing_ticks + 1,
                 }
@@ -205,6 +210,9 @@ class CandleBuilder:
                         "volume": current["volume"],
                         "tick_count": int(current.get("tick_count", 0) or 0),
                         "volume_basis": current.get("volume_basis", ""),
+                        "source": current.get("source", "live_tick"),
+                        "provider_time": current["timestamp"],
+                        "receipt_at": receipt_at,
                     }], index=[current["timestamp"]])
 
                 current = {
@@ -215,6 +223,7 @@ class CandleBuilder:
                     "close": price,
                     "start_volume": volume if volume > 0 else None,
                     "volume_basis": source if (source and volume > 0) else "",
+                    "source": "live_tick",
                     "volume": 0,
                     "tick_count": 1,
                 }
@@ -228,6 +237,9 @@ class CandleBuilder:
                 "volume": current["volume"],
                 "tick_count": int(current.get("tick_count", 0) or 0),
                 "volume_basis": current.get("volume_basis", ""),
+                "source": current.get("source", "live_tick"),
+                "provider_time": current["timestamp"],
+                "receipt_at": receipt_at,
             }], index=[current["timestamp"]])
 
         if finalized is not None:
@@ -237,7 +249,15 @@ class CandleBuilder:
         if partial is not None:
             self.update_candles(instrument, partial, "1min")
 
-    def update_candles(self, instrument: str, new_data: pd.DataFrame, timeframe: str = "1min"):
+    def update_candles(
+        self,
+        instrument: str,
+        new_data: pd.DataFrame,
+        timeframe: str = "1min",
+        *,
+        received_at: Optional[datetime] = None,
+        mark_receipt: bool = True,
+    ):
         """
         Update candle data for an instrument.
         """
@@ -284,6 +304,7 @@ class CandleBuilder:
                     combined = combined[~combined.index.duplicated(keep='last')]
                     combined = combined.sort_index()
                     combined = self._restore_zeroed_volume(combined, existing)
+                    combined = self._restore_candle_telemetry(combined, existing)
                     if len(combined) > self.max_candles:
                         combined = combined.iloc[-self.max_candles:]
                     self._candles_1min[key] = combined
@@ -292,11 +313,55 @@ class CandleBuilder:
                 
                 # Resample to higher timeframes (Merge instead of Overwrite)
                 self._resample_and_merge(instrument)
+                if mark_receipt:
+                    self._note_candle_receipt(instrument, "1min", received_at)
+                    if instrument in self._candles_5min and self._candles_5min[instrument] is not None:
+                        self._note_candle_receipt(instrument, "5min", received_at)
+                    if instrument in self._candles_15min and self._candles_15min[instrument] is not None:
+                        self._note_candle_receipt(instrument, "15min", received_at)
 
             elif timeframe == "5min":
                 self._candles_5min[key] = self._merge_candles(self._candles_5min.get(key), new_data)
+                if mark_receipt:
+                    self._note_candle_receipt(instrument, "5min", received_at)
             elif timeframe == "15min":
                 self._candles_15min[key] = self._merge_candles(self._candles_15min.get(key), new_data)
+                if mark_receipt:
+                    self._note_candle_receipt(instrument, "15min", received_at)
+
+    def _note_candle_receipt(
+        self,
+        instrument: str,
+        timeframe: str,
+        received_at: Optional[datetime] = None,
+    ) -> None:
+        """Record a successful candle-store mutation (caller holds ``_lock``)."""
+        if received_at is None:
+            receipt = datetime.now()
+        elif isinstance(received_at, datetime):
+            receipt = received_at
+        else:
+            # Accept pandas/ISO timestamps at transport seams, but never replace a
+            # malformed explicit receipt with "now"—that would turn a bad clock into
+            # false freshness and let stale OHLC drive a live exit or entry.
+            try:
+                parsed = pd.Timestamp(received_at)
+                if pd.isna(parsed):
+                    return
+                receipt = parsed.to_pydatetime()
+            except Exception:
+                return
+        self._last_candle_receipt.setdefault(instrument, {})[timeframe] = receipt
+
+    def latest_candle_receipt(self, instrument: str, timeframe: str):
+        """Return the local receipt time of the latest accepted candle mutation."""
+        with self._lock:
+            return (self._last_candle_receipt.get(instrument, {}) or {}).get(timeframe)
+
+    def latest_quote_receipt(self, instrument: str):
+        """Return the quote-lane receipt time without treating it as candle freshness."""
+        with self._lock:
+            return self._last_quote_receipt.get(instrument)
 
     @staticmethod
     def _restore_zeroed_volume(combined, existing):
@@ -345,11 +410,55 @@ class CandleBuilder:
             combined = combined[~combined.index.duplicated(keep='last')]
             combined = combined.sort_index()
             combined = self._restore_zeroed_volume(combined, existing)
+            combined = self._restore_candle_telemetry(combined, existing)
             if len(combined) > self.max_candles:
                 combined = combined.iloc[-self.max_candles:]
             return combined
         
         return new_data.iloc[-self.max_candles:] if new_data is not None else None
+
+    @staticmethod
+    def _restore_candle_telemetry(combined, existing):
+        """Keep live telemetry when a historical refresh overlaps a candle.
+
+        Historical providers generally return OHLCV only.  Their duplicate row must
+        not erase tick counts, volume units, or receipt/provenance attached by the
+        websocket builder.  Zero/blank values are treated as missing telemetry; a
+        genuinely populated incoming value still wins.
+        """
+        if combined is None or existing is None or len(combined) == 0 or len(existing) == 0:
+            return combined
+        fields = ("tick_count", "volume_basis", "source", "receipt_at", "provider_time")
+        overlap = combined.index.intersection(existing.index)
+        for idx in overlap:
+            old = existing.loc[idx]
+            new = combined.loc[idx]
+            incoming_history = str(new.get("source", "") or "").lower() in {
+                "fyers_history", "history"
+            }
+            prior_source = str(old.get("source", "") or "").lower()
+            for field in fields:
+                if field not in combined.columns or field not in existing.columns:
+                    continue
+                value = new.get(field)
+                missing = value is None or (isinstance(value, str) and not value.strip())
+                if not missing:
+                    try:
+                        missing = bool(pd.isna(value))
+                    except (TypeError, ValueError):
+                        pass
+                if incoming_history and prior_source not in {"", "history", "fyers_history"}:
+                    missing = True
+                if field == "tick_count" and not missing:
+                    try:
+                        missing = float(value or 0) <= 0
+                    except (TypeError, ValueError):
+                        missing = True
+                if missing:
+                    prior = old.get(field)
+                    if prior is not None:
+                        combined.loc[idx, field] = prior
+        return combined
 
     def _resample_and_merge(self, instrument: str):
         """Resample 1min to higher TFs and merge with existing data to preserve history"""

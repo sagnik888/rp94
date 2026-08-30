@@ -40,7 +40,11 @@ def _provider(fyers_volume=None, age=0.0, futures=_Source()):
     p.kite = futures
     if fyers_volume is not None:
         p._ws_cache[FYERS_INDEX_SYMBOLS["NIFTY"]] = {
-            "ltp": 24383.6, "vol": fyers_volume, "time": time.time() - age,
+            "ltp": 24383.6,
+            "vol": fyers_volume,
+            "time": time.time() - age,
+            # Volume freshness is intentionally independent of quote freshness.
+            "vol_time": time.time() - age,
         }
     return p
 
@@ -90,7 +94,7 @@ def test_no_source_at_all_reports_itself_rather_than_returning_zero():
     activity = _provider(fyers_volume=None, futures=_Source(available=False)).get_index_activity("NIFTY")
     assert activity["source"] == "none"
     assert activity["confirmation"] == "no_volume_source"
-    assert activity["comparable_to_thresholds"] is True   # nothing substituted
+    assert activity["comparable_to_thresholds"] is False
 
 
 def test_fallback_warning_is_throttled():

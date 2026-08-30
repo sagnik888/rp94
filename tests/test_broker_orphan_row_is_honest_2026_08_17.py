@@ -175,7 +175,7 @@ def test_get_positions_maps_last_price_to_ltp():
     b._auth = None
     b._last_call_at = 0.0
     b._min_call_interval = 0.0
-    b._api_call = lambda ctx, fn, timeout=5.0: fn()
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: fn()
     b._position_backoff_until = 0.0
     b._position_backoff_failures = 0
 

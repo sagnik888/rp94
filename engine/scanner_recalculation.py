@@ -127,7 +127,19 @@ class ScannerRecalculationMixin:
                 df = pd.read_csv(path, index_col=0, parse_dates=True)
                 if df is None or df.empty:
                     continue
-                self.candles.update_candles(item.get("instrument", ""), df, item.get("timeframe", "1min"))
+                instrument = item.get("instrument", "")
+                timeframe = item.get("timeframe", "1min")
+                try:
+                    self.candles.update_candles(
+                        instrument,
+                        df,
+                        timeframe,
+                        mark_receipt=False,
+                    )
+                except TypeError as exc:
+                    if "mark_receipt" not in str(exc):
+                        raise
+                    self.candles.update_candles(instrument, df, timeframe)
                 loaded += len(df)
             except Exception as exc:
                 logger.debug(f"Worker candle load skipped: {exc}")

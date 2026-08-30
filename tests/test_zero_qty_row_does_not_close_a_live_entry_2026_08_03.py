@@ -158,6 +158,21 @@ def test_an_open_trade_that_went_flat_outside_the_manager_still_closes():
     assert manager.reconcile_broker_positions({"data": [SQUARED_OFF_ROW]})["closed"] == 1
 
 
+def test_a_broker_protective_fill_keeps_stop_identity_when_reconciled():
+    broker = _Broker()
+    manager = _manager(broker)
+    trade = _trade("OPEN", broker_quantity=75, pending=False)
+    # on_broker_postback stamps this while reconciliation remains the authority
+    # that confirms the account is actually flat.
+    trade.exit_reason = "STOP_HIT"
+    manager.open_trades[trade.id] = trade
+
+    result = manager.reconcile_broker_positions({"data": [SQUARED_OFF_ROW]})
+
+    assert result["closed"] == 1
+    assert manager.closed_trades[0].exit_reason == "STOP_HIT"
+
+
 def test_a_real_fill_on_the_same_contract_is_still_confirmed():
     """A genuine non-zero row must confirm the entry, not be diverted by the guard."""
     broker = _Broker({"orderid": "251003000111111", "orderstatus": "COMPLETE"})

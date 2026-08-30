@@ -290,7 +290,17 @@ class ScannerChartMixin:
                 return current_df
             disk_df = disk_df.set_index("timestamp").sort_index()
             disk_df.columns = [str(c).lower() for c in disk_df.columns]
-            self.candles.update_candles(instrument, disk_df, timeframe)
+            try:
+                self.candles.update_candles(
+                    instrument, disk_df, timeframe, mark_receipt=False
+                )
+            except TypeError as exc:
+                # Lightweight/legacy candle facades may predate the receipt-clock
+                # keyword. They cannot record receipt provenance, so falling back to
+                # their three-argument API cannot accidentally freshen that clock.
+                if "mark_receipt" not in str(exc):
+                    raise
+                self.candles.update_candles(instrument, disk_df, timeframe)
             return disk_df
         except Exception as e:
             logger.debug(f"Chart disk hydration skipped for {instrument}_{timeframe}: {e}")

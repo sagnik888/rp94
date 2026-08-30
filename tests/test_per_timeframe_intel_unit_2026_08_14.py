@@ -116,17 +116,13 @@ def test_the_fallback_path_is_untouched_when_the_flag_is_off():
     assert "return None" in src[i: i + 300]
 
 
-# ── the flag is still off, and that is a separate decision ───────────────────
+# ── the shipped default is enabled, and missing own-timeframe evidence fails closed ──
 
-def test_per_timeframe_grading_is_still_disabled_by_default():
-    """The unit hazard is fixed; whether to ENABLE the route is its own question.
-
-    The remaining reason to leave it off is unrelated to units: the candidate's nested
-    intelligence context and several pre-entry gates still read the outer 5-minute
-    bundle, so enabling it would grade on one timeframe and gate on another.
-    """
+def test_per_timeframe_grading_is_enabled_and_fail_closed_by_default():
+    """Every decision now uses its own independently refreshed TF bundle."""
     from config.settings import Settings
 
     field = Settings.model_fields.get("per_timeframe_grading_enabled")
     assert field is not None
-    assert field.default is False
+    assert field.default is True
+    assert Settings.model_fields["own_timeframe_intel_fail_closed"].default is True

@@ -35,7 +35,13 @@ from engine.signal_quality_policy import is_top_tier_setup
 from intelligence.intelligence_aggregator import IntelligenceAggregator
 from intelligence.memory import IntelligenceMemory
 from intelligence.snapshot_store import MarketIntelSnapshotStore
-from trading.trade_manager import Trade, TradeManager, IST, sample_pnl_path
+from trading.trade_manager import (
+    Trade,
+    TradeManager,
+    IST,
+    sample_pnl_path,
+    sample_intel_path,
+)
 from trading.performance_tracker import PerformanceTracker
 from engine.risk_manager import RiskManager
 from engine.signal_processor import SignalProcessor, TradeCandidate
@@ -49,8 +55,25 @@ from engine.recalculation_worker import ProcessRecalculationWorker
 from engine.settings_persistence import schedule_settings_save
 from engine.safe_mode import validate_real_mode_readiness
 from engine.pre_candle_predictor import build_pre_candle_prediction
+from engine.entry_policy import (
+    GEOMETRY_SCHEMA,
+    EntryPolicyVerdict,
+    ExecutionGeometry,
+    ExpectedMoveForecast,
+    SUPPORTED_ENTRY_INSTRUMENTS,
+    build_directional_mfe_forecast,
+    effective_expected_move_floor_pct,
+    effective_underlying_stop_cap_pct,
+    evaluate_final_entry_policy,
+)
 from engine.intelligence_score import aggregate_intelligence_score, normalize_intelligence_score
-from engine.market_regime import is_risky_regime, is_trending_regime, regime_aligns, uses_tight_trailing
+from engine.market_regime import (
+    futures_stop_tolerance_pct,
+    is_risky_regime,
+    is_trending_regime,
+    regime_aligns,
+    uses_tight_trailing,
+)
 from intelligence.outcome_calibration import OutcomeCalibrationStore
 from intelligence.regime_detector import RegimeDetector
 from intelligence.rtracker import RegimeTracker
@@ -141,6 +164,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # scale-in or stale-limit replacement on a trade restored after restart. Manual
         # and recovery entries are bypassed by TradeManager before this is evaluated.
         self.trades.entry_submission_guard = self._queued_auto_entry_submission_guard
+        # Unlike the Auto/resource guard, the immutable fresh-exposure policy also
+        # applies to an operator-approved manual order. Recovery alone bypasses it.
+        self.trades.fresh_entry_policy_guard = self._queued_fresh_entry_policy_guard
         self.trades.on_trade_closed = self._record_trade_manager_terminal
         self.trades.on_delayed_entry_result = self._record_delayed_entry_result
         # Route Kite's WebSocket order-update feed into the same handler that serves
@@ -346,6 +372,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "exit_reasons": {},
             "instrument_selection": {"OPT": 0, "FUT": 0},
             "source_fallback": {"delayed_entry_blocked": 0},
+            "one_min_freshness": {},
         }
         self._system_perf_last_alert: Dict[str, float] = {}
         self._system_perf_snapshot: Dict[str, Any] = {}
@@ -553,6 +580,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._pre_candle_option_probe: Dict[str, Dict[str, float]] = {}
         self._candidate_ltp_cache: Dict[str, Dict] = {}
         self._candidate_process_cache: Dict[str, Dict] = {}
+        # Executable bid/ask mark-outs for accepted and rejected entry decisions.
+        # The pending book is bounded, lock-protected and persisted because a restart
+        # inside a 60-minute horizon must not selectively erase losing observations.
+        self._entry_shadow_book: Dict[str, Dict[str, Any]] = {}
+        self._entry_shadow_lock = threading.RLock()
+        # Reconciliation can beat the synchronous ACCEPTED telemetry callback on a
+        # fast fill.  Keep those broker-confirmed fills briefly instead of dropping
+        # them merely because the horizon watch has not been installed yet.
+        self._entry_shadow_pending_fills: Dict[str, Dict[str, Any]] = {}
+        self._entry_shadow_last_update = 0.0
+        self._entry_shadow_last_persist = 0.0
+        self._entry_shadow_persist_requested = False
+        self._entry_shadow_cursor = 0
         self._historical_intel_at_cache: Dict[Tuple[int, str, str, str], Tuple[float, str]] = {}
         self._historical_confluence_at_cache: Dict[Tuple[int, int, str], float] = {}
         self._historical_confluence_index_cache: Dict[Tuple[int, int, str], Tuple[List[datetime], List[int]]] = {}
@@ -561,7 +601,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._vix_percentile_cache: Dict[str, Optional[float]] = {}
         self._last_runtime_cache_prune = 0.0
         self._intel_save_inflight = False
-        self.active_indices = settings.active_indices
+        self.active_indices = list(dict.fromkeys(
+            str(name or "").upper()
+            for name in list(settings.active_indices or [])
+            if str(name or "").upper() in SUPPORTED_ENTRY_INSTRUMENTS
+        ))
+        self._load_entry_shadow_book()
         self.system_power = "ON"
         
         from data.data_manager import DataManager
@@ -1231,9 +1276,41 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._counted_entry_keys.add(key)
         instrument = str(candidate.instrument or "").split()[0]
         self._trades_today[instrument] = self._trades_today.get(instrument, 0) + 1
+        # A stop-out retry is spent only when there is an actual non-ghost trade.
+        # Manual mode records the displayed signal here before the operator clicks
+        # Execute; consuming the allowance at that point would charge an order that
+        # was never submitted.  The broker callback commits it below after acceptance.
+        self._commit_stop_out_reentry(candidate, trade)
+        # Use the same source as the session-ledger pass so rtracker's deterministic
+        # id collapses the later duplicate. Recording here starts the shadow horizon at
+        # the actual acceptance boundary instead of waiting for a scan-cycle epilogue.
+        self._rtracker_record_candidate(
+            candidate,
+            decision="ACCEPTED",
+            source="session_candidate",
+        )
         self._log_opposing_exposure_telemetry(candidate)
         # Immediately refresh the dashboard signal/trade panel on a fresh entry.
         self._notify_trade_event()
+
+    def _commit_stop_out_reentry(self, candidate, trade=None) -> bool:
+        """Commit one retry exactly once at a genuine fresh-exposure boundary."""
+        if not bool(getattr(candidate, "stop_out_reentry", False)):
+            return False
+        if trade is None or bool(getattr(trade, "is_ghost", False)):
+            return False
+        if bool(getattr(candidate, "stop_out_reentry_committed", False)):
+            return False
+        instrument = str(getattr(candidate, "instrument", "") or "").split()[0]
+        if not instrument:
+            return False
+        self._note_stop_out_reentry(instrument)
+        setattr(candidate, "stop_out_reentry_committed", True)
+        try:
+            setattr(trade, "stop_out_reentry", True)
+        except Exception:
+            pass
+        return True
 
     def _record_trade_manager_terminal(self, trade) -> None:
         """Write one authoritative EXIT after final fill/reconciliation accounting."""
@@ -1399,6 +1476,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Promote a pending signal only after broker acknowledgement."""
         if accepted:
             if getattr(candidate, "accepted_by_gate", False):
+                # Manual signals are recorded when displayed, but the retry allowance
+                # belongs to this later execution acknowledgement. Ghost/watch trades
+                # are rejected by _commit_stop_out_reentry and consume nothing.
+                self._commit_stop_out_reentry(candidate, trade)
                 await self._publish_trade_payload_now()
                 return
             self._close_superseded_session_entries([candidate])
@@ -1793,14 +1874,34 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             }
 
         self._ensure_trade_like_initial_stop(candidate)
-        exec_price, exec_stop, exec_target = self._execution_levels(candidate)
+        execution_touch_quote = self._candidate_execution_touch_quote(candidate)
+        exec_price, exec_stop, exec_target = self._execution_levels(
+            candidate,
+            execution_touch_quote=execution_touch_quote,
+        )
         if exec_price <= 0:
             candidate.status = "QUOTE UNAVAILABLE"
             self._remember_trade_candidates([candidate])
             await self._publish_trade_payload_now()
             return {"status": "blocked", "reason": "quote_unavailable"}
 
-        execution_touch_quote = self._candidate_execution_touch_quote(candidate)
+        policy_ok, policy_reason = self._entry_policy_allows(
+            candidate,
+            execution_levels=(exec_price, exec_stop, exec_target),
+            phase="manual_dashboard_submit",
+        )
+        if not policy_ok:
+            candidate.status = "BLOCKED - FINAL ENTRY POLICY"
+            self._rtracker_record_candidate(
+                candidate,
+                decision="REJECTED",
+                reason=policy_reason,
+                source="manual_final_entry_policy",
+            )
+            self._remember_trade_candidates([candidate])
+            await self._publish_trade_payload_now()
+            return {"status": "blocked", "reason": policy_reason}
+
         actual_spot = self.candles.get_latest_price(candidate.instrument)
         execution_loop = asyncio.get_running_loop()
 
@@ -1835,9 +1936,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             strategy_revision=str(getattr(candidate, "strategy_revision", "") or ""),
             strategy_direction_mode=str(getattr(candidate, "strategy_direction_mode", "") or ""),
             exec_type="M",
-            entry_spot=actual_spot,
-            spot_stop=candidate.stop,
-            spot_target=candidate.target,
+            entry_spot=float(getattr(candidate, "underlying_entry", 0.0) or actual_spot or 0.0),
+            spot_stop=float(getattr(candidate, "underlying_stop", 0.0) or 0.0),
+            spot_target=float(getattr(candidate, "underlying_target", 0.0) or 0.0),
+            underlying_entry=float(getattr(candidate, "underlying_entry", 0.0) or actual_spot or 0.0),
+            underlying_stop=float(getattr(candidate, "underlying_stop", 0.0) or 0.0),
+            underlying_target=float(getattr(candidate, "underlying_target", 0.0) or 0.0),
+            premium_entry=float(getattr(candidate, "premium_entry", 0.0) or 0.0),
+            premium_stop=float(getattr(candidate, "premium_stop", 0.0) or 0.0),
+            premium_target=float(getattr(candidate, "premium_target", 0.0) or 0.0),
+            geometry_observed_at=str(getattr(candidate, "geometry_observed_at", "") or ""),
+            geometry_source=str(getattr(candidate, "geometry_source", "") or ""),
+            geometry_verified=bool(getattr(candidate, "geometry_verified", False)),
+            expected_move_forecast=dict(getattr(candidate, "expected_move_forecast", {}) or {}),
+            entry_policy_verdict=dict(getattr(candidate, "entry_policy_verdict", {}) or {}),
             is_explosive_bypass=bool(getattr(candidate, "is_explosive_bypass", False)),
             is_reversion_scalp=bool(getattr(candidate, "is_reversion_scalp", False)),
             is_recovery=False,
@@ -2614,9 +2726,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             adx = 0.0
         floor = float(getattr(settings, "stop_out_reentry_min_adx", 25.0) or 0.0)
-        # Only block on a KNOWN-weak reading; an unavailable ADX must not silently
-        # disable the floor (nor silently block every re-entry).
-        if floor > 0 and adx > 0 and adx < floor:
+        # This is fresh exposure after a realised loss.  "Confirmed strong trend"
+        # requires an actual measurement; missing/non-finite evidence may not turn a
+        # safety gate into an implicit pass.
+        if floor > 0 and (not math.isfinite(adx) or adx <= 0):
+            return False, "ADX unavailable for confirmed-trend re-entry"
+        if floor > 0 and adx < floor:
             return False, f"ADX {adx:.1f} < {floor:.1f}"
         return True, (
             f"stop-out re-entry: {regime} still aligned {elapsed:.0f}m after "
@@ -2707,15 +2822,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # more attempt. This bypasses the COOLDOWN only — Rules 1 and 2 above
                 # (daily budget, consecutive-loss halt) have already been enforced.
                 reentry_ok, reentry_reason = self._stop_out_reentry_allowed(
-                    instrument, direction, signal_time, adx_value=adx_value
+                    instrument, direction, cooldown_clock, adx_value=adx_value
                 )
                 if reentry_ok:
-                    self._note_stop_out_reentry(instrument)
                     logger.info(f"Cooldown bypassed for {instrument}: {reentry_reason}.")
                     self.log_event(
-                        f"Stop-out re-entry allowed for {instrument}: {reentry_reason}", "trade"
+                        f"Stop-out re-entry eligible for {instrument}: {reentry_reason}", "trade"
                     )
-                    return True, ""
+                    # The caller stamps this on the candidate.  _record_accepted_entry
+                    # commits the allowance only after all downstream gates (and, in
+                    # REAL auto mode, broker acknowledgement) have succeeded.
+                    return True, reentry_reason
                 remaining = max(0.0, self.index_cooldown_minutes - diff)
                 return False, f"Cooldown active: {remaining:.0f}m remaining ({cooldown_basis})"
 
@@ -2805,7 +2922,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # Pullback hedge (operator A/B; ships OFF — backtest showed the runner lock
             # already captures the give-back more cheaply).
             "pullback_hedge_enabled": getattr(get_settings(), "pullback_hedge_enabled", False),
-            "stop_out_reentry_enabled": getattr(get_settings(), "stop_out_reentry_enabled", True),
+            "stop_out_reentry_enabled": getattr(get_settings(), "stop_out_reentry_enabled", False),
             "per_timeframe_grading_enabled": getattr(get_settings(), "per_timeframe_grading_enabled", False),
             "stop_out_reentry_window_minutes": getattr(get_settings(), "stop_out_reentry_window_minutes", 30.0),
             "stop_out_reentry_max_per_index": getattr(get_settings(), "stop_out_reentry_max_per_index", 1),
@@ -3851,7 +3968,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 df = records_to_dataframe(records or [])
                 if df.empty:
                     continue
-                self.candles.update_candles(instrument, df, tf)
+                # Restored OHLC is historical state, not a live transport receipt.
+                # Keep its candle clock stale until a new candle update arrives.
+                self.candles.update_candles(instrument, df, tf, mark_receipt=False)
                 restored_candles += len(df)
 
         for instrument, price in (payload.get("latest_prices") or {}).items():
@@ -4395,8 +4514,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
 
         if active_indices is not None and active_indices != self.active_indices:
-            self.active_indices = active_indices
-            settings.active_indices = active_indices
+            requested_indices = [
+                str(name or "").upper()
+                for name in list(active_indices or [])
+                if str(name or "").upper() in SUPPORTED_ENTRY_INSTRUMENTS
+            ]
+            self.active_indices = list(dict.fromkeys(requested_indices))
+            settings.active_indices = list(self.active_indices)
             needs_full_refresh = True
             logger.info(f"🔄 Active Indices updated: {self.active_indices}")
 
@@ -5592,7 +5716,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         candle_5min = self._live_analysis_window(candle_5min_raw, "5min")
                         candle_1min = self._live_analysis_window(candle_1min_raw, "1min")
                         latest_spot = float(spot or self.candles.get_latest_price(name) or 0.0)
-                        if latest_spot > 0 and self._regime_history_ready(candle_5min):
+                        if latest_spot > 0:
                             previous_close = float(
                                 (prewarmed.get(name, {}) or {}).get("previous_close") or 0.0
                             )
@@ -5606,22 +5730,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             dte = self._days_to_expiry_for(name, session_date)
                             strike_interval = cfg.get("strike_interval", 50)
                             vol_context = self._get_live_volatility_context()
-                            contexts = self._build_intelligence_contexts(
-                                name,
-                                candle_5min,
-                                spot=latest_spot,
-                                previous_close=previous_close,
-                                volatility_context=vol_context,
-                                as_of=datetime.now(IST),
+                            contexts = (
+                                self._build_intelligence_contexts(
+                                    name,
+                                    candle_5min,
+                                    spot=latest_spot,
+                                    previous_close=previous_close,
+                                    volatility_context=vol_context,
+                                    as_of=datetime.now(IST),
+                                )
+                                if self._regime_history_ready(candle_5min)
+                                else {}
                             )
                             warmed_any = False
-                            for tf in ("5min", "15min"):
+                            for tf in ("1min", "5min", "15min"):
                                 candle_tf = (
-                                    candle_5min
+                                    candle_1min
+                                    if tf == "1min"
+                                    else candle_5min
                                     if tf == "5min"
-                                    else self._live_analysis_window(
-                                        self.candles.get_candles(name, tf), tf
-                                    )
+                                    else self._live_analysis_window(self.candles.get_candles(name, tf), tf)
                                 )
                                 if not self._regime_history_ready(candle_tf):
                                     continue
@@ -5746,6 +5874,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         asyncio.create_task(self._background_hft_worker())
         asyncio.create_task(self._background_recovery_checkpoint_worker())
         asyncio.create_task(self._background_signal_report_worker())
+        asyncio.create_task(self._background_entry_shadow_worker())
         asyncio.create_task(self._smart_health_monitor_loop())
 
         while self.is_running:
@@ -5814,6 +5943,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 logger.debug(f"Daily signal report refresh skipped: {exc}")
             await asyncio.sleep(300)
 
+    async def _background_entry_shadow_worker(self):
+        """Sample subscribed contract books for advisory entry-policy mark-outs."""
+        while self.is_running:
+            try:
+                settings = get_settings()
+                interval = max(
+                    1.0,
+                    float(
+                        getattr(settings, "entry_shadow_update_interval_seconds", 5.0)
+                        or 5.0
+                    ),
+                )
+                if (
+                    str(getattr(self, "mode", "") or "").upper() == "REAL"
+                    and self._setting_enabled(
+                        getattr(settings, "entry_shadow_outcomes_enabled", True), True
+                    )
+                    and bool(getattr(self, "_entry_shadow_book", {}))
+                ):
+                    await asyncio.to_thread(self._update_entry_shadow_outcomes)
+                await asyncio.sleep(interval)
+            except Exception as exc:
+                logger.debug(f"Entry shadow worker skipped: {exc}")
+                await asyncio.sleep(5)
+
     async def _background_ltp_worker(self):
         """Constant high-priority LTP polling utilizing 85% of SmartAPI throughput"""
         while self.is_running:
@@ -5869,14 +6023,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         if options_chain is not None:
                             depth_context = self._get_depth_context(name, cfg)
                             chain_quality = {**chain_quality, "depth": depth_context}
-                            # Pre-calculate intel in background for entry context (5min)
-                            # and own-timeframe active-trade context (15min runners).
+                            # Independently refresh 1m/5m/15m. The 1m bundle is the fast
+                            # support/exit-watch layer for a live 15m position; it is not
+                            # substituted for the position's own 15m decision context.
                             candle_5min = self._live_analysis_window(self.candles.get_candles(name, "5min"), "5min")
                             candle_1min = self._live_analysis_window(self.candles.get_candles(name, "1min"), "1min")
-                            if not self._regime_history_ready(candle_5min):
+                            five_min_ready = self._regime_history_ready(candle_5min)
+                            if not five_min_ready:
                                 self._clear_timeframe_intel(name, "5min")
-                                await asyncio.sleep(5)
-                                continue
 
                             vol_context = self._get_live_volatility_context()
                             previous_close = self._previous_close_for(name)
@@ -5886,17 +6040,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                 previous_close=previous_close,
                             )
                             dte = self._days_to_expiry_for(name, datetime.now(IST))
-                            contexts = self._build_intelligence_contexts(
-                                name,
-                                candle_5min,
-                                spot=spot,
-                                previous_close=previous_close,
-                                volatility_context=vol_context,
-                                as_of=datetime.now(IST),
+                            contexts = (
+                                self._build_intelligence_contexts(
+                                    name,
+                                    candle_5min,
+                                    spot=spot,
+                                    previous_close=previous_close,
+                                    volatility_context=vol_context,
+                                    as_of=datetime.now(IST),
+                                )
+                                if five_min_ready
+                                else {}
                             )
                             intel_res = None
-                            for tf in ("5min", "15min"):
-                                candle_tf = candle_5min if tf == "5min" else self._live_analysis_window(self.candles.get_candles(name, tf), tf)
+                            for tf in ("1min", "5min", "15min"):
+                                candle_tf = (
+                                    candle_1min
+                                    if tf == "1min"
+                                    else candle_5min
+                                    if tf == "5min"
+                                    else self._live_analysis_window(self.candles.get_candles(name, tf), tf)
+                                )
                                 if not self._regime_history_ready(candle_tf):
                                     self._clear_timeframe_intel(name, tf)
                                     continue
@@ -7492,7 +7656,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     ),
                 )
             if df is not None and len(df) > 0:
-                self.candles.update_candles(name, df, tf)
+                # A REST/backfill response is historical state, not a live candle
+                # observation.  Keep the candle receipt clock untouched so a healthy
+                # quote lane or a just-finished download cannot make stale OHLC look
+                # eligible for a fresh entry/exit decision.
+                self.candles.update_candles(name, df, tf, mark_receipt=False)
         except Exception as e:
             logger.error(f"Fetch failed for {name} {tf}: {e}")
 
@@ -7908,10 +8076,69 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
         return str(value or default).upper()
 
+    def _fresh_exact_trade_intel(
+        self,
+        trade_like,
+        *,
+        evaluation_time: Optional[datetime] = None,
+        allow_blocking: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Read intelligence that is fresh, exact-timeframe, and candle-backed."""
+        instrument = str(getattr(trade_like, "instrument", "") or "").upper()
+        timeframe = str(getattr(trade_like, "timeframe", "5min") or "5min").lower()
+        checked_at = evaluation_time or datetime.now(IST).replace(tzinfo=None)
+        candle_status = self._early_exit_candle_freshness(
+            instrument,
+            timeframe,
+            checked_at,
+        )
+        if not candle_status.get("fresh"):
+            self._diag_inc("intel", "exact_candle_stale")
+            return None
+        if allow_blocking:
+            result = self._get_timeframe_intel(
+                instrument,
+                timeframe,
+                allow_fallback=False,
+            )
+        else:
+            result = self._cached_timeframe_intel(
+                instrument,
+                timeframe,
+                allow_fallback=False,
+            )
+        if not isinstance(result, dict):
+            self._diag_inc("intel", "exact_timeframe_missing")
+            return None
+        result_tf = str(result.get("timeframe") or timeframe).lower()
+        if result_tf != timeframe:
+            self._diag_inc("intel", "timeframe_mismatch")
+            return None
+        real_mode = str(getattr(self, "mode", "") or "").upper() == "REAL"
+        if real_mode:
+            try:
+                max_age = float(
+                    getattr(get_settings(), "loss_guard_intel_max_age_seconds", 90.0)
+                    or 90.0
+                )
+            except (TypeError, ValueError):
+                max_age = 90.0
+            age = self._intel_age_seconds(result, instrument, checked_at)
+            if age is None or age < -1.0 or age > max_age:
+                self._diag_inc("intel", "exact_intel_stale")
+                return None
+        return result
+
     def _get_trade_intel(self, trade_like) -> Optional[Dict[str, Any]]:
         instrument = str(getattr(trade_like, "instrument", "") or "").upper()
         timeframe = str(getattr(trade_like, "timeframe", "5min") or "5min").lower()
-        return self._get_timeframe_intel(instrument, timeframe)
+        # A bundle that can drive an exit must belong to the trade's own timeframe and
+        # be backed by a fresh exact-timeframe candle frame.
+        return self._fresh_exact_trade_intel(
+            trade_like,
+            evaluation_time=datetime.now(IST).replace(tzinfo=None),
+            allow_blocking=True,
+        )
 
     def _get_timeframe_intel(
         self,
@@ -8181,9 +8408,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         data = getattr(self, "data", None)
         # ACTIVE indices only. Reporting a configured-but-inactive instrument as
         # "degraded" is a false alarm about a feed nobody is trading.
-        active = list(getattr(self, "active_indices", None) or [])
+        configured_active = getattr(self, "active_indices", None)
+        active = list(configured_active or []) if configured_active is not None else []
         indices = {name: {} for name in active}
-        if not indices:
+        if configured_active is None:
             indices = dict(getattr(self, "config", {}).get("indices", {}) or {})
 
         rows: Dict[str, Any] = {}
@@ -8219,6 +8447,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "unit": "shares",
                         "volume": float(getattr(data, "_index_cum_volume", {}).get(name, 0.0) or 0.0),
                         "comparable_to_thresholds": True,
+                        "volume_available": True,
+                        "volume_source": "fyers_index",
+                        "volume_basis": "cumulative_cash_index_volume",
+                        "volume_unit": "shares",
+                        "volume_comparable": True,
+                        "volume_unavailable_reason": "",
                         "fyers_online": True,
                         "futures": {},
                         "confirmation": "cached",
@@ -8233,6 +8467,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "unit": "contracts",
                         "volume": futures_volume,
                         "comparable_to_thresholds": False,
+                        "volume_available": True,
+                        "volume_source": "kite_index_futures",
+                        "volume_basis": "near_month_futures_confirmation",
+                        "volume_unit": "contracts",
+                        "volume_comparable": False,
+                        "volume_unavailable_reason": (
+                            "cash_index_volume_unavailable; futures_confirmation_only"
+                        ),
                         "fyers_online": False,
                         "futures": {
                             "available": True,
@@ -8246,7 +8488,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "source": "none",
                         "unit": "shares",
                         "volume": 0.0,
-                        "comparable_to_thresholds": True,
+                        "comparable_to_thresholds": False,
+                        "volume_available": False,
+                        "volume_source": "none",
+                        "volume_basis": "unavailable",
+                        "volume_unit": "shares",
+                        "volume_comparable": False,
+                        "volume_unavailable_reason": "no_positive_cash_index_volume",
                         "fyers_online": False,
                         "futures": {},
                         "confirmation": "cached",
@@ -8259,6 +8507,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "unit": str(activity.get("unit") or "shares"),
                 "volume": float(activity.get("volume") or 0.0),
                 "comparable_to_thresholds": bool(activity.get("comparable_to_thresholds", True)),
+                "volume_available": bool(activity.get("volume_available")),
+                "volume_source": str(activity.get("volume_source") or source),
+                "volume_basis": str(activity.get("volume_basis") or ""),
+                "volume_unit": str(activity.get("volume_unit") or activity.get("unit") or ""),
+                "volume_comparable": bool(activity.get("volume_comparable")),
+                "volume_unavailable_reason": str(
+                    activity.get("volume_unavailable_reason") or ""
+                ),
                 "fyers_online": bool(activity.get("fyers_online")),
                 "fyers_volume_age_seconds": activity.get("fyers_volume_age_seconds"),
                 "confirmation": str(activity.get("confirmation") or ""),
@@ -8315,8 +8571,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             row = (health.get("instruments") or {}).get(name, {})
             message = (
                 f"{name} volume feed degraded to '{row.get('source')}' "
-                f"(unit: {row.get('unit')}). Volume-ratio gates still work, but the "
-                "cash-market series every threshold was calibrated on is gone."
+                f"(unit: {row.get('unit')}). Futures activity is confirmation-only; "
+                "cash-volume ratio gates abstain until comparable Fyers volume returns."
             )
             logger.warning(f"📉 {message}")
             notifier = getattr(self, "on_notification", None)
@@ -8341,6 +8597,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         latest_volume = 0.0
         candle_tick_count = 0
+        candle_volume_basis = ""
+        candle_source = ""
         if candle_1min is not None and not candle_1min.empty:
             try:
                 latest_volume = float(candle_1min.get("volume").iloc[-1] or 0.0)
@@ -8351,6 +8609,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     candle_tick_count = int(float(candle_1min["tick_count"].iloc[-1] or 0))
             except Exception:
                 candle_tick_count = 0
+            try:
+                if "volume_basis" in candle_1min.columns:
+                    candle_volume_basis = str(candle_1min["volume_basis"].iloc[-1] or "")
+                if "source" in candle_1min.columns:
+                    candle_source = str(candle_1min["source"].iloc[-1] or "")
+            except Exception:
+                candle_volume_basis = ""
+                candle_source = ""
 
         # In-memory ONLY. This runs per instrument on the 1s scan interval, so calling
         # get_index_activity here meant a Fyers REST probe plus a Kite quote per index
@@ -8367,11 +8633,40 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         diag_tick_count = int(float((diag or {}).get("tick_count_current_minute") or 0))
         volume_available = bool(latest_volume > 0.0 or (diag or {}).get("volume_available"))
+        comparable_cash = bool(
+            volume_available
+            and not on_futures
+            and (
+                volume_source == "fyers_index"
+                or candle_volume_basis.lower() == "fyers_index"
+                or bool((diag or {}).get("volume_comparable"))
+            )
+        )
+        unavailable_reason = ""
+        if not comparable_cash:
+            unavailable_reason = str(
+                (diag or {}).get("volume_unavailable_reason")
+                or (
+                    "cash_index_volume_unavailable; futures_confirmation_only"
+                    if on_futures
+                    else "no_positive_cash_index_volume"
+                )
+            )
         return {
             "instrument": name,
             "volume_available": volume_available,
             "volume_reliable": bool(latest_volume > 0.0 or (diag or {}).get("volume_reliable")),
-            "volume_source": str((diag or {}).get("source") or ""),
+            "volume_source": str(
+                (diag or {}).get("volume_source")
+                or volume_source
+                or candle_source
+                or "none"
+            ),
+            "volume_basis": str(
+                (diag or {}).get("volume_basis")
+                or candle_volume_basis
+                or "unavailable"
+            ),
             "volume_key": str((diag or {}).get("volume_key") or ""),
             "volume_fields": dict((diag or {}).get("volume_fields") or {}),
             "latest_1min_volume": round(latest_volume, 4),
@@ -8390,8 +8685,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # the futures fallback is reported above but never ticked into it, so the
             # unit no longer swaps under the thresholds. `futures_volume_available`
             # remains the signal that the live cash feed has gone quiet.
-            "volume_unit": "shares",
-            "volume_comparable_to_thresholds": True,
+            "volume_unit": str((diag or {}).get("volume_unit") or "shares"),
+            "volume_comparable": comparable_cash,
+            "volume_comparable_to_thresholds": comparable_cash,
+            "volume_unavailable_reason": unavailable_reason,
             "cumulative_volume": cum_volume,
         }
 
@@ -8978,9 +9275,1090 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
         return ""
 
+    @staticmethod
+    def _entry_shadow_horizons(settings=None) -> List[int]:
+        settings = settings or get_settings()
+        raw = getattr(settings, "entry_shadow_horizons_minutes", [15, 30, 60])
+        if not isinstance(raw, (list, tuple, set)):
+            raw = [raw]
+        values = set()
+        for value in raw:
+            try:
+                minutes = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if 0 < minutes <= 390:
+                values.add(minutes)
+        return sorted(values) or [15, 30, 60]
+
+    @staticmethod
+    def _entry_shadow_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST)
+
+    @staticmethod
+    def _entry_shadow_exchange(instrument: str) -> str:
+        return "BFO" if str(instrument or "").split()[0].upper() == "SENSEX" else "NFO"
+
+    @staticmethod
+    def _entry_shadow_quantity(holder) -> int:
+        try:
+            broker_qty = int(getattr(holder, "broker_quantity", 0) or 0)
+        except (TypeError, ValueError):
+            broker_qty = 0
+        if broker_qty > 0:
+            return broker_qty
+        try:
+            return max(
+                0,
+                int(getattr(holder, "lots", 0) or 0)
+                * int(getattr(holder, "lot_size", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    def _entry_shadow_state_path(self) -> Path:
+        configured = str(
+            getattr(
+                get_settings(),
+                "entry_shadow_state_file",
+                "data_store/entry_policy_shadow_pending.json",
+            )
+            or "data_store/entry_policy_shadow_pending.json"
+        )
+        return Path(configured)
+
+    def _persist_entry_shadow_book(self) -> None:
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return
+        try:
+            with self._entry_shadow_lock:
+                rows = [dict(row) for row in self._entry_shadow_book.values()]
+            path = self._entry_shadow_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+            tmp_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "entry-policy-shadow.pending.v1",
+                        "saved_at": datetime.now(IST).isoformat(),
+                        "watches": rows,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, path)
+            self._entry_shadow_last_persist = time.time()
+            self._entry_shadow_persist_requested = False
+        except Exception as exc:
+            logger.debug(f"Entry shadow pending-book save skipped: {exc}")
+
+    def _load_entry_shadow_book(self) -> None:
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "entry_shadow_outcomes_enabled", True), True
+        ):
+            return
+        path = self._entry_shadow_state_path()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_rows = payload.get("watches", []) if isinstance(payload, dict) else []
+            if not isinstance(raw_rows, list):
+                return
+            now = datetime.now(IST)
+            horizons = self._entry_shadow_horizons(settings)
+            expiry_seconds = (
+                max(horizons) * 60.0
+                + max(
+                    0.0,
+                    float(
+                        getattr(settings, "entry_shadow_exit_quote_grace_seconds", 180.0)
+                        or 180.0
+                    ),
+                )
+                + 300.0
+            )
+            maximum = max(
+                1,
+                int(getattr(settings, "entry_shadow_max_watches", 1024) or 1024),
+            )
+            restored = {}
+            discarded = False
+            for raw in raw_rows:
+                if not isinstance(raw, dict):
+                    discarded = True
+                    continue
+                registered = self._entry_shadow_time(raw.get("registered_at"))
+                if registered is None:
+                    discarded = True
+                    continue
+                age = (now - registered).total_seconds()
+                instrument = str(raw.get("instrument") or "").split()[0].upper()
+                decision = str(raw.get("decision_group") or "").upper()
+                inst_type = str(raw.get("inst_type") or "").upper()
+                if (
+                    instrument not in SUPPORTED_ENTRY_INSTRUMENTS
+                    or decision not in {"ACCEPTED", "REJECTED"}
+                    or inst_type not in {"OPT", "FUT"}
+                    or not str(raw.get("trading_symbol") or "")
+                    or not str(raw.get("symbol_token") or "")
+                ):
+                    discarded = True
+                    continue
+                raw["horizons"] = horizons
+                raw["emitted_horizons"] = sorted(
+                    {
+                        int(value)
+                        for value in (raw.get("emitted_horizons") or [])
+                        if str(value).isdigit() and int(value) in horizons
+                    }
+                )
+                key = str(raw.get("key") or "").strip()
+                if not key:
+                    key = f"{raw.get('lifecycle_id', '')}|{decision}"
+                    raw["key"] = key
+                if age < -5.0:
+                    discarded = True
+                    continue
+                if age > expiry_seconds or len(restored) >= maximum:
+                    reason = (
+                        "process_restart_missed_horizon"
+                        if age > expiry_seconds
+                        else "restart_watch_capacity_reached"
+                    )
+                    emitted = set(raw.get("emitted_horizons") or [])
+                    for horizon in horizons:
+                        if horizon not in emitted:
+                            self._record_entry_shadow_outcome(
+                                raw,
+                                horizon_minutes=horizon,
+                                now=now,
+                                quote={"source": "unavailable"},
+                                outcome_available=False,
+                                unavailable_reason=reason,
+                            )
+                    discarded = True
+                    continue
+                restored[key] = raw
+            with self._entry_shadow_lock:
+                self._entry_shadow_book.update(restored)
+            for watch in restored.values():
+                self._subscribe_entry_shadow_watch(watch)
+            if restored:
+                logger.info(f"Restored {len(restored)} pending executable entry shadow watch(es)")
+            if discarded:
+                # Remove corrupt/expired rows after their deterministic unavailable
+                # outcomes are written, so the same stale state is not replayed forever.
+                self._persist_entry_shadow_book()
+        except Exception as exc:
+            logger.debug(f"Entry shadow pending-book restore skipped: {exc}")
+
+    def _subscribe_entry_shadow_watch(self, watch: Dict[str, Any]) -> None:
+        token = str(watch.get("symbol_token") or "").strip()
+        data = getattr(self, "data", None)
+        if not token or data is None or not hasattr(data, "subscribe_tokens"):
+            return
+        exchange_type = 3 if str(watch.get("instrument") or "").upper() == "SENSEX" else 2
+        try:
+            data.subscribe_tokens([token], exchange_type=exchange_type)
+        except Exception as exc:
+            logger.debug(f"Entry shadow subscription skipped for {token}: {exc}")
+
+    def _register_entry_shadow_outcome(self, candidate, decision: str) -> None:
+        """Register one immutable decision for future executable bid/ask mark-outs."""
+        settings = get_settings()
+        if (
+            str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or bool(getattr(self, "is_warmup", False))
+            or not self._setting_enabled(
+                getattr(settings, "entry_shadow_outcomes_enabled", True), True
+            )
+            or bool(getattr(candidate, "is_recovery", False))
+            or bool(getattr(candidate, "is_ghost", False))
+        ):
+            return
+        normalized = str(decision or "").upper()
+        decision_group = "ACCEPTED" if normalized == "ACCEPTED" else (
+            "REJECTED" if normalized in {"REJECTED", "MISSED", "NO_ENTRY"} else ""
+        )
+        action = str(getattr(candidate, "action", "ENTRY") or "ENTRY").upper()
+        if not decision_group or action == "EXIT":
+            return
+        instrument = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+        inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
+        trading_symbol = str(getattr(candidate, "trading_symbol", "") or "").strip()
+        symbol_token = str(getattr(candidate, "symbol_token", "") or "").strip()
+        quantity = self._entry_shadow_quantity(candidate)
+        if (
+            instrument not in SUPPORTED_ENTRY_INSTRUMENTS
+            or inst_type not in {"OPT", "FUT"}
+            or not trading_symbol
+            or not symbol_token
+            or quantity <= 0
+        ):
+            return
+        try:
+            lifecycle_id = self._candidate_lifecycle_key(candidate)
+        except Exception:
+            lifecycle_id = str(getattr(candidate, "lifecycle_id", "") or "").strip()
+        if not lifecycle_id:
+            return
+        key = f"{lifecycle_id}|{decision_group}"
+        maximum = max(
+            1,
+            int(getattr(settings, "entry_shadow_max_watches", 1024) or 1024),
+        )
+        horizons = self._entry_shadow_horizons(settings)
+        now = datetime.now(IST)
+        direction = str(getattr(candidate, "direction", "") or "").upper()
+        try:
+            decision_price = float(
+                getattr(candidate, "price", getattr(candidate, "entry_price", 0.0)) or 0.0
+            )
+        except (TypeError, ValueError):
+            decision_price = 0.0
+        try:
+            underlying_entry = float(
+                getattr(candidate, "underlying_entry", 0.0)
+                or getattr(candidate, "entry_spot", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            underlying_entry = 0.0
+        underlying_entry_basis = (
+            "candidate_geometry" if underlying_entry > 0 else "unavailable"
+        )
+        if underlying_entry <= 0:
+            try:
+                fallback_spot, _fallback_observed_at, _fallback_source = (
+                    self._entry_policy_live_index_quote(instrument, now)
+                )
+                underlying_entry = float(fallback_spot or 0.0)
+                if underlying_entry > 0:
+                    underlying_entry_basis = "fresh_index_quote_fallback"
+            except Exception:
+                underlying_entry = 0.0
+        decision_price_basis = "candidate_contract_price"
+        if inst_type == "OPT" and decision_price > 0 and underlying_entry > 0:
+            # Legacy candidates occasionally carried the spot index in ``price``.
+            # Comparing that to an option ask generated five-figure fake slippage.
+            looks_like_underlying = (
+                abs(decision_price - underlying_entry) / underlying_entry <= 0.05
+            )
+            if looks_like_underlying:
+                premium_geometry = self._entry_policy_float(
+                    getattr(candidate, "premium_entry", 0.0) or 0.0
+                )
+                if premium_geometry > 0:
+                    decision_price = premium_geometry
+                    decision_price_basis = "premium_geometry_recovered"
+                else:
+                    decision_price = 0.0
+                    decision_price_basis = "cross_geometry_unavailable"
+        bid = self._entry_policy_float(
+            getattr(candidate, "execution_bid_price", 0.0) or 0.0
+        )
+        ask = self._entry_policy_float(
+            getattr(candidate, "execution_ask_price", 0.0) or 0.0
+        )
+        touch_age = self._entry_policy_float(
+            getattr(candidate, "execution_touch_age_seconds", 0.0) or 0.0,
+            default=float("inf"),
+        )
+        touch_max_age = max(
+            0.05,
+            self._entry_policy_float(
+                getattr(settings, "execution_touch_quote_max_age_seconds", 1.5),
+                default=1.5,
+            ),
+        )
+        touch_usable = bool(getattr(candidate, "execution_touch_usable", False))
+        if (
+            bid <= 0
+            or ask < bid
+            or not math.isfinite(touch_age)
+            or touch_age < 0
+            or touch_age > touch_max_age
+        ):
+            touch_usable = False
+        side_is_long = inst_type == "OPT" or direction == "LONG"
+        entry_executable = (ask if side_is_long else bid) if touch_usable else 0.0
+        cost = self._entry_policy_float(
+            getattr(settings, "opt_cost", 80.0)
+            if inst_type == "OPT"
+            else getattr(settings, "fut_cost", 200.0)
+        )
+        forecast = dict(getattr(candidate, "expected_move_forecast", {}) or {})
+        policy = dict(getattr(candidate, "entry_policy_verdict", {}) or {})
+        geometry = {
+            name: getattr(candidate, name, None)
+            for name in (
+                "underlying_entry",
+                "underlying_stop",
+                "underlying_target",
+                "premium_entry",
+                "premium_stop",
+                "premium_target",
+                "geometry_observed_at",
+                "geometry_source",
+                "geometry_verified",
+                "geometry_schema",
+            )
+        }
+        try:
+            geometry["geometry_conversion_ratio"] = abs(
+                float(
+                    getattr(
+                        candidate,
+                        "geometry_conversion_ratio",
+                        getattr(candidate, "multiplier", 1.0),
+                    )
+                    or 0.0
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            geometry["geometry_conversion_ratio"] = 0.0
+        # Persist the geometry actually used by the shadow sampler.  A candidate
+        # attribute can be empty even when the safe live-quote fallback above was
+        # available, and emitting the stale attribute made the audit trail disagree
+        # with the calculation.
+        geometry["underlying_entry"] = underlying_entry or None
+        geometry["underlying_entry_basis"] = underlying_entry_basis
+        watch = {
+            "key": key,
+            "lifecycle_id": lifecycle_id,
+            "decision_group": decision_group,
+            "registered_at": now.isoformat(),
+            "session_date": now.date().isoformat(),
+            "signal_timestamp": str(
+                getattr(getattr(candidate, "signal_timestamp", None), "isoformat", lambda: "")()
+            ),
+            "instrument": instrument,
+            "timeframe": str(getattr(candidate, "timeframe", "") or ""),
+            "direction": direction,
+            "regime": str(getattr(candidate, "market_regime", "") or "UNKNOWN"),
+            "source_lane": str(getattr(candidate, "source_lane", "") or "UNKNOWN"),
+            "inst_type": inst_type,
+            "trading_symbol": trading_symbol,
+            "symbol_token": symbol_token,
+            "quantity": quantity,
+            "decision_price": decision_price,
+            "decision_price_basis": decision_price_basis,
+            # An accepted/submitted order is not a fill.  Only the broker
+            # reconciliation callback may populate the accepted_actual_fill fields.
+            "accepted_actual_fill_price": 0.0,
+            "accepted_actual_fill_quantity": 0,
+            "accepted_actual_fill_at": "",
+            "underlying_entry": underlying_entry,
+            "entry_bid": bid if touch_usable else 0.0,
+            "entry_ask": ask if touch_usable else 0.0,
+            "entry_executable_price": entry_executable,
+            "entry_quote_source": str(
+                getattr(candidate, "execution_touch_source", "") or ""
+            ),
+            "entry_quote_age_seconds": touch_age if touch_usable else None,
+            "entry_quote_captured_at": (
+                (now - timedelta(seconds=touch_age)).isoformat()
+                if touch_usable
+                else ""
+            ),
+            "round_trip_cost_rs": max(0.0, cost),
+            "horizons": horizons,
+            "emitted_horizons": [],
+            "mfe_gross_rs": None,
+            "mae_gross_rs": None,
+            "directional_mfe_pct": None,
+            "underlying_observation_count": 0,
+            "underlying_last_observed_at": "",
+            "underlying_last_source": "",
+            "forecast": forecast,
+            "entry_policy": policy,
+            "geometry": geometry,
+        }
+        changed = False
+        capacity_reached = False
+        with self._entry_shadow_lock:
+            pending_fills = getattr(self, "_entry_shadow_pending_fills", None)
+            if not isinstance(pending_fills, dict):
+                self._entry_shadow_pending_fills = {}
+                pending_fills = self._entry_shadow_pending_fills
+            pending_fill = pending_fills.pop(key, None)
+            if isinstance(pending_fill, dict):
+                watch.update(pending_fill)
+            existing = self._entry_shadow_book.get(key)
+            if existing is None:
+                if len(self._entry_shadow_book) >= maximum:
+                    capacity_reached = True
+                else:
+                    self._entry_shadow_book[key] = watch
+                    changed = True
+            else:
+                if isinstance(pending_fill, dict):
+                    existing.update(pending_fill)
+                    changed = True
+                if (
+                    float(existing.get("entry_executable_price") or 0.0) <= 0
+                    and entry_executable > 0
+                ):
+                    for field in (
+                        "entry_bid",
+                        "entry_ask",
+                        "entry_executable_price",
+                        "entry_quote_source",
+                        "entry_quote_age_seconds",
+                        "entry_quote_captured_at",
+                    ):
+                        existing[field] = watch[field]
+                    changed = True
+        if capacity_reached:
+            warned_at = float(getattr(self, "_entry_shadow_capacity_warned_at", 0.0) or 0.0)
+            if time.time() - warned_at >= 300.0:
+                self._entry_shadow_capacity_warned_at = time.time()
+                logger.warning(
+                    f"Entry shadow capacity reached ({maximum}); outcome marked unavailable"
+                )
+            for horizon in horizons:
+                self._record_entry_shadow_outcome(
+                    watch,
+                    horizon_minutes=horizon,
+                    now=now,
+                    quote={"source": "unavailable"},
+                    outcome_available=False,
+                    unavailable_reason="watch_capacity_reached",
+                )
+            return
+        if changed:
+            self._subscribe_entry_shadow_watch(watch)
+            # Registration runs on the scan/execution path. Persist from the dedicated
+            # shadow worker's to_thread call so JSON serialization and Windows file I/O
+            # can never add latency to a live admission decision.
+            self._entry_shadow_persist_requested = True
+
+    def _update_accepted_entry_shadow_fill(
+        self,
+        trade,
+        fill_price: float,
+        filled_quantity: int = 0,
+    ) -> None:
+        """Attach the broker-confirmed fill to an already registered acceptance."""
+        lifecycle_id = str(getattr(trade, "lifecycle_id", "") or "").strip()
+        try:
+            measured_fill = float(fill_price or 0.0)
+            measured_quantity = max(0, int(filled_quantity or 0))
+        except (TypeError, ValueError):
+            return
+        if not lifecycle_id or measured_fill <= 0:
+            return
+        key = f"{lifecycle_id}|ACCEPTED"
+        observed_at = datetime.now(IST)
+        payload = {
+            "accepted_actual_fill_price": measured_fill,
+            "accepted_actual_fill_quantity": measured_quantity,
+            "accepted_actual_fill_at": observed_at.isoformat(),
+        }
+        with self._entry_shadow_lock:
+            watch = self._entry_shadow_book.get(key)
+            if isinstance(watch, dict):
+                payload["accepted_actual_fill_quantity"] = max(
+                    int(watch.get("accepted_actual_fill_quantity") or 0),
+                    measured_quantity,
+                )
+                watch.update(payload)
+            else:
+                pending = getattr(self, "_entry_shadow_pending_fills", None)
+                if not isinstance(pending, dict):
+                    self._entry_shadow_pending_fills = {}
+                    pending = self._entry_shadow_pending_fills
+                # Reconciliation-before-registration is a very short race.  Bound
+                # and age this side map so malformed lifecycle callbacks cannot grow
+                # it indefinitely when no matching candidate is ever registered.
+                expiry_seconds = 3600.0
+                for pending_key, pending_fill in list(pending.items()):
+                    pending_at = self._entry_shadow_time(
+                        (pending_fill or {}).get("accepted_actual_fill_at")
+                    )
+                    if (
+                        pending_at is None
+                        or (observed_at - pending_at).total_seconds() > expiry_seconds
+                    ):
+                        pending.pop(pending_key, None)
+                maximum = max(
+                    1,
+                    int(
+                        getattr(
+                            get_settings(), "entry_shadow_max_watches", 1024
+                        )
+                        or 1024
+                    ),
+                )
+                previous = pending.get(key)
+                if isinstance(previous, dict):
+                    payload["accepted_actual_fill_quantity"] = max(
+                        int(previous.get("accepted_actual_fill_quantity") or 0),
+                        measured_quantity,
+                    )
+                elif len(pending) >= maximum:
+                    pending.pop(next(iter(pending)), None)
+                pending[key] = payload
+        self._entry_shadow_persist_requested = True
+
+    def _entry_shadow_cached_quote(self, watch: Dict[str, Any]) -> Dict[str, Any]:
+        data = getattr(self, "data", None)
+        quoter = getattr(data, "get_cached_contract_touch_quote", None)
+        if not callable(quoter):
+            return {
+                "usable": False,
+                "reason": "cache_only_quoter_unavailable",
+                "source": "unavailable",
+            }
+        max_quote_age = max(
+            1.0,
+            float(
+                getattr(get_settings(), "entry_shadow_quote_max_age_seconds", 10.0)
+                or 10.0
+            ),
+        )
+        try:
+            quote = quoter(
+                self._entry_shadow_exchange(str(watch.get("instrument") or "")),
+                str(watch.get("trading_symbol") or ""),
+                str(watch.get("symbol_token") or ""),
+                max_age_seconds=max_quote_age,
+            )
+            return dict(quote) if isinstance(quote, dict) else {}
+        except Exception as exc:
+            logger.debug(f"Entry shadow quote skipped: {exc}")
+            return {"usable": False, "reason": "quote_exception", "source": "unavailable"}
+
+    @staticmethod
+    def _entry_shadow_gross_pnl(watch: Dict[str, Any], executable_exit: float) -> Optional[float]:
+        try:
+            entry = float(watch.get("entry_executable_price") or 0.0)
+            exit_price = float(executable_exit or 0.0)
+            quantity = int(watch.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return None
+        if entry <= 0 or exit_price <= 0 or quantity <= 0:
+            return None
+        side_is_long = (
+            str(watch.get("inst_type") or "").upper() == "OPT"
+            or str(watch.get("direction") or "").upper() == "LONG"
+        )
+        points = exit_price - entry if side_is_long else entry - exit_price
+        return points * quantity
+
+    def _record_entry_shadow_outcome(
+        self,
+        watch: Dict[str, Any],
+        *,
+        horizon_minutes: int,
+        now: datetime,
+        quote: Dict[str, Any],
+        outcome_available: bool,
+        unavailable_reason: str = "",
+    ) -> bool:
+        tracker = getattr(self, "rtracker", None)
+        if tracker is None or not callable(getattr(tracker, "record_event", None)):
+            return False
+        bid = float(quote.get("bid") or 0.0) if outcome_available else 0.0
+        ask = float(quote.get("ask") or 0.0) if outcome_available else 0.0
+        side_is_long = (
+            str(watch.get("inst_type") or "").upper() == "OPT"
+            or str(watch.get("direction") or "").upper() == "LONG"
+        )
+        executable_exit = (bid if side_is_long else ask) if outcome_available else 0.0
+        gross = self._entry_shadow_gross_pnl(watch, executable_exit)
+        cost = max(0.0, float(watch.get("round_trip_cost_rs") or 0.0))
+        after_cost = gross - cost if gross is not None else None
+        entry_bid = float(watch.get("entry_bid") or 0.0)
+        entry_ask = float(watch.get("entry_ask") or 0.0)
+        entry_mid = (entry_bid + entry_ask) / 2.0 if entry_bid > 0 and entry_ask >= entry_bid else 0.0
+        quantity = int(watch.get("quantity") or 0)
+        entry_spread_cost = (
+            abs(float(watch.get("entry_executable_price") or 0.0) - entry_mid) * quantity
+            if entry_mid > 0
+            else None
+        )
+        decision_price = float(watch.get("decision_price") or 0.0)
+        entry_executable = float(watch.get("entry_executable_price") or 0.0)
+        decision_to_executable_delta = None
+        if decision_price > 0 and entry_executable > 0:
+            decision_to_executable_delta = (
+                entry_executable - decision_price
+                if side_is_long
+                else decision_price - entry_executable
+            ) * quantity
+        actual_fill = float(watch.get("accepted_actual_fill_price") or 0.0)
+        actual_fill_slippage = None
+        decision_to_fill_delta = None
+        actual_fill_quantity = max(
+            0,
+            int(watch.get("accepted_actual_fill_quantity") or 0),
+        )
+        if entry_executable > 0 and actual_fill > 0:
+            actual_fill_slippage = (
+                actual_fill - entry_executable
+                if side_is_long
+                else entry_executable - actual_fill
+            ) * (actual_fill_quantity or quantity)
+        if decision_price > 0 and actual_fill > 0:
+            decision_to_fill_delta = (
+                actual_fill - decision_price
+                if side_is_long
+                else decision_price - actual_fill
+            ) * (actual_fill_quantity or quantity)
+        forecast = dict(watch.get("forecast") or {})
+        policy = dict(watch.get("entry_policy") or {})
+        quote_age_for_exit = (
+            max(0.0, self._entry_policy_float(quote.get("age_seconds"), 0.0))
+            if outcome_available
+            else 0.0
+        )
+        outcome = {
+            "basis": "marketable_touch_at_decision_and_horizon",
+            "decision_group": str(watch.get("decision_group") or ""),
+            "session_date": str(watch.get("session_date") or ""),
+            "registered_at": str(watch.get("registered_at") or ""),
+            "completed_at": now.isoformat(),
+            "horizon_minutes": int(horizon_minutes),
+            "outcome_available": bool(outcome_available and gross is not None),
+            "unavailable_reason": str(unavailable_reason or ""),
+            "entry_bid": entry_bid,
+            "entry_ask": entry_ask,
+            "entry_executable_price": entry_executable,
+            "entry_quote_source": str(watch.get("entry_quote_source") or ""),
+            "entry_quote_age_seconds": watch.get("entry_quote_age_seconds"),
+            "entry_quote_delay_seconds": max(
+                0.0,
+                (
+                    (self._entry_shadow_time(watch.get("entry_quote_captured_at")) or now)
+                    - (self._entry_shadow_time(watch.get("registered_at")) or now)
+                ).total_seconds(),
+            ),
+            "exit_bid": bid,
+            "exit_ask": ask,
+            "exit_executable_price": executable_exit,
+            "exit_quote_source": str(quote.get("source") or ""),
+            "exit_quote_age_seconds": (
+                quote_age_for_exit if outcome_available else None
+            ),
+            "exit_quote_delay_seconds": max(
+                0.0,
+                (now - (self._entry_shadow_time(watch.get("registered_at")) or now)).total_seconds()
+                - int(horizon_minutes) * 60.0
+                - quote_age_for_exit,
+            ),
+            "quantity": quantity,
+            "round_trip_cost_rs": cost,
+            "gross_pnl_rs": round(gross, 2) if gross is not None else None,
+            "after_cost_pnl_rs": round(after_cost, 2) if after_cost is not None else None,
+            "mfe_gross_rs": watch.get("mfe_gross_rs"),
+            "mae_gross_rs": watch.get("mae_gross_rs"),
+            "directional_mfe_pct": (
+                float(watch.get("directional_mfe_pct"))
+                if watch.get("directional_mfe_pct") is not None
+                and int(watch.get("underlying_observation_count") or 0) > 0
+                else None
+            ),
+            "underlying_observation_count": max(
+                0, int(watch.get("underlying_observation_count") or 0)
+            ),
+            "underlying_last_observed_at": str(
+                watch.get("underlying_last_observed_at") or ""
+            ),
+            "underlying_last_source": str(
+                watch.get("underlying_last_source") or ""
+            ),
+            "entry_spread_cost_rs": (
+                round(entry_spread_cost, 2) if entry_spread_cost is not None else None
+            ),
+            "decision_price": decision_price or None,
+            "decision_price_basis": str(watch.get("decision_price_basis") or ""),
+            "decision_to_executable_delta_rs": (
+                round(decision_to_executable_delta, 2)
+                if decision_to_executable_delta is not None
+                else None
+            ),
+            "accepted_actual_fill_price": actual_fill or None,
+            "accepted_actual_fill_quantity": actual_fill_quantity or None,
+            "accepted_actual_fill_at": str(watch.get("accepted_actual_fill_at") or ""),
+            "accepted_actual_fill_slippage_rs": (
+                round(actual_fill_slippage, 2) if actual_fill_slippage is not None else None
+            ),
+            # Stable generic slippage name now means what slippage actually is:
+            # executable touch -> broker fill. Decision movement has distinct fields.
+            "entry_slippage_rs": (
+                round(actual_fill_slippage, 2) if actual_fill_slippage is not None else None
+            ),
+            "entry_slippage_basis": (
+                "executable_touch_to_actual_fill"
+                if actual_fill_slippage is not None
+                else "unavailable_no_fill"
+            ),
+            "accepted_decision_to_fill_delta_rs": (
+                round(decision_to_fill_delta, 2)
+                if decision_to_fill_delta is not None
+                else None
+            ),
+            # Neutral alias for downstream aggregation.  The accepted-only name is
+            # retained for backwards compatibility, but the metric itself is the
+            # decision-to-fill movement and must not be confused with executable-
+            # touch-to-fill slippage above.
+            "decision_to_fill_delta_rs": (
+                round(decision_to_fill_delta, 2)
+                if decision_to_fill_delta is not None
+                else None
+            ),
+            "regime": str(watch.get("regime") or "UNKNOWN"),
+            "source_lane": str(watch.get("source_lane") or "UNKNOWN"),
+        }
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"entry-policy-shadow|{watch.get('key', '')}|{int(horizon_minutes)}",
+            )
+        )
+        event = {
+            "id": event_id,
+            "schema": "rtracker.v1",
+            "timestamp": now.isoformat(),
+            "date": now.date().isoformat(),
+            "signal_timestamp": str(watch.get("signal_timestamp") or ""),
+            "lifecycle_id": str(watch.get("lifecycle_id") or ""),
+            "instrument": str(watch.get("instrument") or ""),
+            "timeframe": str(watch.get("timeframe") or ""),
+            "direction": str(watch.get("direction") or ""),
+            "decision": "SHADOW_OUTCOME",
+            "status": "COMPLETED" if outcome["outcome_available"] else "UNAVAILABLE",
+            "reason": str(watch.get("decision_group") or ""),
+            "source": "entry_policy_executable_shadow",
+            "source_lane": str(watch.get("source_lane") or ""),
+            "contract": {
+                "trading_symbol": str(watch.get("trading_symbol") or ""),
+                "symbol_token": str(watch.get("symbol_token") or ""),
+                "inst_type": str(watch.get("inst_type") or ""),
+                "quantity": quantity,
+            },
+            "geometry": dict(watch.get("geometry") or {}),
+            "expected_move": forecast,
+            "entry_policy": policy,
+            "regime": {
+                "smoothed_regime": str(watch.get("regime") or "UNKNOWN"),
+                "hard_label": str(watch.get("regime") or "UNKNOWN"),
+            },
+            "quote": {
+                "entry_bid": entry_bid,
+                "entry_ask": entry_ask,
+                "exit_bid": bid,
+                "exit_ask": ask,
+                "entry_source": str(watch.get("entry_quote_source") or ""),
+                "exit_source": str(quote.get("source") or ""),
+            },
+            "shadow_outcome": outcome,
+        }
+        try:
+            # False also means the deterministic id already exists after a restart;
+            # either way this horizon is durably represented and can be retired.
+            tracker.record_event(event)
+            return True
+        except Exception as exc:
+            logger.debug(f"Entry shadow outcome record skipped: {exc}")
+            return False
+
+    def _update_entry_shadow_outcomes(self) -> int:
+        """Advance a bounded batch of pending watches from cached executable books."""
+        settings = get_settings()
+        if (
+            str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or not self._setting_enabled(
+                getattr(settings, "entry_shadow_outcomes_enabled", True), True
+            )
+        ):
+            return 0
+        now = datetime.now(IST)
+        with self._entry_shadow_lock:
+            keys = list(self._entry_shadow_book)
+        if not keys:
+            return 0
+        batch_size = max(
+            1,
+            int(getattr(settings, "entry_shadow_update_batch_size", 64) or 64),
+        )
+        start = int(getattr(self, "_entry_shadow_cursor", 0) or 0) % len(keys)
+        selected = [keys[(start + offset) % len(keys)] for offset in range(min(batch_size, len(keys)))]
+        self._entry_shadow_cursor = (start + len(selected)) % max(1, len(keys))
+        entry_grace = max(
+            0.0,
+            float(
+                getattr(settings, "entry_shadow_entry_quote_grace_seconds", 30.0)
+                or 30.0
+            ),
+        )
+        exit_grace = max(
+            0.0,
+            float(
+                getattr(settings, "entry_shadow_exit_quote_grace_seconds", 180.0)
+                or 180.0
+            ),
+        )
+        completed = 0
+        dirty = False
+        for key in selected:
+            with self._entry_shadow_lock:
+                current = self._entry_shadow_book.get(key)
+                watch = dict(current) if isinstance(current, dict) else None
+                if watch is not None:
+                    watch["emitted_horizons"] = list(current.get("emitted_horizons") or [])
+            if watch is None:
+                continue
+            registered = self._entry_shadow_time(watch.get("registered_at"))
+            if registered is None:
+                with self._entry_shadow_lock:
+                    self._entry_shadow_book.pop(key, None)
+                dirty = True
+                continue
+            age_seconds = (now - registered).total_seconds()
+            if age_seconds < -5.0:
+                continue
+            quote = self._entry_shadow_cached_quote(watch)
+            try:
+                bid = float(quote.get("bid") or 0.0)
+                ask = float(quote.get("ask") or 0.0)
+                quote_age = float(quote.get("age_seconds"))
+            except (TypeError, ValueError):
+                bid, ask, quote_age = 0.0, 0.0, float("inf")
+            quote_usable = bool(
+                quote.get("usable")
+                and bid > 0
+                and ask >= bid
+                and math.isfinite(quote_age)
+                and quote_age >= 0.0
+            )
+            side_is_long = (
+                str(watch.get("inst_type") or "").upper() == "OPT"
+                or str(watch.get("direction") or "").upper() == "LONG"
+            )
+            if (
+                float(watch.get("entry_executable_price") or 0.0) <= 0
+                and quote_usable
+                and age_seconds <= entry_grace
+                # A cache-only quote observed before the decision is not an
+                # executable entry after the decision. Waiting for the first
+                # post-registration book avoids a subtle look-back advantage for
+                # candidates whose original touch was unavailable.
+                and age_seconds - quote_age >= -1e-9
+            ):
+                watch["entry_bid"] = bid
+                watch["entry_ask"] = ask
+                watch["entry_executable_price"] = ask if side_is_long else bid
+                watch["entry_quote_source"] = str(quote.get("source") or "")
+                watch["entry_quote_age_seconds"] = quote_age
+                watch["entry_quote_captured_at"] = (
+                    now - timedelta(seconds=quote_age)
+                ).isoformat()
+                dirty = True
+
+            # Directional MFE is sampled from the underlying, not from option premium.
+            try:
+                spot, spot_observed_at, spot_source = (
+                    self._entry_policy_live_index_quote(
+                        str(watch.get("instrument") or ""),
+                        now,
+                    )
+                )
+                entry_spot = float(watch.get("underlying_entry") or 0.0)
+            except Exception:
+                spot, entry_spot = 0.0, 0.0
+            if spot > 0 and entry_spot > 0:
+                move = (
+                    (spot - entry_spot) / entry_spot * 100.0
+                    if str(watch.get("direction") or "").upper() == "LONG"
+                    else (entry_spot - spot) / entry_spot * 100.0
+                )
+                prior_directional_mfe = watch.get("directional_mfe_pct")
+                watch["directional_mfe_pct"] = max(
+                    0.0,
+                    float(prior_directional_mfe or 0.0),
+                    move,
+                )
+                if (
+                    spot_observed_at
+                    and spot_observed_at
+                    != str(watch.get("underlying_last_observed_at") or "")
+                ):
+                    watch["underlying_observation_count"] = max(
+                        0, int(watch.get("underlying_observation_count") or 0)
+                    ) + 1
+                watch["underlying_last_observed_at"] = str(spot_observed_at or "")
+                watch["underlying_last_source"] = str(spot_source or "")
+
+            if quote_usable and float(watch.get("entry_executable_price") or 0.0) > 0:
+                executable_exit = bid if side_is_long else ask
+                gross = self._entry_shadow_gross_pnl(watch, executable_exit)
+                if gross is not None:
+                    prior_mfe = watch.get("mfe_gross_rs")
+                    prior_mae = watch.get("mae_gross_rs")
+                    watch["mfe_gross_rs"] = gross if prior_mfe is None else max(float(prior_mfe), gross)
+                    watch["mae_gross_rs"] = gross if prior_mae is None else min(float(prior_mae), gross)
+
+            # The fill observer owns accepted_actual_fill_* and can run while the
+            # quote work above is in progress.  Merge only worker-owned monotonic
+            # fields into the live dictionary, then take the emission snapshot.
+            # Replacing the whole dictionary here used to erase a confirmed fill
+            # that arrived after the detached copy at the top of this loop.
+            with self._entry_shadow_lock:
+                live_watch = self._entry_shadow_book.get(key)
+                if not isinstance(live_watch, dict):
+                    continue
+                if (
+                    float(live_watch.get("entry_executable_price") or 0.0) <= 0
+                    and float(watch.get("entry_executable_price") or 0.0) > 0
+                ):
+                    for field in (
+                        "entry_bid",
+                        "entry_ask",
+                        "entry_executable_price",
+                        "entry_quote_source",
+                        "entry_quote_age_seconds",
+                        "entry_quote_captured_at",
+                    ):
+                        live_watch[field] = watch.get(field)
+                worker_mfe = watch.get("mfe_gross_rs")
+                if worker_mfe is not None:
+                    live_mfe = live_watch.get("mfe_gross_rs")
+                    live_watch["mfe_gross_rs"] = (
+                        float(worker_mfe)
+                        if live_mfe is None
+                        else max(float(live_mfe), float(worker_mfe))
+                    )
+                worker_mae = watch.get("mae_gross_rs")
+                if worker_mae is not None:
+                    live_mae = live_watch.get("mae_gross_rs")
+                    live_watch["mae_gross_rs"] = (
+                        float(worker_mae)
+                        if live_mae is None
+                        else min(float(live_mae), float(worker_mae))
+                    )
+                worker_directional_mfe = watch.get("directional_mfe_pct")
+                if worker_directional_mfe is not None:
+                    live_directional_mfe = live_watch.get("directional_mfe_pct")
+                    live_watch["directional_mfe_pct"] = (
+                        float(worker_directional_mfe)
+                        if live_directional_mfe is None
+                        else max(
+                            float(live_directional_mfe),
+                            float(worker_directional_mfe),
+                        )
+                    )
+                worker_observations = max(
+                    0, int(watch.get("underlying_observation_count") or 0)
+                )
+                if worker_observations >= int(
+                    live_watch.get("underlying_observation_count") or 0
+                ):
+                    live_watch["underlying_observation_count"] = worker_observations
+                    live_watch["underlying_last_observed_at"] = str(
+                        watch.get("underlying_last_observed_at") or ""
+                    )
+                    live_watch["underlying_last_source"] = str(
+                        watch.get("underlying_last_source") or ""
+                    )
+                watch = dict(live_watch)
+                watch["emitted_horizons"] = list(
+                    live_watch.get("emitted_horizons") or []
+                )
+
+            horizons = [int(value) for value in (watch.get("horizons") or self._entry_shadow_horizons(settings))]
+            emitted = {int(value) for value in (watch.get("emitted_horizons") or [])}
+            entry_ready = float(watch.get("entry_executable_price") or 0.0) > 0
+            if not entry_ready and age_seconds >= entry_grace:
+                reason = (
+                    "entry_quote_deadline_missed"
+                    if quote_usable
+                    else f"entry_quote_{str(quote.get('reason') or 'unavailable')}"
+                )
+                for horizon in horizons:
+                    if horizon in emitted:
+                        continue
+                    if self._record_entry_shadow_outcome(
+                        watch,
+                        horizon_minutes=horizon,
+                        now=now,
+                        quote=quote,
+                        outcome_available=False,
+                        unavailable_reason=reason,
+                    ):
+                        emitted.add(horizon)
+                        completed += 1
+                watch["emitted_horizons"] = sorted(emitted)
+            else:
+                for horizon in horizons:
+                    if horizon in emitted or age_seconds < horizon * 60.0:
+                        continue
+                    if age_seconds >= horizon * 60.0 + exit_grace:
+                        available = False
+                        reason = "exit_quote_deadline_missed"
+                    elif quote_usable:
+                        # Cache freshness alone is insufficient: immediately after a
+                        # horizon the newest cached book can still predate that horizon.
+                        # Wait for the first quote actually observed at/after it, rather
+                        # than labelling a pre-horizon price as the horizon exit.
+                        quote_observed_age = age_seconds - quote_age
+                        if quote_observed_age + 1e-9 < horizon * 60.0:
+                            continue
+                        available = True
+                        reason = ""
+                    else:
+                        continue
+                    if self._record_entry_shadow_outcome(
+                        watch,
+                        horizon_minutes=horizon,
+                        now=now,
+                        quote=quote,
+                        outcome_available=available,
+                        unavailable_reason=reason,
+                    ):
+                        emitted.add(horizon)
+                        completed += 1
+                watch["emitted_horizons"] = sorted(emitted)
+
+            with self._entry_shadow_lock:
+                live_watch = self._entry_shadow_book.get(key)
+                if isinstance(live_watch, dict):
+                    live_watch["emitted_horizons"] = sorted(
+                        set(live_watch.get("emitted_horizons") or [])
+                        | set(watch.get("emitted_horizons") or [])
+                    )
+                    if set(live_watch["emitted_horizons"]) >= set(horizons):
+                        self._entry_shadow_book.pop(key, None)
+            dirty = True
+
+        self._entry_shadow_last_update = time.time()
+        if dirty and (
+            completed > 0
+            or bool(getattr(self, "_entry_shadow_persist_requested", False))
+            or time.time() - float(getattr(self, "_entry_shadow_last_persist", 0.0) or 0.0) >= 30.0
+        ):
+            self._persist_entry_shadow_book()
+        return completed
+
     def _candidate_execution_touch_quote(self, candidate: TradeCandidate) -> Dict[str, Any]:
         """Best-effort executable bid/ask quote; never changes signal scoring."""
-        if str(getattr(candidate, "inst_type", "") or "").upper() != "OPT":
+        if str(getattr(candidate, "inst_type", "") or "").upper() not in {"OPT", "FUT"}:
             return {}
         trading_symbol = str(getattr(candidate, "trading_symbol", "") or "")
         token = str(getattr(candidate, "symbol_token", "") or "")
@@ -9422,15 +10800,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         ttl = 2.0
         key = f"FUT:{trade.symbol_token}"
         now = time.time()
-        cached = self._candidate_ltp_cache.get(key)
+        cache = getattr(self, "_candidate_ltp_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._candidate_ltp_cache = cache
+        cached = cache.get(key)
         if cached and now - cached.get("time", 0.0) <= ttl:
             return cached.get("price")
 
         exchange = "BFO" if "SENSEX" in trade.trading_symbol.upper() else "NFO"
+        get_ltp = getattr(getattr(self, "data", None), "get_ltp", None)
+        if not callable(get_ltp):
+            return cached.get("price") if cached else None
         try:
-            price = self.data.get_ltp(exchange, trade.trading_symbol, trade.symbol_token)
+            price = get_ltp(exchange, trade.trading_symbol, trade.symbol_token)
             if price and price > 0:
-                self._candidate_ltp_cache[key] = {"price": float(price), "time": now}
+                cache[key] = {"price": float(price), "time": now}
                 return float(price)
         except Exception as e:
             logger.debug(f"FUT LTP fetch failed for {trade.trading_symbol}: {e}")
@@ -9688,15 +11073,70 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             pass
         return max(0.5, premium * (opt_sl_pct / 100.0))
 
-    def _execution_levels(self, candidate: TradeCandidate) -> Tuple[float, float, float]:
+    def _execution_levels(
+        self,
+        candidate: TradeCandidate,
+        *,
+        execution_touch_quote: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, float, float]:
         """Resolve contract-space entry, stop, and target levels for execution."""
-        entry = float(candidate.price or 0.0)
-        stop = float(candidate.stop or 0.0)
-        target = float(candidate.target or 0.0)
+        # This seam is intentionally usable for both a pre-ledger TradeCandidate and
+        # the Trade held by the queued broker worker.  The latter has entry_price /
+        # current_stop rather than price / stop; requiring the candidate-only names
+        # made the supposed last-moment policy re-check reuse the old submitted levels
+        # because it could not actually reprice a queued trade.
+        candidate_entry = getattr(
+            candidate,
+            "price",
+            getattr(candidate, "entry_price", 0.0),
+        )
+        candidate_stop = getattr(
+            candidate,
+            "stop",
+            getattr(candidate, "current_stop", getattr(candidate, "trailing_stop", 0.0)),
+        )
+        candidate_target = getattr(candidate, "target", 0.0)
+        entry = float(candidate_entry or 0.0)
+        stop = float(candidate_stop or 0.0)
+        target = float(candidate_target or 0.0)
         inst_type = str(getattr(candidate, "inst_type", "FUT") or "FUT").upper()
+        direction = str(getattr(candidate, "direction", "LONG") or "LONG").upper()
+        touch_entry = 0.0
+        if execution_touch_quote is not None:
+            quote = execution_touch_quote if isinstance(execution_touch_quote, dict) else {}
+            try:
+                bid = float(quote.get("bid") or 0.0)
+                ask = float(quote.get("ask") or 0.0)
+                age = float(quote.get("age_seconds"))
+                max_age = max(
+                    0.05,
+                    float(
+                        getattr(
+                            get_settings(),
+                            "execution_touch_quote_max_age_seconds",
+                            1.5,
+                        )
+                        or 1.5
+                    ),
+                )
+            except (TypeError, ValueError):
+                bid, ask, age, max_age = 0.0, 0.0, float("inf"), 1.5
+            touch_ok = bool(
+                quote.get("usable")
+                and bid > 0
+                and ask >= bid
+                and math.isfinite(age)
+                and 0.0 <= age <= max_age
+            )
+            if not touch_ok and str(getattr(self, "mode", "") or "").upper() == "REAL":
+                return 0.0, 0.0, 0.0
+            if touch_ok:
+                # Options are bought on both CE/LONG and PE/SHORT signals. Futures use
+                # the marketable side matching the directional order.
+                touch_entry = ask if inst_type == "OPT" or direction == "LONG" else bid
 
         if inst_type == "OPT":
-            live_premium = self._get_live_premium_cached(candidate)
+            live_premium = touch_entry or self._get_live_premium_cached(candidate)
             if not live_premium or live_premium <= 0:
                 self.log_signal_decision_once(
                     (
@@ -9726,8 +11166,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # min(), not replace: the execution-time function also applies the volume-spike
             # and expiry-gamma tightenings, and those must still bind. This can only make
             # the stop TIGHTER than the cap, never wider.
-            cand_price = float(candidate.price or 0.0)
-            cand_stop = float(candidate.stop or 0.0)
+            cand_price = float(candidate_entry or 0.0)
+            cand_stop = float(candidate_stop or 0.0)
             if cand_price > 0 and 0.0 < cand_stop < cand_price:
                 risk = min(risk, entry * ((cand_price - cand_stop) / cand_price))
             stop = max(0.05, entry - risk)
@@ -9744,9 +11184,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # fabricated target at twice the entry (and, while the delta was being applied
             # twice, at 1.5x). Either way it is a level that can never be reached, which
             # silently disables TARGET_HIT for that trade instead of leaving it unset.
-            cand_target = float(candidate.target or 0.0)
+            cand_target = float(candidate_target or 0.0)
             target_move = abs(cand_target - cand_price) if cand_target > 0 else 0.0
-            target = entry + target_move if target_move > 0 else 0.0
+            if cand_target <= 0:
+                return entry, stop, 0.0
+            # Repricing the stop as a percentage of the NEW premium while keeping the
+            # old absolute target move silently destroys RR. 100/96/106 is 1.5R; at a
+            # live ask of 120 the stop becomes 115.2 and the old +6 target is only
+            # 1.25R. Preserve the candidate's measured contract RR, with the system's
+            # explicit 1.5R floor, and rebuild from the actual execution risk.
+            candidate_risk = cand_price - cand_stop
+            candidate_reward = target_move
+            measured_candidate_rr = (
+                candidate_reward / candidate_risk
+                if candidate_risk > 0 and candidate_reward > 0
+                else 0.0
+            )
+            min_rr = max(
+                1.5,
+                float(getattr(get_settings(), "entry_policy_min_rr", 1.5) or 1.5),
+            )
+            execution_rr = max(min_rr, measured_candidate_rr)
+            target = entry + (risk * execution_rr) if risk > 0 else 0.0
             if (
                 bool(getattr(candidate, "volume_spike_entry", False))
                 or bool(getattr(candidate, "late_session_reclaim_entry", False))
@@ -9754,24 +11213,660 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 or bool(getattr(candidate, "missed_signal_reentry", False))
                 or bool(getattr(candidate, "is_reversion_scalp", False))
             ):
-                rr = max(1.0, float(getattr(candidate, "rr", 2.5) or 2.5))
+                # Special lanes may request more than the geometry carried by an older
+                # candidate, but never less than the measured/final-policy floor.
+                rr = max(min_rr, float(getattr(candidate, "rr", min_rr) or min_rr))
                 target = entry + (risk * rr) if risk > 0 else target
             return entry, stop, target
 
-        live_future = self._get_live_fut_ltp_cached(candidate)
+        live_future = touch_entry or self._get_live_fut_ltp_cached(candidate)
         if not live_future or live_future <= 0:
             return entry, stop, target
 
-        risk_distance = abs(float(candidate.price or 0.0) - float(candidate.stop or 0.0))
-        reward_distance = abs(float(candidate.target or 0.0) - float(candidate.price or 0.0))
+        risk_distance = abs(float(candidate_entry or 0.0) - float(candidate_stop or 0.0))
+        reward_distance = abs(float(candidate_target or 0.0) - float(candidate_entry or 0.0))
         entry = float(live_future)
-        if str(candidate.direction or "LONG").upper() == "SHORT":
+        if direction == "SHORT":
             stop = entry + risk_distance
             target = entry - reward_distance if reward_distance > 0 else 0.0
         else:
             stop = entry - risk_distance
             target = entry + reward_distance if reward_distance > 0 else 0.0
         return entry, stop, target
+
+    @staticmethod
+    def _entry_policy_number_map(value: Any) -> Dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        result: Dict[str, float] = {}
+        for key, raw in value.items():
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                result[str(key or "").upper()] = number
+        return result
+
+    def _entry_policy_underlying_stop_cap_pct(self, instrument: str, regime: str) -> float:
+        caps = self._entry_policy_number_map(
+            getattr(get_settings(), "entry_policy_underlying_stop_max_pct_by_index", {})
+        )
+        configured = effective_underlying_stop_cap_pct(
+            str(instrument or "").upper(),
+            caps.get(str(instrument or "").upper(), 0.0),
+        )
+        return futures_stop_tolerance_pct(configured, regime)
+
+    def _cap_option_geometry_to_underlying_policy(
+        self,
+        *,
+        instrument: str,
+        regime: str,
+        spot: float,
+        premium: float,
+        stop: float,
+        target: float,
+        signed_delta: float,
+        rr_hint: float,
+    ) -> Tuple[float, float, float, float]:
+        """Tighten converted option geometry so both price spaces satisfy the cap."""
+        premium = float(premium or 0.0)
+        stop = float(stop or 0.0)
+        target = float(target or 0.0)
+        delta = max(0.1, abs(float(signed_delta or 0.0)))
+        risk = max(0.0, premium - stop)
+        reward = max(0.0, target - premium)
+        measured_rr = reward / risk if risk > 0 and reward > 0 else 0.0
+        min_rr = max(
+            1.5,
+            float(getattr(get_settings(), "entry_policy_min_rr", 1.5) or 1.5),
+        )
+        rr = max(min_rr, measured_rr, float(rr_hint or 0.0))
+        cap_pct = self._entry_policy_underlying_stop_cap_pct(instrument, regime)
+        max_underlying_risk = max(0.0, float(spot or 0.0)) * (cap_pct / 100.0)
+        max_premium_risk = max_underlying_risk * delta
+        if premium <= 0 or risk <= 0 or max_premium_risk <= 0:
+            return stop, target, 0.0, 0.0
+        capped_risk = min(risk, max_premium_risk)
+        capped_stop = max(0.05, premium - capped_risk)
+        capped_target = premium + (capped_risk * rr)
+        return (
+            capped_stop,
+            capped_target,
+            capped_risk / delta,
+            (capped_risk * rr) / delta,
+        )
+
+    def _entry_policy_clock(self, holder, phase: str) -> datetime:
+        if str(getattr(self, "mode", "") or "").upper() == "HISTORICAL":
+            value = getattr(holder, "signal_timestamp", None) or getattr(holder, "entry_time", None)
+            if isinstance(value, datetime):
+                return (
+                    value.astimezone(IST).replace(tzinfo=None)
+                    if value.tzinfo is not None
+                    else value
+                )
+        return datetime.now(IST).replace(tzinfo=None)
+
+    @staticmethod
+    def _entry_policy_float(value: Any, default: float = 0.0) -> float:
+        """Finite numeric coercion for the fail-closed policy integration seam."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return number if math.isfinite(number) else float(default)
+
+    @staticmethod
+    def _directional_underlying_tuple_valid(
+        direction: str,
+        entry: float,
+        stop: float,
+        target: float,
+    ) -> bool:
+        try:
+            values = (float(entry), float(stop), float(target))
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            return False
+        if str(direction or "").upper() == "SHORT":
+            return target < entry < stop
+        return stop < entry < target
+
+    def _entry_policy_live_index_quote(
+        self,
+        instrument: str,
+        checked_at: datetime,
+    ) -> Tuple[float, str, str]:
+        """Return a fresh, sourced index quote and its actual observation clock.
+
+        CandleBuilder's latest-price map intentionally serves charts and historically
+        carried no receipt timestamp.  Reading it and stamping ``checked_at`` made a
+        dead feed look newly observed on every policy call.  The market-data snapshot
+        retains broker/feed source plus effective quote age, so REAL entry decisions
+        use that evidence exclusively.
+        """
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            try:
+                price = self._entry_policy_float(
+                    self.candles.get_latest_price(instrument) or 0.0
+                )
+            except Exception:
+                price = 0.0
+            return (
+                price,
+                checked_at.isoformat() if price > 0 else "",
+                "historical_replay_clock" if price > 0 else "",
+            )
+
+        reader = getattr(
+            getattr(self, "data", None),
+            "get_cached_index_quote_snapshot",
+            None,
+        )
+        if not callable(reader):
+            return 0.0, "", ""
+        try:
+            quote = reader(instrument)
+        except Exception:
+            return 0.0, "", ""
+        if not isinstance(quote, dict):
+            return 0.0, "", ""
+        price = self._entry_policy_float(
+            quote.get("spot_price") or quote.get("ltp") or 0.0
+        )
+        age = self._entry_policy_float(quote.get("quote_age_seconds"), -1.0)
+        source = str(
+            quote.get("selected_price_source")
+            or quote.get("quote_source")
+            or quote.get("source")
+            or ""
+        ).strip()
+        source_lower = source.lower()
+        source_ok = bool(
+            source
+            and source_lower not in {"unavailable", "unknown", "previous_close"}
+            and not source_lower.startswith("yahoo")
+            and not source_lower.endswith("_stale")
+            and str(quote.get("source_role") or "").lower() != "delayed"
+        )
+        if not (
+            price > 0
+            and bool(quote.get("is_fresh", quote.get("quote_fresh", False)))
+            and math.isfinite(age)
+            and age >= 0
+            and source_ok
+        ):
+            return 0.0, "", ""
+        observed_at = checked_at - timedelta(seconds=age)
+        return price, observed_at.isoformat(), source
+
+    def _entry_execution_geometry(
+        self,
+        holder,
+        execution_levels: Tuple[float, float, float],
+        *,
+        phase: str,
+        observed_at: datetime,
+    ) -> ExecutionGeometry:
+        """Build and stamp the two price spaces without ever cross-filling units."""
+        instrument = str(getattr(holder, "instrument", "") or "").split()[0].upper()
+        direction = str(getattr(holder, "direction", "") or "").upper()
+        inst_type = str(getattr(holder, "inst_type", "FUT") or "FUT").upper()
+        try:
+            contract_entry, contract_stop, contract_target = (
+                float(execution_levels[0]),
+                float(execution_levels[1]),
+                float(execution_levels[2]),
+            )
+        except (TypeError, ValueError, IndexError):
+            contract_entry = contract_stop = contract_target = 0.0
+
+        underlying_entry = self._entry_policy_float(
+            getattr(holder, "underlying_entry", 0.0)
+            or getattr(holder, "entry_spot", 0.0)
+            or 0.0
+        )
+        underlying_stop = self._entry_policy_float(
+            getattr(holder, "underlying_stop", 0.0)
+            or getattr(holder, "spot_stop", 0.0)
+            or 0.0
+        )
+        underlying_target = self._entry_policy_float(
+            getattr(holder, "underlying_target", 0.0)
+            or getattr(holder, "spot_target", 0.0)
+            or 0.0
+        )
+
+        # A fresh candidate may have moved between signal construction and executable
+        # repricing. Rebase its already-approved UNDERLYING distances onto the current
+        # spot; never derive an option's underlying risk from its premium at this seam.
+        is_candidate = isinstance(holder, TradeCandidate)
+        tuple_valid = self._directional_underlying_tuple_valid(
+            direction, underlying_entry, underlying_stop, underlying_target
+        )
+        current_spot = 0.0
+        current_spot_observed_at = ""
+        current_spot_source = ""
+        if is_candidate or phase in {
+            "broker_queue",
+            "stale_entry_replacement_pre_submit",
+            "actual_broker_fill",
+            "scale_in_pre_submit",
+            "scale_in_actual_fill",
+        }:
+            (
+                current_spot,
+                current_spot_observed_at,
+                current_spot_source,
+            ) = self._entry_policy_live_index_quote(instrument, observed_at)
+
+        scale_phase = phase in {"scale_in_pre_submit", "scale_in_actual_fill"}
+        if scale_phase and tuple_valid and current_spot > 0:
+            prior_qty = max(0, int(getattr(holder, "_entry_policy_prior_quantity", 0) or 0))
+            add_qty = max(0, int(getattr(holder, "_entry_policy_add_quantity", 0) or 0))
+            if prior_qty > 0 and add_qty > 0:
+                underlying_entry = (
+                    underlying_entry * prior_qty + current_spot * add_qty
+                ) / (prior_qty + add_qty)
+                tuple_valid = self._directional_underlying_tuple_valid(
+                    direction, underlying_entry, underlying_stop, underlying_target
+                )
+        elif current_spot > 0 and tuple_valid:
+            if inst_type == "FUT":
+                # Futures and spot can differ by basis. Preserve the measured CONTRACT
+                # distances around the current index level so the stop cap reflects the
+                # actual submitted/fill geometry without writing a futures price into a
+                # spot alias.
+                risk = abs(contract_entry - contract_stop)
+                reward = abs(contract_target - contract_entry)
+            else:
+                risk = abs(underlying_entry - underlying_stop)
+                reward = abs(underlying_target - underlying_entry)
+            underlying_entry = current_spot
+            if direction == "SHORT":
+                underlying_stop = current_spot + risk
+                underlying_target = current_spot - reward
+            else:
+                underlying_stop = current_spot - risk
+                underlying_target = current_spot + reward
+            tuple_valid = self._directional_underlying_tuple_valid(
+                direction, underlying_entry, underlying_stop, underlying_target
+            )
+
+        source = str(getattr(holder, "geometry_source", "") or "").split("|")[0]
+        schema = str(getattr(holder, "geometry_schema", GEOMETRY_SCHEMA) or "")
+        requires_real_refresh = bool(
+            str(getattr(self, "mode", "") or "").upper() == "REAL"
+            and (
+                is_candidate
+                or phase
+                in {
+                    "broker_queue",
+                    "stale_entry_replacement_pre_submit",
+                    "actual_broker_fill",
+                    "scale_in_pre_submit",
+                    "scale_in_actual_fill",
+                }
+            )
+        )
+        verified = bool(
+            getattr(holder, "geometry_verified", False)
+            and tuple_valid
+            and source
+            and schema == GEOMETRY_SCHEMA
+            and (not requires_real_refresh or current_spot > 0)
+        )
+        prior_observed_at = str(getattr(holder, "geometry_observed_at", "") or "")
+        refreshed_geometry = bool(current_spot > 0)
+        geometry_observed_at = (
+            current_spot_observed_at if refreshed_geometry else prior_observed_at
+        )
+        geometry_source = (
+            f"{source}|{phase}|underlying:{current_spot_source}"
+            if source and refreshed_geometry and current_spot_source
+            else f"{source}|{phase}"
+            if source
+            else ""
+        )
+        premium_entry = contract_entry if inst_type == "OPT" else 0.0
+        premium_stop = contract_stop if inst_type == "OPT" else 0.0
+        premium_target = contract_target if inst_type == "OPT" else 0.0
+        try:
+            conversion_ratio = abs(
+                float(
+                    getattr(
+                        holder,
+                        "multiplier",
+                        getattr(holder, "instrument_multiplier", 1.0),
+                    )
+                    or 0.0
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            conversion_ratio = 0.0
+        if inst_type == "FUT" and conversion_ratio <= 0:
+            conversion_ratio = 1.0
+        geometry = ExecutionGeometry(
+            instrument=instrument,
+            direction=direction,
+            inst_type=inst_type,
+            underlying_entry=underlying_entry,
+            underlying_stop=underlying_stop,
+            underlying_target=underlying_target,
+            premium_entry=premium_entry,
+            premium_stop=premium_stop,
+            premium_target=premium_target,
+            contract_entry=contract_entry,
+            contract_stop=contract_stop,
+            contract_target=contract_target,
+            observed_at=geometry_observed_at,
+            source=geometry_source,
+            verified=verified,
+            schema=schema,
+            conversion_ratio=conversion_ratio,
+        )
+        return geometry
+
+    def _expected_move_forecast_for_entry(
+        self,
+        holder,
+        *,
+        checked_at: datetime,
+        floor_pct: float,
+    ) -> ExpectedMoveForecast:
+        settings = get_settings()
+        instrument = str(getattr(holder, "instrument", "") or "").split()[0].upper()
+        timeframe = str(getattr(holder, "timeframe", "5min") or "5min").lower()
+        direction = str(getattr(holder, "direction", "") or "").upper()
+        horizons = getattr(settings, "entry_policy_forecast_horizon_minutes_by_timeframe", {})
+        horizon = (horizons or {}).get(timeframe, 0) if isinstance(horizons, dict) else 0
+        try:
+            candle_df = self.candles.get_candles(instrument, timeframe)
+        except Exception:
+            candle_df = None
+        real_mode = str(getattr(self, "mode", "") or "").upper() == "REAL"
+        if real_mode:
+            # A live quote proves only quote freshness.  The MFE model consumes OHLC,
+            # so its clock must come from the candle transport itself; if that receipt
+            # clock is unavailable, the final policy fails closed.
+            receipt_getter = getattr(self.candles, "latest_candle_receipt", None)
+            data_observed_at = (
+                receipt_getter(instrument, timeframe)
+                if callable(receipt_getter)
+                else None
+            )
+            # If the newest row itself came from Kite historical REST, that source's
+            # independent health must also be fresh.  A live quote/websocket cannot
+            # vouch for a failed candle REST request.
+            latest_source = ""
+            try:
+                if candle_df is not None and not candle_df.empty:
+                    latest_source = str(candle_df.iloc[-1].get("source", "") or "").lower()
+            except Exception:
+                latest_source = ""
+            if latest_source.startswith("kite_history"):
+                historical = getattr(getattr(self, "data", None), "kite", None)
+                status_fn = getattr(historical, "historical_rest_status", None)
+                try:
+                    history_status = status_fn() if callable(status_fn) else {}
+                except Exception:
+                    history_status = {}
+                if not bool((history_status or {}).get("kite_historical_rest_fresh")):
+                    data_observed_at = None
+        else:
+            data_observed_at = checked_at
+        return build_directional_mfe_forecast(
+            candle_df,
+            instrument=instrument,
+            direction=direction,
+            timeframe=timeframe,
+            horizon_minutes=horizon,
+            floor_pct=floor_pct,
+            as_of=checked_at,
+            data_observed_at=data_observed_at,
+            quantile=getattr(settings, "entry_policy_forecast_quantile", 0.25),
+            min_samples=getattr(settings, "entry_policy_forecast_min_samples", 30),
+            max_samples=getattr(settings, "entry_policy_forecast_max_samples", 480),
+            max_source_age_seconds=getattr(
+                settings, "entry_policy_forecast_max_age_seconds", 90.0
+            ),
+            require_observation_clock=real_mode,
+        )
+
+    @staticmethod
+    def _stamp_expected_move_evidence(holder, forecast: ExpectedMoveForecast) -> None:
+        values = {
+            "expected_move_pct": forecast.expected_favorable_move_pct,
+            "expected_move_floor_pct": forecast.floor_pct,
+            "expected_move_uncertainty_pct": forecast.uncertainty_pct,
+            "expected_move_probability": forecast.probability_meeting_floor,
+            "expected_move_sample_count": forecast.sample_count,
+            "expected_move_horizon_minutes": forecast.horizon_minutes,
+            "expected_move_generated_at": forecast.generated_at,
+            "expected_move_data_as_of": forecast.data_as_of,
+            "expected_move_model_version": forecast.model_version,
+            "expected_move_source": forecast.source,
+        }
+        for name, value in values.items():
+            try:
+                setattr(holder, name, value)
+            except Exception:
+                pass
+        try:
+            setattr(holder, "expected_move_forecast", forecast.to_dict())
+        except Exception:
+            pass
+
+    @staticmethod
+    def _stamp_entry_policy_evidence(
+        holder,
+        geometry: ExecutionGeometry,
+        forecast: ExpectedMoveForecast,
+        verdict: EntryPolicyVerdict,
+    ) -> None:
+        values = {
+            "underlying_entry": geometry.underlying_entry,
+            "underlying_stop": geometry.underlying_stop,
+            "underlying_target": geometry.underlying_target,
+            "entry_spot": geometry.underlying_entry,
+            "spot_stop": geometry.underlying_stop,
+            "spot_target": geometry.underlying_target,
+            "premium_entry": geometry.premium_entry,
+            "premium_stop": geometry.premium_stop,
+            "premium_target": geometry.premium_target,
+            "geometry_observed_at": geometry.observed_at,
+            "geometry_source": geometry.source,
+            "geometry_verified": geometry.verified,
+            "geometry_schema": geometry.schema,
+            "geometry_conversion_ratio": geometry.conversion_ratio,
+            "entry_policy_allowed": verdict.allowed,
+            "entry_policy_phase": verdict.phase,
+            "entry_policy_checked_at": verdict.checked_at,
+            "entry_policy_reason": verdict.reason,
+            "entry_policy_actual_rr": verdict.actual_rr,
+            "entry_policy_underlying_stop_pct": verdict.underlying_stop_pct,
+            "entry_policy_version": verdict.policy_version,
+        }
+        for name, value in values.items():
+            try:
+                setattr(holder, name, value)
+            except Exception:
+                pass
+        Scanner._stamp_expected_move_evidence(holder, forecast)
+        try:
+            setattr(holder, "entry_policy_verdict", verdict.to_dict())
+        except Exception:
+            pass
+
+    def _final_entry_policy_verdict(
+        self,
+        holder,
+        *,
+        execution_levels: Optional[Tuple[float, float, float]] = None,
+        phase: str,
+        fresh_exposure: bool = True,
+    ) -> EntryPolicyVerdict:
+        settings = get_settings()
+        checked_at = self._entry_policy_clock(holder, phase)
+        policy_enabled = self._setting_enabled(
+            getattr(settings, "entry_policy_enabled", True), True
+        )
+        # The switch remains useful for historical A/B research, but a REAL broker
+        # session may not turn off the final invariant.  Treating a dashboard/config
+        # toggle as authority to bypass the one last exposure check would make the
+        # policy neither immutable nor fail-closed.
+        if not policy_enabled and str(getattr(self, "mode", "REAL") or "REAL").upper() == "HISTORICAL":
+            verdict = EntryPolicyVerdict(
+                allowed=True,
+                phase=phase,
+                checked_at=checked_at.isoformat(),
+                actual_rr=0.0,
+                underlying_stop_pct=0.0,
+                expected_move_pct=0.0,
+                expected_move_floor_pct=0.0,
+                min_rr=float(getattr(settings, "entry_policy_min_rr", 1.5) or 1.5),
+                max_underlying_stop_pct=0.0,
+                reasons=("entry policy disabled",),
+                checks=(("enabled", False),),
+                lane=str(getattr(holder, "source_lane", "") or ""),
+            )
+            return verdict
+
+        if execution_levels is None:
+            override = getattr(holder, "_entry_policy_execution_levels", None)
+            if isinstance(override, (tuple, list)) and len(override) >= 3:
+                execution_levels = tuple(
+                    self._entry_policy_float(value) for value in override[:3]
+                )
+            else:
+                execution_levels = (
+                    self._entry_policy_float(
+                        getattr(holder, "entry_price", getattr(holder, "price", 0.0))
+                        or 0.0
+                    ),
+                    self._entry_policy_float(
+                        getattr(holder, "current_stop", getattr(holder, "stop", 0.0))
+                        or 0.0
+                    ),
+                    self._entry_policy_float(getattr(holder, "target", 0.0) or 0.0),
+                )
+        geometry = self._entry_execution_geometry(
+            holder,
+            execution_levels,
+            phase=phase,
+            observed_at=checked_at,
+        )
+        floors = self._entry_policy_number_map(
+            getattr(settings, "entry_policy_expected_move_floor_pct_by_index", {})
+        )
+        stop_caps = self._entry_policy_number_map(
+            getattr(settings, "entry_policy_underlying_stop_max_pct_by_index", {})
+        )
+        floor_pct = effective_expected_move_floor_pct(
+            geometry.instrument, floors.get(geometry.instrument, 0.0)
+        )
+        configured_stop_cap = effective_underlying_stop_cap_pct(
+            geometry.instrument, stop_caps.get(geometry.instrument, 0.0)
+        )
+        regime = str(getattr(holder, "market_regime", "") or "UNKNOWN")
+        stop_cap = futures_stop_tolerance_pct(configured_stop_cap, regime)
+        forecast = self._expected_move_forecast_for_entry(
+            holder,
+            checked_at=checked_at,
+            floor_pct=floor_pct,
+        )
+        verdict = evaluate_final_entry_policy(
+            geometry,
+            forecast,
+            min_rr=getattr(settings, "entry_policy_min_rr", 1.5),
+            expected_move_floor_pct=floor_pct,
+            max_underlying_stop_pct=stop_cap,
+            max_forecast_age_seconds=getattr(
+                settings, "entry_policy_forecast_max_age_seconds", 90.0
+            ),
+            max_geometry_age_seconds=getattr(
+                settings, "entry_policy_geometry_max_age_seconds", 10.0
+            ),
+            checked_at=checked_at,
+            phase=phase,
+            lane=str(getattr(holder, "source_lane", "") or ""),
+            # Re-resolve operator-active permission at the final boundary.  A cached
+            # candidate or queued retry must not regain an index removed after it was
+            # created; recovery is already exempted inside the policy evaluator.
+            supported_instruments=self._fresh_entry_universe(),
+            fresh_exposure=fresh_exposure,
+        )
+        if phase == "scale_in_pre_submit":
+            # This is a hypothetical combined position. If the order is rejected or
+            # never fills, overwriting the parent trade's canonical geometry would make
+            # every subsequent P&L/risk calculation describe exposure that never existed.
+            setattr(holder, "projected_entry_policy_verdict", verdict.to_dict())
+            setattr(holder, "projected_expected_move_forecast", forecast.to_dict())
+        else:
+            self._stamp_entry_policy_evidence(holder, geometry, forecast, verdict)
+        return verdict
+
+    def _fresh_entry_universe(self) -> Tuple[str, ...]:
+        """Return the current operator-active universe for fresh exposure.
+
+        ``SUPPORTED_ENTRY_INSTRUMENTS`` is a capability whitelist, not permission to
+        trade every index.  An explicitly empty active list means no fresh entries;
+        only a missing attribute on a lightweight test double uses the static default.
+        """
+        configured = getattr(self, "active_indices", None)
+        if configured is None:
+            return tuple(SUPPORTED_ENTRY_INSTRUMENTS)
+        active = {
+            str(value or "").split()[0].upper()
+            for value in list(configured or [])
+            if str(value or "").strip()
+        }
+        return tuple(
+            instrument
+            for instrument in SUPPORTED_ENTRY_INSTRUMENTS
+            if instrument in active
+        )
+
+    def _entry_policy_allows(
+        self,
+        holder,
+        *,
+        execution_levels: Optional[Tuple[float, float, float]] = None,
+        phase: str,
+    ) -> Tuple[bool, str]:
+        phase_name = str(phase or "entry")
+        recovery_row = bool(
+            getattr(holder, "is_recovery", False)
+            or getattr(holder, "_entry_submission_guard_bypass", False)
+        )
+        # Recovery of an already-held broker position is bookkeeping, not a fresh
+        # entry. A later scale-in on that recovered row *is* fresh exposure and must
+        # not inherit the exemption.
+        fresh_exposure = bool(
+            not recovery_row or phase_name.startswith("scale_in_")
+        )
+        verdict = self._final_entry_policy_verdict(
+            holder,
+            execution_levels=execution_levels,
+            phase=phase_name,
+            fresh_exposure=fresh_exposure,
+        )
+        if verdict.allowed:
+            return True, ""
+        reason = verdict.reason or "final entry policy rejected the execution"
+        try:
+            self.log_signal_decision_once(
+                f"{getattr(holder, 'instrument', '')}|{getattr(holder, 'timeframe', '')}|"
+                f"{getattr(holder, 'direction', '')}|entry-policy|{phase}|{reason}",
+                f"Entry blocked by immutable final policy ({phase}): {reason}",
+                "trade",
+            )
+        except Exception:
+            pass
+        return False, reason
 
     @staticmethod
     def _looks_like_synthetic_option_entry(candidate: TradeCandidate) -> bool:
@@ -9800,6 +11895,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         candidate.current_price = premium
         candidate.stop = premium - risk
         candidate.target = premium + (risk * rr)
+        candidate.premium_entry = premium
+        candidate.premium_stop = candidate.stop
+        candidate.premium_target = candidate.target
+        candidate.geometry_observed_at = datetime.now(IST).isoformat()
+        if not str(getattr(candidate, "geometry_source", "") or ""):
+            candidate.geometry_source = "verified_quote_repair"
         candidate.pnl = self._candidate_net_pnl(candidate, premium)
         setattr(candidate, "initial_stop", candidate.stop)
         setattr(candidate, "peak_pnl", 0.0)
@@ -10114,9 +12215,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     def _market_breadth_context(self, as_of=None) -> Dict[str, Any]:
         try:
-            active = list(getattr(self, "active_indices", []) or [])
-            if not active:
-                active = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+            configured_active = getattr(self, "active_indices", None)
+            active = (
+                list(configured_active)
+                if configured_active is not None
+                else ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+            )
             regimes = getattr(self, "latest_regimes", {}) or {}
             # Timestamps within the last bar are "now" (live cache is the truth);
             # anything older is a replay grade and must use at-timestamp regimes.
@@ -11189,6 +13293,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # begins partway through — a truncated path reads as a position that never
             # visited levels it did visit, which is worse than no path at all.
             "pnl_path": [[float(t), float(p)] for t, p in (getattr(candidate, "pnl_path", None) or [])],
+            # Market-side twin of pnl_path. Rows are transitions, not ticks: a snapshot
+            # is only kept when it differs from the one before it.
+            "intel_path": [
+                [float(t), dict(snap)]
+                for t, snap in (getattr(candidate, "intel_path", None) or [])
+                if isinstance(snap, dict)
+            ],
             "runner_mode": bool(getattr(candidate, "runner_mode", False)),
             "runner_activation_timestamp": (
                 getattr(candidate, "runner_activation_timestamp").isoformat()
@@ -11208,6 +13319,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ),
             "initial_stop": float(getattr(candidate, "initial_stop", getattr(candidate, "stop", 0.0)) or 0.0),
             "entry_spot": float(getattr(candidate, "entry_spot", 0.0) or 0.0),
+            "spot_stop": float(getattr(candidate, "spot_stop", 0.0) or 0.0),
+            "spot_target": float(getattr(candidate, "spot_target", 0.0) or 0.0),
+            "underlying_entry": float(getattr(candidate, "underlying_entry", 0.0) or 0.0),
+            "underlying_stop": float(getattr(candidate, "underlying_stop", 0.0) or 0.0),
+            "underlying_target": float(getattr(candidate, "underlying_target", 0.0) or 0.0),
+            "premium_entry": float(getattr(candidate, "premium_entry", 0.0) or 0.0),
+            "premium_stop": float(getattr(candidate, "premium_stop", 0.0) or 0.0),
+            "premium_target": float(getattr(candidate, "premium_target", 0.0) or 0.0),
+            "geometry_observed_at": str(getattr(candidate, "geometry_observed_at", "") or ""),
+            "geometry_source": str(getattr(candidate, "geometry_source", "") or ""),
+            "geometry_verified": bool(getattr(candidate, "geometry_verified", False)),
+            "geometry_schema": str(getattr(candidate, "geometry_schema", "dual_price_geometry.v1") or "dual_price_geometry.v1"),
+            "geometry_conversion_ratio": self._entry_policy_float(
+                getattr(
+                    candidate,
+                    "geometry_conversion_ratio",
+                    getattr(candidate, "multiplier", 0.0),
+                )
+                or 0.0,
+            ),
+            "expected_move_forecast": dict(getattr(candidate, "expected_move_forecast", {}) or {}),
+            "entry_policy_verdict": dict(getattr(candidate, "entry_policy_verdict", {}) or {}),
             "scalp_lock_mode": bool(getattr(candidate, "scalp_lock_mode", False)),
             "location_risk": str(getattr(candidate, "location_risk", "") or ""),
             "location_position_pct": float(getattr(candidate, "location_position_pct", 0.0) or 0.0),
@@ -11495,8 +13628,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # The lookback straddles a volume-unit change (Fyers cash shares vs
                 # near-month futures contracts, ~1000x apart). A ratio across that
                 # boundary is ~100x with no change in participation whatsoever, and
-                # it clears every surge gate — including the 2.5x that is the only
-                # route a 1min signal has into a live entry. The per-candle rebase
+                # it clears every configured surge gate regardless of the active
+                # per-index floor. The per-candle rebase
                 # cannot see this: it only protects the delta INSIDE one bar.
                 return False
             prior_vol = Scanner._surge_prior_mean(prior)
@@ -11531,6 +13664,204 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.debug(f"Power-move detection failed for {instrument} {timeframe}: {exc}")
             return False
 
+    @staticmethod
+    def _one_min_timestamp(value) -> Optional[datetime]:
+        """Normalise a candle/provider clock to IST-naive for age comparisons."""
+        if value is None or str(value).strip().lower() in {"", "nan", "nat", "none"}:
+            return None
+        try:
+            stamp = pd.Timestamp(value)
+            if pd.isna(stamp):
+                return None
+            if stamp.tzinfo is not None:
+                stamp = stamp.tz_convert("Asia/Kolkata").tz_localize(None)
+            return stamp.to_pydatetime()
+        except Exception:
+            return None
+
+    def _one_min_entry_freshness(self, instrument: str, df) -> Dict[str, Any]:
+        """Freshness/provenance of the exact 1m bar used by a fast entry.
+
+        A REST download receipt is not a market observation.  The live receipt clock
+        comes from CandleBuilder tick mutations, while row metadata records when the
+        provider observed the bar.  Both have to be current for a REAL 1m entry.
+        """
+        settings = get_settings()
+        evaluation = datetime.now(IST).replace(tzinfo=None)
+        result: Dict[str, Any] = {
+            "instrument": str(instrument or "").upper(),
+            "fresh": False,
+            "reason": "NO_CANDLE_FRAME",
+            "latest_bar_at": None,
+            "bar_age_seconds": None,
+            "receipt_at": None,
+            "receipt_age_seconds": None,
+            "provider_at": None,
+            "provider_age_seconds": None,
+            "provider_lag_seconds": None,
+            "backfill_age_seconds": None,
+            "source": "",
+            "tick_count_available": False,
+            "tick_count": 0,
+            "volume_available": False,
+            "checked_at": evaluation.isoformat(),
+        }
+        if df is None or getattr(df, "empty", True):
+            return result
+
+        row = df.iloc[-1]
+        latest = self._one_min_timestamp(df.index[-1])
+        result["latest_bar_at"] = latest.isoformat() if latest is not None else None
+        if latest is None:
+            result["reason"] = "INVALID_BAR_TIMESTAMP"
+            return result
+        bar_age = (evaluation - latest).total_seconds()
+        result["bar_age_seconds"] = round(bar_age, 3)
+
+        receipt_getter = getattr(self.candles, "latest_candle_receipt", None)
+        receipt = self._one_min_timestamp(
+            receipt_getter(instrument, "1min") if callable(receipt_getter) else None
+        )
+        result["receipt_at"] = receipt.isoformat() if receipt is not None else None
+        if receipt is not None:
+            result["receipt_age_seconds"] = round(
+                (evaluation - receipt).total_seconds(), 3
+            )
+
+        source = str(
+            row.get("source", row.get("data_source", row.get("candle_source", "")))
+            or ""
+        )
+        result["source"] = source
+        provider = self._one_min_timestamp(
+            row.get(
+                "provider_time",
+                row.get("provider_timestamp", row.get("provider_at", row.get("exchange_at"))),
+            )
+        )
+        result["provider_at"] = provider.isoformat() if provider is not None else None
+        if provider is not None:
+            result["provider_age_seconds"] = round(
+                (evaluation - provider).total_seconds(), 3
+            )
+        row_receipt = self._one_min_timestamp(
+            row.get("received_at", row.get("receipt_at"))
+        ) or receipt
+        if provider is not None and row_receipt is not None:
+            result["provider_lag_seconds"] = round(
+                (row_receipt - provider).total_seconds(), 3
+            )
+
+        try:
+            tick_count = int(float(row.get("tick_count", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            tick_count = 0
+        result["tick_count"] = tick_count
+        result["tick_count_available"] = bool(
+            "tick_count" in getattr(df, "columns", []) and tick_count > 0
+        )
+        try:
+            result["volume_available"] = float(row.get("volume", 0.0) or 0.0) > 0
+        except (TypeError, ValueError):
+            result["volume_available"] = False
+
+        if "history" in source.lower() or "backfill" in source.lower():
+            result["backfill_age_seconds"] = round(max(0.0, bar_age), 3)
+
+        max_bar_age = float(
+            getattr(settings, "one_min_entry_max_bar_age_seconds", 90.0) or 90.0
+        )
+        max_receipt_age = float(
+            getattr(settings, "one_min_entry_max_receipt_age_seconds", 30.0) or 30.0
+        )
+        max_provider_lag = float(
+            getattr(settings, "one_min_entry_max_provider_lag_seconds", 90.0) or 90.0
+        )
+        if any(
+            not math.isfinite(limit) or limit < 0.0
+            for limit in (max_bar_age, max_receipt_age, max_provider_lag)
+        ):
+            result["reason"] = "INVALID_FRESHNESS_LIMIT"
+            return result
+        if bar_age < -1.0 or bar_age > max_bar_age:
+            result["reason"] = (
+                "STALE_BACKFILL"
+                if result["backfill_age_seconds"] is not None
+                else "STALE_LATEST_BAR"
+            )
+            return result
+        if not source:
+            result["reason"] = "CANDLE_SOURCE_UNAVAILABLE"
+            return result
+        if provider is None:
+            result["reason"] = "PROVIDER_TIMESTAMP_UNAVAILABLE"
+            return result
+        provider_age = float(result["provider_age_seconds"] or 0.0)
+        if provider_age < -1.0:
+            result["reason"] = "FUTURE_PROVIDER_TIMESTAMP"
+            return result
+        if receipt is None:
+            result["reason"] = "LIVE_CANDLE_RECEIPT_UNAVAILABLE"
+            return result
+        receipt_age = float(result["receipt_age_seconds"] or 0.0)
+        if receipt_age < -1.0 or receipt_age > max_receipt_age:
+            result["reason"] = "STALE_CANDLE_RECEIPT"
+            return result
+        provider_lag = result.get("provider_lag_seconds")
+        if provider_lag is None:
+            result["reason"] = "PROVIDER_RECEIPT_LAG_UNAVAILABLE"
+            return result
+        if float(provider_lag) < -1.0:
+            result["reason"] = "FUTURE_PROVIDER_TIMESTAMP"
+            return result
+        if float(provider_lag) > max_provider_lag:
+            result["reason"] = "STALE_PROVIDER_BAR"
+            return result
+        result["fresh"] = True
+        result["reason"] = "FRESH_LIVE_1MIN"
+        return result
+
+    def _record_one_min_thrust_state(
+        self,
+        instrument: str,
+        status: Optional[Dict[str, Any]],
+        reason: str = "",
+    ) -> None:
+        payload = dict(status or {})
+        payload["instrument"] = str(instrument or "").upper()
+        if reason:
+            payload["fresh"] = False
+            payload["reason"] = str(reason)
+        self._diagnostics.setdefault("one_min_freshness", {})[
+            payload["instrument"]
+        ] = payload
+        if payload.get("fresh"):
+            return
+        marker = (
+            payload.get("latest_bar_at"),
+            payload.get("reason"),
+            payload.get("tick_count"),
+        )
+        markers = getattr(self, "_one_min_freshness_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self._one_min_freshness_log_markers = markers
+        if markers.get(payload["instrument"]) == marker:
+            return
+        markers[payload["instrument"]] = marker
+        logger.info(
+            "1MIN ENTRY ABSTAIN {}: {} (bar_age={}, receipt_age={}, "
+            "provider_lag={}, ticks={}, volume={}, source={})",
+            payload["instrument"],
+            payload.get("reason"),
+            payload.get("bar_age_seconds"),
+            payload.get("receipt_age_seconds"),
+            payload.get("provider_lag_seconds"),
+            payload.get("tick_count"),
+            payload.get("volume_available"),
+            payload.get("source") or "unknown",
+        )
+
     def _candle_thrust_metrics(
         self,
         instrument: str,
@@ -11546,16 +13877,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         is degenerate (zero range), otherwise a dict with ``volume_ratio``,
         ``range_atr_ratio`` and ``close_location``.
         """
+        one_min_status = None
         try:
             df = self.candles.get_candles(instrument, timeframe)
             if df is None or "volume" not in getattr(df, "columns", []):
+                if str(timeframe or "").lower() == "1min":
+                    self._record_one_min_thrust_state(
+                        instrument, self._one_min_entry_freshness(instrument, df),
+                        "NO_CANDLE_FRAME" if df is None else "NO_VOLUME_COLUMN",
+                    )
                 return None
+            if (
+                str(timeframe or "").lower() == "1min"
+                and as_of is None
+                and str(getattr(self, "mode", "") or "").upper() == "REAL"
+            ):
+                one_min_status = self._one_min_entry_freshness(instrument, df)
+                self._record_one_min_thrust_state(instrument, one_min_status)
+                if not one_min_status.get("fresh"):
+                    return None
             if as_of is not None:
                 try:
                     df = df[df.index <= as_of]
                 except Exception:
                     pass
             if len(df) < 6:
+                if one_min_status is not None:
+                    self._record_one_min_thrust_state(
+                        instrument, one_min_status, "INSUFFICIENT_CANDLE_HISTORY"
+                    )
                 return None
             lookback = max(5, int(getattr(get_settings(), "power_move_volume_lookback", 20) or 20))
             recent = df.tail(lookback + 1)
@@ -11566,14 +13916,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             high = float(last["high"]); low = float(last["low"]); close = float(last["close"])
             rng = high - low
             if rng <= 0:
+                if one_min_status is not None:
+                    self._record_one_min_thrust_state(
+                        instrument, one_min_status, "DEGENERATE_SIGNAL_CANDLE"
+                    )
                 return None
             if not Scanner._volume_window_is_homogeneous(recent):
                 # The lookback straddles a volume-unit change (Fyers cash shares vs
                 # near-month futures contracts, ~1000x apart). A ratio across that
                 # boundary is ~100x with no change in participation whatsoever, and
-                # it clears every surge gate — including the 2.5x that is the only
-                # route a 1min signal has into a live entry. The per-candle rebase
+                # it can clear every configured surge gate regardless of the active
+                # per-index floor. The per-candle rebase
                 # cannot see this: it only protects the delta INSIDE one bar.
+                if one_min_status is not None:
+                    self._record_one_min_thrust_state(
+                        instrument, one_min_status, "MIXED_VOLUME_UNITS"
+                    )
                 return None
             prior_vol = Scanner._surge_prior_mean(prior)
             # The NUMERATOR was never guarded. _surge_prior_mean fixed the denominator
@@ -11582,8 +13940,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # edge carries no traded volume at all: measured 13 of the last 20 bars on
             # 1min for every index, versus 1/20 on 5min and 0/20 on 15min. A fresh 1min
             # signal therefore always computed 0 / prior_mean = 0.00x and could never
-            # clear the 2.2x floor that this comment block itself calls "the only route
-            # a 1min signal has into a live entry". That is why no 1min trade has ever
+            # clear the configured traded-volume floor required by the fast-entry
+            # route. That is why no 1min trade has ever
             # appeared, live or in backtest: the fix for the false positive created a
             # permanent false negative.
             #
@@ -11606,14 +13964,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if not Scanner._setting_enabled(
                     getattr(get_settings(), "surge_tick_proxy_enabled", False), False
                 ):
-                    # Ships OFF: a tick threshold cannot be calibrated until a live
-                    # session has been recorded, and guessing one would re-run tonight's
-                    # other finding (a threshold applied to a quantity it was not cut
-                    # for). Until then this abstains, which is honest — and no worse
-                    # than today, where the same bar silently scored 0.00x.
+                    # This setting is normally ON after percentile calibration. If an
+                    # operator disables it, absence of cash-index volume is an explicit
+                    # abstention rather than a fabricated 0.00x participation reading.
+                    if one_min_status is not None:
+                        self._record_one_min_thrust_state(
+                            instrument, one_min_status, "TICK_PROXY_DISABLED"
+                        )
                     return None
                 proxy = Scanner._surge_tick_ratio(recent)
                 if proxy is None:
+                    if one_min_status is not None:
+                        self._record_one_min_thrust_state(
+                            instrument, one_min_status, "INSUFFICIENT_TICK_ACTIVITY"
+                        )
                     return None
                 volume_ratio, surge_pct = proxy
                 volume_basis = "TICK_ACTIVITY"
@@ -11675,14 +14039,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         The PERCENTILE is what the gate judges, not the ratio. A fixed ratio floor is
         basis-dependent: traded volume is heavily tailed (a z-score of 5 still admits
-        4.7% of 1min bars) while tick counts are near-Poisson, so reusing the 2.2x
+        4.7% of 1min bars) while tick counts are near-Poisson, so reusing a traded-volume
         traded floor on ticks would admit almost nothing and leave 1min as dead as it
         was. Percentile rank is uniform for any continuous distribution, so the SAME
         threshold means the same thing on either measurement — "among the busiest N% of
         recent minutes for this instrument, right now".
 
-        Calibrated on the real 1min candles: ratio>=2.2 admits 4.73% of measurable
-        traded-volume bars, and rank>=97 admits 4.98% — the same strictness, expressed
+        Calibrated on the real 1min candles: the sampled traded-ratio rule admitted
+        4.73% of measurable bars, and rank>=97 admitted 4.98% — similar strictness, expressed
         in a form that survives the change of basis.
         """
         try:
@@ -11785,7 +14149,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         active = list(getattr(self, "active_indices", []) or [])
         if not active:
-            active = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+            return None
 
         candidate_base = str(instrument or "").split()[0].upper()
         votes: Dict[str, Dict[str, Any]] = {}
@@ -11958,12 +14322,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             float(getattr(settings, "market_ltp_shock_min_volume_ratio", 1.10) or 1.10),
         )
 
-        active = list(getattr(self, "active_indices", []) or []) or [
-            "NIFTY",
-            "BANKNIFTY",
-            "SENSEX",
-            "MIDCPNIFTY",
-        ]
+        configured_active = getattr(self, "active_indices", None)
+        active = (
+            list(configured_active)
+            if configured_active is not None
+            else ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+        )
         candidate_base = str(instrument or "").split()[0].upper()
         direction = -1.0 if sig_type == "SELL" else 1.0
 
@@ -12116,12 +14480,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             return None
 
-        active = list(getattr(self, "active_indices", []) or []) or [
-            "NIFTY",
-            "BANKNIFTY",
-            "SENSEX",
-            "MIDCPNIFTY",
-        ]
+        configured_active = getattr(self, "active_indices", None)
+        active = (
+            list(configured_active)
+            if configured_active is not None
+            else ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+        )
         candidate_base = str(instrument or "").split()[0].upper()
         min_core_votes = max(1, int(getattr(settings, "one_way_cascade_core_votes", 3) or 3))
         min_total_votes = max(1, int(getattr(settings, "one_way_cascade_total_votes", 3) or 3))
@@ -12418,7 +14782,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         active = list(getattr(self, "active_indices", []) or [])
         if not active:
-            active = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+            return None
         candidate_base = str(instrument or "").split()[0].upper()
         votes: Dict[str, Dict[str, Any]] = {}
         for inst in active:
@@ -12972,9 +15336,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if depth_usable
                 else ", depth n/a"
             )
+            evidence_note = SignalProcessor._volume_spike_metric_text(
+                metrics, settings, str(instrument or ""), timeframe
+            )
             self.log_event(
                 f"⚡ VOLUME-SPIKE entry confirmed: {instrument} {timeframe} {signal_type} "
-                f"(vol {metrics['volume_ratio']:.1f}x, range {metrics['range_atr_ratio']:.1f}x ATR, "
+                f"({evidence_note}, range {metrics['range_atr_ratio']:.1f}x ATR, "
                 f"close {metrics['close_location']:.0%} of range{depth_note}).",
                 "trade",
             )
@@ -13494,42 +15861,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         window = float(getattr(settings, "eod_protect_window_minutes", 30.0) or 30.0)
         mins = self._minutes_to_force_exit(now)
         return 0.0 <= mins <= window
-
-    @staticmethod
-    def _breakeven_peak_gross(trade_like, current_gross_pnl_rs: float) -> float:
-        """Gross high-water mark for the breakeven stop, kept on the trade.
-
-        The live lane fed this rule a GROSS mark against a NET peak: current_pnl_rs is
-        (current_price - entry) * qty, but trade.peak_pnl tracks trade.pnl, which is
-        trade.unrealized_pnl — "Net P&L including estimated charges"
-        (trading/trade_manager.py:6112-6115). On a BANKNIFTY 1x35 at 200 -> 210 that is
-        gross 350.0 against peak_pnl 226.9, so a rule configured to arm at Rs.150 did
-        not arm until roughly Rs.273 gross while still firing on the gross floor of 80.
-
-        GROSS is the right unit for both halves: the floor is 80 and opt_cost is 80, so
-        "gross has fallen back to the round trip" IS the breakeven statement, and every
-        calibration of this rule was replayed over pnl_path, which is gross.
-
-        Mirrors what the session lane already does inline at scanner.py:22267-22269 —
-        take the running max and write it back — rather than adding a persisted column.
-        Not persisted on purpose: it is an intraday high-water mark, and after a restart
-        it re-derives from the next tick exactly as peak_pnl does.
-        """
-        try:
-            current = float(current_gross_pnl_rs or 0.0)
-        except (TypeError, ValueError):
-            current = 0.0
-        try:
-            stored = float(getattr(trade_like, "peak_gross_pnl", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            stored = 0.0
-        # A peak is a high-water mark: it never starts below flat and never falls.
-        peak = max(0.0, stored, current)
-        try:
-            setattr(trade_like, "peak_gross_pnl", peak)
-        except Exception:
-            pass
-        return peak
 
     def _peak_giveback_cap_exit(
         self, trade_like, *, current_pnl_rs: float, peak_pnl_rs: float,
@@ -15615,9 +17946,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Post-entry cross-index correlation read: count active peer indices whose
         live regime opposes / aligns with the trade view. Correlation is not assumed
         — peers with a non-directional (ranging/unknown) regime simply do not vote."""
-        active = list(getattr(self, "active_indices", []) or []) or [
-            "NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"
-        ]
+        configured_active = getattr(self, "active_indices", None)
+        active = (
+            list(configured_active)
+            if configured_active is not None
+            else ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+        )
         regimes = getattr(self, "latest_regimes", {}) or {}
         base = str(base_instrument or "").split()[0].upper()
         aligning_side = "BUY" if str(view or "").upper() == "LONG" else "SELL"
@@ -15967,6 +18301,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "spot_stop",
             "spot_target",
             "entry_spot",
+            "underlying_entry",
+            "underlying_stop",
+            "underlying_target",
+            "premium_entry",
+            "premium_stop",
+            "premium_target",
+            "geometry_observed_at",
+            "geometry_source",
+            "geometry_verified",
+            "geometry_schema",
+            "expected_move_forecast",
+            "entry_policy_verdict",
             "lots",
             "lot_size",
             "rr",
@@ -16327,6 +18673,103 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             f"< severe {severe_threshold:.2f}, closes in {seconds_to_close:.0f}s"
         )
 
+    def _early_exit_candle_freshness(
+        self,
+        instrument: str,
+        timeframe: str,
+        evaluation_time: Optional[datetime],
+    ) -> Dict[str, Any]:
+        """Validate exact-timeframe candle provenance before strategy exits act."""
+        tf = str(timeframe or "").lower()
+        minutes = {"1min": 1, "5min": 5, "15min": 15}.get(tf)
+        result: Dict[str, Any] = {
+            "fresh": False,
+            "timeframe": tf,
+            "latest_bar": None,
+            "receipt_at": None,
+            "age_seconds": None,
+            "reason": "unsupported timeframe",
+        }
+        if minutes is None:
+            return result
+        try:
+            frame = self.candles.get_candles(instrument, tf)
+        except Exception:
+            frame = None
+        if frame is None or getattr(frame, "empty", True):
+            result["reason"] = "candle frame unavailable"
+            return result
+        try:
+            if not isinstance(frame.index, pd.DatetimeIndex):
+                result["reason"] = "candle timestamps unavailable"
+                return result
+            last_bar = frame.index[-1]
+            last_bar = (
+                last_bar.tz_convert(IST).tz_localize(None)
+                if getattr(last_bar, "tzinfo", None) is not None
+                else last_bar.to_pydatetime()
+            )
+            evaluation = self._parse_trade_timestamp(evaluation_time)
+            if evaluation is None:
+                result["reason"] = "evaluation clock unavailable"
+                return result
+            if last_bar > evaluation:
+                result["reason"] = "latest candle is future-dated"
+                return result
+            settings = get_settings()
+            # Keep each operator knob explicit (rather than only composing a
+            # dynamic attribute name) so configuration audits can prove that all
+            # declared freshness controls are live consumers.
+            if tf == "1min":
+                configured_max_age = getattr(
+                    settings, "early_exit_candle_max_age_seconds_1min", 90.0
+                )
+            elif tf == "5min":
+                configured_max_age = getattr(
+                    settings, "early_exit_candle_max_age_seconds_5min", 90.0
+                )
+            else:
+                configured_max_age = getattr(
+                    settings, "early_exit_candle_max_age_seconds_15min", 90.0
+                )
+            alignment_max_age = getattr(
+                settings, "early_exit_timeframe_alignment_seconds", 90.0
+            )
+            max_age = min(float(configured_max_age), float(alignment_max_age))
+            if not math.isfinite(max_age) or max_age < 0:
+                result["reason"] = "invalid candle freshness limit"
+                return result
+            receipt_getter = getattr(self.candles, "latest_candle_receipt", None)
+            receipt = receipt_getter(instrument, tf) if callable(receipt_getter) else None
+            result["latest_bar"] = last_bar.isoformat()
+            result["receipt_at"] = (
+                self._parse_trade_timestamp(receipt).isoformat()
+                if self._parse_trade_timestamp(receipt) is not None
+                else None
+            )
+            if str(getattr(self, "mode", "") or "").upper() == "REAL":
+                receipt_ts = self._parse_trade_timestamp(receipt)
+                if receipt_ts is None:
+                    result["reason"] = "candle receipt clock unavailable"
+                    return result
+                receipt_age = (evaluation - receipt_ts).total_seconds()
+                result["age_seconds"] = receipt_age
+                if receipt_age < -1.0 or receipt_age > max_age:
+                    result["reason"] = f"candle receipt age {receipt_age:.1f}s outside {max_age:.1f}s"
+                    return result
+            if str(getattr(self, "mode", "") or "").upper() == "REAL":
+                bar_end = last_bar + timedelta(minutes=minutes)
+                bar_gap = max(0.0, (evaluation - bar_end).total_seconds())
+                if bar_gap > max_age + 1e-9:
+                    result["reason"] = f"candle bar age {bar_gap:.1f}s outside {max_age:.1f}s"
+                    return result
+            result["fresh"] = True
+            result["reason"] = "fresh exact-timeframe candle"
+            return result
+        except Exception as exc:
+            result["reason"] = f"candle freshness check failed: {exc}"
+            return result
+
     def _profit_guard_reversal_context(
         self,
         trade_like,
@@ -16346,6 +18789,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tf = str(timeframe or getattr(trade_like, "timeframe", "") or "1min").lower()
         if tf not in {"1min", "5min", "15min"}:
             tf = "1min"
+        freshness = self._early_exit_candle_freshness(
+            str(getattr(trade_like, "instrument", "") or "").split()[0].upper(),
+            tf,
+            latest_time,
+        )
+        context["candle_freshness"] = freshness
+        if not freshness.get("fresh"):
+            context["reason"] = str(freshness.get("reason") or "candle frame is stale")
+            return context
         try:
             df = self.candles.get_candles(getattr(trade_like, "instrument", ""), tf)
         except Exception:
@@ -16573,6 +19025,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # that want it as a fraction need the price it was measured against.
                 # Dividing it by an option premium instead is off by roughly 100x.
                 "reference_price": float(closes.iloc[-1]),
+                "candle_freshness": freshness,
             }
         )
         if tf != "1min":
@@ -16631,6 +19084,80 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         f"({one_min_context.get('reason')})"
                     )
         return context
+
+    def _fifteen_min_one_min_support_exit_decision(
+        self,
+        trade,
+        current_spot: float,
+        latest_time: Optional[datetime],
+    ) -> Tuple[bool, str]:
+        """Let 1m detect emergencies while the 15m chart remains the owning frame."""
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "fifteen_min_one_min_support_exit_enabled", True), True
+        ):
+            return False, ""
+        if str(getattr(trade, "timeframe", "") or "").lower() != "15min":
+            return False, ""
+        entry_time = getattr(trade, "entry_time", None) or getattr(
+            trade, "signal_timestamp", None
+        )
+        if not isinstance(entry_time, datetime) or not isinstance(latest_time, datetime):
+            return False, "entry/evaluation clock unavailable"
+        if isinstance(entry_time, datetime) and isinstance(latest_time, datetime):
+            entry_cmp = (
+                entry_time.astimezone(IST).replace(tzinfo=None)
+                if entry_time.tzinfo is not None
+                else entry_time
+            )
+            now_cmp = (
+                latest_time.astimezone(IST).replace(tzinfo=None)
+                if latest_time.tzinfo is not None
+                else latest_time
+            )
+            held = max(0.0, (now_cmp - entry_cmp).total_seconds())
+            configured_hold = getattr(
+                settings, "fifteen_min_one_min_support_min_hold_seconds", 15.0
+            )
+            try:
+                min_hold = max(
+                    0.0,
+                    float(15.0 if configured_hold is None else configured_hold),
+                )
+            except (TypeError, ValueError):
+                min_hold = 15.0
+            if held < min_hold:
+                return False, f"held {held:.1f}s<{min_hold:.1f}s"
+
+        context = self._profit_guard_reversal_context(
+            trade,
+            float(current_spot or 0.0),
+            latest_time,
+            timeframe="15min",
+        )
+        one_min = context.get("one_min_context", {}) if isinstance(context, dict) else {}
+        if not context.get("has_context") or not isinstance(one_min, dict) or not one_min.get("has_context"):
+            return False, "missing own 15m or supporting 1m chart context"
+        # The established classifier promotes only a large 1m body/close move, a severe
+        # rejection wick, a multi-bar adverse grind, or a simultaneous 1m+15m trend
+        # break. Ordinary 1m noise explicitly leaves one_min_emergency false.
+        emergency = bool(context.get("one_min_emergency"))
+        reversal_shape = bool(
+            context.get("fast_reversal")
+            or context.get("pullback_class") == "structure_break"
+        )
+        confirmed = bool(
+            emergency
+            and reversal_shape
+            and not context.get("trend_supportive")
+            and context.get("pullback_class") in {"reversal", "big_reversal", "structure_break"}
+        )
+        if not confirmed:
+            return False, str(context.get("reason") or "1m support did not confirm a 15m reversal")
+        return True, (
+            "15m structure under emergency 1m opposing move; "
+            f"15m={context.get('reason', '')}; 1m={one_min.get('reason', '')}"
+        )
 
     def _intel_age_seconds(
         self,
@@ -18157,6 +20684,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "spot_target",
             "initial_stop",
             "entry_spot",
+            "underlying_entry",
+            "underlying_stop",
+            "underlying_target",
+            "premium_entry",
+            "premium_stop",
+            "premium_target",
+            "geometry_observed_at",
+            "geometry_source",
+            "geometry_verified",
+            "geometry_schema",
+            "expected_move_forecast",
+            "entry_policy_verdict",
             "accepted_by_gate",
         ):
             if hasattr(previous, attr):
@@ -18330,6 +20869,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "impulse_confirmed",
             "is_explosive_bypass",
             "entry_spot",
+            "underlying_entry",
+            "underlying_stop",
+            "underlying_target",
+            "premium_entry",
+            "premium_stop",
+            "premium_target",
+            "geometry_observed_at",
+            "geometry_source",
+            "geometry_verified",
+            "geometry_schema",
+            "expected_move_forecast",
+            "entry_policy_verdict",
             "initial_stop",
             "source_lane",
             "location_risk",
@@ -18344,6 +20895,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # routes, and a shared list would let the recorded path grow after the exit.
         if hasattr(entry_candidate, "pnl_path"):
             setattr(exit_candidate, "pnl_path", list(getattr(entry_candidate, "pnl_path", []) or []))
+        # Its market-side twin, on the same terms and for the same reason. The EXIT row
+        # is the one that gets written down, so a series that is not carried across is a
+        # series that was collected and then discarded at the only moment it mattered.
+        if hasattr(entry_candidate, "intel_path"):
+            setattr(exit_candidate, "intel_path", [
+                (t, dict(snap) if isinstance(snap, dict) else snap)
+                for t, snap in (getattr(entry_candidate, "intel_path", []) or [])
+            ])
         # The intel that produced the ENTRY, carried onto the exit row so the outcome
         # and the conditions that preceded it land in the same record.
         if getattr(entry_candidate, "entry_intel", None):
@@ -18445,8 +21004,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 rr=float(payload.get("rr") or 1.5),
                 score=float(payload.get("score") or 0.0),
                 reasons=reasons,
+                entry_spot=float(payload.get("underlying_entry") or payload.get("entry_spot") or 0.0),
                 spot_stop=float(payload.get("spot_stop") or 0.0),
                 spot_target=float(payload.get("spot_target") or 0.0),
+                underlying_entry=float(payload.get("underlying_entry") or payload.get("entry_spot") or 0.0),
+                underlying_stop=float(payload.get("underlying_stop") or payload.get("spot_stop") or 0.0),
+                underlying_target=float(payload.get("underlying_target") or payload.get("spot_target") or 0.0),
+                premium_entry=float(payload.get("premium_entry") or 0.0),
+                premium_stop=float(payload.get("premium_stop") or 0.0),
+                premium_target=float(payload.get("premium_target") or 0.0),
+                geometry_observed_at=str(payload.get("geometry_observed_at") or ""),
+                geometry_source=str(payload.get("geometry_source") or ""),
+                geometry_verified=bool(payload.get("geometry_verified", False)),
+                geometry_schema=str(payload.get("geometry_schema") or "dual_price_geometry.v1"),
+                expected_move_forecast=dict(payload.get("expected_move_forecast") or {}),
+                entry_policy_verdict=dict(payload.get("entry_policy_verdict") or {}),
                 signal_timestamp=signal_ts,
                 current_price=float(payload.get("current_price") or payload.get("price") or 0.0),
                 pnl=float(payload.get("pnl") or 0.0),
@@ -18473,6 +21045,25 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 for row in (payload.get("pnl_path") or [])
                 if isinstance(row, (list, tuple)) and len(row) >= 2
             ])
+            # Restored for the reason pnl_path is: a restart mid-position would otherwise
+            # leave a series that begins partway through, which reads as a market that
+            # never held conditions it did hold.
+            #
+            # Row by row, and every failure skipped rather than raised. This is a
+            # DIAGNOSTIC series being read on the restart path that rebuilds live
+            # positions -- one unparseable timestamp in the archive must cost that row,
+            # never the position. float("x") raising here would drop the whole candidate.
+            _intel_rows = []
+            for _row in (payload.get("intel_path") or []):
+                try:
+                    if not isinstance(_row, (list, tuple)) or len(_row) < 2:
+                        continue
+                    if not isinstance(_row[1], dict):
+                        continue
+                    _intel_rows.append((float(_row[0]), dict(_row[1])))
+                except (TypeError, ValueError):
+                    continue
+            setattr(candidate, "intel_path", _intel_rows)
             setattr(candidate, "trade_id", str(payload.get("id") or payload.get("trade_id") or ""))
             setattr(candidate, "lifecycle_id", str(payload.get("lifecycle_id") or ""))
             setattr(candidate, "runner_mode", bool(payload.get("runner_mode") or False))
@@ -18504,7 +21095,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._ensure_trade_like_initial_stop(candidate)
             setattr(candidate, "display_stop", float(payload.get("display_stop") or payload.get("stop") or candidate.stop or 0.0))
             setattr(candidate, "display_target", float(payload.get("display_target") or payload.get("target") or candidate.target or 0.0))
-            setattr(candidate, "entry_spot", float(payload.get("entry_spot") or 0.0))
+            setattr(
+                candidate,
+                "entry_spot",
+                float(payload.get("underlying_entry") or payload.get("entry_spot") or 0.0),
+            )
             setattr(candidate, "scalp_lock_mode", bool(payload.get("scalp_lock_mode") or False))
             setattr(candidate, "location_risk", str(payload.get("location_risk") or ""))
             setattr(candidate, "location_position_pct", float(payload.get("location_position_pct") or 0.0))
@@ -19154,6 +21749,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(candidate, "decision_intel", self._entry_intel_snapshot(candidate))
         except Exception as exc:
             logger.debug(f"Decision intel snapshot skipped: {exc}")
+        # Forecast evidence belongs on the whole decision funnel, not only on trades
+        # that survive long enough to reach the final gate. Without rejected outcomes,
+        # calibration sees only winners selected by the current rules and cannot tell
+        # whether the expected-move floor is filtering useful or useless setups.
+        try:
+            action = str(getattr(candidate, "action", "ENTRY") or "ENTRY").upper()
+            if action != "EXIT" and not dict(
+                getattr(candidate, "expected_move_forecast", {}) or {}
+            ):
+                settings = get_settings()
+                floors = self._entry_policy_number_map(
+                    getattr(settings, "entry_policy_expected_move_floor_pct_by_index", {})
+                )
+                instrument = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+                forecast = self._expected_move_forecast_for_entry(
+                    candidate,
+                    checked_at=self._entry_policy_clock(candidate, "decision_telemetry"),
+                    floor_pct=float(floors.get(instrument, 0.0) or 0.0),
+                )
+                self._stamp_expected_move_evidence(candidate, forecast)
+        except Exception as exc:
+            logger.debug(f"Decision expected-move forecast skipped: {exc}")
         record_candidate = candidate
         record_decision = str(decision or "")
         record_extra = dict(extra or {})
@@ -19190,6 +21807,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # canonical terminal identity from the eventual broker fill.
                 logger.debug(f"Advisory EXIT telemetry copy skipped: {exc}")
                 return
+        try:
+            shadow_decision = record_decision or self._rtracker_candidate_decision(
+                record_candidate
+            )
+            self._register_entry_shadow_outcome(record_candidate, shadow_decision)
+        except Exception as exc:
+            # Measurement must never become an entry/rejection failure mode.
+            logger.debug(f"Entry shadow registration skipped: {exc}")
         try:
             tracker.record_candidate(
                 record_candidate,
@@ -19766,6 +22391,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             risk = max(0.5, fut_price * (sl_pct / 100.0))
             stop = fut_price - risk if direction == "LONG" else fut_price + risk
             target = fut_price + (risk * rr) if direction == "LONG" else fut_price - (risk * rr)
+            spot_stop = spot - risk if direction == "LONG" else spot + risk
+            spot_target = spot + (risk * rr) if direction == "LONG" else spot - (risk * rr)
             candidate = TradeCandidate(
                 instrument=instrument,
                 direction=direction,
@@ -19789,6 +22416,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 rr=rr,
                 score=float(getattr(seed, "score", getattr(seed, "confidence", 0.0)) or 0.0),
                 reasons=base_reasons,
+                entry_spot=spot,
+                spot_stop=spot_stop,
+                spot_target=spot_target,
+                underlying_entry=spot,
+                underlying_stop=spot_stop,
+                underlying_target=spot_target,
+                geometry_observed_at=now.isoformat(),
+                geometry_source="missed_reentry.futures",
+                geometry_verified=True,
                 signal_timestamp=now,
                 current_price=fut_price,
                 status="MISSED RE-ENTRY SIGNAL",
@@ -19820,15 +22456,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             sl_pct = max(0.0, float(getattr(settings, "missed_signal_reentry_options_sl_pct", 5.0) or 5.0))
             risk = max(0.5, premium * (sl_pct / 100.0))
             multiplier = 0.5 if option_type == "CE" else -0.5
-            spot_risk = max(1.0, risk / abs(multiplier))
+            premium_stop, premium_target, capped_spot_risk, capped_spot_reward = (
+                self._cap_option_geometry_to_underlying_policy(
+                    instrument=instrument,
+                    regime=str(getattr(seed, "market_regime", "") or "UNKNOWN"),
+                    spot=spot,
+                    premium=premium,
+                    stop=max(0.05, premium - risk),
+                    target=premium + (risk * rr),
+                    signed_delta=multiplier,
+                    rr_hint=rr,
+                )
+            )
+            spot_risk = max(0.0, capped_spot_risk)
+            spot_reward = max(0.0, capped_spot_reward)
             spot_stop = spot - spot_risk if direction == "LONG" else spot + spot_risk
-            spot_target = spot + (spot_risk * rr) if direction == "LONG" else spot - (spot_risk * rr)
+            spot_target = spot + spot_reward if direction == "LONG" else spot - spot_reward
             candidate = TradeCandidate(
                 instrument=instrument,
                 direction=direction,
                 price=premium,
-                stop=max(0.05, premium - risk),
-                target=premium + (risk * rr),
+                stop=premium_stop,
+                target=premium_target,
                 lots=max(1, int((getattr(self, "user_lots", {}) or {}).get(instrument, getattr(seed, "lots", 1) or 1))),
                 lot_size=max(1, int(cfg.get("lot_size", getattr(seed, "lot_size", 1) or 1))),
                 grade=str(getattr(seed, "grade", "B+") or "B+"),
@@ -19843,8 +22492,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 rr=rr,
                 score=float(getattr(seed, "score", getattr(seed, "confidence", 0.0)) or 0.0),
                 reasons=base_reasons,
+                entry_spot=spot,
                 spot_stop=spot_stop,
                 spot_target=spot_target,
+                underlying_entry=spot,
+                underlying_stop=spot_stop,
+                underlying_target=spot_target,
+                premium_entry=premium,
+                premium_stop=premium_stop,
+                premium_target=premium_target,
+                geometry_observed_at=now.isoformat(),
+                geometry_source="missed_reentry.option_delta",
+                geometry_verified=True,
                 signal_timestamp=now,
                 current_price=premium,
                 status="MISSED RE-ENTRY SIGNAL",
@@ -21820,6 +24479,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         unconditional record would write the same refusal hundreds of times per
         session and inflate exactly the counts the report medians over.
         """
+        # Keep the detailed verdict on the candidate as well as in the archive.  The
+        # execution funnel still consumes a bool from this method, but its caller may
+        # need the exact gate reason for the missed-signal seed and candidate row.
+        try:
+            setattr(candidate, "live_gate_rejection_reason", self._gate_block_reason(message))
+            setattr(candidate, "live_gate_rejection_source", "live_entry_gate")
+        except Exception:
+            pass
         logger.info(message)
         # Tape logging must never alter the gate's decision (e.g. bare test
         # instances without an activity log). Fail closed to the file log only.
@@ -21936,6 +24603,51 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return False, "; ".join(str(item) for item in blockers)
         return True, ""
 
+    def _queued_fresh_entry_policy_guard(self, trade) -> Tuple[bool, str]:
+        """Reprice and recompute policy facts at the broker mutation boundary."""
+        phase = str(getattr(trade, "_entry_policy_phase", "") or "broker_queue")
+        execution_levels = None
+        # Normal first-entry attempts and every retry may sit in the execution queue
+        # long enough for a nominal 1.5R setup to stop being 1.5R.  Refresh the
+        # executable touch here, after the queue wait and immediately before the
+        # broker call.  Scale-in and actual-fill phases supply their own explicit
+        # combined/fill geometry and must not be overwritten by this branch.
+        if phase in {"broker_queue", "stale_entry_replacement_pre_submit"}:
+            touch_quote = self._candidate_execution_touch_quote(trade)
+            execution_levels = self._execution_levels(
+                trade,
+                execution_touch_quote=touch_quote,
+            )
+            if not all(
+                math.isfinite(float(level)) and float(level) > 0
+                for level in execution_levels
+            ):
+                return False, "fresh executable bid/ask geometry is unavailable"
+            # Runtime-only handoff to TradeManager.  The same measured touch and levels
+            # that passed policy are the ones used for the immediately following order;
+            # neither field is persisted or trusted on a later retry.
+            setattr(trade, "_entry_policy_submission_touch_quote", dict(touch_quote))
+            setattr(trade, "_entry_policy_submission_levels", tuple(execution_levels))
+
+        allowed, reason = self._entry_policy_allows(
+            trade,
+            execution_levels=execution_levels,
+            phase=phase,
+        )
+        if allowed and execution_levels is not None:
+            entry, stop, target = (float(value) for value in execution_levels)
+            trade.entry_price = entry
+            trade.current_price = entry
+            trade.current_stop = stop
+            trade.trailing_stop = stop
+            trade.initial_stop = stop
+            trade.target = target
+            if str(getattr(trade, "inst_type", "") or "").upper() == "OPT":
+                trade.premium_entry = entry
+                trade.premium_stop = stop
+                trade.premium_target = target
+        return allowed, reason
+
     def _passes_live_trade_ready_gate(self, candidate: TradeCandidate) -> bool:
         """Final live/manual gate before a signal is allowed into the session ledger."""
         if getattr(self, "mode", "") == "HISTORICAL":
@@ -21953,6 +24665,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             resource_blockers = Scanner._auto_entry_resource_blockers(self)
             if resource_blockers:
                 reason = "; ".join(str(item) for item in resource_blockers)
+                setattr(candidate, "live_gate_rejection_reason", reason)
+                setattr(candidate, "live_gate_rejection_source", "resource_pressure_gate")
                 try:
                     self.log_signal_decision_once(
                         f"resource-pressure|{getattr(candidate, 'instrument', '')}|"
@@ -21971,6 +24685,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Unbound so a caller that binds Scanner methods individually still reaches it.
         standaside, standaside_why = Scanner._session_bias_standaside(self, candidate)
         if standaside:
+            setattr(candidate, "live_gate_rejection_reason", str(standaside_why or "session bias stand-aside"))
+            setattr(candidate, "live_gate_rejection_source", "session_bias_gate")
             try:
                 self.log_signal_decision_once(
                     f"standaside|{getattr(candidate, 'instrument', '')}|"
@@ -21994,10 +24710,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     load_event_blackout_windows(),
                 )
                 if label:
+                    reason = f"macro-event blackout active ({label})"
+                    setattr(candidate, "live_gate_rejection_reason", reason)
+                    setattr(candidate, "live_gate_rejection_source", "event_blackout_gate")
                     self.log_signal_decision_once(
                         f"{candidate.instrument}|{candidate.timeframe}|{candidate.direction}|event-blackout|{label}",
                         f"Signal rejected: {candidate.instrument} {candidate.direction} "
-                        f"{candidate.timeframe} - macro-event blackout active ({label})",
+                        f"{candidate.timeframe} - {reason}",
                         "trade",
                     )
                     return False
@@ -22561,6 +25280,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     float(previous.price or 0.0) - float(getattr(previous, "stop", 0.0) or 0.0)
                 ) * max(1, int(getattr(previous, "lots", 1) or 1) * int(getattr(previous, "lot_size", 1) or 1))
 
+            # A non-executed manual/session row is still a live 15m signal. Give it the
+            # same 1m emergency + owning-15m structure interpretation as broker-backed
+            # trades; create_exit only closes the virtual ledger and never mutates the
+            # broker position.
+            fast_exit, fast_exit_reason = self._fifteen_min_one_min_support_exit_decision(
+                previous,
+                float(current_price or 0.0),
+                latest_time,
+            )
+            if fast_exit:
+                create_exit(
+                    previous,
+                    float(current_price),
+                    "TF15_FAST_REVERSAL",
+                    fast_exit_reason,
+                )
+                continue
+
             if getattr(settings, "ut_intel_early_exit", False):
                 intel_result = self._get_trade_intel(previous)
                 if intel_result:
@@ -22873,6 +25610,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             sample_pnl_path(
                 previous,
                 pnl=current_pnl_rs,
+                entry_time=getattr(previous, "entry_timestamp", None),
+            )
+            # The market beside the P&L. decision_intel froze these at one instant, at
+            # exit, which cannot show whether the case changed mid-trade -- the only
+            # thing a market-aware exit rule would need to be judged on. Same object,
+            # same clock, so the two series line up sample for sample on replay.
+            # The snapshot is passed as a CALLABLE so it is built only when the timer is
+            # actually due, not on every cycle.
+            sample_intel_path(
+                previous,
+                lambda: self._entry_intel_snapshot(previous),
                 entry_time=getattr(previous, "entry_timestamp", None),
             )
             self._ensure_trade_like_initial_stop(previous)
@@ -23603,7 +26351,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if fut_price <= 0:
                 fut_price = spot
 
-            risk = max(1.0, fut_price * (float(getattr(self, "futures_sl_pct", 0.2) or 0.2) / 100.0))
+            regime = str(getattr(candidate, "market_regime", "") or "UNKNOWN")
+            configured_risk_pct = float(getattr(self, "futures_sl_pct", 0.2) or 0.2)
+            policy_risk_pct = self._entry_policy_underlying_stop_cap_pct(
+                candidate.instrument, regime
+            )
+            risk_pct = min(configured_risk_pct, policy_risk_pct)
+            risk = max(1.0, fut_price * (risk_pct / 100.0))
             candidate.inst_type = "FUT"
             candidate.option_type = ""
             candidate.atm_strike = 0.0
@@ -23615,9 +26369,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if candidate.direction == "LONG":
                 candidate.stop = fut_price - risk
                 candidate.target = fut_price + (risk * rr)
+                underlying_stop = spot - risk
+                underlying_target = spot + (risk * rr)
             else:
                 candidate.stop = fut_price + risk
                 candidate.target = fut_price - (risk * rr)
+                underlying_stop = spot + risk
+                underlying_target = spot - (risk * rr)
+            candidate.initial_stop = candidate.stop
+            candidate.entry_spot = spot
+            candidate.underlying_entry = spot
+            candidate.underlying_stop = underlying_stop
+            candidate.underlying_target = underlying_target
+            candidate.spot_stop = underlying_stop
+            candidate.spot_target = underlying_target
+            candidate.premium_entry = 0.0
+            candidate.premium_stop = 0.0
+            candidate.premium_target = 0.0
+            candidate.geometry_observed_at = datetime.now(IST).isoformat()
+            candidate.geometry_source = "concurrency_conversion.futures"
+            candidate.geometry_verified = True
             candidate.reasons = list(candidate.reasons or []) + ["Concurrency Guard forced FUT complement"]
             return True
 
@@ -23645,16 +26416,48 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 premium = max(1.0, spot * 0.012)
 
             risk = Scanner._option_premium_stop_distance_for_candidate(self, premium, candidate)
+            signed_delta = 0.5 if option_type == "CE" else -0.5
+            premium_stop, premium_target, underlying_risk, underlying_reward = (
+                self._cap_option_geometry_to_underlying_policy(
+                    instrument=candidate.instrument,
+                    regime=str(getattr(candidate, "market_regime", "") or "UNKNOWN"),
+                    spot=spot,
+                    premium=premium,
+                    stop=premium - risk,
+                    target=premium + (risk * rr),
+                    signed_delta=signed_delta,
+                    rr_hint=rr,
+                )
+            )
             candidate.inst_type = "OPT"
             candidate.option_type = option_type
             candidate.atm_strike = strike
-            candidate.multiplier = 0.5 if option_type == "CE" else -0.5
+            candidate.multiplier = signed_delta
             candidate.trading_symbol = opt_info["symbol"]
             candidate.symbol_token = opt_info["token"]
             candidate.price = premium
             candidate.current_price = premium
-            candidate.stop = premium - risk
-            candidate.target = premium + (risk * rr)
+            candidate.stop = premium_stop
+            candidate.target = premium_target
+            candidate.initial_stop = candidate.stop
+            candidate.entry_spot = spot
+            if candidate.direction == "LONG":
+                underlying_stop = spot - underlying_risk
+                underlying_target = spot + underlying_reward
+            else:
+                underlying_stop = spot + underlying_risk
+                underlying_target = spot - underlying_reward
+            candidate.underlying_entry = spot
+            candidate.underlying_stop = underlying_stop
+            candidate.underlying_target = underlying_target
+            candidate.spot_stop = underlying_stop
+            candidate.spot_target = underlying_target
+            candidate.premium_entry = premium
+            candidate.premium_stop = candidate.stop
+            candidate.premium_target = candidate.target
+            candidate.geometry_observed_at = datetime.now(IST).isoformat()
+            candidate.geometry_source = "concurrency_conversion.option_delta"
+            candidate.geometry_verified = True
             candidate.reasons = list(candidate.reasons or []) + ["Concurrency Guard forced OPT complement"]
             return True
 
@@ -24156,7 +26959,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         active = [str(x).upper() for x in (getattr(self, "active_indices", []) or []) if str(x or "").strip()]
         if not active:
-            active = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+            return False, "no active entry universe"
         regimes = getattr(self, "latest_regimes", {}) or {}
         aligned = []
         missing = []
@@ -24627,16 +27430,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         and returns its refusal so the operator can see why in the decision log.
         """
         try:
+            base = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
+            timeframe = str(getattr(candidate, "timeframe", "") or "")
+            direction = str(getattr(candidate, "direction", "") or "").upper()
+            if not base or not timeframe or direction not in {"LONG", "SHORT"}:
+                return False, ""
+            # The candidate may have been queued before the operator changed the
+            # universe.  A cascade add is fresh exposure, so it must resolve the
+            # current permission at the add boundary as well as at broker submit.
+            if base not in self._fresh_entry_universe():
+                return False, f"{base} is not in the active entry universe"
             resource_blockers = Scanner._auto_entry_resource_blockers(self)
             if resource_blockers:
                 return False, "new Auto exposure blocked: " + "; ".join(resource_blockers)
             adder = getattr(getattr(self, "trades", None), "scale_in_trade", None)
             if not callable(adder):
-                return False, ""
-            base = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
-            timeframe = str(getattr(candidate, "timeframe", "") or "")
-            direction = str(getattr(candidate, "direction", "") or "").upper()
-            if not base or not timeframe or direction not in {"LONG", "SHORT"}:
                 return False, ""
 
             for trade_id, trade in list(getattr(self.trades, "open_trades", {}).items()):
@@ -25752,6 +28560,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if symbol_token:
             candidate.symbol_token = symbol_token
         candidate.entry_spot = float(spot or price)
+        underlying_entry = float(spot or price)
+        if direction == "SHORT":
+            underlying_stop = underlying_entry + stop_dist
+            underlying_target = underlying_entry - (stop_dist * rr)
+        else:
+            underlying_stop = underlying_entry - stop_dist
+            underlying_target = underlying_entry + (stop_dist * rr)
+        candidate.underlying_entry = underlying_entry
+        candidate.underlying_stop = underlying_stop
+        candidate.underlying_target = underlying_target
+        candidate.spot_stop = underlying_stop
+        candidate.spot_target = underlying_target
+        candidate.premium_entry = 0.0
+        candidate.premium_stop = 0.0
+        candidate.premium_target = 0.0
+        candidate.geometry_observed_at = datetime.now(IST).isoformat()
+        candidate.geometry_source = "instrument_conversion.futures"
+        candidate.geometry_verified = True
         try:
             role = "FUT-only preference" if pref == "FUT" else "sole FUT slot"
             candidate.reasons = list(candidate.reasons or []) + [
@@ -25946,6 +28772,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             mult = 0.5 if option_type == "CE" else -0.5
 
+        stop, target, derived_underlying_risk, derived_underlying_reward = (
+            self._cap_option_geometry_to_underlying_policy(
+                instrument=instrument,
+                regime=str(
+                    getattr(candidate, "market_regime", "")
+                    or (getattr(self, "latest_regimes", {}) or {}).get(instrument, "UNKNOWN")
+                ),
+                spot=spot,
+                premium=premium,
+                stop=stop,
+                target=target,
+                signed_delta=mult,
+                rr_hint=rr,
+            )
+        )
+
         candidate.inst_type = "OPT"
         candidate.option_type = option_type
         candidate.atm_strike = float(strike)
@@ -25958,6 +28800,58 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         candidate.lots = int(lots)
         candidate.multiplier = float(mult)
         candidate.entry_spot = float(spot)
+        underlying_entry = float(spot)
+        existing_underlying = self._directional_underlying_tuple_valid(
+            direction,
+            float(getattr(candidate, "underlying_entry", 0.0) or 0.0),
+            float(getattr(candidate, "underlying_stop", 0.0) or 0.0),
+            float(getattr(candidate, "underlying_target", 0.0) or 0.0),
+        )
+        if existing_underlying:
+            old_entry = float(candidate.underlying_entry)
+            underlying_risk = abs(old_entry - float(candidate.underlying_stop))
+            underlying_reward = abs(float(candidate.underlying_target) - old_entry)
+            cap_pct = self._entry_policy_underlying_stop_cap_pct(
+                instrument,
+                str(
+                    getattr(candidate, "market_regime", "")
+                    or (getattr(self, "latest_regimes", {}) or {}).get(instrument, "UNKNOWN")
+                ),
+            )
+            max_underlying_risk = float(spot) * (cap_pct / 100.0)
+            measured_underlying_rr = (
+                underlying_reward / underlying_risk
+                if underlying_risk > 0 and underlying_reward > 0
+                else 0.0
+            )
+            underlying_risk = min(underlying_risk, max_underlying_risk)
+            underlying_reward = underlying_risk * max(
+                1.5,
+                float(getattr(get_settings(), "entry_policy_min_rr", 1.5) or 1.5),
+                measured_underlying_rr,
+            )
+            geometry_source = "instrument_conversion.option_preserved_underlying"
+        else:
+            underlying_risk = derived_underlying_risk
+            underlying_reward = derived_underlying_reward
+            geometry_source = "instrument_conversion.option_delta"
+        if direction == "SHORT":
+            underlying_stop = underlying_entry + underlying_risk
+            underlying_target = underlying_entry - underlying_reward
+        else:
+            underlying_stop = underlying_entry - underlying_risk
+            underlying_target = underlying_entry + underlying_reward
+        candidate.underlying_entry = underlying_entry
+        candidate.underlying_stop = underlying_stop
+        candidate.underlying_target = underlying_target
+        candidate.spot_stop = underlying_stop
+        candidate.spot_target = underlying_target
+        candidate.premium_entry = float(premium)
+        candidate.premium_stop = float(stop)
+        candidate.premium_target = float(target)
+        candidate.geometry_observed_at = datetime.now(IST).isoformat()
+        candidate.geometry_source = geometry_source
+        candidate.geometry_verified = True
         try:
             candidate.reasons = list(candidate.reasons or []) + [
                 f"Multi-signal mixed book: OPT book ({option_type} {int(strike)}) "
@@ -26167,7 +29061,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         aligned: set = set()
         active = [
             str(i or "").split()[0].upper()
-            for i in (getattr(self, "active_indices", None) or list(self.CORE_CORRELATED_INDICES))
+            for i in (getattr(self, "active_indices", None) if getattr(self, "active_indices", None) is not None else self.CORE_CORRELATED_INDICES)
         ]
 
         # 0) Same-wave / session votes (registered as each index is graded)
@@ -27585,25 +30479,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         source="trade_limit_gate",
                     )
                     continue
+                if str(limit_reason or "").startswith("stop-out re-entry:"):
+                    setattr(sig, "stop_out_reentry", True)
 
                 if not self._passes_live_trade_ready_gate(sig):
                     ts = getattr(sig, "signal_timestamp", None)
                     ts_key = ts.isoformat(timespec="seconds") if ts else ""
+                    rejection_reason = str(
+                        getattr(sig, "live_gate_rejection_reason", "") or
+                        "live readiness gate returned False without a stamped sub-gate reason"
+                    )
+                    rejection_source = str(
+                        getattr(sig, "live_gate_rejection_source", "") or
+                        "live_ready_gate_unstamped"
+                    )
                     self.log_signal_decision_once(
                         f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{ts_key}|live-ready",
-                        f"Signal rejected: {sig.instrument} {sig.direction} {sig.timeframe} - live trade readiness gate blocked it",
+                        f"Signal rejected: {sig.instrument} {sig.direction} {sig.timeframe} - {rejection_reason}",
                         "trade",
                     )
                     self._rtracker_record_candidate(
                         sig,
                         decision="REJECTED",
-                        reason="Live trade readiness gate blocked it",
-                        source="live_ready_gate",
+                        reason=rejection_reason,
+                        source=rejection_source,
                     )
                     self._remember_missed_reentry_seed(
                         sig,
-                        reason="Live trade readiness gate blocked it",
-                        source="live_ready_gate",
+                        reason=rejection_reason,
+                        source=rejection_source,
                     )
                     continue
 
@@ -27720,6 +30624,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
                 if can_take:
                     self._ensure_trade_like_initial_stop(sig)
+                    # All lane/conversion mutations are complete. Calculate the first
+                    # immutable verdict from executable prices now; do it again at the
+                    # broker worker because quotes and resources can change while queued.
+                    policy_touch = (
+                        self._candidate_execution_touch_quote(sig)
+                        if str(getattr(self, "mode", "") or "").upper() == "REAL"
+                        else None
+                    )
+                    policy_levels = self._execution_levels(
+                        sig,
+                        execution_touch_quote=policy_touch,
+                    )
+                    policy_ok, policy_reason = self._entry_policy_allows(
+                        sig,
+                        execution_levels=policy_levels,
+                        phase="post_lane_final",
+                    )
+                    if not policy_ok:
+                        sig.status = "NO ENTRY - FINAL POLICY"
+                        self._rtracker_record_candidate(
+                            sig,
+                            decision="REJECTED",
+                            reason=policy_reason,
+                            source="final_entry_policy",
+                        )
+                        self._remember_missed_reentry_seed(
+                            sig,
+                            reason=policy_reason,
+                            source="final_entry_policy",
+                        )
+                        continue
                     # â”€â”€â”€ Manual Signal Gate â”€â”€â”€
                     if not self.auto_mode and not is_warmup:
                         # The auto path reaches open_trade, which reprices via
@@ -27771,11 +30706,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             if not pref_ok:
                                                 candidate_sig.status = f"BLOCKED - {self._strict_instrument_pref()} PREF ({pref_why})"
                                                 return
-                                        exec_price, exec_stop, exec_target = self._execution_levels(candidate_sig)
+                                        execution_touch_quote = self._candidate_execution_touch_quote(candidate_sig)
+                                        exec_price, exec_stop, exec_target = self._execution_levels(
+                                            candidate_sig,
+                                            execution_touch_quote=execution_touch_quote,
+                                        )
                                         if exec_price <= 0:
                                             candidate_sig.status = "QUOTE UNAVAILABLE"
                                             return
-                                        execution_touch_quote = self._candidate_execution_touch_quote(candidate_sig)
+                                        policy_ok, policy_reason = self._entry_policy_allows(
+                                            candidate_sig,
+                                            execution_levels=(exec_price, exec_stop, exec_target),
+                                            phase="manual_toast_submit",
+                                        )
+                                        if not policy_ok:
+                                            candidate_sig.status = "BLOCKED - FINAL ENTRY POLICY"
+                                            self._rtracker_record_candidate(
+                                                candidate_sig,
+                                                decision="REJECTED",
+                                                reason=policy_reason,
+                                                source="manual_final_entry_policy",
+                                            )
+                                            return
                                         actual_spot = self.candles.get_latest_price(candidate_sig.instrument)
                                         
                                         def on_execution_result(executed_trade, accepted, candidate=candidate_sig):
@@ -27804,9 +30756,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             strategy_direction_mode=str(getattr(candidate_sig, "strategy_direction_mode", "") or ""),
                                             entry_momentum_urgency=self._entry_momentum_urgency(candidate_sig),
                                             exec_type="M",
-                                            entry_spot=actual_spot,
-                                            spot_stop=candidate_sig.stop,
-                                            spot_target=candidate_sig.target,
+                                            entry_spot=float(getattr(candidate_sig, "underlying_entry", 0.0) or actual_spot or 0.0),
+                                            spot_stop=float(getattr(candidate_sig, "underlying_stop", 0.0) or 0.0),
+                                            spot_target=float(getattr(candidate_sig, "underlying_target", 0.0) or 0.0),
+                                            underlying_entry=float(getattr(candidate_sig, "underlying_entry", 0.0) or actual_spot or 0.0),
+                                            underlying_stop=float(getattr(candidate_sig, "underlying_stop", 0.0) or 0.0),
+                                            underlying_target=float(getattr(candidate_sig, "underlying_target", 0.0) or 0.0),
+                                            premium_entry=float(getattr(candidate_sig, "premium_entry", 0.0) or 0.0),
+                                            premium_stop=float(getattr(candidate_sig, "premium_stop", 0.0) or 0.0),
+                                            premium_target=float(getattr(candidate_sig, "premium_target", 0.0) or 0.0),
+                                            geometry_observed_at=str(getattr(candidate_sig, "geometry_observed_at", "") or ""),
+                                            geometry_source=str(getattr(candidate_sig, "geometry_source", "") or ""),
+                                            geometry_verified=bool(getattr(candidate_sig, "geometry_verified", False)),
+                                            expected_move_forecast=dict(getattr(candidate_sig, "expected_move_forecast", {}) or {}),
+                                            entry_policy_verdict=dict(getattr(candidate_sig, "entry_policy_verdict", {}) or {}),
                                             is_explosive_bypass=bool(getattr(candidate_sig, "is_explosive_bypass", False)),
                                             is_reversion_scalp=bool(getattr(candidate_sig, "is_reversion_scalp", False)),
                                             is_recovery=False,
@@ -27877,7 +30840,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     logger.info(f"⏱️ Exact Execution Trigger: Signal={sig_ts_str} + 20s Buffer + Latency -> Entry={exec_ts_str}")
                     
                     # Resolve entries in the traded contract's price space.
-                    exec_price, exec_stop, exec_target = self._execution_levels(sig)
+                    execution_touch_quote = self._candidate_execution_touch_quote(sig)
+                    exec_price, exec_stop, exec_target = self._execution_levels(
+                        sig,
+                        execution_touch_quote=execution_touch_quote,
+                    )
                     if exec_price <= 0:
                         sig.status = "QUOTE UNAVAILABLE"
                         self.log_event(
@@ -27891,9 +30858,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             source="execution_quote_gate",
                         )
                         continue
-                    execution_touch_quote = self._candidate_execution_touch_quote(sig)
-                    spot_stop = sig.stop
-                    spot_target = sig.target
+                    policy_ok, policy_reason = self._entry_policy_allows(
+                        sig,
+                        execution_levels=(exec_price, exec_stop, exec_target),
+                        phase="auto_pre_submit",
+                    )
+                    if not policy_ok:
+                        sig.status = "BLOCKED - FINAL ENTRY POLICY"
+                        self._rtracker_record_candidate(
+                            sig,
+                            decision="REJECTED",
+                            reason=policy_reason,
+                            source="auto_final_entry_policy",
+                        )
+                        continue
+                    spot_stop = float(getattr(sig, "underlying_stop", 0.0) or 0.0)
+                    spot_target = float(getattr(sig, "underlying_target", 0.0) or 0.0)
 
                     execution_loop = asyncio.get_running_loop()
 
@@ -27942,9 +30922,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         strategy_direction_mode=str(getattr(sig, "strategy_direction_mode", "") or ""),
                         entry_momentum_urgency=self._entry_momentum_urgency(sig),
                         exec_type="A",
-                        entry_spot=actual_spot,
+                        entry_spot=float(getattr(sig, "underlying_entry", 0.0) or actual_spot or 0.0),
                         spot_stop=spot_stop,
                         spot_target=spot_target,
+                        underlying_entry=float(getattr(sig, "underlying_entry", 0.0) or actual_spot or 0.0),
+                        underlying_stop=spot_stop,
+                        underlying_target=spot_target,
+                        premium_entry=float(getattr(sig, "premium_entry", 0.0) or 0.0),
+                        premium_stop=float(getattr(sig, "premium_stop", 0.0) or 0.0),
+                        premium_target=float(getattr(sig, "premium_target", 0.0) or 0.0),
+                        geometry_observed_at=str(getattr(sig, "geometry_observed_at", "") or ""),
+                        geometry_source=str(getattr(sig, "geometry_source", "") or ""),
+                        geometry_verified=bool(getattr(sig, "geometry_verified", False)),
+                        expected_move_forecast=dict(getattr(sig, "expected_move_forecast", {}) or {}),
+                        entry_policy_verdict=dict(getattr(sig, "entry_policy_verdict", {}) or {}),
                         is_reversion_scalp=bool(getattr(sig, "is_reversion_scalp", False)),
                         # A fresh entry is NEVER a recovery. This passed is_warmup, which
                         # only means the scanner is still loading data — unrelated. When
@@ -29037,6 +32028,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 except Exception:
                     pass
 
+            fast_exit, fast_exit_reason = self._fifteen_min_one_min_support_exit_decision(
+                trade,
+                float(price or 0.0),
+                latest_time,
+            )
+            if fast_exit:
+                self.log_event(
+                    f"Early 15m exit for {trade.instrument}: {fast_exit_reason}",
+                    "trade",
+                )
+                self._close_and_record(
+                    tid,
+                    opt_val,
+                    "TF15_FAST_REVERSAL",
+                    exit_time=latest_time,
+                )
+                continue
+
             # Open-trade distress: underwater + reverse/fast opposite → reversion window.
             try:
                 self._maybe_arm_open_distress_reversion(
@@ -29059,26 +32068,40 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # pass do the work; an early exit that waits one cycle is not worse than
                 # a scanner loop that misses its cadence.
                 intel_result = (
-                    self._get_trade_intel(trade)
+                    (
+                        # Keep the cache probe explicit at this boundary. The
+                        # blocking reader below may still recompute the bundle;
+                        # this probe is non-authoritative and makes the split
+                        # auditable in source and traces.
+                        self._cached_timeframe_intel(
+                            str(getattr(trade, "instrument", "") or "").upper(),
+                            str(getattr(trade, "timeframe", "5min") or "5min").lower(),
+                            allow_fallback=False,
+                        ),
+                        self._get_trade_intel(trade),
+                    )[1]
                     if allow_blocking
-                    else self._cached_timeframe_intel(
-                        str(getattr(trade, "instrument", "") or "").upper(),
-                        str(getattr(trade, "timeframe", "5min") or "5min").lower(),
-                        allow_fallback=True,
+                    else (
+                        self._fresh_exact_trade_intel(
+                            trade,
+                            evaluation_time=latest_time,
+                            allow_blocking=False,
+                        )
+                        if self._cached_timeframe_intel(
+                            str(getattr(trade, "instrument", "") or "").upper(),
+                            str(getattr(trade, "timeframe", "5min") or "5min").lower(),
+                            allow_fallback=False,
+                        )
+                        is not None
+                        else None
                     )
                 )
+                if intel_result is None and not allow_blocking:
+                    self._diag_inc("intel", "fast_path_stale_skipped")
                 if intel_result is not None and not allow_blocking:
-                    # The cache read above has no age bound, and this result can CLOSE a
-                    # live position via OI_PCR_REVERSAL. When the scan loop stalls — the
-                    # exact condition the fast path exists for — the bundle stops
-                    # refreshing while this 100ms loop keeps acting on it, so the exit
-                    # fires on evidence that may have reverted minutes ago.
-                    #
-                    # loss_guard_intel_max_age_seconds (90s) is this codebase's existing
-                    # answer to "too old to drive a decision" and sits well above the 30s
-                    # recompute TTL, so a healthy loop is never affected. Dropping the
-                    # read simply defers the exit to the next unhurried pass, which is
-                    # what the comment above already intends.
+                    # Keep an explicit age guard at the 100ms boundary as well as in
+                    # the exact-timeframe reader.  This protects the close decision if
+                    # a future refactor supplies a cached bundle through another seam.
                     try:
                         max_age = float(
                             getattr(get_settings(), "loss_guard_intel_max_age_seconds", 90.0)
@@ -29086,8 +32109,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
                     except (TypeError, ValueError):
                         max_age = 90.0
-                    age = Scanner._intel_age_seconds(
-                        self,
+                    age = self._intel_age_seconds(
                         intel_result,
                         str(getattr(trade, "instrument", "") or "").upper(),
                         latest_time,
@@ -29216,7 +32238,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     else:
                         new_stop = min(new_stop, trade_raw_ts)
 
-            # 2. VOLATILE / REVERSAL / CHOPPY (Tight Trailing)
+            # 2. Configured tight-trailing regimes (VOLATILE is deliberately excluded;
+            # its measured giveback profile uses the normal guard stack instead).
             elif uses_tight_trailing(regime):
                 df_1m = self.candles.get_candles(trade.instrument, "1min")
                 if df_1m is not None and len(df_1m) > 2:
@@ -29593,14 +32616,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # 0.55R / 0.35R when intel + price action confirm a BIG reversal
             # (not a small pullback). Mirrors profit-lock on the downside.
             try:
-                # peak_pnl is NET (it tracks trade.unrealized_pnl) while current_pnl_rs
-                # above is GROSS, so passing it here compared two different units and
-                # left the arm ~Rs.123 out of reach. Keep a gross high-water mark
-                # instead, matching the session lane at scanner.py:22267-22269.
+                # trade.peak_pnl, deliberately. On a bare Trade it does track
+                # unrealized_pnl, which is NET -- but this lane does not read a bare
+                # Trade. Forty lines up, unconditionally, in this same method:
+                #
+                #   scanner.py:29429
+                #   trade.peak_pnl = max(trade.peak_pnl, current_pnl_rs, candle_extreme_pnl)
+                #
+                # current_pnl_rs there is THIS gross number, so by the time the rule
+                # reads peak_pnl it is already gross AND already carries the intrabar
+                # extreme. The unit mismatch that a separate gross high-water mark was
+                # introduced to fix does not exist on this path.
+                #
+                # That separate mark cost two things. It never saw candle_extreme_pnl,
+                # so a peak reached between two samples was invisible (sampled marks
+                # 40/90/120/100/60 against a real intrabar high of Rs.500 gave a peak of
+                # 120, and the rule stayed silent at Rs.60 where it used to fire). And
+                # peak_gross_pnl is absent from Trade.to_dict/from_dict and from the
+                # sqlite persisted set, so after a restart it reset to the CURRENT mark
+                # -- and a number can never be Rs.150 above itself, so the rule could
+                # never arm again for that position. main.py restarts several times a
+                # session, so that was not a corner case.
+                #
+                # Rs.150 / Rs.80 were fitted by replaying pnl_path, which is the gross
+                # series peak_pnl tracks. Feeding the rule anything lower feeds it a
+                # series the calibration never saw. Arming more often is safe here: the
+                # rule cannot fire while a trade is in profit above the floor, so it
+                # cannot clip a winner (measured helped 10, hurt 0 over 49 positions).
                 cap_verdict = self._peak_giveback_cap_exit(
                     trade,
                     current_pnl_rs=current_pnl_rs,
-                    peak_pnl_rs=self._breakeven_peak_gross(trade, current_pnl_rs),
+                    peak_pnl_rs=float(getattr(trade, "peak_pnl", 0.0) or 0.0),
                 )
                 cap_exit, cap_reason = cap_verdict
                 # The method hosts two rules; log the one that actually fired.
@@ -29987,6 +33033,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     def stop(self):
         self._save_warm_memory(force=True)
+        self._persist_entry_shadow_book()
         try:
             self.generate_daily_signal_report()
         except Exception as exc:

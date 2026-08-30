@@ -65,10 +65,19 @@ def test_the_default_floor_is_the_round_trip_not_zero():
     assert Settings.model_fields["breakeven_stop_floor_rs"].default == 80.0
 
 
-def test_the_arm_is_unchanged():
-    """Fix 02 moves the floor only. The arm has no evidence to move it, and moving
-    both at once would make the measurement unattributable."""
-    assert Settings.model_fields["breakeven_stop_arm_rs"].default == 150.0
+def test_only_one_knob_moved_at_a_time():
+    """This started life as "the arm is unchanged": Fix 02 moved the FLOOR only, because
+    the arm had no evidence behind it and moving both at once would have made the
+    measurement unattributable. The discipline stands; the direction has swapped.
+
+    2026-08-26 the arm moved 150 -> 100 on its own evidence (replay of 100 recorded
+    lifecycles: +Rs.5,164 vs recorded at arm 100, against +Rs.3,038 at 150, on a plateau
+    spanning 80-120), and the FLOOR is the one now held still. Rs.80 remains the best
+    floor of every value replayed, and it is what makes the floor net-zero on a gross
+    path. Move one, measure it, leave the other alone.
+    """
+    assert Settings.model_fields["breakeven_stop_arm_rs"].default == 100.0
+    assert Settings.model_fields["breakeven_stop_floor_rs"].default == 80.0
 
 
 # ── behaviour ────────────────────────────────────────────────────────────────

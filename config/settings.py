@@ -162,12 +162,63 @@ class Settings(BaseSettings):
     trading_mode: Literal["HISTORICAL", "REAL"] = "HISTORICAL"
     strategy_revision: str = "ut1-current"
     strategy_direction_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = "LONG_SHORT"
-    # Grade each candidate with its OWN timeframe's intelligence/regime. Today a single
-    # 5-minute snapshot grades every candidate, so 15-minute signals are scored on
-    # 5-minute intelligence. DEFAULT OFF because enabling it shifts grades and
-    # confidences system-wide — A/B it against archived sessions before turning it on.
-    per_timeframe_grading_enabled: bool = False
+    # Grade every candidate with independently refreshed intelligence from its OWN
+    # timeframe. 1m is a fast support/monitoring layer for a 15m trade, not a renamed
+    # 15m decision. When an own-timeframe decision is requested, missing evidence must
+    # not silently borrow the 5m cache.
+    per_timeframe_grading_enabled: bool = True
+    own_timeframe_intel_fail_closed: bool = True
     active_indices: list[str] = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+    # One final fresh-exposure invariant, evaluated from actual execution prices after
+    # all lane/conversion mutations and once more in the queued broker worker. Recovery
+    # of an existing broker position is deliberately not a fresh entry.
+    entry_policy_enabled: bool = True
+    entry_policy_min_rr: float = 1.5
+    entry_policy_expected_move_floor_pct_by_index: dict[str, float] = {
+        # Entry floors are deliberately permissive enough to admit executable
+        # 1.5R opportunities while still rejecting sub-movement noise.  These
+        # percentages are directional expected favourable movement, not an
+        # already-realised spot move.
+        "NIFTY": 0.15,
+        "BANKNIFTY": 0.15,
+        "SENSEX": 0.15,
+        "MIDCPNIFTY": 0.25,
+    }
+    entry_policy_underlying_stop_max_pct_by_index: dict[str, float] = {
+        "NIFTY": 0.15,
+        "BANKNIFTY": 0.15,
+        "SENSEX": 0.15,
+        "MIDCPNIFTY": 0.15,
+    }
+    # Explicit forecast horizons. The 1m series forecasts the next 15 minutes and is
+    # therefore honest about its role supporting live 15m decisions.
+    entry_policy_forecast_horizon_minutes_by_timeframe: dict[str, int] = {
+        "1min": 15,
+        "5min": 30,
+        "15min": 60,
+    }
+    entry_policy_forecast_quantile: float = 0.25
+    entry_policy_forecast_min_samples: int = 30
+    entry_policy_forecast_max_samples: int = 480
+    entry_policy_forecast_max_age_seconds: float = 90.0
+    entry_policy_geometry_max_age_seconds: float = 10.0
+    # Bid/ask shadow mark-outs for BOTH accepted and rejected entry decisions. These
+    # rows are research evidence only: they never promote a rule or alter a live order.
+    # A bounded, durable pending book survives process restarts and emits one outcome
+    # per horizon so after-cost expectancy can be compared without candle-close or LTP
+    # look-ahead.
+    entry_shadow_outcomes_enabled: bool = True
+    entry_shadow_horizons_minutes: list[int] = [15, 30, 60]
+    entry_shadow_update_interval_seconds: float = 5.0
+    # Cache-only bid/ask evidence older than this is unavailable, never silently
+    # treated as an executable mark. Keep this separate from the worker cadence so
+    # quote freshness remains an explicit, tunable measurement contract.
+    entry_shadow_quote_max_age_seconds: float = 10.0
+    entry_shadow_entry_quote_grace_seconds: float = 30.0
+    entry_shadow_exit_quote_grace_seconds: float = 180.0
+    entry_shadow_max_watches: int = 1024
+    entry_shadow_update_batch_size: int = 64
+    entry_shadow_state_file: str = "data_store/entry_policy_shadow_pending.json"
     # Indices that must NEVER trade futures (route to options instead). Was set in
     # .env but never read by any code — so MIDCPNIFTY was reaching the FUT stop
     # gate and being rejected. Now enforced in _resolve_instrument_type.
@@ -805,9 +856,46 @@ class Settings(BaseSettings):
     #    peak cannot see the big winner coming.
     #  - A min-hold lowers the total at every floor (it delays protective exits and lets
     #    losses run). It does defuse the floor-100 cliff at >=45s, but only by paying
-    #    more elsewhere than it saves.
+    #    more elsewhere than it saves. RE-MEASURED 2026-08-26 on the arm axis as well,
+    #    because a min-hold is the obvious answer to "the rule fires 3 seconds after
+    #    entry" -- and it is still wrong. Sweeping arm x min-hold over the 100 recorded
+    #    lifecycles, versus the recorded outcome:
+    #        arm      0s      15s      30s      45s      60s
+    #        100  +5,164   +4,774   +4,413   +2,782   +2,999
+    #        150  +3,038   +2,790   +2,558   +1,776   +1,697
+    #    Every hold costs money at both arms. The 3-second firings are not a defect:
+    #    that is a spike-and-fade being scratched at breakeven, and waiting is what
+    #    turns the scratch into a loss.
+    #
+    # ARM 150 -> 100, measured 2026-08-26. pnl_path is GROSS (the recorded `pnl` field
+    # is path_last - 80.00 in 81 of 107 lifecycles), so the floor of 80 IS net-zero and
+    # an arm of 100 means "it was up Rs.20 net at some point, so it may not close red".
+    #
+    # Why 150 was leaving money: the largest losing cohort in the corpus is 33 trades
+    # that dipped early, poked into profit at a MEDIAN PEAK OF Rs.139, and finished at
+    # a median of -Rs.212 -- Rs.12,991 surrendered. A median peak of 139 sits just below
+    # a 150 arm, so the guard whose entire job is "a proven trade may not close negative"
+    # could not arm on the median member of the cohort it exists for.
+    #
+    # Sweep vs recorded, 100 deduped lifecycles over 10 sessions, net of Rs.80/trip:
+    #        arm  0(off)     60      80     100     120     150     200     250
+    #        net  +0     +3,190  +3,942  +5,164  +3,199  +3,038  +1,533  +1,157
+    # A plateau across 80-120, not a spike, so this is not fitted to one number. 100 is
+    # taken over the marginally better 80 because arm==floor makes "proven" mean nothing.
+    #
+    # It converts LOSSES INTO SCRATCHES rather than manufacturing winners, which is why
+    # the headline win-rate falls while the money rises -- read the loss column:
+    #        recorded        Rs. 5,454   win 34  scratch 12  loss 54   avg win 705
+    #        arm 150         Rs. 8,492   win 30  scratch 27  loss 43   avg win 772
+    #        arm 100         Rs.10,617   win 25  scratch 42  loss 33   avg win 874
+    # Robustness vs arm 150: 7 of 10 sessions improve, median +Rs.343, and it is still
+    # +Rs.1,736 with the single best session removed.
+    #
+    # The rule still cannot clip a winner at any arm: it fires only when the mark is at
+    # or below the floor, so lowering the arm widens WHICH trades it defends, never how
+    # much profit it takes off one.
     breakeven_stop_enabled: bool = True
-    breakeven_stop_arm_rs: float = 150.0
+    breakeven_stop_arm_rs: float = 100.0
     breakeven_stop_floor_rs: float = 80.0
 
     # ── Peak trail, gated to LARGE peaks only (2026-08-19) ─────────────────────
@@ -1196,6 +1284,27 @@ class Settings(BaseSettings):
     pnl_path_min_interval_seconds: float = 2.0
     pnl_path_min_move_rs: float = 50.0
     pnl_path_max_samples: int = 400
+
+    # ── Intel path: the same idea as pnl_path, for the MARKET rather than the P&L ──
+    # decision_intel already freezes pcr / oi_signal / adx / atr_pct / volume_ratio /
+    # close_above_vwap_pct / kaufman_er and the rest at ONE instant, at exit. One instant
+    # cannot answer the only question worth asking of it -- "did the case change while we
+    # held?" -- so no proposed exit rule keyed on those values can be replayed before it
+    # ships. That is why the 2026-08-25 audit of a market-aware exit engine had to end in
+    # "unmeasurable" rather than yes or no.
+    #
+    # Sized from what was measured, not guessed. PCR only CHANGES every ~99s per
+    # instrument (median over 21 sessions, n=3,067; SENSEX 188s) while the median hold is
+    # ~103s, so a 5s timer oversamples the fastest-moving chain value by 20x and the whole
+    # series still costs almost nothing -- because a sample is only APPENDED when the
+    # snapshot actually differs from the last one kept. The typical trade therefore stores
+    # 2-3 rows, and those rows are exactly the transitions.
+    #
+    # Observation only. Nothing reads this to make a decision, and a failure to record it
+    # must never be able to touch a live position.
+    intel_path_logging_enabled: bool = True
+    intel_path_min_interval_seconds: float = 5.0
+    intel_path_max_samples: int = 60
     # ── Sub-1R give-back guard (Fix 1) ──────────────────────────────
     # Below the full 1R profit-lock arm, a modest peak used to be unprotected and
     # could round-trip into a loss (e.g. a +0.4R peak fading past breakeven). Once
@@ -1280,7 +1389,7 @@ class Settings(BaseSettings):
     trend_runner_min_peak_r_multiple: float = 0.4
     # Dynamic runner profit-lock: give a trending premium more room in fast/volatile
     # tape (lock the looser high-vol pct so noise does not shake the runner out) and
-    # tighten toward dynamic_rr_runner_lock_pct (0.90) in calm regimes.
+    # tighten toward dynamic_rr_runner_lock_pct (currently 0.85) in calm regimes.
     trend_runner_dynamic_lock_enabled: bool = True
     trend_runner_lock_pct_high_vol: float = 0.85
     # Big-move gate: the ride/runner engages EARLY (before the fixed target) only when a
@@ -1339,10 +1448,13 @@ class Settings(BaseSettings):
     # SAME direction re-validates in a confirmed trend shortly after a STOP-type exit,
     # allow one more attempt by bypassing ONLY the post-exit cooldown. The daily trade
     # budget and the consecutive-loss halt are real risk limits and are NEVER bypassed.
-    # Backtest across 8 archived sessions: 20/54 stop-outs qualified, 11 replayable on
-    # real premium paths -> 73% win rate, +Rs 3,560 (avg +324/trade). Enabled on that
-    # evidence, with conservative caps below; flip to False to revert.
-    stop_out_reentry_enabled: bool = True
+    # Cost-correct replay across the current archive (2026-08-30): 33 replayable
+    # retries, 64% wins and +Rs 2,519 gross, but Rs 4,952 modeled round-trip
+    # costs/slippage -> -Rs 2,433 net.  Narrow 8-10 minute sensitivity was only
+    # marginally positive and failed again by 12 minutes, so it is not robust enough
+    # to ship enabled.  Keep the operator A/B toggle, but fail closed by default until
+    # executable shadow outcomes demonstrate positive after-cost expectancy.
+    stop_out_reentry_enabled: bool = False
     stop_out_reentry_window_minutes: float = 30.0   # same move, not a new session phase
     stop_out_reentry_max_per_index: int = 1         # one second chance per index per day
     stop_out_reentry_min_adx: float = 25.0          # only a genuinely strong trend
@@ -1676,7 +1788,7 @@ class Settings(BaseSettings):
     # circuit-breaker budgets (risk_fut_pct / risk_opt_pct). Set >0 only if an
     # extra rupee backstop per trade is explicitly wanted.
     max_trade_loss_abs: float = 0.0
-    dynamic_rr_min: float = 1.6 # Minimum initial RR for qualified trades
+    dynamic_rr_min: float = 1.5 # Minimum initial RR; final policy recomputes it from execution levels
     dynamic_rr_max: float = 12.0 # Quality-scaled initial RR ceiling; runner mode can capture larger option moves
     dynamic_rr_runner_unlock_ratio: float = 0.85 # T1 progress before removing hard target (lowered so winners flip to trail-and-ride earlier; was 1.00)
     dynamic_rr_runner_lock_pct: float = 0.85 # Runner-mode trailing lock on open gains
@@ -1685,7 +1797,7 @@ class Settings(BaseSettings):
     # separately from the 15min swing ladder. Set == dynamic_rr_max to disable.
     dynamic_rr_5min_max: float = 2.5
     # RR-scaled position sizing. The legacy `1.0 if rr>=1.5 else rr/1.5` factor was
-    # dead (dynamic_rr floors at 1.6), so it never shrank size. When enabled, size is
+    # dead because dynamic_rr already floors at 1.5R, so it never shrank size. When enabled, size is
     # scaled down for low-RR setups toward rr_size_floor and reaches full size once
     # final_rr >= rr_size_reference_rr. Default OFF so live sizing is unchanged until
     # replay-validated.
@@ -2085,6 +2197,11 @@ class Settings(BaseSettings):
     option_chain_background_retry_cooldown_seconds: float = 5.0 # Avoid cold-chain retry storms after provider failure
     dynamic_subscription_background_workers: int = 2 # Bound slow WebSocket subscribe sends outside ScannerEventLoop
     history_cache_ttl_seconds: float = 240.0 # Broker history cache TTL for candles/volume
+    # The REAL-session 1m history worker runs once a minute. Reusing the general
+    # four-minute cache there makes every "fresh" backfill arrive 3-5 minutes late,
+    # which the ghost guard correctly refuses. Keep the deep/history cache long, but
+    # let the live 1m index edge refresh on each worker pass.
+    live_1min_history_cache_ttl_seconds: float = 45.0
     # Broker history request pacing (requests/second). Too aggressive a rate trips
     # AngelOne's history limit, which forces the Yahoo fallback — and Yahoo reports
     # volume=0 for Indian index tickers, killing every volume-gated entry path.
@@ -2153,14 +2270,20 @@ class Settings(BaseSettings):
     # 1min continuous scalps require high-burst/spike context (ADX/intel/power)
     # plus volume/range/close floors — not weak 1min noise.
     one_min_scalping_high_burst_only: bool = True
+    # A live 1m entry must be backed by the current bar and a recent candle receipt.
+    # Historical REST rows may remain useful for baselines, but cannot impersonate the
+    # live edge merely because they were downloaded a moment ago.
+    one_min_entry_max_bar_age_seconds: float = 90.0
+    one_min_entry_max_receipt_age_seconds: float = 30.0
+    one_min_entry_max_provider_lag_seconds: float = 90.0
     # A cash index publishes no traded volume in real time: measured 13 of the last 20
     # 1min bars carry volume 0 on every index (5min 1/20, 15min 0/20), because it only
     # arrives with the periodic Fyers backfill. The signal bar of a fresh 1min entry is
     # therefore almost always unmeasurable, and the surge ratio read 0.00x — which is
     # why no 1min trade has ever fired. tick_count is the only live participation
-    # measure available. Ships OFF until a session of real tick data exists to cut the
-    # threshold against; tick counts are far less dispersed than traded quantity, so the
-    # traded floor cannot simply be reused on them.
+    # measure available. This is enabled because the threshold below was calibrated on
+    # recorded live tick data. Tick counts are far less dispersed than traded quantity,
+    # so the traded-volume ratio floor is deliberately NOT reused on them.
     surge_tick_proxy_enabled: bool = True
     # Calibrated on the real 1min candles, not guessed: ratio>=2.2 admits 4.73% of
     # measurable traded-volume bars and rank>=97 admits 4.98% — matched strictness in a
@@ -2493,6 +2616,10 @@ class Settings(BaseSettings):
     # window. Applied per endpoint, and only on a recognised rate-limit refusal.
     kite_rest_backoff_seconds: float = 1.0
     kite_rest_backoff_max_seconds: float = 8.0
+    # Candle REST is an independent capability from the live quote socket. A
+    # successful call older than this is stale evidence for historical-dependent
+    # live decisions and is reported unhealthy even while LTP ticks remain fresh.
+    kite_historical_rest_max_age_seconds: float = 90.0
     # ── 2026-07-03 session-audit fixes ──
     # Bounded option-quote retry before dropping a live candidate (transient
     # chain hiccups cost 16 tradeable candidates that session).
@@ -2530,6 +2657,17 @@ class Settings(BaseSettings):
     # telemetry so live sessions accumulate evidence before it gates anything.
     pre_candle_flip_veto_enabled: bool = False
     pre_candle_flip_veto_min_confidence: float = 0.70
+    # Live 15m positions are monitored by BOTH their own 15m structure and the fast 1m
+    # tape. A 1m wiggle never exits by itself: it must be an emergency reversal or agree
+    # with a broken 15m structure, using the established profit-guard classifier.
+    fifteen_min_one_min_support_exit_enabled: bool = True
+    fifteen_min_one_min_support_min_hold_seconds: float = 15.0
+    # A candle must have both a recent transport receipt and a bar clock compatible
+    # with the live evaluation time before it can drive an early exit.
+    early_exit_candle_max_age_seconds_1min: float = 90.0
+    early_exit_candle_max_age_seconds_5min: float = 90.0
+    early_exit_candle_max_age_seconds_15min: float = 90.0
+    early_exit_timeframe_alignment_seconds: float = 90.0
     # Range-day regime-pillar damp: on 2026-07-03 the 5min regime detector read
     # TRENDING 54-60% of a day the session context correctly classified RANGE_DAY
     # all day; the grading regime pillar's +0.30 "alignment" bonus on those
@@ -2606,6 +2744,24 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra='ignore'
     )
+
+    @field_validator('active_indices')
+    @classmethod
+    def validate_active_indices(cls, values: list[str]) -> list[str]:
+        """Keep the runtime universe explicit; FINNIFTY is intentionally out of scope."""
+        supported = {"NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"}
+        result: list[str] = []
+        for value in list(values or []):
+            name = str(value or "").strip().upper()
+            if name in supported and name not in result:
+                result.append(name)
+        return result
+
+    @field_validator('entry_policy_min_rr')
+    @classmethod
+    def validate_entry_policy_min_rr(cls, value: float) -> float:
+        """The live fresh-exposure boundary may be stricter, never below 1.5R."""
+        return max(1.5, float(value or 1.5))
 
     @field_validator('max_daily_loss_pct')
     @classmethod

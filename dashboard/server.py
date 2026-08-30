@@ -3084,6 +3084,125 @@ async def api_signal_report(date: str | None = None):
     return make_serializable({"status": "ok", "report": report})
 
 
+# ── Signal Forensics / Flight Recorder ────────────────────────────────────
+
+_FORENSIC_PHASES = {
+    "DETECTED", "STABILIZING", "ACCEPTED", "REJECTED", "DISCARDED",
+    "ORDER_PENDING", "ORDER_SUBMITTED", "ORDER_CANCELLED", "ORDER_REJECTED",
+    "FILLED", "ENTERED", "STOP_MOVED", "TARGET_MOVED", "TRAILING",
+    "MARK_TO_MARKET", "PARTIAL_EXIT", "EXITED", "TIMED_OUT", "MANAGED",
+    "PARTIAL",
+}
+_FORENSIC_DECISIONS = {
+    "PENDING", "ACCEPTED", "REJECTED", "SUBMITTED", "FILLED", "OPEN",
+    "PARTIAL_EXIT", "CLOSED", "CANCELLED", "FAILED",
+}
+
+
+def _forensic_date(raw):
+    """Validate and clean a date string, falling back to latest available."""
+    if not raw:
+        return None
+    import re as _re
+    cleaned = str(raw).strip()
+    return cleaned if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned) else None
+
+
+@app.get("/api/signal-forensics")
+async def api_signal_forensics(
+    date: str | None = None,
+    instrument: str | None = None,
+    timeframe: str | None = None,
+    phase: str | None = None,
+    decision: str | None = None,
+    search: str | None = None,
+    cursor: str | None = None,
+    limit: int = 100,
+):
+    """Query recent signal lifecycle forensic events for session flight recorder."""
+    from data.sqlite_db import db
+    cleaned_date = _forensic_date(date)
+    if not cleaned_date:
+        try:
+            available = await asyncio.to_thread(db.list_signal_forensics_dates)
+            cleaned_date = available[0] if available else None
+        except Exception:
+            pass
+    inst = str(instrument).upper().strip() if instrument else None
+    tf = str(timeframe).lower().strip() if timeframe else None
+    phase_val = (
+        str(phase).upper().strip()
+        if phase and str(phase).upper().strip() in _FORENSIC_PHASES
+        else None
+    )
+    decision_val = (
+        str(decision).upper().strip()
+        if decision and str(decision).upper().strip() in _FORENSIC_DECISIONS
+        else None
+    )
+    clamped_limit = max(1, min(int(limit or 100), 500))
+
+    try:
+        result = await asyncio.to_thread(
+            db.query_signal_lifecycle_events,
+            session_date=cleaned_date,
+            cursor=cursor,
+            limit=clamped_limit,
+            instrument=inst,
+            timeframe=tf,
+            phase=phase_val,
+            decision=decision_val,
+            search=search,
+        )
+        available_dates = await asyncio.to_thread(db.list_signal_forensics_dates)
+    except Exception as exc:
+        logger.error(f"Signal forensics query failed: {exc}")
+        return {
+            "status": "error",
+            "message": "Failed to load signal forensics",
+            "items": [],
+            "available_dates": [],
+        }
+
+    result["status"] = "ok"
+    result["session_date"] = cleaned_date or (available_dates[0] if available_dates else None)
+    result["available_dates"] = available_dates
+    return result
+
+
+@app.get("/api/signal-forensics/{lifecycle_id}")
+async def api_signal_forensics_lifecycle(lifecycle_id: str):
+    """Retrieve full chronological flight-recorder timeline for a single signal lifecycle."""
+    from data.sqlite_db import db
+    clean_id = str(lifecycle_id).strip()
+    if not clean_id or len(clean_id) > 128:
+        return {"status": "error", "message": "Invalid lifecycle_id", "events": []}
+
+    try:
+        events = await asyncio.to_thread(db.load_signal_lifecycle, clean_id)
+    except Exception as exc:
+        logger.error(f"Signal lifecycle detail load failed for {clean_id}: {exc}")
+        return {
+            "status": "error",
+            "message": "Failed to load signal lifecycle",
+            "events": [],
+        }
+
+    if not events:
+        return {
+            "status": "error",
+            "message": "Lifecycle record not found",
+            "events": [],
+        }
+
+    return {
+        "status": "ok",
+        "lifecycle_id": clean_id,
+        "count": len(events),
+        "events": events,
+    }
+
+
 @app.get("/api/chart")
 async def api_chart(instrument: str = "NIFTY", tf: str = "5min", bars: int | None = None):
     if not scanner_ref:

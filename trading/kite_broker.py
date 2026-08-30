@@ -27,6 +27,7 @@ from loguru import logger
 from trading.account_execution_lease import AccountExecutionLease, lease_owner_description
 from trading.broker import Broker
 from trading.order_retry import BrokerOrderAmbiguous, BrokerOrderRejected
+from data.kite_auth import is_kite_auth_failure, kite_auth_failure_reason
 
 try:
     from kiteconnect import KiteConnect
@@ -154,6 +155,13 @@ def _status_is_working(status: str) -> bool:
 
 def classify_kite_exception(exc: Exception) -> str:
     """AMBIGUOUS / TERMINAL / RETRYABLE for one Kite SDK exception."""
+    # Internal broker exceptions already encode whether placement was known to
+    # occur.  Classify them before SDK types so a pre-dispatch session-change guard
+    # is never mislabeled as a possibly-live order.
+    if isinstance(exc, BrokerOrderAmbiguous):
+        return "AMBIGUOUS"
+    if isinstance(exc, BrokerOrderRejected):
+        return "TERMINAL" if exc.terminal else "RETRYABLE"
     if isinstance(exc, _TERMINAL_EXCEPTIONS):
         return "TERMINAL"
     if isinstance(exc, OrderException):
@@ -233,6 +241,19 @@ class KiteBroker(Broker):
             self.api = kite
 
     def _require_api(self, action: str):
+        # Some recovery/test harnesses construct a broker around an already-owned
+        # client without the KiteAuth coordinator.  Keep that supported while the
+        # normal runtime still follows the shared auth object's client identity.
+        auth = getattr(self, "_auth", None)
+        if auth is not None and hasattr(auth, "kite"):
+            shared_api = getattr(auth, "kite", None)
+            if shared_api is None:
+                self.api = None
+            elif shared_api is not None and self.api is not shared_api:
+                # Re-login may have completed before the provider callback reached
+                # this broker. Adopt only the shared authenticated client; never keep
+                # submitting through a stale private reference.
+                self.api = shared_api
         if self.api is None:
             raise BrokerOrderRejected(
                 f"{action} blocked: no authenticated Kite session. "
@@ -241,7 +262,7 @@ class KiteBroker(Broker):
             )
         return self.api
 
-    def _api_call(self, context: str, fn, timeout: float = 5.0):
+    def _api_call(self, context: str, fn, timeout: float = 5.0, *, client=None):
         # `timeout` is advisory and deliberately NOT applied to the SDK client.
         # KiteConnect.timeout is a single mutable attribute on a client this process
         # SHARES with data/kite_market_data.py, which guards it with a different lock.
@@ -258,26 +279,66 @@ class KiteBroker(Broker):
         # pacing bug above, not the network time; the real fix for the rest is a second
         # client dedicated to reads, which is a larger change than this audit warrants.
         with self._order_lock:
+            initial_api = self._require_api(context)
+            failed_api = client if client is not None else initial_api
             gap = time.monotonic() - self._last_call_at
             if gap < self._min_call_interval:
                 time.sleep(self._min_call_interval - gap)
+            # Pacing is deliberately inside the serialized order lane.  Re-check
+            # authority *after* that sleep because a browser login can replace the
+            # shared client while this request is waiting its turn.
+            current_api = self._require_api(context)
+            if current_api is not failed_api:
+                raise BrokerOrderRejected(
+                    f"{context} deferred: Kite session changed before the API call",
+                    terminal=False,
+                )
+            auth = getattr(self, "_auth", None)
+            guard = getattr(auth, "current_client_guard", None)
+            dispatched = False
             try:
+                if callable(guard):
+                    # The auth RLock establishes a total order: either this exact
+                    # client dispatches first, or the replacement installs first and
+                    # this call fails locally without reaching the broker.
+                    with guard(failed_api) as is_current:
+                        if not is_current:
+                            raise BrokerOrderRejected(
+                                f"{context} deferred: Kite session changed before the API call",
+                                terminal=False,
+                            )
+                        dispatched = True
+                        return fn()
+                # Compatibility for isolated test/recovery auth doubles. Production
+                # KiteAuth always exposes current_client_guard.
+                if auth is not None and hasattr(auth, "kite"):
+                    if getattr(auth, "kite", None) is not failed_api:
+                        raise BrokerOrderRejected(
+                            f"{context} deferred: Kite session changed before the API call",
+                            terminal=False,
+                        )
+                dispatched = True
                 return fn()
-            except TokenException as exc:
+            except Exception as exc:
                 # The daily token died mid-session. Tell the auth layer so the
                 # watchdog surfaces a re-login instead of every call failing blindly.
-                if self._auth is not None:
-                    self._auth.invalidate(f"{context}: {exc}")
-                # Drop our own reference too (2026-08-16). invalidate() nulls the client
-                # inside KiteAuth, but this broker holds a SEPARATE reference, so
-                # _require_api kept returning the dead client and every subsequent order
-                # made a full round trip for a guaranteed 403 — instead of failing
-                # instantly with the actionable "complete the daily login" message.
-                # replace_api() rebinds this on re-login, which is the intended path back.
-                self.api = None
+                if is_kite_auth_failure(exc):
+                    auth = getattr(self, "_auth", None)
+                    if auth is not None:
+                        reason = kite_auth_failure_reason(context, exc)
+                        try:
+                            auth.invalidate(reason, failed_client=failed_api)
+                        except TypeError:
+                            auth.invalidate(reason)
+                    # invalidate() nulls the client inside KiteAuth, but this broker
+                    # holds a separate reference. Clear it so subsequent calls fail
+                    # locally until replace_api() receives the fresh login client.
+                    if self.api is failed_api:
+                        self.api = None
                 raise
             finally:
-                self._last_call_at = time.monotonic()
+                if dispatched:
+                    self._last_call_at = time.monotonic()
 
     # ── execution lease (unchanged semantics from the AngelOne broker) ────────
     def acquire_execution_lease(self) -> bool:
@@ -911,7 +972,9 @@ class KiteBroker(Broker):
             f"Type: {order_type} | Price: {params.get('price', 0.0):.2f}"
         )
         try:
-            order_id = self._api_call("place entry order", lambda: api.place_order(**params))
+            order_id = self._api_call(
+                "place entry order", lambda: api.place_order(**params), client=api
+            )
         except Exception as exc:
             if classify_kite_exception(exc) != "AMBIGUOUS":
                 # Refused outright: nothing is live, so this attempt must not count
@@ -1019,6 +1082,7 @@ class KiteBroker(Broker):
                     market_protection=-1,
                     **({"tag": str(tag)[:20]} if tag else {}),
                 ),
+                client=api,
             )
         except Exception as exc:
             # An exit that failed is live risk. Say so loudly, and keep the ambiguous
@@ -1078,6 +1142,7 @@ class KiteBroker(Broker):
                     market_protection=-1,
                     **({"tag": str(tag)[:20]} if tag else {}),
                 ),
+                client=api,
             )
         except Exception as exc:
             if classify_kite_exception(exc) == "AMBIGUOUS":
@@ -1147,6 +1212,7 @@ class KiteBroker(Broker):
                     last_price=float(last_price or trigger),
                     orders=orders,
                 ),
+                client=api,
             )
         except Exception as exc:
             # A GTT is a resting order on Zerodha's servers, so a call that did not
@@ -1188,11 +1254,14 @@ class KiteBroker(Broker):
         except PermissionError as exc:
             logger.error(f"GTT cancellation refused for {trigger_id}: {exc}")
             return False
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("GTT cancellation")
+        except BrokerOrderRejected:
             return False
         try:
-            self._api_call("delete GTT", lambda: api.delete_gtt(str(trigger_id)))
+            self._api_call(
+                "delete GTT", lambda: api.delete_gtt(str(trigger_id)), client=api
+            )
             return True
         except Exception as exc:
             # False on refusal, same polarity rule as cancel_order: a caller that reads
@@ -1202,11 +1271,14 @@ class KiteBroker(Broker):
 
     def find_gtt_stop(self, symbol: str) -> Dict[str, Any]:
         """Tri-state lookup of an existing GTT for this contract."""
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("GTT lookup")
+        except BrokerOrderRejected:
             return {"state": "UNKNOWN", "trigger_id": "", "reason": "no session"}
         try:
-            triggers = self._api_call("list GTTs", lambda: api.get_gtts(), timeout=3.0)
+            triggers = self._api_call(
+                "list GTTs", lambda: api.get_gtts(), timeout=3.0, client=api
+            )
         except Exception as exc:
             # Never NONE from a failed scan — that would authorise a duplicate trigger.
             return {"state": "UNKNOWN", "trigger_id": "", "reason": f"GTT scan failed: {exc}"}
@@ -1256,6 +1328,7 @@ class KiteBroker(Broker):
                     # protection band off the stop the first time it is tightened.
                     market_protection=-1,
                 ),
+                client=api,
             )
             return True
         except Exception as exc:
@@ -1275,6 +1348,7 @@ class KiteBroker(Broker):
             self._api_call(
                 "cancel order",
                 lambda: api.cancel_order(variety="regular", order_id=str(order_id)),
+                client=api,
             )
             return True
         except Exception as exc:
@@ -1286,11 +1360,14 @@ class KiteBroker(Broker):
 
     # ── reads ────────────────────────────────────────────────────────────────
     def _order_book(self) -> Optional[List[Dict[str, Any]]]:
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("order-book read")
+        except BrokerOrderRejected:
             return None
         try:
-            rows = self._api_call("fetch order book", lambda: api.orders(), timeout=2.0)
+            rows = self._api_call(
+                "fetch order book", lambda: api.orders(), timeout=2.0, client=api
+            )
         except Exception as exc:
             logger.warning(f"Kite order-book read failed: {exc}")
             return None
@@ -1331,8 +1408,9 @@ class KiteBroker(Broker):
 
     def get_positions(self) -> Optional[Dict]:
         """Normalised to {"data": [...]} with netqty, as the reconciler expects."""
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("positions read")
+        except BrokerOrderRejected:
             return None
         # Without this cooldown a throttled positions endpoint is re-hit on every
         # reconcile tick, which is what keeps the throttle alive.
@@ -1341,7 +1419,9 @@ class KiteBroker(Broker):
             logger.debug(f"Skipping broker positions; backoff active for {remaining:.1f}s")
             return None
         try:
-            book = self._api_call("fetch positions", lambda: api.positions(), timeout=2.0)
+            book = self._api_call(
+                "fetch positions", lambda: api.positions(), timeout=2.0, client=api
+            )
         except Exception as exc:
             if self._position_should_backoff(exc):
                 self._mark_position_backoff(exc)
@@ -1609,12 +1689,14 @@ class KiteBroker(Broker):
         """
         if not order_id:
             return {"state": "UNKNOWN", "reason": "no order id"}
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("fill lookup")
+        except BrokerOrderRejected:
             return {"state": "UNKNOWN", "reason": "no session"}
         try:
             fills = self._api_call(
-                "order trades", lambda: api.order_trades(str(order_id)), timeout=3.0
+                "order trades", lambda: api.order_trades(str(order_id)),
+                timeout=3.0, client=api,
             )
         except Exception as exc:
             # A failed lookup is UNKNOWN, never "not filled" — concluding no-fill from a
@@ -1651,12 +1733,14 @@ class KiteBroker(Broker):
         """
         if not order_id:
             return {"state": "UNKNOWN", "reason": "no order id", "transitions": []}
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("order-history lookup")
+        except BrokerOrderRejected:
             return {"state": "UNKNOWN", "reason": "no session", "transitions": []}
         try:
             history = self._api_call(
-                "order history", lambda: api.order_history(str(order_id)), timeout=3.0
+                "order history", lambda: api.order_history(str(order_id)),
+                timeout=3.0, client=api,
             )
         except Exception as exc:
             return {"state": "UNKNOWN", "reason": f"history lookup failed: {exc}",
@@ -1694,11 +1778,14 @@ class KiteBroker(Broker):
         That is a normal condition, not a broken integration, so it returns None for
         the caller to interpret rather than raising.
         """
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("margin-balance read")
+        except BrokerOrderRejected:
             return None
         try:
-            funds = self._api_call("fetch margins", lambda: api.margins(), timeout=2.0)
+            funds = self._api_call(
+                "fetch margins", lambda: api.margins(), timeout=2.0, client=api
+            )
         except Exception as exc:
             logger.debug(f"Kite margins unavailable: {exc}")
             return None
@@ -1738,8 +1825,9 @@ class KiteBroker(Broker):
         estimate rather than the debit the LIMIT will actually incur. Omitted or zero
         keeps the MARKET form, which is right for a market entry.
         """
-        api = self.api
-        if api is None:
+        try:
+            api = self._require_api("entry-margin quote")
+        except BrokerOrderRejected:
             return None
         limit_price = 0.0
         try:
@@ -1759,7 +1847,8 @@ class KiteBroker(Broker):
             payload[0]["price"] = self._tick_price(limit_price)
         try:
             rows = self._api_call(
-                "order margins", lambda: api.order_margins(payload), timeout=3.0
+                "order margins", lambda: api.order_margins(payload),
+                timeout=3.0, client=api,
             )
         except Exception as exc:
             logger.warning(f"Kite order-margin preflight failed for {symbol}: {exc}")
@@ -1795,7 +1884,9 @@ class KiteBroker(Broker):
         missing balance degrades to a stated limitation instead of blocking entries on
         a Zerodha endpoint quirk.
         """
-        if self.api is None:
+        try:
+            self._require_api("entry-margin preflight")
+        except BrokerOrderRejected:
             return {"ok": False, "reservation_id": "", "basis": "NO_SESSION",
                     "limitation": "no authenticated Kite session"}
 

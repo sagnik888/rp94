@@ -188,7 +188,7 @@ def test_the_dashboard_defaults_match_the_settings_defaults():
 
     js = pathlib.Path("dashboard/static/js/dashboard-settings.js").read_text(encoding="utf-8")
     for field, default in (
-        ("breakeven_stop_arm_rs", 150.0),
+        ("breakeven_stop_arm_rs", 100.0),   # 150 -> 100, measured 2026-08-26
         ("breakeven_stop_floor_rs", 80.0),
         ("peak_giveback_cap_arm_rs", 100.0),
         ("peak_giveback_cap_rs", 200.0),

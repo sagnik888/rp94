@@ -80,7 +80,7 @@ def _param_broker():
     b._auth = None
     b._last_call_at = 0.0
     b._min_call_interval = 0.0
-    b._api_call = lambda ctx, fn, timeout=5.0: fn()
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: fn()
     b._entry_rate_allowed = lambda: True
     return b
 

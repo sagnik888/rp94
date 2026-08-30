@@ -73,7 +73,7 @@ def _broker(**canned):
     b._auth = None
     b._last_call_at = 0.0
     b._min_call_interval = 0.0
-    b._api_call = lambda ctx, fn, timeout=5.0: fn()
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: fn()
     b._entry_rate_allowed = lambda: True
     b._ip_block_alerted = ""
     return b
@@ -210,7 +210,7 @@ def _preflight_at(monkeypatch, when):
     b._auth = None
     b._last_call_at = 0.0
     b._min_call_interval = 0.0
-    b._api_call = lambda c, fn, timeout=5.0: fn()
+    b._api_call = lambda c, fn, timeout=5.0, **_kw: fn()
     b._margin_lock = threading.Lock()
     b._margin_reservations = {}
     b._margin_reservation_ttl_seconds = 90.0
@@ -419,7 +419,7 @@ def test_a_terminal_exit_refusal_raises_instead_of_returning_none():
 
     b = _broker()
     b._authorize_mutation = lambda *_a, **_kw: None
-    b._api_call = lambda ctx, fn, timeout=5.0: (_ for _ in ()).throw(
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: (_ for _ in ()).throw(
         PermissionException("IP (2405:201:8000:d071::1) is not allowed to place orders")
     )
     with pytest.raises(BrokerOrderRejected) as caught:
@@ -436,7 +436,7 @@ def test_an_ip_block_on_an_exit_is_escalated():
     b._authorize_mutation = lambda *_a, **_kw: None
     seen = []
     b._escalate_if_ip_blocked = lambda detail: seen.append(detail)
-    b._api_call = lambda ctx, fn, timeout=5.0: (_ for _ in ()).throw(
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: (_ for _ in ()).throw(
         PermissionException("IP (2405:201:8000:d071::1) is not allowed to place orders")
     )
     with pytest.raises(BrokerOrderRejected):
@@ -450,7 +450,7 @@ def test_an_ambiguous_exit_is_still_ambiguous():
 
     b = _broker()
     b._authorize_mutation = lambda *_a, **_kw: None
-    b._api_call = lambda ctx, fn, timeout=5.0: (_ for _ in ()).throw(
+    b._api_call = lambda ctx, fn, timeout=5.0, **_kw: (_ for _ in ()).throw(
         NetworkException("connection reset")
     )
     with pytest.raises(BrokerOrderAmbiguous):
@@ -523,6 +523,7 @@ def test_a_protective_stop_fill_is_matched():
         "order_id": "STOP-9", "status": "COMPLETE",
         "filled_quantity": 65, "average_price": 101.20,
     }) is True
+    assert trade.exit_reason == "STOP_HIT"
 
 
 def test_an_exit_fill_does_not_overwrite_the_entry_quantity():

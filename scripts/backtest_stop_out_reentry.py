@@ -18,7 +18,7 @@ import glob
 import importlib.util
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import scanner as scanner_module  # noqa: E402
+from config.settings import get_settings as get_runtime_settings  # noqa: E402
 from scanner import Scanner  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location("bt", ROOT / "scripts" / "backtest_exit_lifecycle.py")
@@ -38,10 +39,28 @@ STOP_REASONS = {"STOP_HIT", "STOP_LOSS", "TRAILING_STOP", "EARLY_LOSS_CUT", "LOS
 
 
 def _ts(value):
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", ""))
-    except Exception:
-        return None
+    ts = bt._market_timestamp(value)
+    return None if pd.isna(ts) else ts.to_pydatetime()
+
+
+def _option_replay_pnl(
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    instrument: str,
+    settings=None,
+) -> tuple[float, float, float]:
+    """Return gross, modeled round-trip costs, and net replay P&L.
+
+    There are no archived executable bid/ask fills for these hypothetical
+    re-entries.  Use the existing shared accounting model rather than inventing
+    another spread assumption; it combines configured costs with the same
+    static/calibrated option-slippage policy used elsewhere in the system.
+    """
+    accounting_settings = settings if settings is not None else get_runtime_settings()
+    return bt.option_replay_pnl(
+        entry_price, exit_price, quantity, instrument, accounting_settings
+    )
 
 
 def _fresh_atm(instrument: str, opt_type: str, contracts: dict, when) -> tuple[str, pd.DataFrame] | None:
@@ -71,6 +90,7 @@ def main() -> None:
         elif a.startswith("--adx="):
             adx_floor = float(a.split("=")[1])
 
+    accounting_settings = get_runtime_settings()
     scanner_module.get_settings = lambda: SimpleNamespace(
         stop_out_reentry_enabled=True,
         stop_out_reentry_window_minutes=window,
@@ -87,7 +107,7 @@ def main() -> None:
 
     print(f"Stop-out re-entry backtest (delay={delay:.0f}m window={window:.0f}m adx>={adx_floor:.0f})\n")
     days = sorted({Path(p).stem for p in glob.glob(str(ROOT / "data_store" / "rtracker" / "events" / "2026-*.jsonl"))})
-    total_pnl = 0.0
+    total_gross_pnl = total_costs = total_pnl = 0.0
     taken = wins = 0
     skipped_no_data = 0
     per_day: dict[str, float] = {}
@@ -104,6 +124,7 @@ def main() -> None:
         contracts = bt.load_today_contracts(day)
         used: dict[str, int] = {}
         day_pnl = 0.0
+        day_taken = 0
 
         for e in stops:
             inst = str(e.get("instrument", "")).split()[0]
@@ -164,15 +185,20 @@ def main() -> None:
             }
             qty = bt.LOT_SIZE.get(inst, 1)
             px, why = bt.sim_runner(trade, bars, bt._sc(), qty)
-            pnl = (px - entry) * qty
-            day_pnl += pnl
-            total_pnl += pnl
+            gross_pnl, costs, net_pnl = _option_replay_pnl(
+                entry, px, qty, inst, accounting_settings,
+            )
+            day_pnl += net_pnl
+            total_gross_pnl += gross_pnl
+            total_costs += costs
+            total_pnl += net_pnl
             taken += 1
-            wins += 1 if pnl > 0 else 0
+            day_taken += 1
+            wins += 1 if net_pnl > 0 else 0
             used[inst] = used.get(inst, 0) + 1
             print(f"  {day} {inst:11}{direction:6}{raw:15} entry={entry:7.1f} exit={px:7.1f} "
-                  f"{why:12} pnl={pnl:+9,.0f}")
-        if taken:
+                  f"{why:12} gross={gross_pnl:+9,.0f} costs={costs:7,.0f} net={net_pnl:+9,.0f}")
+        if day_taken:
             per_day[day] = day_pnl
 
     print("\n" + "=" * 78)
@@ -180,7 +206,9 @@ def main() -> None:
           f"   (skipped, no contract data: {skipped_no_data})")
     if taken:
         print(f"WIN RATE: {wins / taken:.0%}")
-        print(f"TOTAL P&L of stop-out re-entries: Rs {total_pnl:+,.0f}   "
+        print(f"GROSS P&L: Rs {total_gross_pnl:+,.0f}   "
+              f"MODELED COSTS/SLIPPAGE: Rs {total_costs:,.0f}")
+        print(f"TOTAL NET P&L of stop-out re-entries: Rs {total_pnl:+,.0f}   "
               f"(avg {total_pnl / taken:+,.0f}/trade)")
         pos = sum(1 for v in per_day.values() if v > 0)
         neg = sum(1 for v in per_day.values() if v < 0)

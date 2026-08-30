@@ -229,7 +229,7 @@ function setupSettingsExperience() {
         soCard.innerHTML = `
             <span>
                 <strong>Stop-Out Re-Entry</strong>
-                <small>One more attempt when a stop-out is followed by the same trend continuing. Backtest (8 sessions): 73% win rate, +Rs 3,560. Bypasses only the cooldown — never the daily budget or loss halt.</small>
+                <small>Optional shadow/A-B feature. Current cost-correct archive replay is negative after costs, so it ships OFF. If enabled, it bypasses only the cooldown — never the daily budget or loss halt.</small>
             </span>
             <input type="checkbox" id="settStopOutReentry">
         `;
@@ -337,7 +337,15 @@ function setupSettingsExperience() {
     advancedTab.style.color = 'var(--text-muted)';
     advancedTab.style.cursor = 'pointer';
 
-    tabsNav.append(generalTab, advancedTab);
+    const forensicsTab = document.createElement('button');
+    forensicsTab.className = 'sett-tab';
+    forensicsTab.textContent = 'Signal Forensics';
+    forensicsTab.style.background = 'transparent';
+    forensicsTab.style.border = 'none';
+    forensicsTab.style.color = 'var(--text-muted)';
+    forensicsTab.style.cursor = 'pointer';
+
+    tabsNav.append(generalTab, advancedTab, forensicsTab);
 
     const content = document.createElement('div');
     content.className = 'settings-content-wrapper';
@@ -351,22 +359,100 @@ function setupSettingsExperience() {
     advancedContent.id = 'advancedSettContentView';
     advancedContent.style.display = 'none';
 
-    generalTab.addEventListener('click', () => {
-        generalTab.style.fontWeight = 'bold';
-        generalTab.style.color = 'var(--text-color)';
-        advancedTab.style.fontWeight = 'normal';
-        advancedTab.style.color = 'var(--text-muted)';
-        generalContent.style.display = 'block';
-        advancedContent.style.display = 'none';
-    });
+    const forensicsContent = document.createElement('div');
+    forensicsContent.className = 'sett-content-pane';
+    forensicsContent.id = 'forensicsSettContentView';
+    forensicsContent.style.display = 'none';
+    forensicsContent.innerHTML = `
+        <div class="sf-shell">
+            <!-- Header -->
+            <div class="sf-header">
+                <div>
+                    <div class="sf-header-label">LIVE SESSION FLIGHT RECORDER</div>
+                    <div class="sf-title">Signal Forensics</div>
+                    <div class="sf-subtitle">Structured evidence from detection through final exit. Analysis only.</div>
+                </div>
+                <div class="sf-header-right">
+                    <span class="sf-live-badge"><span class="sf-live-dot"></span> LIVE</span>
+                    <span class="sf-live-time" id="sfLiveTime"></span>
+                </div>
+            </div>
+            <!-- Session + Stats -->
+            <div class="sf-stats-bar">
+                <div class="sf-stats-session">
+                    <div class="sf-stats-label">Session</div>
+                    <select id="sfFilterDate" class="sf-stats-select"><option value="">Current</option></select>
+                </div>
+                <div class="sf-stats-cell"><div class="sf-stats-label">EVENTS</div><div class="sf-stats-num" id="sfStatEvents">0</div></div>
+                <div class="sf-stats-cell"><div class="sf-stats-label">SIGNALS</div><div class="sf-stats-num" id="sfStatSignals">0</div></div>
+                <div class="sf-stats-cell"><div class="sf-stats-label">LATEST ID</div><div class="sf-stats-num" id="sfStatLatest">0</div></div>
+            </div>
+            <!-- Filters -->
+            <div class="sf-filters">
+                <select id="sfFilterInstrument" class="sf-flt"><option value="">All instruments</option><option>NIFTY</option><option>BANKNIFTY</option><option>SENSEX</option><option>MIDCPNIFTY</option></select>
+                <select id="sfFilterTimeframe" class="sf-flt"><option value="">All TF</option><option value="1min">1min</option><option value="3min">3min</option><option value="5min">5min</option><option value="15min">15min</option></select>
+                <select id="sfFilterPhase" class="sf-flt sf-flt-wide"><option value="">All phases</option><option>DETECTED</option><option>STABILIZING</option><option>ACCEPTED</option><option>REJECTED</option><option>ORDER_PENDING</option><option>ORDER_SUBMITTED</option><option>FILLED</option><option>ENTERED</option><option>TRAILING</option><option>MARK_TO_MARKET</option><option>EXITED</option></select>
+                <select id="sfFilterDecision" class="sf-flt"><option value="">All decisions</option><option>PENDING</option><option>ACCEPTED</option><option>REJECTED</option><option>SUBMITTED</option><option>FILLED</option><option>OPEN</option><option>CLOSED</option><option>CANCELLED</option></select>
+                <input type="text" id="sfFilterSearch" class="sf-flt sf-flt-search" placeholder="Reason, contract, signal ID\u2026">
+            </div>
+            <!-- Actions -->
+            <div class="sf-actions">
+                <div class="sf-actions-l">
+                    <button class="sf-btn" id="sfBtnApply">APPLY</button>
+                    <button class="sf-btn" id="sfBtnClear">CLEAR</button>
+                    <button class="sf-btn" id="sfBtnRefresh">REFRESH</button>
+                </div>
+                <div class="sf-actions-r">
+                    <label class="sf-toggle"><input type="checkbox" id="sfAutoFollow" checked> Auto follow newest</label>
+                    <button class="sf-btn" id="sfBtnExportCsv">EXPORT CSV</button>
+                    <button class="sf-btn" id="sfBtnExportJson">EXPORT JSON</button>
+                </div>
+            </div>
+            <!-- Table -->
+            <div class="sf-ledger-wrap">
+                <table class="sf-ledger">
+                    <thead><tr>
+                        <th>IST TIME</th><th>SIGNAL / LIFECYCLE</th><th>INSTRUMENT / CONTRACT</th>
+                        <th>TF</th><th>DIR</th><th>PHASE</th><th>DECISION</th>
+                        <th>EXACT REASON</th><th>SOURCE / GATE</th><th>GRADE / CONF</th>
+                        <th>LTP / ENTRY</th><th>STOP I&rarr;NOW</th><th>TARGET</th><th>P&amp;L</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <button class="sf-load-more" style="display:none;">Load more\u2026</button>
+        </div>
+        <div class="sf-drawer" id="sfDrawer">
+            <div class="sf-drawer-header">
+                <h3 id="sfDrawerTitle">Lifecycle Detail</h3>
+                <button class="sf-drawer-close" aria-label="Close drawer">\u00d7</button>
+            </div>
+            <div class="sf-drawer-body" id="sfDrawerBody"></div>
+        </div>
+    `;
+    let _forensicsInited = false;
 
-    advancedTab.addEventListener('click', () => {
-        advancedTab.style.fontWeight = 'bold';
-        advancedTab.style.color = 'var(--text-color)';
-        generalTab.style.fontWeight = 'normal';
-        generalTab.style.color = 'var(--text-muted)';
-        advancedContent.style.display = 'block';
-        generalContent.style.display = 'none';
+    function _activateTab(activeBtn, activePane) {
+        [generalTab, advancedTab, forensicsTab].forEach(t => {
+            t.style.fontWeight = 'normal';
+            t.style.color = 'var(--text-muted)';
+        });
+        [generalContent, advancedContent, forensicsContent].forEach(c => {
+            c.style.display = 'none';
+        });
+        activeBtn.style.fontWeight = 'bold';
+        activeBtn.style.color = 'var(--text-color)';
+        activePane.style.display = 'block';
+    }
+
+    generalTab.addEventListener('click', () => _activateTab(generalTab, generalContent));
+    advancedTab.addEventListener('click', () => _activateTab(advancedTab, advancedContent));
+    forensicsTab.addEventListener('click', () => {
+        _activateTab(forensicsTab, forensicsContent);
+        if (!_forensicsInited && window.SignalForensics) {
+            window.SignalForensics.init({ pane: forensicsContent });
+            _forensicsInited = true;
+        }
     });
 
     content.className = 'settings-content';
@@ -660,7 +746,7 @@ function setupSettingsExperience() {
     ]);
 
     advancedContent.append(advTradeCard, advTimingCard, advMomentumCard, advPeakExitCard, advMarketCard, advOneWayCascadeCard, advCascadeBookCard, advMissedReentryCard, advLateReclaimCard, advChoppyScalpCard, advDualLaneCard, advExecutionCard);
-    content.append(generalContent, advancedContent);
+    content.append(generalContent, advancedContent, forensicsContent);
 
 
     body.innerHTML = '';
@@ -736,7 +822,7 @@ function syncSettingsFromConfig(data) {
         const hedgeEl = document.getElementById('settPullbackHedge');
         if (hedgeEl) hedgeEl.checked = cfg.pullback_hedge_enabled === true;
         const soEl = document.getElementById('settStopOutReentry');
-        if (soEl) soEl.checked = cfg.stop_out_reentry_enabled !== false;
+        if (soEl) soEl.checked = cfg.stop_out_reentry_enabled === true;
         const tfEl = document.getElementById('settPerTfGrading');
         if (tfEl) tfEl.checked = cfg.per_timeframe_grading_enabled === true;
         setChecked('settEngineLab', cfg.engine_lab_enabled !== undefined ? cfg.engine_lab_enabled : true);
@@ -812,7 +898,7 @@ function syncSettingsFromConfig(data) {
         setChecked('settPeakThreatExit', cfg.peak_threat_exit_enabled !== undefined ? cfg.peak_threat_exit_enabled : true);
         setVal('settPeakThreatMinPeak', cfg.peak_threat_exit_min_peak_rs !== undefined ? cfg.peak_threat_exit_min_peak_rs : 400.0);
         setChecked('settBreakevenStop', cfg.breakeven_stop_enabled !== undefined ? cfg.breakeven_stop_enabled : true);
-        setVal('settBreakevenStopArm', cfg.breakeven_stop_arm_rs !== undefined ? cfg.breakeven_stop_arm_rs : 150.0);
+        setVal('settBreakevenStopArm', cfg.breakeven_stop_arm_rs !== undefined ? cfg.breakeven_stop_arm_rs : 100.0);
         setVal('settBreakevenStopFloor', cfg.breakeven_stop_floor_rs !== undefined ? cfg.breakeven_stop_floor_rs : 80.0);
         setChecked('settPeakTrail', cfg.peak_trail_enabled !== undefined ? cfg.peak_trail_enabled : false);
         setVal('settPeakTrailAbove', cfg.peak_trail_above_rs !== undefined ? cfg.peak_trail_above_rs : 600.0);
@@ -1062,7 +1148,7 @@ function saveSettings() {
         index_cooldown_minutes: Math.max(0, parseFloat(document.getElementById('settIndexCooldown')?.value) || 0),
         futures_shadow_enabled: document.getElementById('settFuturesShadow')?.checked === true,
         pullback_hedge_enabled: document.getElementById('settPullbackHedge')?.checked === true,
-        stop_out_reentry_enabled: document.getElementById('settStopOutReentry')?.checked !== false,
+        stop_out_reentry_enabled: document.getElementById('settStopOutReentry')?.checked === true,
         per_timeframe_grading_enabled: document.getElementById('settPerTfGrading')?.checked === true,
         engine_lab_enabled: document.getElementById('settEngineLab')?.checked !== false,
         engine_lab_real_mode_only: document.getElementById('settEngineLabRealOnly')?.checked === true,
@@ -1131,7 +1217,7 @@ function saveSettings() {
         peak_threat_exit_enabled: checkedVal('settPeakThreatExit', true),
         peak_threat_exit_min_peak_rs: numberVal('settPeakThreatMinPeak', 400.0),
         breakeven_stop_enabled: checkedVal('settBreakevenStop', true),
-        breakeven_stop_arm_rs: numberVal('settBreakevenStopArm', 150.0),
+        breakeven_stop_arm_rs: numberVal('settBreakevenStopArm', 100.0),
         breakeven_stop_floor_rs: numberVal('settBreakevenStopFloor', 80.0),
         peak_trail_enabled: checkedVal('settPeakTrail', false),
         peak_trail_above_rs: numberVal('settPeakTrailAbove', 600.0),

@@ -357,17 +357,17 @@ def dynamic_rr(
 ) -> float:
     """Return quality-scaled initial RR; runner mode handles exceptional moves."""
     conf = min(max(float(confidence or 0.0), 0.0), 1.0)
-    min_rr = 1.6
+    min_rr = 1.5
     settings = None
     if max_rr is None:
         try:
             settings = get_settings()
-            min_rr = float(getattr(settings, "dynamic_rr_min", 1.6) or 1.6)
+            min_rr = float(getattr(settings, "dynamic_rr_min", 1.5) or 1.5)
             max_rr = float(getattr(settings, "dynamic_rr_max", 12.0) or 12.0)
         except Exception:
             max_rr = 12.0
-    max_rr = max(1.60, float(max_rr or 12.0))
-    min_rr = min(max(1.60, float(min_rr or 1.6)), max_rr)
+    max_rr = max(1.50, float(max_rr or 12.0))
+    min_rr = min(max(1.50, float(min_rr or 1.5)), max_rr)
     base_grade = str(grade or "C").split()[0]
     grade_bonus = {
         "A+": 1.15,

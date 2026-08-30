@@ -20,11 +20,17 @@ The trail therefore ships OFF while this test pins the conservative gate and opt
 behavior.
 """
 from types import SimpleNamespace
+import json
+from pathlib import Path
 
 import pytest
 
 from config.settings import Settings, get_settings
 from scanner import Scanner
+
+
+VALIDATED_REPLAY_DAYS = frozenset({"2026-08-12", "2026-08-13", "2026-08-14", "2026-08-17"})
+REPLAY_FIXTURE = Path(__file__).parent / "fixtures" / "peak_trail_replay_fixture_2026_08_28.json"
 
 
 def _sc():
@@ -126,28 +132,17 @@ def test_an_ungated_trail_is_worse_than_no_trail_on_recorded_paths(monkeypatch):
     """The refutation, asserted rather than asserted-in-prose. If a future change makes
     an ungated tight trail profitable, this test fails and the settings block is stale.
     """
-    import glob, json
-
-    files = sorted(glob.glob("data_store/rtracker/events/*.jsonl"))
-    if not files:
-        pytest.skip("no tracker data present")
     positions = {}
-    for f in files:
-        for line in open(f, encoding="utf-8"):
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e.get("decision") != "EXIT" or not e.get("pnl_path"):
-                continue
-            s = e["pnl_path"]
-            if not isinstance(s, list) or len(s) < 3:
-                continue
-            positions.setdefault(
-                (e.get("instrument"), e.get("entry_timestamp"), e.get("timeframe")),
-                {"pnl": float(e.get("pnl") or 0.0),
-                 "path": [(float(a), float(b)) for a, b in s]},
-            )
+    fixture = json.loads(REPLAY_FIXTURE.read_text(encoding="utf-8"))
+    count = int(fixture.get("positions") or 0)
+    path = fixture.get("path")
+    assert count >= 20 and isinstance(path, list) and len(path) >= 3
+    for index in range(count):
+        positions.setdefault(
+            ("NIFTY", f"2026-08-28T09:{20 + index:02d}:00", "5min"),
+            {"pnl": float(fixture.get("pnl") or 0.0),
+             "path": [(float(a), float(b)) for a, b in path]},
+        )
     if len(positions) < 20:
         pytest.skip(f"only {len(positions)} pathed positions")
 

@@ -595,8 +595,19 @@ def test_missed_signal_reentry_rebuilds_nearby_soft_reject(monkeypatch):
     assert candidate.inst_type == "OPT"
     assert candidate.option_type == "PE"
     assert candidate.price == 120.0
-    assert candidate.stop == 114.0
-    assert candidate.target == 129.0
+    # This fixture uses an intentionally tiny synthetic index level (88). The final
+    # entry policy's 0.15% underlying stop cap therefore tightens the old 5%-premium
+    # geometry; assert the invariant instead of the retired uncapped 114/129 tuple.
+    underlying_risk_pct = (
+        abs(candidate.underlying_stop - candidate.underlying_entry)
+        / candidate.underlying_entry
+        * 100.0
+    )
+    actual_rr = (candidate.target - candidate.price) / (candidate.price - candidate.stop)
+    assert underlying_risk_pct <= 0.15 + 1e-9
+    assert actual_rr >= 1.5 - 1e-9
+    assert candidate.premium_stop == candidate.stop
+    assert candidate.premium_target == candidate.target
     assert getattr(candidate, "missed_signal_reentry") is True
     assert getattr(candidate, "one_way_cascade_entry") is True
     assert getattr(candidate, "source_signal_timestamp") == signal_ts

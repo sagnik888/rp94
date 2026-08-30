@@ -12,11 +12,12 @@ login, so storing one would be liability with no capability.
 from datetime import datetime, timedelta
 
 import json
+import threading
 
 import pytest
 import pytz
 
-from data.kite_auth import IST, KiteAuth, most_recent_token_cutoff
+from data.kite_auth import IST, KiteAuth, is_kite_auth_failure, most_recent_token_cutoff
 
 MORNING = datetime(2026, 7, 31, 9, 15)
 BEFORE_DAWN = datetime(2026, 7, 31, 5, 30)
@@ -78,7 +79,171 @@ def test_a_token_kite_rejects_forces_a_fresh_login(tmp_path, monkeypatch):
     assert auth.load_cached_session() is False
     assert auth.status()["auth_required"] is True
     assert "rejected" in auth.status()["reason"]
+    assert not auth.token_file.exists(), "a broker-rejected token must not be reusable"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "InputException: invalid token",
+        "Invalid `access_token`",
+        "Token is invalid or has expired",
+        "The access token has expired",
+    ],
+)
+def test_input_exception_auth_shapes_are_classified(message):
+    class InputException(Exception):
+        pass
+
+    assert is_kite_auth_failure(InputException(message)) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["invalid trigger price", "invalid order id", "quantity is required"],
+)
+def test_ordinary_input_errors_do_not_invalidate_auth(message):
+    class InputException(Exception):
+        pass
+
+    assert is_kite_auth_failure(InputException(message)) is False
+
+
+def test_cached_session_verifier_rejects_input_exception_invalid_token():
+    class InputException(Exception):
+        pass
+
+    class Client:
+        def profile(self):
+            raise InputException("Invalid `access_token`")
+
+    verdict, reason = KiteAuth._verify_live(Client())
+    assert verdict is False
+    assert "rejected" in reason.lower()
+
+
+def test_late_failure_from_old_client_cannot_invalidate_new_login(tmp_path):
+    auth = _auth(tmp_path)
+    old_client = object()
+    new_client = object()
+    auth._kite = new_client
+    auth._auth_required = False
+    auth._auth_failure_latched = False
+
+    assert auth.invalidate("old request failed", failed_client=old_client) is False
+    assert auth.kite is new_client
+    assert auth.status()["auth_required"] is False
+
+
+def test_auth_invalidation_is_latched_once_per_client(tmp_path):
+    auth = _auth(tmp_path)
+    client = object()
+    auth._kite = client
+    auth._auth_required = False
+
+    assert auth.invalidate("expired", failed_client=client) is True
+    assert auth.invalidate("expired again", failed_client=client) is False
     assert auth.kite is None
+    assert auth.kite is None
+
+
+def test_latched_invalid_token_cannot_be_reinstalled_from_cache(tmp_path, monkeypatch):
+    auth = _auth(tmp_path)
+    client = object()
+    auth._kite = client
+    auth._auth_required = False
+    _write_token(auth, issued_at=datetime(2026, 7, 31, 8, 45))
+    assert auth.invalidate("invalid token", failed_client=client) is True
+    # Even if another process recreates the old cache path, this process has already
+    # proved the session dead and must not provisionally reinstall it.
+    _write_token(auth, issued_at=datetime(2026, 7, 31, 8, 45))
+    monkeypatch.setattr(
+        KiteAuth,
+        "_verify_live",
+        staticmethod(lambda client: pytest.fail("latched cache was re-verified")),
+    )
+    assert auth.load_cached_session() is False
+    assert auth.kite is None
+
+
+def test_late_cached_verification_cannot_overwrite_or_delete_browser_login(
+    tmp_path, monkeypatch
+):
+    auth = _auth(tmp_path)
+    _write_token(auth, issued_at=datetime(2026, 7, 31, 8, 45), access_token="AT-OLD")
+    verify_started = threading.Event()
+    release_verify = threading.Event()
+
+    class _Client:
+        def __init__(self, api_key=None, **_kwargs):
+            self.api_key = api_key
+            self.token = ""
+
+        def set_access_token(self, token):
+            self.token = token
+
+        def generate_session(self, request_token, api_secret):
+            assert request_token == "RT-NEW"
+            return {"access_token": "AT-NEW", "user_id": "JOQ915"}
+
+    def verify(client):
+        assert client.token == "AT-OLD"
+        verify_started.set()
+        assert release_verify.wait(2.0)
+        return False, "Kite rejected the cached token: invalid token"
+
+    monkeypatch.setattr("kiteconnect.KiteConnect", _Client)
+    monkeypatch.setattr(KiteAuth, "_verify_live", staticmethod(verify))
+    result = []
+    worker = threading.Thread(target=lambda: result.append(auth.load_cached_session()))
+    worker.start()
+    assert verify_started.wait(2.0)
+
+    auth.complete_login("RT-NEW")
+    installed = auth.kite
+    release_verify.set()
+    worker.join(2.0)
+
+    assert not worker.is_alive()
+    assert result == [True]
+    assert auth.kite is installed and installed.token == "AT-NEW"
+    assert auth.status()["auth_required"] is False
+    cached = json.loads(auth.token_file.read_text(encoding="utf-8"))
+    assert cached["access_token"] == "AT-NEW"
+
+
+def test_cached_session_verification_is_single_flight(tmp_path, monkeypatch):
+    auth = _auth(tmp_path)
+    _write_token(auth, issued_at=datetime(2026, 7, 31, 8, 45))
+    verify_started = threading.Event()
+    release_verify = threading.Event()
+    verify_calls = []
+
+    def verify(_client):
+        verify_calls.append(1)
+        verify_started.set()
+        assert release_verify.wait(2.0)
+        return False, "Kite rejected the cached token: invalid token"
+
+    monkeypatch.setattr(KiteAuth, "_verify_live", staticmethod(verify))
+    results = []
+    workers = [
+        threading.Thread(target=lambda: results.append(auth.load_cached_session()))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    assert verify_started.wait(2.0)
+    release_verify.set()
+    for worker in workers:
+        worker.join(2.0)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert verify_calls == [1]
+    assert results == [False, False]
+    assert auth.kite is None
+    assert auth.status()["auth_required"] is True
+    assert not auth.token_file.exists()
 
 
 def test_an_early_morning_token_survives_the_same_day_cutoff(tmp_path, monkeypatch):

@@ -82,7 +82,37 @@ def build_source_health(
         else "idle_standby"
     )
 
-    return {
+    historical_source = getattr(provider, "kite", None)
+    historical_status = {
+        "kite_historical_rest_source": "kite_historical_rest",
+        "kite_historical_rest_available": False,
+        "kite_historical_rest_healthy": False,
+        "kite_historical_rest_fresh": False,
+        "kite_historical_rest_stale": False,
+        "kite_historical_rest_last_call_ok": None,
+        "kite_historical_rest_max_age_seconds": None,
+        "kite_historical_rest_last_attempt_at": None,
+        "kite_historical_rest_last_attempt_age_seconds": None,
+        "kite_historical_rest_last_success_at": None,
+        "kite_historical_rest_age_seconds": None,
+        "kite_historical_rest_last_error_at": None,
+        "kite_historical_rest_last_error_age_seconds": None,
+        "kite_historical_rest_failure": "not available",
+        "kite_historical_rest_last_error": "",
+        "kite_historical_rest_failures": 0,
+    }
+    status_fn = getattr(historical_source, "historical_rest_status", None)
+    if callable(status_fn):
+        try:
+            try:
+                observed = status_fn(now_ts=now)
+            except TypeError:
+                observed = status_fn()
+            historical_status.update(dict(observed or {}))
+        except Exception:
+            historical_status["kite_historical_rest_failure"] = "health unavailable"
+
+    result = {
         "kite": kite_health,
         # Live order capability. `kite` above is the latched connect-time flag and stays
         # True after a mid-session token death; this one goes False with the session.
@@ -109,6 +139,10 @@ def build_source_health(
             else None
         ),
     }
+    # Candle REST is a separate capability. Never let it rewrite websocket/LTP
+    # freshness, which is used for live price and order-authority decisions.
+    result.update(historical_status)
+    return result
 
 
 def _uptime_seconds(provider: Any, now_ts: float) -> Optional[float]:

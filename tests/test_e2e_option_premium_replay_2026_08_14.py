@@ -148,7 +148,7 @@ def test_a_proven_big_move_is_not_cut_by_the_giveback_guard(index, regime):
 
 @pytest.mark.parametrize("regime", REGIMES)
 def test_the_runner_lock_keeps_most_of_the_peak(regime):
-    """The lock is 0.85 in breakout/volatile and 0.90 elsewhere, so >=85% is the bar."""
+    """The current runtime base lock is 0.85, so >=85% is the invariant."""
     bars = _bars([(105, 104), (120, 118), (140, 138), (132, 128)])
     peak_gain = 140.0 - ENTRY
 
@@ -158,8 +158,8 @@ def test_the_runner_lock_keeps_most_of_the_peak(regime):
     assert px >= ENTRY + peak_gain * 0.85
 
 
-def test_choppier_regimes_are_given_more_room_than_trends():
-    """Real behaviour: breakout and volatile lock at 0.85, trends at 0.90."""
+def test_dynamic_helper_can_give_choppier_regimes_more_room():
+    """When a tighter 0.90 base is supplied, high-volatility tape relaxes to 0.85."""
     sc = _sc()
 
     assert sc._dynamic_runner_lock_pct(0.90, "BREAKOUT_UP") < sc._dynamic_runner_lock_pct(

@@ -117,7 +117,11 @@ def cheapest_one_lot_cost(settings) -> tuple[float, str]:
     except Exception:
         return 0.0, ""
 
-    active = [str(x).upper() for x in (getattr(settings, "active_indices", None) or indices)]
+    configured_active = getattr(settings, "active_indices", None)
+    active = [
+        str(x).upper()
+        for x in (configured_active if configured_active is not None else indices)
+    ]
     best_cost, best_name, best_lot = 0.0, "", 0
     for name in active:
         row = indices.get(name) or {}

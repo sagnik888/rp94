@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import pytz
 from loguru import logger
+from data.kite_auth import is_kite_auth_failure, kite_auth_failure_reason
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -67,12 +68,32 @@ class KiteDataSource:
         # throttle open indefinitely.
         self._throttle_until: Dict[str, float] = {}
         self._throttle_failures: Dict[str, int] = {}
+        self._historical_rest_last_success: float = 0.0
+        self._historical_rest_last_failure: float = 0.0
+        self._historical_rest_last_error_reason: str = ""
+        self._historical_rest_failure_reason: str = ""
+        self._historical_rest_failure_count: int = 0
+        self._historical_rest_last_attempt: float = 0.0
+        self._historical_rest_last_call_ok: Optional[bool] = None
+        self._historical_rest_sequence: int = 0
+        self._historical_rest_completed_sequence: int = 0
+        self._historical_rest_lock = threading.RLock()
 
     @property
     def kite(self):
-        if self._kite is not None:
-            return self._kite
-        return getattr(self._auth, "kite", None)
+        auth = self._auth
+        if auth is not None and hasattr(auth, "kite"):
+            # The shared auth object is authoritative.  A locally pinned client must
+            # disappear immediately when another component invalidates that session,
+            # and a completed re-login must replace it before health/read calls run.
+            try:
+                shared = getattr(auth, "kite", None)
+            except Exception:
+                shared = None
+            with self._lock:
+                self._kite = shared
+                return self._kite
+        return self._kite
 
     @property
     def is_connected(self) -> bool:
@@ -128,10 +149,74 @@ class KiteDataSource:
             "kite_rest_backoff_failures": sum(self._throttle_failures.values()),
         }
 
+    def _begin_historical_rest_call(self, context: str) -> int:
+        if context != "historical_data":
+            return 0
+        with self._historical_rest_lock:
+            self._historical_rest_sequence += 1
+            return self._historical_rest_sequence
+
+    def _record_historical_rest_result(
+        self,
+        sequence: int,
+        *,
+        ok: bool,
+        reason: str = "",
+        observed_at: Optional[float] = None,
+    ) -> None:
+        if sequence <= 0:
+            return
+        stamp = _time.time() if observed_at is None else float(observed_at)
+        with self._historical_rest_lock:
+            if ok:
+                self._historical_rest_last_success = max(
+                    self._historical_rest_last_success, stamp
+                )
+            else:
+                if stamp >= self._historical_rest_last_failure:
+                    self._historical_rest_last_failure = stamp
+                    self._historical_rest_last_error_reason = str(
+                        reason or "historical REST failed"
+                    )[:300]
+            # A request that began before a newer one may finish later. It can add a
+            # timestamp, but it must not overwrite the newer call's verdict.
+            if sequence < self._historical_rest_completed_sequence:
+                return
+            self._historical_rest_completed_sequence = sequence
+            self._historical_rest_last_attempt = stamp
+            self._historical_rest_last_call_ok = bool(ok)
+            if ok:
+                self._historical_rest_failure_reason = ""
+                self._historical_rest_failure_count = 0
+            else:
+                self._historical_rest_failure_reason = str(reason or "historical REST failed")[:300]
+                self._historical_rest_failure_count += 1
+
     def _call(self, context: str, fn, default=None):
+        historical_sequence = self._begin_historical_rest_call(context)
+        if self._auth is not None:
+            status_fn = getattr(self._auth, "status", None)
+            if callable(status_fn):
+                try:
+                    status = status_fn() or {}
+                    if status.get("auth_required") and getattr(self._auth, "kite", None) is None:
+                        self._kite = None
+                        self._record_historical_rest_result(
+                            historical_sequence,
+                            ok=False,
+                            reason="authentication required",
+                        )
+                        return default
+                except Exception:
+                    pass
         api = self.kite
         if api is None:
             logger.debug(f"Kite {context} skipped: no authenticated session")
+            self._record_historical_rest_result(
+                historical_sequence,
+                ok=False,
+                reason="no authenticated session",
+            )
             return default
         now_ts = _time.time()
         if self._throttled(context, now_ts):
@@ -140,12 +225,29 @@ class KiteDataSource:
             # allowed to drain instead of being kept open by the retry.
             logger.debug(f"Kite {context} skipped: throttled for another "
                          f"{self._throttle_until[context] - now_ts:.1f}s")
+            self._record_historical_rest_result(
+                historical_sequence,
+                ok=False,
+                reason="historical REST throttled",
+            )
             return default
         try:
             result = fn(api)
         except Exception as exc:
-            if type(exc).__name__ == "TokenException" and self._auth is not None:
-                self._auth.invalidate(f"{context}: {exc}")
+            if is_kite_auth_failure(exc) and self._auth is not None:
+                reason = kite_auth_failure_reason(context, exc)
+                try:
+                    self._auth.invalidate(reason, failed_client=api)
+                except TypeError:
+                    # Compatibility with lightweight test/dry-run auth facades.
+                    self._auth.invalidate(reason)
+                if self._kite is api:
+                    self._kite = None
+            self._record_historical_rest_result(
+                historical_sequence,
+                ok=False,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
             if self._is_throttle(exc):
                 cooldown = self._mark_throttled(context, now_ts)
                 logger.warning(
@@ -156,7 +258,73 @@ class KiteDataSource:
                 logger.warning(f"Kite {context} failed: {type(exc).__name__}: {exc}")
             return default
         self._clear_throttle(context)
+        self._record_historical_rest_result(historical_sequence, ok=True)
         return result
+
+    def historical_rest_status(
+        self,
+        *,
+        now_ts: Optional[float] = None,
+        max_age_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Independent health for candle REST, never conflated with quote/ticks."""
+        now = _time.time() if now_ts is None else float(now_ts)
+        if max_age_seconds is None:
+            try:
+                from config.settings import get_settings
+
+                max_age_seconds = float(
+                    getattr(
+                        get_settings(), "kite_historical_rest_max_age_seconds", 90.0
+                    )
+                    or 90.0
+                )
+            except Exception:
+                max_age_seconds = 90.0
+        max_age = max(0.0, float(max_age_seconds or 0.0))
+        with self._historical_rest_lock:
+            last_success = float(self._historical_rest_last_success or 0.0)
+            last_error = float(self._historical_rest_last_failure or 0.0)
+            last_attempt = float(self._historical_rest_last_attempt or 0.0)
+            last_call_ok = self._historical_rest_last_call_ok
+            failure_reason = str(self._historical_rest_failure_reason or "")
+            last_error_reason = str(self._historical_rest_last_error_reason or "")
+            failure_count = int(self._historical_rest_failure_count)
+        success_age = max(0.0, now - last_success) if last_success > 0.0 else None
+        error_age = max(0.0, now - last_error) if last_error > 0.0 else None
+        attempt_age = max(0.0, now - last_attempt) if last_attempt > 0.0 else None
+        available = self.kite is not None
+        fresh = bool(
+            available
+            and
+            last_call_ok is True
+            and success_age is not None
+            and success_age <= max_age
+        )
+        return {
+            "kite_historical_rest_source": "kite_historical_rest",
+            "kite_historical_rest_available": available,
+            "kite_historical_rest_healthy": fresh,
+            "kite_historical_rest_fresh": fresh,
+            "kite_historical_rest_stale": bool(last_attempt > 0.0 and not fresh),
+            "kite_historical_rest_last_call_ok": last_call_ok,
+            "kite_historical_rest_max_age_seconds": max_age,
+            "kite_historical_rest_last_attempt_at": last_attempt or None,
+            "kite_historical_rest_last_attempt_age_seconds": (
+                round(attempt_age, 2) if attempt_age is not None else None
+            ),
+            "kite_historical_rest_last_success_at": last_success or None,
+            "kite_historical_rest_age_seconds": (
+                round(success_age, 2) if success_age is not None else None
+            ),
+            "kite_historical_rest_last_error_at": last_error or None,
+            "kite_historical_rest_last_error_age_seconds": (
+                round(error_age, 2) if error_age is not None else None
+            ),
+            "kite_historical_rest_failure": failure_reason,
+            "kite_historical_rest_last_error": last_error_reason,
+            "kite_historical_rest_failures": failure_count,
+        }
 
     # ── contract master ──────────────────────────────────────────────────────
     def load_instruments(self, exchanges: Tuple[str, ...] = ("NFO", "BFO", "NSE", "BSE"),

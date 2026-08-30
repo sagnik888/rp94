@@ -50,12 +50,12 @@ def test_hygiene_excludes_shadow_and_dedups_dicts():
         {"id": "1_FUT", "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
          "inst_type": "FUT", "trading_symbol": "FUT_SHADOW", "pnl": 500,
          "grade": "A (Hist, Fut Shadow)", "entry_time": "2026-07-08T13:35:00"},
-        {"id": "2a", "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
+        {"id": "H_NIFTY_5min_EMA_20260708140000", "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
          "inst_type": "OPT", "trading_symbol": "NIFTYCE", "pnl": 200,
-         "entry_time": "2026-07-08T14:00:00"},
-        {"id": "2b", "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
+         "entry_time": "2026-07-08T14:00:00", "data_provenance": "BACKTEST"},
+        {"id": "H_NIFTY_5min_CONSENSUS_20260708140000", "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
          "inst_type": "OPT", "trading_symbol": "NIFTYCE", "pnl": 200,
-         "entry_time": "2026-07-08T14:00:00"},
+         "entry_time": "2026-07-08T14:00:00", "data_provenance": "BACKTEST"},
     ]
     head, tel = hygiene_closed_rows(rows)
     assert len(head) == 2
@@ -63,6 +63,34 @@ def test_hygiene_excludes_shadow_and_dedups_dicts():
     assert tel["futures_shadow"]["rows"] == 1
     assert tel["engine_replay"]["excess_rows"] == 1
     assert is_futures_shadow_row(rows[1]) is True
+
+
+def test_hygiene_never_deduplicates_identical_live_ledger_rows():
+    """A heuristic replay signature may never erase two real broker fills."""
+    shared = {
+        "instrument": "NIFTY",
+        "timeframe": "5min",
+        "direction": "LONG",
+        "inst_type": "OPT",
+        "trading_symbol": "NIFTYCE",
+        "entry_price": 100.0,
+        "exit_price": 110.0,
+        "pnl": 570.0,
+        "entry_timestamp": 1783500300.0,
+        "status": "CLOSED",
+        "data_provenance": "LIVE",
+    }
+    rows = [
+        {**shared, "id": "T001_NIFTY"},
+        {**shared, "id": "T002_NIFTY"},
+    ]
+
+    headline, telemetry = hygiene_closed_rows(rows)
+
+    assert [row["id"] for row in headline] == ["T001_NIFTY", "T002_NIFTY"]
+    assert telemetry["engine_replay"]["candidate_rows"] == 0
+    assert telemetry["engine_replay"]["stream_variant_rows"] == 0
+    assert telemetry["engine_replay"]["non_replay_rows"] == 2
 
 
 def test_hygiene_handles_blank_instrument_and_keeps_distinct_symbols():

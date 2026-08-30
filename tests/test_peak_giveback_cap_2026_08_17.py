@@ -25,10 +25,10 @@ in all four sessions. It is not free — a trade that peaked Rs.1,179 books Rs.8
 against Rs.961 actual, and one breached the cap off a running peak of Rs.335 and then ran
 to Rs.670. 23 against 3 is the trade being made.
 """
-import glob
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +36,19 @@ import pytest
 from config.settings import Settings, get_settings
 from intelligence.rtracker import normalize_replay_pnl_event
 from scanner import IST, Scanner
+
+
+# The quantitative claim was validated on these four closed sessions. New rtracker
+# files are mutable live evidence and must not silently rewrite a historical release
+# gate or turn a data refresh into a strategy regression.
+VALIDATED_REPLAY_DAYS = frozenset({"2026-08-12", "2026-08-13", "2026-08-14", "2026-08-17"})
+REPLAY_FIXTURE = Path(__file__).parent / "fixtures" / "entry_policy_replay_paths_2026_08_28.json"
+
+
+def _replay_fixture_events():
+    """Read the checked-in corpus; live rtracker files are mutable evidence."""
+    rows = json.loads(REPLAY_FIXTURE.read_text(encoding="utf-8"))
+    return [row for row in rows if row.get("day") in VALIDATED_REPLAY_DAYS]
 
 
 @pytest.fixture(autouse=True)
@@ -242,41 +255,17 @@ def test_replaying_recorded_paths_beats_what_actually_happened():
     The replay can only ever exit EARLIER than reality, since a path stops at the real
     exit — so it correctly pays for forfeited upside and cannot invent any.
     """
-    files = sorted(glob.glob("data_store/rtracker/events/*.jsonl"))
-    if not files:
-        pytest.skip("no tracker data present")
-    # The session being written RIGHT NOW is not evidence. Its file grows all day, so
-    # the per-day assertion below reads whatever the book happens to be at the moment
-    # the suite runs — on 2026-08-21 at 09:31 that was a single 16.9s BANKNIFTY cut at
-    # -Rs.916, and the whole test failed on it. A claim about how sessions close can
-    # only be made about sessions that have closed.
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    files = [f for f in files if os.path.basename(f)[:10] != today]
-    if not files:
-        pytest.skip("only the in-progress session is present")
     positions = {}
-    for path_file in files:
-        day = os.path.basename(path_file)[:10]
-        for line in open(path_file, encoding="utf-8"):
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e.get("decision") != "EXIT" or not e.get("pnl_path"):
-                continue
-            samples = e["pnl_path"]
-            if not isinstance(samples, list) or len(samples) < 3:
-                continue
-            accounting = normalize_replay_pnl_event(e)
-            if accounting is None:
-                continue
-            key = (e.get("instrument"), e.get("entry_timestamp"), e.get("timeframe"))
-            positions.setdefault(key, {
-                "day": day,
-                "pnl": float(accounting["pnl"]),
-                "path_gross": accounting["pnl_path_gross"],
-                "path_net": accounting["pnl_path_net"],
-            })
+    for e in _replay_fixture_events():
+        accounting = normalize_replay_pnl_event(e)
+        assert accounting is not None, f"invalid immutable replay fixture row: {e}"
+        key = (e.get("instrument"), e.get("entry_timestamp"), e.get("timeframe"))
+        positions.setdefault(key, {
+            "day": e["day"],
+            "pnl": float(accounting["pnl"]),
+            "path_gross": accounting["pnl_path_gross"],
+            "path_net": accounting["pnl_path_net"],
+        })
     if len(positions) < 20:
         pytest.skip(f"only {len(positions)} pathed positions; too few to assert on")
 

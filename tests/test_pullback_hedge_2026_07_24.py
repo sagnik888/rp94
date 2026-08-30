@@ -151,7 +151,7 @@ def test_dashboard_toggle_is_fully_wired():
     # give-back-cap and backtest-live-exit controls were added: they were present
     # in the JS and mounted in the DOM, but invisible in the running dashboard
     # because the version string still said v=24 and browsers served the cache.
-    assert "dashboard-settings.js?v=26-peak-threat-recalibration" in index_html
+    assert "dashboard-settings.js?v=31-stop-reentry-net" in index_html
 
 
 def test_configure_applies_and_reverts_the_toggle(monkeypatch):

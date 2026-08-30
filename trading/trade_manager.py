@@ -12,6 +12,7 @@ Handles:
 
 import uuid
 import inspect
+import math
 import re
 import threading
 import time
@@ -113,6 +114,74 @@ def sample_pnl_path(holder, pnl=None, entry_time=None) -> None:
         logger.debug(f"P&L path sample skipped: {exc}")
 
 
+def sample_intel_path(holder, snapshot_fn, entry_time=None) -> None:
+    """Append a bounded (seconds_since_entry, intel snapshot) row to `holder.intel_path`.
+
+    The market-side twin of sample_pnl_path. pnl_path says what the POSITION did; this
+    says what the MARKET was doing while it did it, so the two can be replayed together.
+
+    `snapshot_fn` is a zero-argument callable, not a dict, and that is deliberate: the
+    timer is checked BEFORE it is invoked, so building the snapshot costs nothing on the
+    ~9 cycles out of 10 that are not due. The caller supplies it because the snapshot
+    lives on the scanner (Scanner._entry_intel_snapshot) while the bounding logic belongs
+    next to the path it mirrors -- one definition of each, neither importing the other.
+
+    Two bounds, both cheap:
+
+      * TIME   -- at most one snapshot per intel_path_min_interval_seconds
+      * CHANGE -- and it is only KEPT if it differs from the last row kept. PCR changes
+                  every ~99s against a ~103s median hold, so an unfiltered timer would
+                  store the same numbers over and over. Storing only transitions makes
+                  the series both small and exactly what a replay needs to read.
+
+    A hard SIZE cap thins the middle and keeps both ends, matching sample_pnl_path, so a
+    long position loses resolution rather than losing its tail.
+
+    Observation only: every failure is swallowed. A diagnostic may never cost a position.
+    """
+    from config.settings import get_settings
+
+    settings = get_settings()
+    if not _setting_enabled(getattr(settings, "intel_path_logging_enabled", True), True):
+        return
+    try:
+        if entry_time is None:
+            entry_time = getattr(holder, "entry_time", None) or getattr(
+                holder, "entry_timestamp", None
+            )
+        if entry_time is None:
+            return
+
+        path = getattr(holder, "intel_path", None)
+        if not isinstance(path, list):
+            path = []
+            setattr(holder, "intel_path", path)
+
+        ref = entry_time if getattr(entry_time, "tzinfo", None) else IST.localize(entry_time)
+        elapsed = max(0.0, (datetime.now(IST) - ref).total_seconds())
+
+        min_gap = float(getattr(settings, "intel_path_min_interval_seconds", 5.0) or 5.0)
+        if path and (elapsed - path[-1][0]) < min_gap:
+            return
+
+        snapshot = snapshot_fn() if callable(snapshot_fn) else snapshot_fn
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+        # Only transitions. An identical snapshot carries no information the previous row
+        # does not already carry, and the timestamp of a NON-change is not interesting.
+        if path and path[-1][1] == snapshot:
+            return
+
+        path.append((round(elapsed, 2), snapshot))
+
+        cap = int(getattr(settings, "intel_path_max_samples", 60) or 60)
+        if cap > 2 and len(path) > cap:
+            setattr(holder, "intel_path", [path[0]] + path[1:-1:2] + [path[-1]])
+    except Exception as exc:
+        # Diagnostics must never interfere with a live position.
+        logger.debug(f"Intel path sample skipped: {exc}")
+
+
 def _setting_enabled(value, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
@@ -207,6 +276,37 @@ class Trade:
     entry_spot: float = 0.0  # Spot price at entry (for option tracking)
     spot_stop: float = 0.0   # Original index/spot stop for premium-led option trades
     spot_target: float = 0.0 # Original index/spot target for premium-led option trades
+    # Canonical dual-price geometry. Legacy entry_spot/spot_* mirror only the
+    # underlying tuple; premium values must never enter those aliases.
+    underlying_entry: float = 0.0
+    underlying_stop: float = 0.0
+    underlying_target: float = 0.0
+    premium_entry: float = 0.0
+    premium_stop: float = 0.0
+    premium_target: float = 0.0
+    geometry_observed_at: str = ""
+    geometry_source: str = ""
+    geometry_verified: bool = False
+    geometry_schema: str = "dual_price_geometry.v1"
+    # Forecast and final-policy evidence are scalar so SQLite can retain every fact
+    # without serialising opaque mutable dictionaries.
+    expected_move_pct: float = 0.0
+    expected_move_floor_pct: float = 0.0
+    expected_move_uncertainty_pct: float = 0.0
+    expected_move_probability: float = 0.0
+    expected_move_sample_count: int = 0
+    expected_move_horizon_minutes: int = 0
+    expected_move_generated_at: str = ""
+    expected_move_data_as_of: str = ""
+    expected_move_model_version: str = ""
+    expected_move_source: str = ""
+    entry_policy_allowed: bool = False
+    entry_policy_phase: str = ""
+    entry_policy_checked_at: str = ""
+    entry_policy_reason: str = ""
+    entry_policy_actual_rr: float = 0.0
+    entry_policy_underlying_stop_pct: float = 0.0
+    entry_policy_version: str = ""
     exit_price: float = 0.0
     exit_time: Optional[datetime] = None
     exit_reason: str = ""
@@ -227,6 +327,10 @@ class Trade:
     # be useless. The path closes it. See _sample_pnl_path for the cost bound.
     pnl_path: List[Tuple[float, float]] = field(default_factory=list)
     is_ghost: bool = False
+    # True only when this row reconstructs exposure that already existed at the
+    # broker. Persist it so a restart cannot mistake recovery reconciliation for a
+    # fresh fill and emergency-flatten it for lacking new-entry forecast evidence.
+    is_recovery: bool = False
     is_reversion_scalp: bool = False
     signal_fire_mode: str = "INTRACANDLE"
     entered_intracandle: bool = True
@@ -307,7 +411,8 @@ class Trade:
     @property
     def stop_loss(self) -> float:
         """Alias used by UI/risk helpers: prefer live stop, then trail, then initial."""
-        for attr in ("current_stop", "trailing_stop", "initial_stop", "spot_stop"):
+        # Contract-space property: never fall through to an underlying index level.
+        for attr in ("current_stop", "trailing_stop", "initial_stop"):
             try:
                 val = float(getattr(self, attr, 0.0) or 0.0)
             except Exception:
@@ -366,6 +471,7 @@ class Trade:
             "id": self.id,
             "status": self.status,
             "is_ghost": getattr(self, 'is_ghost', False),
+            "is_recovery": bool(getattr(self, "is_recovery", False)),
             "execution_status": self.execution_status,
             "execution_error": self.execution_error,
             "pending_execution": self.pending_execution,
@@ -445,6 +551,33 @@ class Trade:
             "entry_spot": self.entry_spot,
             "spot_stop": self.spot_stop,
             "spot_target": self.spot_target,
+            "underlying_entry": self.underlying_entry,
+            "underlying_stop": self.underlying_stop,
+            "underlying_target": self.underlying_target,
+            "premium_entry": self.premium_entry,
+            "premium_stop": self.premium_stop,
+            "premium_target": self.premium_target,
+            "geometry_observed_at": self.geometry_observed_at,
+            "geometry_source": self.geometry_source,
+            "geometry_verified": self.geometry_verified,
+            "geometry_schema": self.geometry_schema,
+            "expected_move_pct": self.expected_move_pct,
+            "expected_move_floor_pct": self.expected_move_floor_pct,
+            "expected_move_uncertainty_pct": self.expected_move_uncertainty_pct,
+            "expected_move_probability": self.expected_move_probability,
+            "expected_move_sample_count": self.expected_move_sample_count,
+            "expected_move_horizon_minutes": self.expected_move_horizon_minutes,
+            "expected_move_generated_at": self.expected_move_generated_at,
+            "expected_move_data_as_of": self.expected_move_data_as_of,
+            "expected_move_model_version": self.expected_move_model_version,
+            "expected_move_source": self.expected_move_source,
+            "entry_policy_allowed": self.entry_policy_allowed,
+            "entry_policy_phase": self.entry_policy_phase,
+            "entry_policy_checked_at": self.entry_policy_checked_at,
+            "entry_policy_reason": self.entry_policy_reason,
+            "entry_policy_actual_rr": self.entry_policy_actual_rr,
+            "entry_policy_underlying_stop_pct": self.entry_policy_underlying_stop_pct,
+            "entry_policy_version": self.entry_policy_version,
             "instrument_multiplier": self.instrument_multiplier,
             "peak_pnl": self.peak_pnl,
             "max_drawdown": self.max_drawdown,
@@ -624,6 +757,35 @@ class Trade:
             entry_spot=data.get("entry_spot", 0.0),
             spot_stop=data.get("spot_stop", 0.0),
             spot_target=data.get("spot_target", 0.0),
+            underlying_entry=float(data.get("underlying_entry") or data.get("entry_spot") or 0.0),
+            underlying_stop=float(data.get("underlying_stop") or data.get("spot_stop") or 0.0),
+            underlying_target=float(data.get("underlying_target") or data.get("spot_target") or 0.0),
+            premium_entry=float(data.get("premium_entry") or 0.0),
+            premium_stop=float(data.get("premium_stop") or 0.0),
+            premium_target=float(data.get("premium_target") or 0.0),
+            geometry_observed_at=str(data.get("geometry_observed_at") or ""),
+            geometry_source=str(data.get("geometry_source") or ""),
+            geometry_verified=bool(data.get("geometry_verified", False)),
+            geometry_schema=str(data.get("geometry_schema") or "dual_price_geometry.v1"),
+            expected_move_pct=float(data.get("expected_move_pct") or 0.0),
+            expected_move_floor_pct=float(data.get("expected_move_floor_pct") or 0.0),
+            expected_move_uncertainty_pct=float(data.get("expected_move_uncertainty_pct") or 0.0),
+            expected_move_probability=float(data.get("expected_move_probability") or 0.0),
+            expected_move_sample_count=int(data.get("expected_move_sample_count") or 0),
+            expected_move_horizon_minutes=int(data.get("expected_move_horizon_minutes") or 0),
+            expected_move_generated_at=str(data.get("expected_move_generated_at") or ""),
+            expected_move_data_as_of=str(data.get("expected_move_data_as_of") or ""),
+            expected_move_model_version=str(data.get("expected_move_model_version") or ""),
+            expected_move_source=str(data.get("expected_move_source") or ""),
+            entry_policy_allowed=bool(data.get("entry_policy_allowed", False)),
+            entry_policy_phase=str(data.get("entry_policy_phase") or ""),
+            entry_policy_checked_at=str(data.get("entry_policy_checked_at") or ""),
+            entry_policy_reason=str(data.get("entry_policy_reason") or ""),
+            entry_policy_actual_rr=float(data.get("entry_policy_actual_rr") or 0.0),
+            entry_policy_underlying_stop_pct=float(
+                data.get("entry_policy_underlying_stop_pct") or 0.0
+            ),
+            entry_policy_version=str(data.get("entry_policy_version") or ""),
             exit_price=data.get("exit_price", data.get("current_price", 0.0)),
             exit_time=exit_time,
             exit_reason=data.get("exit_reason", ""),
@@ -636,6 +798,7 @@ class Trade:
             peak_pnl=data.get("peak_pnl", 0.0),
             max_drawdown=data.get("max_drawdown", 0.0),
             is_ghost=bool(data.get("is_ghost", False)),
+            is_recovery=bool(data.get("is_recovery", False)),
             pnl_path=[
                 (float(row[0]), float(row[1]))
                 for row in (data.get("pnl_path") or [])
@@ -795,6 +958,9 @@ class TradeManager:
         # submission (including retries), so a decision that became stale while waiting
         # in the queue cannot leak through.  Manual entries deliberately bypass it.
         self.entry_submission_guard = entry_submission_guard
+        # Separate, always-on fresh-exposure policy. Manual approval bypasses Auto
+        # authority, not execution RR/geometry/forecast safety. Recovery alone bypasses.
+        self.fresh_entry_policy_guard: Optional[Callable[[Trade], Any]] = None
         self.max_positions = max_positions
         self.session_end = self._parse_time(session_end)
         self.product_type = str(product_type or "CARRYFORWARD").upper()
@@ -1921,6 +2087,14 @@ class TradeManager:
                     self._record_fill(
                         trade, order_id, _POSTBACK_LEG_SIGNS.get(leg, 1) * filled, leg
                     )
+                    if leg == "PROTECTIVE":
+                        # Reconciliation remains the sole authority that closes the
+                        # position, but it must retain what the broker just proved:
+                        # this flatten was caused by the exchange-side stop. Without
+                        # this hint a subsequent net_qty=0 row was labelled
+                        # MANUAL_SYNC, disabling stop-out re-entry and corrupting exit
+                        # analytics. exit_reason is already restart-persistent.
+                        trade.exit_reason = "STOP_HIT"
                 if average > 0 and leg == "ENTRY":
                     trade.execution_error = ""
                 logger.info(
@@ -3061,6 +3235,51 @@ class TradeManager:
                 and not getattr(trade, "is_ghost", False)
             )
             if not is_real:
+                # A paper/replay add is still fresh exposure. Previously it was booked
+                # directly here, bypassing the one policy seam exercised by live
+                # scale-ins. Validate the exact simulated fill and combined-position
+                # geometry before mutating the parent ledger.
+                if getattr(self, "fresh_entry_policy_guard", None) is not None:
+                    existing_qty = max(1, int(self._transactable_quantity(trade) or 0))
+                    add_qty = int(add_lots) * int(trade.lot_size or 1)
+                    projected_entry = (
+                        float(trade.entry_price or 0.0) * existing_qty
+                        + float(price) * add_qty
+                    ) / max(1, existing_qty + add_qty)
+                    setattr(
+                        trade,
+                        "_entry_policy_execution_levels",
+                        (
+                            projected_entry,
+                            float(trade.current_stop or trade.trailing_stop or 0.0),
+                            float(trade.target or 0.0),
+                        ),
+                    )
+                    setattr(trade, "_entry_policy_phase", "scale_in_actual_fill")
+                    setattr(trade, "_entry_policy_prior_quantity", existing_qty)
+                    setattr(trade, "_entry_policy_add_quantity", add_qty)
+                    try:
+                        allowed, policy_reason = self._entry_submission_guard_verdict(
+                            trade,
+                            getattr(trade, "_entry_submission_guard", None),
+                            force_auto_exposure=True,
+                        )
+                    finally:
+                        for attr_name in (
+                            "_entry_policy_execution_levels",
+                            "_entry_policy_phase",
+                            "_entry_policy_prior_quantity",
+                            "_entry_policy_add_quantity",
+                        ):
+                            try:
+                                delattr(trade, attr_name)
+                            except AttributeError:
+                                pass
+                    if not allowed:
+                        return False, (
+                            "final entry policy: "
+                            f"{policy_reason or 'simulated scale-in rejected'}"
+                        )
                 self._book_scale_in(trade, add_lots, price, reason)
                 self._mark_dirty()
                 return True, "booked"
@@ -3402,6 +3621,7 @@ class TradeManager:
         is_option = str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
         order_kwargs = self._tag_kwargs(self.broker.place_order, trade, "ADD")
         order_price = float(price or 0.0)
+        policy_guard_installed = getattr(self, "fresh_entry_policy_guard", None) is not None
         if is_option:
             touch_quote, touch_reason = self._scale_in_option_touch_quote(trade)
             if not touch_quote:
@@ -3419,6 +3639,42 @@ class TradeManager:
                 order_kwargs["trade_id"] = str(getattr(trade, "id", "") or "")
             if self._accepts_kwarg(self.broker.place_order, "confidence"):
                 order_kwargs["confidence"] = 1.0
+        elif policy_guard_installed:
+            # Futures adds are submitted as MARKET orders below, but the final policy
+            # still needs a measured marketable touch rather than the price captured
+            # when the scanner first offered the add.  Refuse when that evidence cannot
+            # be refreshed; the existing parent exposure remains untouched.
+            scanner = getattr(self, "scanner", None)
+            quote_reader = getattr(scanner, "_candidate_execution_touch_quote", None)
+            if not callable(quote_reader):
+                logger.warning(
+                    f"Futures scale-in refused for {trade.trading_symbol}: "
+                    "fresh executable touch reader unavailable."
+                )
+                return
+            try:
+                touch_quote = quote_reader(trade) or {}
+                bid = float(touch_quote.get("bid") or 0.0)
+                ask = float(touch_quote.get("ask") or 0.0)
+            except Exception as exc:
+                logger.warning(
+                    f"Futures scale-in refused for {trade.trading_symbol}: "
+                    f"fresh executable touch failed ({exc})."
+                )
+                return
+            if not bool(touch_quote.get("usable")) or bid <= 0 or ask < bid:
+                logger.warning(
+                    f"Futures scale-in refused for {trade.trading_symbol}: "
+                    "fresh executable bid/ask unavailable."
+                )
+                return
+            order_price = (
+                ask
+                if str(getattr(trade, "direction", "") or "").upper() in {"LONG", "BUY"}
+                else bid
+            )
+            if self._accepts_kwarg(self.broker.place_order, "touch_quote"):
+                order_kwargs["touch_quote"] = touch_quote
         # Every new entry funnels through _entry_margin_verdict, which both checks the
         # exact Kite order margin against free cash AND reserves it so a concurrent entry
         # cannot spend the same rupees. The add path did neither. The missing reservation
@@ -3449,14 +3705,46 @@ class TradeManager:
         # decided to add exposure. Re-ask at the same last-moment boundary used by a
         # first entry. A refusal leaves the parent position and its existing protective
         # stop untouched, and the just-created margin reservation is returned.
-        allowed, guard_reason = self._entry_submission_guard_verdict(
-            trade,
-            getattr(trade, "_entry_submission_guard", None),
-            # A cascade add is automated new exposure even when the parent trade
-            # was originally opened manually, so the parent's exec_type must not
-            # bypass the final Auto/resource authority.
-            force_auto_exposure=True,
-        )
+        if policy_guard_installed:
+            existing_qty = max(1, int(self._transactable_quantity(trade) or 0))
+            prior_entry = float(getattr(trade, "entry_price", order_price) or order_price)
+            projected_entry = (
+                prior_entry * existing_qty + order_price * int(quantity)
+            ) / max(1, existing_qty + int(quantity))
+            setattr(
+                trade,
+                "_entry_policy_execution_levels",
+                (
+                    projected_entry,
+                    float(
+                        getattr(trade, "current_stop", 0.0)
+                        or getattr(trade, "trailing_stop", 0.0)
+                        or 0.0
+                    ),
+                    float(getattr(trade, "target", 0.0) or 0.0),
+                ),
+            )
+            setattr(trade, "_entry_policy_phase", "scale_in_pre_submit")
+            setattr(trade, "_entry_policy_prior_quantity", existing_qty)
+            setattr(trade, "_entry_policy_add_quantity", int(quantity))
+        try:
+            allowed, guard_reason = self._entry_submission_guard_verdict(
+                trade,
+                getattr(trade, "_entry_submission_guard", None),
+                # A cascade add is automated new exposure even when the parent trade
+                # was originally opened manually, so the parent's exec_type must not
+                # bypass the final Auto/resource authority.
+                force_auto_exposure=True,
+            )
+        finally:
+            if policy_guard_installed:
+                try:
+                    delattr(trade, "_entry_policy_execution_levels")
+                    delattr(trade, "_entry_policy_phase")
+                    delattr(trade, "_entry_policy_prior_quantity")
+                    delattr(trade, "_entry_policy_add_quantity")
+                except AttributeError:
+                    pass
         if not allowed:
             self._release_margin_reservations(reservations)
             logger.warning(
@@ -3532,6 +3820,19 @@ class TradeManager:
                 f"Scale-in on {trade.trading_symbol} filled {actually_added} of "
                 f"{int(quantity)}; weighting the average entry on the filled quantity."
             )
+        actual_add_price = float(order_price or 0.0)
+        actual_add_price_verified = False
+        filler = getattr(self.broker, "get_fill", None)
+        if callable(filler) and getattr(trade, "scale_in_order_id", ""):
+            try:
+                detail = filler(str(trade.scale_in_order_id)) or {}
+                if str(detail.get("state") or "").upper() == "FILLED":
+                    measured = float(detail.get("average_price") or 0.0)
+                    if measured > 0:
+                        actual_add_price = measured
+                        actual_add_price_verified = True
+            except Exception as exc:
+                logger.debug(f"Scale-in own-order fill price unavailable: {exc}")
         with self._lock:
             # Same rule as the reduce, and for the same reason: `or None` would make
             # _book_scale_in size off the REQUESTED lots. An add cannot confirm to 0
@@ -3540,7 +3841,7 @@ class TradeManager:
             # dangerous in the first place.
             if actually_added > 0:
                 self._book_scale_in(
-                    trade, add_lots, order_price, reason,
+                    trade, add_lots, actual_add_price, reason,
                     filled_quantity=actually_added,
                 )
             else:
@@ -3554,6 +3855,31 @@ class TradeManager:
             # what a 0 MEANS -- that divergence is what made the reduce dangerous.
             trade.broker_quantity = int(confirmed)
         self._mark_dirty()
+
+        setattr(trade, "_entry_policy_prior_quantity", max(0, int(confirmed) - actually_added))
+        setattr(trade, "_entry_policy_add_quantity", actually_added)
+        setattr(
+            trade,
+            "_entry_policy_actual_fill_verified",
+            actual_add_price_verified,
+        )
+        try:
+            policy_ok, policy_reason = self._actual_fill_entry_policy_verdict(
+                trade, phase="scale_in_actual_fill"
+            )
+        finally:
+            try:
+                delattr(trade, "_entry_policy_prior_quantity")
+                delattr(trade, "_entry_policy_add_quantity")
+                delattr(trade, "_entry_policy_actual_fill_verified")
+            except AttributeError:
+                pass
+        if not policy_ok:
+            reason_text = f"Scale-in fill violates final entry policy: {policy_reason}"
+            logger.error(reason_text)
+            if not self.emergency_flatten_trade(trade, reason_text):
+                self._mark_recovery(trade, reason_text)
+            return
 
         if not self.ensure_broker_protection(trade, trade.broker_quantity):
             self._mark_recovery(
@@ -4843,9 +5169,20 @@ class TradeManager:
                             # sending the MARKET replacement. A refusal can be closed
                             # cleanly because the cancel proved that no original order is
                             # still resting or filled.
-                            allowed, guard_reason = self._entry_submission_guard_verdict(
-                                trade, getattr(trade, "_entry_submission_guard", None)
+                            setattr(
+                                trade,
+                                "_entry_policy_phase",
+                                "stale_entry_replacement_pre_submit",
                             )
+                            try:
+                                allowed, guard_reason = self._entry_submission_guard_verdict(
+                                    trade, getattr(trade, "_entry_submission_guard", None)
+                                )
+                            finally:
+                                try:
+                                    delattr(trade, "_entry_policy_phase")
+                                except AttributeError:
+                                    pass
                             if not allowed:
                                 trade.status = "CLOSED"
                                 trade.pending_execution = False
@@ -4865,6 +5202,19 @@ class TradeManager:
                                 changed = True
                                 continue
                             try:
+                                replacement_touch_kwargs: Dict[str, Any] = {}
+                                replacement_touch = getattr(
+                                    trade,
+                                    "_entry_policy_submission_touch_quote",
+                                    None,
+                                )
+                                if (
+                                    isinstance(replacement_touch, dict)
+                                    and self._accepts_kwarg(
+                                        self.broker.place_order, "touch_quote"
+                                    )
+                                ):
+                                    replacement_touch_kwargs["touch_quote"] = replacement_touch
                                 replacement = self.broker.place_order(
                                     trade.trading_symbol,
                                     trade.symbol_token,
@@ -4882,11 +5232,15 @@ class TradeManager:
                                     # contract shape, which cannot tell two trades on
                                     # one strike apart. attempt distinguishes it from
                                     # the original entry's tag.
+                                    **replacement_touch_kwargs,
                                     **self._tag_kwargs(
                                         self.broker.place_order,
                                         trade,
                                         "ENTRY",
-                                        attempt=int(getattr(trade, "entry_replace_count", 0) or 0) + 1,
+                                        attempt=int(
+                                            getattr(trade, "entry_replace_count", 0) or 0
+                                        )
+                                        + 1,
                                     ),
                                 )
                             except (BrokerOrderAmbiguous, BrokerOrderRejected, PermissionError) as exc:
@@ -4997,7 +5351,11 @@ class TradeManager:
                         )
                 reason = (
                     trade.exit_reason
-                    if trade.execution_status == "EXIT_PENDING" and trade.exit_reason
+                    if trade.exit_reason
+                    and (
+                        trade.execution_status == "EXIT_PENDING"
+                        or str(trade.exit_reason).upper() == "STOP_HIT"
+                    )
                     else "MANUAL_SYNC"
                 )
                 realised = position.get("realised")
@@ -5063,11 +5421,13 @@ class TradeManager:
                 # FILLED answer is used — UNKNOWN falls through to the position figure
                 # rather than being treated as "no fill".
                 fill_price = 0.0
+                fill_geometry_verified = False
+                shadow_fill_quantity = filled_qty
                 filler = getattr(self.broker, "get_fill", None)
                 if callable(filler) and getattr(trade, "broker_order_id", ""):
                     try:
                         detail = filler(str(trade.broker_order_id))
-                        if str(detail.get("state") or "") == "FILLED":
+                        if str(detail.get("state") or "").upper() == "FILLED":
                             fill_price = float(detail.get("average_price") or 0.0)
                             # The same lookup states this ORDER's own filled quantity,
                             # which was being fetched and thrown away. It is the
@@ -5079,6 +5439,7 @@ class TradeManager:
                             except (TypeError, ValueError):
                                 _order_qty = 0
                             if _order_qty:
+                                shadow_fill_quantity = _order_qty
                                 self._record_fill(
                                     trade, str(trade.broker_order_id), _order_qty, "ENTRY"
                                 )
@@ -5103,6 +5464,21 @@ class TradeManager:
                             or float(trade.entry_price or 0.0),
                         )
                         trade.entry_price = fill_price
+                        fill_geometry_verified = True
+                        shadow_fill_observer = getattr(
+                            getattr(self, "scanner", None),
+                            "_update_accepted_entry_shadow_fill",
+                            None,
+                        )
+                        if callable(shadow_fill_observer):
+                            try:
+                                shadow_fill_observer(
+                                    trade,
+                                    fill_price,
+                                    shadow_fill_quantity,
+                                )
+                            except Exception as exc:
+                                logger.debug(f"Accepted entry shadow fill update skipped: {exc}")
                     else:
                         logger.warning(
                             f"Ignored implausible broker fill {fill_price:.2f} "
@@ -5117,6 +5493,30 @@ class TradeManager:
                 )
                 confirmed += 1
                 changed = True
+                setattr(
+                    trade,
+                    "_entry_policy_actual_fill_verified",
+                    fill_geometry_verified,
+                )
+                try:
+                    policy_ok, policy_reason = self._actual_fill_entry_policy_verdict(trade)
+                finally:
+                    try:
+                        delattr(trade, "_entry_policy_actual_fill_verified")
+                    except AttributeError:
+                        pass
+                if not policy_ok:
+                    reason = (
+                        "Actual fill violates immutable final entry policy: "
+                        f"{policy_reason}"
+                    )
+                    logger.error(f"{reason} ({trade.trading_symbol or trade.instrument})")
+                    if not self.emergency_flatten_trade(trade, reason):
+                        # If a flatten cannot be submitted, protection is still safer
+                        # than leaving the now-known position naked while recovery runs.
+                        if not self.ensure_broker_protection(trade, filled_qty):
+                            self._mark_recovery(trade, reason)
+                    continue
                 protected = self.ensure_broker_protection(trade, filled_qty)
                 if not protected:
                     self._maybe_auto_flatten_unprotected(
@@ -5686,6 +6086,32 @@ class TradeManager:
             and not force_auto_exposure
         ):
             return True, ""
+
+        policy_guard = getattr(self, "fresh_entry_policy_guard", None)
+        if policy_guard is not None:
+            if not callable(policy_guard):
+                return False, "fresh-entry policy guard is not callable"
+            try:
+                policy_verdict = policy_guard(trade)
+            except Exception as exc:
+                return False, f"fresh-entry policy guard raised {type(exc).__name__}: {exc}"
+            if isinstance(policy_verdict, tuple):
+                policy_allowed = bool(policy_verdict[0]) if policy_verdict else False
+                policy_reason = str(policy_verdict[1] if len(policy_verdict) > 1 else "")
+            elif isinstance(policy_verdict, dict):
+                if "allowed" in policy_verdict:
+                    policy_allowed = bool(policy_verdict.get("allowed"))
+                elif "ok" in policy_verdict:
+                    policy_allowed = bool(policy_verdict.get("ok"))
+                else:
+                    return False, "fresh-entry policy returned no allowed/ok field"
+                policy_reason = str(policy_verdict.get("reason") or "")
+            elif isinstance(policy_verdict, bool):
+                policy_allowed, policy_reason = policy_verdict, ""
+            else:
+                return False, "fresh-entry policy returned an unsupported verdict"
+            if not policy_allowed:
+                return False, policy_reason or "fresh-entry policy rejected the submission"
         if (
             not force_auto_exposure
             and str(getattr(trade, "exec_type", "A") or "A").upper()
@@ -5727,6 +6153,101 @@ class TradeManager:
         if allowed:
             return True, reason
         return False, reason or "entry submission guard rejected the queued entry"
+
+    def _actual_fill_entry_policy_verdict(
+        self,
+        trade: Trade,
+        *,
+        phase: str = "actual_broker_fill",
+    ) -> Tuple[bool, str]:
+        """Revalidate 1.5R+ on the broker's own fill before arming protection.
+
+        An adverse fill is never repaired by stretching the profit target beyond the
+        approved expected move. If possible, the stop is tightened toward the fill;
+        otherwise the filled exposure is risked off by the caller.
+        """
+        # TradeManager is also used on its own by historical/reconciliation tools that
+        # have no candle cache and therefore cannot produce the immutable final-policy
+        # evidence. Scanner installs this guard for every live fresh-entry path. Do not
+        # fabricate a partial RR-only policy in the unintegrated case; the queued check
+        # above already follows the same optional-service boundary.
+        guard = getattr(self, "fresh_entry_policy_guard", None)
+        if guard is None:
+            return True, ""
+        if not bool(getattr(trade, "_entry_policy_actual_fill_verified", True)):
+            return False, "actual broker fill price is unavailable or unverified"
+
+        from config.settings import get_settings
+
+        settings = get_settings()
+        try:
+            configured_min_rr = float(getattr(settings, "entry_policy_min_rr", 1.5))
+            entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+            stop = float(getattr(trade, "current_stop", 0.0) or 0.0)
+            target = float(getattr(trade, "target", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return False, "actual fill has malformed policy or execution geometry"
+        if not all(math.isfinite(value) for value in (configured_min_rr, entry, stop, target)):
+            return False, "actual fill has non-finite policy or execution geometry"
+        min_rr = max(1.5, configured_min_rr)
+        inst_type = str(getattr(trade, "inst_type", "FUT") or "FUT").upper()
+        direction = str(getattr(trade, "direction", "LONG") or "LONG").upper()
+        if inst_type not in {"OPT", "FUT"} or direction not in {"LONG", "SHORT"}:
+            return False, "actual fill has unsupported execution identity"
+        if entry <= 0 or stop <= 0 or target <= 0:
+            return False, "actual fill has incomplete entry/stop/target geometry"
+
+        if inst_type == "OPT" or direction != "SHORT":
+            risk, reward = entry - stop, target - entry
+            if reward > 0 and risk > 0 and reward / risk + 1e-9 < min_rr:
+                tightened = entry - (reward / min_rr)
+                if 0 < tightened < entry:
+                    stop = max(stop, tightened)
+        else:
+            risk, reward = stop - entry, entry - target
+            if reward > 0 and risk > 0 and reward / risk + 1e-9 < min_rr:
+                tightened = entry + (reward / min_rr)
+                if tightened > entry:
+                    stop = min(stop, tightened)
+
+        trade.current_stop = stop
+        trade.trailing_stop = stop
+        trade.initial_stop = stop
+        if inst_type == "OPT":
+            trade.premium_entry = entry
+            trade.premium_stop = stop
+            trade.premium_target = target
+
+        if inst_type == "OPT" or direction != "SHORT":
+            risk, reward = entry - stop, target - entry
+        else:
+            risk, reward = stop - entry, entry - target
+        actual_rr = reward / risk if reward > 0 and risk > 0 else 0.0
+        trade.entry_policy_actual_rr = actual_rr
+        if actual_rr + 1e-9 < min_rr:
+            return False, f"actual broker fill RR {actual_rr:.4f} is below {min_rr:.2f}R"
+
+        setattr(trade, "_entry_policy_execution_levels", (entry, stop, target))
+        setattr(trade, "_entry_policy_phase", str(phase or "actual_broker_fill"))
+        try:
+            verdict = guard(trade)
+        except Exception as exc:
+            return False, f"actual-fill policy crashed: {type(exc).__name__}: {exc}"
+        finally:
+            try:
+                delattr(trade, "_entry_policy_execution_levels")
+                delattr(trade, "_entry_policy_phase")
+            except AttributeError:
+                pass
+        if isinstance(verdict, tuple):
+            allowed = bool(verdict[0]) if verdict else False
+            reason = str(verdict[1] if len(verdict) > 1 else "")
+        elif isinstance(verdict, dict):
+            allowed = bool(verdict.get("allowed", verdict.get("ok", False)))
+            reason = str(verdict.get("reason") or "")
+        else:
+            allowed, reason = bool(verdict), ""
+        return allowed, reason or ("" if allowed else "actual-fill policy rejected exposure")
 
     def open_trade(
         self,
@@ -5777,6 +6298,17 @@ class TradeManager:
         raw_union_entry: bool = False,
         initial_stop: float = 0.0,
         scalp_lock_mode: bool = False,
+        underlying_entry: float = 0.0,
+        underlying_stop: float = 0.0,
+        underlying_target: float = 0.0,
+        premium_entry: float = 0.0,
+        premium_stop: float = 0.0,
+        premium_target: float = 0.0,
+        geometry_observed_at: str = "",
+        geometry_source: str = "",
+        geometry_verified: bool = False,
+        expected_move_forecast: Optional[Dict[str, Any]] = None,
+        entry_policy_verdict: Optional[Dict[str, Any]] = None,
         execution_touch_quote: Optional[Dict[str, Any]] = None,
         on_execution_result: Optional[Callable[[Trade, bool], None]] = None,
         lifecycle_id: str = "",
@@ -5862,6 +6394,11 @@ class TradeManager:
             if entry_intelligence_score is None
             else entry_intelligence_score
         )
+        forecast = dict(expected_move_forecast or {})
+        policy = dict(entry_policy_verdict or {})
+        resolved_underlying_entry = float(underlying_entry or entry_spot or 0.0)
+        resolved_underlying_stop = float(underlying_stop or spot_stop or 0.0)
+        resolved_underlying_target = float(underlying_target or spot_target or 0.0)
 
         trade = Trade(
             id=trade_id,
@@ -5897,10 +6434,41 @@ class TradeManager:
             # and falls back to holding entry_price (see update_trade below, "do NOT use
             # spot price as option price"). That guard was unreachable while this line
             # guaranteed entry_spot > 0 whenever price > 0.
+            # Keep the legacy alias sourced only from its own spot-space argument.
+            # ``underlying_entry`` below is canonical and may be populated by newer
+            # callers independently; neither field may ever fall back to contract
+            # ``price`` (option premium or futures LTP).
             entry_spot=float(entry_spot or 0.0),
-            spot_stop=spot_stop,
-            spot_target=spot_target,
+            spot_stop=resolved_underlying_stop,
+            spot_target=resolved_underlying_target,
+            underlying_entry=resolved_underlying_entry,
+            underlying_stop=resolved_underlying_stop,
+            underlying_target=resolved_underlying_target,
+            premium_entry=float(premium_entry or 0.0),
+            premium_stop=float(premium_stop or 0.0),
+            premium_target=float(premium_target or 0.0),
+            geometry_observed_at=str(geometry_observed_at or ""),
+            geometry_source=str(geometry_source or ""),
+            geometry_verified=bool(geometry_verified),
+            expected_move_pct=float(forecast.get("expected_favorable_move_pct") or 0.0),
+            expected_move_floor_pct=float(forecast.get("floor_pct") or 0.0),
+            expected_move_uncertainty_pct=float(forecast.get("uncertainty_pct") or 0.0),
+            expected_move_probability=float(forecast.get("probability_meeting_floor") or 0.0),
+            expected_move_sample_count=int(forecast.get("sample_count") or 0),
+            expected_move_horizon_minutes=int(forecast.get("horizon_minutes") or 0),
+            expected_move_generated_at=str(forecast.get("generated_at") or ""),
+            expected_move_data_as_of=str(forecast.get("data_as_of") or ""),
+            expected_move_model_version=str(forecast.get("model_version") or ""),
+            expected_move_source=str(forecast.get("source") or ""),
+            entry_policy_allowed=bool(policy.get("allowed", False)),
+            entry_policy_phase=str(policy.get("phase") or ""),
+            entry_policy_checked_at=str(policy.get("checked_at") or ""),
+            entry_policy_reason=str("; ".join(policy.get("reasons") or [])),
+            entry_policy_actual_rr=float(policy.get("actual_rr") or 0.0),
+            entry_policy_underlying_stop_pct=float(policy.get("underlying_stop_pct") or 0.0),
+            entry_policy_version=str(policy.get("policy_version") or ""),
             is_ghost=is_ghost,
+            is_recovery=bool(is_recovery),
             is_reversion_scalp=is_reversion_scalp,
             signal_fire_mode=str(signal_fire_mode or "INTRACANDLE"),
             entered_intracandle=bool(entered_intracandle),
@@ -5967,7 +6535,7 @@ class TradeManager:
         # ⚡ REAL BROKER ENTRY (Background Thread) ⚡ 
         is_warmup = getattr(self, "is_warmup", False)
         if (self._live_orders_permitted() and self.broker and trading_symbol
-                and symbol_token and not is_warmup and not is_ghost):
+                and symbol_token and not is_warmup and not is_ghost and not is_recovery):
             order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
             
             def _place_bg_body():
@@ -6024,6 +6592,18 @@ class TradeManager:
                     # re-evaluate every attempt and let the definitive-rejection cleanup
                     # below release every reservation accumulated by earlier attempts.
                     require_submission_guard()
+                    submission_levels = getattr(
+                        trade, "_entry_policy_submission_levels", None
+                    )
+                    if isinstance(submission_levels, (tuple, list)) and len(submission_levels) >= 3:
+                        submission_price = float(submission_levels[0] or 0.0)
+                    else:
+                        submission_price = float(price or 0.0)
+                    submission_touch = getattr(
+                        trade,
+                        "_entry_policy_submission_touch_quote",
+                        execution_touch_quote,
+                    )
                     # Start the acknowledgement/fill clock BEFORE the first broker
                     # submission. Stamping after place_order returned excluded the whole
                     # API round trip and left no timestamp at all while a slow/ambiguous
@@ -6042,8 +6622,8 @@ class TradeManager:
                             qty=trade.quantity,
                             side=order_side,
                             product_type=self.product_type,
-                            price=price,
-                            touch_quote=execution_touch_quote,
+                            price=submission_price,
+                            touch_quote=submission_touch,
                             # Tag the order with its trade so the order book, trades
                             # and postbacks map back exactly instead of by heuristic.
                             trade_id=trade.id,
@@ -6069,13 +6649,22 @@ class TradeManager:
                         # the guard again in case its state changed after the first call
                         # failed on unsupported keyword arguments.
                         require_submission_guard()
+                        fallback_levels = getattr(
+                            trade, "_entry_policy_submission_levels", None
+                        )
+                        fallback_price = (
+                            float(fallback_levels[0] or 0.0)
+                            if isinstance(fallback_levels, (tuple, list))
+                            and len(fallback_levels) >= 3
+                            else float(price or 0.0)
+                        )
                         return self.broker.place_order(
                             symbol=trading_symbol,
                             token=symbol_token,
                             qty=trade.quantity,
                             side=order_side,
                             product_type=self.product_type,
-                            price=price,
+                            price=fallback_price,
                         )
 
                 order_id, error, attempts = execute_order_with_retry(
@@ -7716,3 +8305,229 @@ class TradeManager:
             },
         }
 
+    # ── signal forensics / flight recorder ────────────────────────────────────
+
+    @staticmethod
+    def _forensic_structural_state(trade, prior=None):
+        """Derive (fingerprint_tuple, phase, decision) from trade state."""
+        status = str(getattr(trade, "status", "") or "").upper()
+        execution = str(getattr(trade, "execution_status", "") or "").upper()
+        stop = float(getattr(trade, "current_stop", 0.0) or 0.0)
+        target = float(getattr(trade, "target", 0.0) or 0.0)
+        reason = str(
+            getattr(trade, "exit_reason", "")
+            or getattr(trade, "execution_error", "")
+            or ""
+        )
+        if status == "CLOSED":
+            phase, decision = "EXITED", "CLOSED"
+        elif execution in {"ENTRY_PENDING", "PENDING"}:
+            phase, decision = "ORDER_PENDING", "PENDING"
+        elif execution == "ENTRY_SUBMITTED":
+            phase, decision = "ORDER_SUBMITTED", "PENDING"
+        elif execution == "REJECTED":
+            phase, decision = "ORDER_REJECTED", "REJECTED"
+        elif execution in {"EXIT_PENDING", "PARTIAL_EXIT"}:
+            phase, decision = (
+                "PARTIAL" if execution == "PARTIAL_EXIT" else "MANAGED"
+            ), "OPEN"
+        elif prior and abs(stop - float(prior[1] or 0.0)) > 1e-9:
+            phase, decision = "TRAILING", "OPEN"
+        elif prior and abs(target - float(prior[2] or 0.0)) > 1e-9:
+            phase, decision = "TARGET_MOVED", "OPEN"
+        else:
+            phase, decision = "ENTERED", "OPEN"
+        return (execution or status, stop, target, reason), phase, decision
+
+    def _seed_trade_forensic_state(self, trade):
+        """Seed recovered state so restart never replays historical trades."""
+        cache = getattr(self, "_forensic_trade_states", None)
+        if not isinstance(cache, dict):
+            self._forensic_trade_states = {}
+            cache = self._forensic_trade_states
+        state, _, _ = self._forensic_structural_state(trade)
+        cache[str(trade.id)] = state
+        marks = getattr(self, "_forensic_mark_states", None)
+        if not isinstance(marks, dict):
+            self._forensic_mark_states = {}
+            marks = self._forensic_mark_states
+        marks[str(trade.id)] = (
+            time.monotonic(),
+            float(getattr(trade, "current_price", 0.0) or 0.0),
+            float(getattr(trade, "pnl", 0.0) or 0.0),
+            float(getattr(trade, "peak_pnl", 0.0) or 0.0),
+            float(getattr(trade, "max_drawdown", 0.0) or 0.0),
+        )
+
+    def _record_trade_forensics(self, trades):
+        """Persist meaningful trade-state transitions; never record replay rows."""
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return
+        cache = getattr(self, "_forensic_trade_states", None)
+        if not isinstance(cache, dict):
+            self._forensic_trade_states = {}
+            cache = self._forensic_trade_states
+        mark_cache = getattr(self, "_forensic_mark_states", None)
+        if not isinstance(mark_cache, dict):
+            self._forensic_mark_states = {}
+            mark_cache = self._forensic_mark_states
+
+        mark_interval = 5.0
+        mark_price_delta = 0.05
+        mark_pnl_delta = 25.0
+        now_mono = time.monotonic()
+        events = []
+
+        for trade in trades:
+            if bool(getattr(trade, "is_ghost", False)):
+                continue
+            trade_id = str(trade.id)
+            prior = cache.get(trade_id)
+            state, phase, decision = self._forensic_structural_state(trade, prior)
+            structural_change = prior != state
+
+            ltp = float(getattr(trade, "current_price", 0.0) or 0.0)
+            pnl = float(
+                getattr(trade, "pnl", 0.0)
+                or getattr(trade, "unrealized_pnl", 0.0)
+                or 0.0
+            )
+            peak = float(getattr(trade, "peak_pnl", 0.0) or 0.0)
+            drawdown = float(getattr(trade, "max_drawdown", 0.0) or 0.0)
+
+            previous_mark = mark_cache.get(trade_id)
+            mark_due = False
+            if (
+                not structural_change
+                and str(getattr(trade, "status", "") or "").upper() == "OPEN"
+                and previous_mark
+            ):
+                elapsed = now_mono - float(previous_mark[0] or 0.0)
+                moved = (
+                    abs(ltp - float(previous_mark[1] or 0.0)) >= mark_price_delta
+                    or abs(pnl - float(previous_mark[2] or 0.0)) >= mark_pnl_delta
+                    or abs(peak - float(previous_mark[3] or 0.0)) >= mark_pnl_delta
+                    or abs(drawdown - float(previous_mark[4] or 0.0)) >= mark_pnl_delta
+                )
+                mark_due = elapsed >= mark_interval and moved
+
+            if not structural_change and not mark_due:
+                continue
+
+            cache[trade_id] = state
+            mark_cache[trade_id] = (now_mono, ltp, pnl, peak, drawdown)
+
+            if mark_due:
+                phase, decision = "MARK_TO_MARKET", "OPEN"
+                reason_text = "Periodic live mark: LTP, P&L, peak or drawdown changed"
+                reason_code = "LIVE_MARK"
+            else:
+                reason_text = str(
+                    getattr(trade, "exit_reason", "")
+                    or getattr(trade, "execution_error", "")
+                    or ""
+                )
+                execution = str(
+                    getattr(trade, "execution_status", "") or ""
+                ).upper()
+                reason_code = (
+                    reason_text.split(":", 1)[0][:96] if reason_text else execution
+                )
+
+            try:
+                from datetime import datetime, timedelta, timezone
+                _IST = timezone(timedelta(hours=5, minutes=30))
+                lifecycle_id = str(
+                    getattr(trade, "lifecycle_id", "") or trade.id
+                )
+                events.append({
+                    "session_date": (
+                        getattr(trade, "entry_time", datetime.now(_IST))
+                        .date().isoformat()
+                        if hasattr(getattr(trade, "entry_time", None), "date")
+                        else datetime.now(_IST).date().isoformat()
+                    ),
+                    "event_ts": datetime.now(_IST).isoformat(
+                        timespec="milliseconds"
+                    ),
+                    "lifecycle_id": lifecycle_id,
+                    "signal_id": str(trade.id),
+                    "instrument": str(
+                        getattr(trade, "instrument", "") or ""
+                    ).split()[0],
+                    "contract": str(
+                        getattr(trade, "trading_symbol", "") or ""
+                    ),
+                    "symbol_token": str(
+                        getattr(trade, "symbol_token", "") or ""
+                    ),
+                    "timeframe": str(
+                        getattr(trade, "timeframe", "") or ""
+                    ),
+                    "direction": str(
+                        getattr(trade, "direction", "") or ""
+                    ),
+                    "phase": phase,
+                    "decision": decision,
+                    "reason_code": reason_code,
+                    "reason_text": reason_text,
+                    "source": "trade_manager",
+                    "grade": str(getattr(trade, "grade", "") or ""),
+                    "confidence": float(
+                        getattr(trade, "confidence", 0.0) or 0.0
+                    ),
+                    "engine": str(
+                        getattr(trade, "source_engine", "") or ""
+                    ),
+                    "lane": str(
+                        getattr(trade, "source_lane", "") or ""
+                    ),
+                    "ltp": ltp,
+                    "entry_price": float(
+                        getattr(trade, "entry_price", 0.0) or 0.0
+                    ),
+                    "initial_stop": float(
+                        getattr(trade, "initial_stop", 0.0)
+                        or getattr(trade, "trailing_stop", 0.0)
+                        or 0.0
+                    ),
+                    "current_stop": float(
+                        getattr(trade, "current_stop", 0.0) or 0.0
+                    ),
+                    "initial_target": float(
+                        getattr(trade, "initial_target", 0.0)
+                        or getattr(trade, "target", 0.0)
+                        or 0.0
+                    ),
+                    "current_target": float(
+                        getattr(trade, "target", 0.0) or 0.0
+                    ),
+                    "pnl": pnl,
+                    "peak_pnl": peak,
+                    "drawdown": drawdown,
+                    "quote_source": str(
+                        getattr(trade, "quote_source", "") or ""
+                    ),
+                    "quote_verified": bool(
+                        getattr(trade, "quote_verified", False)
+                    ),
+                    "payload": {
+                        "trade_id": trade.id,
+                        "lifecycle_id": lifecycle_id,
+                        "broker_order_id": getattr(
+                            trade, "broker_order_id", ""
+                        ),
+                        "exit_order_id": getattr(
+                            trade, "exit_order_id", ""
+                        ),
+                    },
+                })
+            except Exception:
+                pass
+
+        if events:
+            try:
+                from data.sqlite_db import db
+                db.append_signal_lifecycle_events(events)
+            except Exception:
+                pass

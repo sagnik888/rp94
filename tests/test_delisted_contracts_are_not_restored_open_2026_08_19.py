@@ -42,6 +42,7 @@ DatabaseManager. An earlier version did, and its fixture perturbed the module-le
 singleton enough to fail three unrelated persistence tests when run in the same session.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -217,17 +218,11 @@ def test_the_restore_path_actually_calls_the_guard():
     assert "_drop_delisted_open_records(" in src
 
 
-def test_the_real_listing_separates_the_fixtures_from_the_live_contracts():
-    """No mocking: the actual 39,892-symbol file this ships against."""
-    import os
-
-    if not os.path.exists("data_store/kite_instruments.json"):
-        pytest.skip("instrument listing not present")
-    symbols = DatabaseManager._tradable_symbols()
-    if not symbols:
-        pytest.skip("instrument listing unreadable in this environment")
-    assert len(symbols) > 1000
+def test_the_immutable_listing_fixture_separates_live_and_delisted_symbols():
+    """The historical membership contract must not change when today's dump refreshes."""
+    fixture = Path(__file__).parent / "fixtures" / "instrument_listing_2026_08_19.json"
+    symbols = set(json.loads(fixture.read_text(encoding="utf-8")))
     for sym in REAL:
-        assert sym in symbols, f"{sym} traded on 2026-08-19 but is not listed"
+        assert sym in symbols, f"{sym} traded on 2026-08-19 but is not in the fixture"
     for sym in FIXTURES:
         assert sym not in symbols, f"{sym} is a delisted fixture but appears listed"

@@ -216,6 +216,7 @@ def _scanner_harness(mtf, initial_lanes, monkeypatch):
     scanner._passes_correlated_index_guard = lambda _candidate, _direction: True
     scanner._ensure_trade_like_initial_stop = lambda _candidate: None
     scanner._candidate_entry_mark_refusal = lambda _candidate: ""
+    scanner._entry_policy_allows = lambda *_args, **_kwargs: (True, "")
     scanner._close_superseded_session_entries = lambda _candidates: None
     scanner._mark_candidate_accepted_time = lambda _candidate, _at=None: None
     scanner._remember_trade_candidates = lambda candidates: remembered.extend(candidates)

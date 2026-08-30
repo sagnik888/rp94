@@ -24,10 +24,9 @@ produced a trade while 5min and 15min traded normally.
 cardinal error, the same shape as the empty scan cache reading as a repaint. Unmeasurable
 must read as unmeasurable, so the metric now abstains.
 
-The tick_count fallback is built but ships OFF: tick counts are far less dispersed than
-traded quantity, so reusing the 2.2x traded floor on them would repeat tonight's other
-finding — a threshold applied to a quantity it was never cut for. It needs one live
-session of tick data to calibrate against.
+The tick_count fallback originally shipped off. It is now enabled after replacing the
+incompatible fixed traded-volume ratio with a calibrated, basis-independent percentile
+floor; missing tick evidence still abstains.
 """
 import pandas as pd
 import pytest
@@ -86,7 +85,7 @@ def test_the_basis_is_reported_so_a_gate_can_tell_them_apart():
     assert _metrics(_frame(last_volume=2500.0))["volume_basis"] == "TRADED"
 
 
-# ── the tick fallback: built, and off ────────────────────────────────────────
+# ── the calibrated tick fallback ─────────────────────────────────────────────
 
 def test_the_tick_proxy_is_now_calibrated_and_on(_pinned):
     """Superseded within the same night. This shipped OFF while its threshold was

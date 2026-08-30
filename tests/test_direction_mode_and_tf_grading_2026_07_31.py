@@ -5,11 +5,10 @@
    anything, so selecting LONG_ONLY did not stop SHORT entries. Now enforced in the
    live entry loop. No-op under the default LONG_SHORT.
 
-2. process_best_signal receives ONE intel_result/intel_score/regime (the 5-minute
-   snapshot) and grades every candidate with it, so 15-minute candidates are graded on
-   5-minute intelligence and regime. Per-timeframe grading is available behind
-   `per_timeframe_grading_enabled`, DEFAULT OFF: enabling it shifts grades and
-   confidences system-wide, so it must be A/B'd on archived sessions first.
+2. process_best_signal can grade each candidate with its own independently refreshed
+   timeframe snapshot. Per-timeframe grading is enabled by default; 1-minute data is a
+   fast support/monitoring layer for live 15-minute signals, not a renamed 15-minute
+   decision.
 """
 from types import SimpleNamespace
 
@@ -58,10 +57,12 @@ def test_direction_mode_is_enforced_in_the_entry_loop():
     assert "_direction_mode_allows" in src, "declared-but-unenforced was the whole defect"
 
 
-# ── 2. per-timeframe grading (flagged, default OFF) ──────────────────────────
+# ── 2. per-timeframe grading (enabled by default; own-timeframe evidence is fail-closed) ──
 
-def test_feature_ships_disabled():
-    assert Settings(_env_file=None).per_timeframe_grading_enabled is False
+def test_feature_ships_enabled_with_fail_closed_own_timeframe_evidence():
+    settings = Settings(_env_file=None)
+    assert settings.per_timeframe_grading_enabled is True
+    assert settings.own_timeframe_intel_fail_closed is True
 
 
 def _scanner_with_intel():
@@ -105,6 +106,22 @@ def test_enabled_grades_each_timeframe_with_its_own_intelligence():
     assert (score5, regime5) == (0.055, "VOLATILE")
 
 
+def test_stale_exact_timeframe_cache_is_not_used_for_grading():
+    import time
+
+    scanner = _scanner_with_intel()
+    scanner._intel_cache_time = {
+        "NIFTY_1min": time.time() - 31.0,
+        "NIFTY_5min": time.time() - 31.0,
+        "NIFTY_15min": time.time() - 31.0,
+    }
+    settings = SimpleNamespace(
+        per_timeframe_grading_enabled=True,
+        intelligence_analysis_ttl_seconds=30.0,
+    )
+    assert SignalProcessor._build_timeframe_contexts(scanner, "NIFTY", settings) == {}
+
+
 def test_unknown_timeframe_falls_back_safely():
     ctx = SignalProcessor._build_timeframe_contexts(
         _scanner_with_intel(), "NIFTY", SimpleNamespace(per_timeframe_grading_enabled=True)
@@ -119,7 +136,7 @@ def test_missing_scanner_cache_is_tolerated():
     ctx = SignalProcessor._build_timeframe_contexts(
         SimpleNamespace(), "NIFTY", SimpleNamespace(per_timeframe_grading_enabled=True)
     )
-    assert ctx is None
+    assert ctx == {}, "enabled own-timeframe mode must expose a cache miss to fail closed"
 
 
 def test_grading_call_uses_the_timeframe_context():
