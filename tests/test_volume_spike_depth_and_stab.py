@@ -42,9 +42,22 @@ def test_defaults_spike_stab_floor_3s_and_depth_on():
     the literal no longer holds.
 
     What this file actually cares about is the TIERING, so that is what is asserted now:
-    spike << general << midcap-risky. That is stronger than the literals it replaces --
-    the old form would have passed if the spike floor had been raised to meet a lowered
-    general window, which is precisely the collapse this test exists to prevent.
+    spike << general << midcap-risky.
+
+    Not "stronger", and an earlier version of this docstring wrongly said so. Pinned
+    literals reject ANY deviation, so the old form caught every collapse the new one
+    does -- including a spike floor raised to meet the general window, which it pinned
+    at 3.0. Checked case by case:
+
+        spike raised to meet general      old rejects   new rejects
+        general lowered to meet spike     old rejects   new rejects
+        general pushed past midcap        old rejects   new rejects
+        the two general windows drift     old rejects   new rejects
+        general moved 30 -> 15            old rejects   new ALLOWS   <- the change
+
+    The trade is a literal for a band. What the new form genuinely ADDS is the ordering
+    and the drift check -- general < midcap, and the two general windows staying equal --
+    neither of which a literal expresses, and both of which survive future retuning.
     """
     fields = Settings.model_fields
     assert fields["volume_spike_entry_stabilization_seconds"].default == 3.0

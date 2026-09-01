@@ -105,11 +105,22 @@ def test_trade_manager_never_BRANCHES_on_auto_mode():
 
     That does not touch this test's concern. The hazard is `scale_in_trade` placing a
     live BUY on a running position with no operator approval, which requires auto_mode to
-    be part of a DECISION. So the assertion is now the property that actually matters --
-    auto_mode may be read, but never branched on -- which is a stronger guard than the
-    string check it replaces: the old version would have passed a decision written as
-    `if not self.auto_mode: return` anywhere in the file, as long as it spelled the
-    attribute differently.
+    be part of a DECISION. So the assertion is now the property that actually matters:
+    auto_mode may be READ, but never branched on.
+
+    Honest accounting of the trade, because an earlier version of this docstring claimed
+    the new form was "stronger" and that was checked and found false. Compared case by
+    case against the old string check:
+
+        forensics label (the exception)   old REJECTS   new allows   <- the only change
+        `if not self.auto_mode: return`   old rejects   new rejects
+        a bare read outside forensics     old rejects   new rejects (via the test below)
+        a gate under a different name     old ALLOWS    new ALLOWS   <- neither catches
+
+    So this is not stricter. It is the old guard minus one documented exception, with
+    test_auto_mode_in_trade_manager_is_confined_to_forensics covering the gap that
+    removing the blanket string check opened. Both were verified by inserting the
+    offending code and watching them fail.
     """
     import trading.trade_manager as tm
 

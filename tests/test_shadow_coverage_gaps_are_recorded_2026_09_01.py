@@ -137,3 +137,41 @@ def test_it_still_declines_outside_real_mode(scanner):
     scanner.mode = "HISTORICAL"
     scanner._register_entry_shadow_outcome(_candidate(trading_symbol=""), "REJECTED")
     assert _skips(scanner) == {}
+
+
+def test_the_counter_survives_a_simulation_reset():
+    """_reset_simulation_diagnostics REPLACES the dict; it does not update it.
+
+    A key created only by setdefault() at the write site is therefore erased on every
+    reset. This counter was shipped that way on 2026-09-01 and would have recorded
+    nothing across a session boundary -- the exact evidence it exists to gather.
+    """
+    import inspect
+
+    from engine.scanner_telemetry import ScannerTelemetryMixin
+
+    source = inspect.getsource(ScannerTelemetryMixin._reset_simulation_diagnostics)
+    assert "entry_shadow_skipped" in source, (
+        "entry_shadow_skipped is not declared in the reset skeleton, so a simulation "
+        "reset silently drops it"
+    )
+
+
+def test_the_counter_reaches_the_diagnostics_payload():
+    """A counter nobody can read is not instrumentation.
+
+    _get_diagnostics_payload builds a CURATED payload -- it does not return the raw
+    diagnostics dict -- so a new key is invisible until it is added explicitly.
+    """
+    import inspect
+
+    from engine.scanner_telemetry import ScannerTelemetryMixin
+
+    source = inspect.getsource(ScannerTelemetryMixin._get_diagnostics_payload)
+    assert '"entry_shadow_skipped": entry_shadow_skipped' in source, (
+        "the shadow-coverage counter is not returned in the diagnostics payload, so it "
+        "cannot be read from the dashboard or the API"
+    )
+    assert 'diagnostics.get("entry_shadow_skipped"' in source, (
+        "the payload does not read the counter out of _diagnostics"
+    )

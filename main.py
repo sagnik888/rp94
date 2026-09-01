@@ -1355,6 +1355,45 @@ def create_system():
     logger.info(f"📊 Dashboard: http://localhost:{settings.dashboard_port}")
     logger.info(f"📊 Mode: {settings.trading_mode.upper()}")
     logger.info(f"📊 Max Daily Loss: {settings.max_daily_loss_pct}%")
+
+    # Say out loud which behaviour-shaping values are ACTUALLY in force, and whether a
+    # .env entry is masking the committed default.
+    #
+    # .env is the real settings store here and it is gitignored, so a value can differ
+    # from the code on one machine and nobody can see it. This build has already been
+    # bitten twice: .env was once pruned 755 keys -> 99 and the deleted keys silently
+    # reverted to DIFFERENT code defaults, and on 2026-09-01 a stabilization change
+    # looked applied while .env still pinned the old number. A committed default that
+    # never takes effect is worse than no default, because the comment next to it
+    # documents a behaviour the system does not have.
+    try:
+        from config.settings import Settings as _SettingsModel
+
+        _watched = (
+            "live_signal_stabilization_seconds",
+            "live_signal_stabilization_seconds_5min",
+            "live_signal_stabilization_seconds_15min",
+            "loss_guard_never_green_cut_seconds",
+            "live_5min_quality_min_confidence",
+            "index_cooldown_minutes",
+            "opposite_flip_confirm_min_seconds",
+        )
+        for _name in _watched:
+            _field = _SettingsModel.model_fields.get(_name)
+            if _field is None:
+                continue
+            _effective = getattr(settings, _name, None)
+            _default = _field.default
+            if str(_effective) != str(_default):
+                logger.warning(
+                    f"⚙️  {_name} = {_effective} (env overrides the committed default "
+                    f"{_default})"
+                )
+            else:
+                logger.info(f"⚙️  {_name} = {_effective}")
+    except Exception as exc:  # never let telemetry block startup
+        logger.debug(f"Effective-settings banner skipped: {exc}")
+
     logger.info("═" * 60)
 
     return scanner, settings

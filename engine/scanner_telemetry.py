@@ -239,6 +239,14 @@ class ScannerTelemetryMixin:
             "exit_reasons": {},
             "instrument_selection": {"OPT": 0, "FUT": 0},
             "source_fallback": {"delayed_entry_blocked": 0},
+            # Why an accepted/rejected signal got no shadow outcome, by reason and by
+            # the gate that refused it. Only 127 of 312 single-gate rejections over
+            # 2026-08-25..09-01 had any measured outcome, and without one a gate cannot
+            # be judged -- which is why no threshold on this system can currently be
+            # defended with evidence. Declared HERE so the reset cannot silently drop
+            # it: this dict is REPLACED, not updated, so a key that only ever appears
+            # via setdefault() elsewhere is erased on every simulation reset.
+            "entry_shadow_skipped": {},
             "simulation": {
                 "id": int(getattr(self, "simulation_id", 0) or 0),
                 "backtest_days": int(getattr(self, "backtest_days", 0) or 0),
@@ -746,6 +754,9 @@ class ScannerTelemetryMixin:
     def _get_diagnostics_payload(self) -> Dict[str, Any]:
         diagnostics = getattr(self, "_diagnostics", {}) or {}
         rejects = diagnostics.get("rejects", {}) or {}
+        # Shadow-coverage gaps. A counter nobody can read is not instrumentation, and
+        # this one was written but never surfaced until 2026-09-01.
+        entry_shadow_skipped = diagnostics.get("entry_shadow_skipped", {}) or {}
 
         source_health = {}
         try:
@@ -879,6 +890,7 @@ class ScannerTelemetryMixin:
 
         return {
             "rejects": dict(sorted(rejects.items(), key=lambda item: item[1], reverse=True)[:12]),
+            "entry_shadow_skipped": entry_shadow_skipped,
             "risk_configuration": get_settings().risk_configuration_summary(),
             "option_history": option_history,
             "option_history_quality": option_history_quality,
