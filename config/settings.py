@@ -1382,6 +1382,11 @@ class Settings(BaseSettings):
 
     quad_prime_raw_standard_floor_min_grade: str = "B+"
 
+    # Where today's 4-index warmup record is kept so a mid-session restart does not
+    # erase it. The auto-execution gate reads this when its in-memory copy is empty;
+    # the session_day inside the file is what stops yesterday's record arming today.
+    morning_refresh_state_file: str = "data_store/morning_refresh_summary.json"
+
     loss_guard_never_green_cut_enabled: bool = True
     loss_guard_never_green_cut_seconds: float = 300.0
 

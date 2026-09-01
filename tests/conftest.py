@@ -129,3 +129,27 @@ def _disable_real_env_persistence_during_tests(monkeypatch):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "schedule_settings_save"):
             monkeypatch.setattr(module, "schedule_settings_save", _no_persist)
+
+
+@pytest.fixture(autouse=True)
+def _keep_morning_readiness_out_of_data_store(tmp_path, monkeypatch):
+    """Tests exercise the morning refresh; never let it write real runtime state.
+
+    `_persist_morning_refresh_summary` keeps today's 4-index warmup record so a
+    mid-session restart does not erase it and block Auto Mode. Harmless in production,
+    but the premarket-scheduling tests drive the refresh with SIMULATED dates and were
+    writing data_store/morning_refresh_summary.json for real. That file is gitignored
+    and its session_day made it inert, so nothing broke -- but a test that happened to
+    use today's date with complete=True would have written a record that satisfies a
+    LIVE auto-execution safety gate, which is not a thing a test run may do.
+
+    Same reasoning as _disable_real_env_persistence_during_tests above.
+    """
+    try:
+        from scanner import Scanner
+    except Exception:
+        return
+    target = tmp_path / "morning_refresh_summary.json"
+    monkeypatch.setattr(
+        Scanner, "_morning_refresh_state_path", lambda self: target, raising=False
+    )

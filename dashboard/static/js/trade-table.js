@@ -432,7 +432,20 @@ function renderTradeControlCell(row = {}, flags = {}) {
     } = flags;
     if (isOpenTrade) {
         const label = executionRetryable ? 'RETRY' : 'EXIT';
-        return `<div class="trade-control-stack"><button class="trade-control-btn exit" data-action="close-trade" data-trade-id="${escHtml(row.id)}" data-trade-price="${Number(row.current_price) || 0}" title="${label === 'RETRY' ? 'Retry pending exit' : 'Submit manual exit'}">${label}</button></div>`;
+        // Guard the price the way the manual-signal EXIT below already does.
+        //
+        // This button had NO disabled state and sent `Number(row.current_price) || 0`.
+        // The server refuses price <= 0 with "invalid_price", so whenever the trade had
+        // no live price -- a stalled or degraded feed, which this system has had -- the
+        // operator got a clickable EXIT on an open position that could only ever fail,
+        // and a toast reading "Exit blocked: invalid_price". The two exit paths now
+        // behave the same: no price, no button, and the tooltip says why.
+        const exitPrice = Number(row.current_price) || 0;
+        const canExit = exitPrice > 0;
+        const title = canExit
+            ? (label === 'RETRY' ? 'Retry pending exit' : 'Submit manual exit')
+            : 'Exit unavailable: no live price for this trade yet';
+        return `<div class="trade-control-stack"><button class="trade-control-btn exit" data-action="close-trade" data-trade-id="${escHtml(row.id)}" data-trade-price="${exitPrice}" ${canExit ? '' : 'disabled'} title="${escHtml(title)}">${label}</button></div>`;
     }
     if (isSignalRow) {
         const manualExitTradeId = row.manual_exit_trade_id || '';

@@ -5143,11 +5143,72 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except Exception:
             return False
 
+    def _morning_refresh_state_path(self) -> Path:
+        configured = str(
+            getattr(
+                get_settings(),
+                "morning_refresh_state_file",
+                "data_store/morning_refresh_summary.json",
+            )
+            or "data_store/morning_refresh_summary.json"
+        )
+        return Path(configured)
+
+    def _persist_morning_refresh_summary(self, summary: Dict[str, Any]) -> None:
+        """Keep today's warmup record across a restart.
+
+        `_morning_refresh_summary` was memory-only, so every restart erased proof that
+        the 4-index warmup had already run, and the auto-execution gate then refused
+        with "morning readiness unavailable" until the scan loop rebuilt it -- roughly
+        three minutes. On 2026-09-01 that blocked an operator switching Auto Mode on at
+        15:20 even though the warmup had completed at 09:13, 13:33 and 14:15 that day.
+
+        The gate is right to demand today's warmup; it was wrong to forget it. Writing
+        the record makes a restart transparent instead of a three-minute outage, and the
+        session_day check means yesterday's file can never satisfy today's gate.
+        """
+        try:
+            if not summary or not summary.get("session_day"):
+                return
+            path = self._morning_refresh_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(summary, default=str), encoding="utf-8")
+        except Exception as exc:  # bookkeeping must never break the refresh
+            logger.debug(f"Morning refresh summary not persisted: {exc}")
+
     def _morning_refresh_summary_for_day(self, session_day: str) -> Dict[str, Any]:
+        """In-memory only, ON PURPOSE.
+
+        The scheduler reads this too (_live_open_catchup_due and the premarket phase
+        logic), and those decide whether to RUN a refresh. Answering them from disk
+        makes a fresh process believe a refresh already happened and skip scheduling
+        one -- which is a different change from the one intended, and it broke three
+        premarket-scheduling tests when it was briefly wired here. The disk fallback
+        belongs only to the readiness GATE, which asks a different question: did
+        today's warmup happen, not should one be scheduled.
+        """
         summary = getattr(self, "_morning_refresh_summary", None) or {}
         if str(summary.get("session_day") or "") != str(session_day):
             return {}
         return dict(summary)
+
+    def _restored_morning_refresh_summary(self, session_day: str) -> Dict[str, Any]:
+        """Today's warmup record from disk, for the readiness gate only."""
+        try:
+            path = self._morning_refresh_state_path()
+            if not path.exists():
+                return {}
+            stored = json.loads(path.read_text(encoding="utf-8")) or {}
+            if str(stored.get("session_day") or "") != str(session_day):
+                return {}
+            logger.info(
+                f"Morning readiness restored from disk for {session_day} "
+                f"(complete={bool(stored.get('complete'))})"
+            )
+            return dict(stored)
+        except Exception as exc:
+            logger.debug(f"Morning refresh summary not restored: {exc}")
+            return {}
 
     def _auto_execution_morning_readiness_blockers(
         self,
@@ -5161,6 +5222,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             now_ist = now_ist.astimezone(IST)
         session_day = now_ist.date().isoformat()
         summary = self._morning_refresh_summary_for_day(session_day)
+        if not summary:
+            # This process may have started after today's warmup ran. Losing the record
+            # to a restart is not the same as never having warmed up, and refusing on
+            # that basis turned every mid-session restart into a ~3 minute outage on a
+            # control the operator expects to work the moment they flip it.
+            summary = self._restored_morning_refresh_summary(session_day)
         if not summary:
             return [f"morning readiness unavailable for {session_day}"]
         active_count = max(1, len(list(getattr(self, "active_indices", []) or [])))
@@ -5255,6 +5322,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             summary["complete"] = False
             summary["accepted_incomplete"] = True
             self._morning_refresh_summary = summary
+            # Mirror to disk like the other write sites: the record on disk must never
+            # be STALER than memory, or a restart could restore an older, rosier state.
+            self._persist_morning_refresh_summary(summary)
             return
 
         self._morning_refresh_inflight = True
@@ -5920,6 +5990,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             summary["missing_keys"] = missing
             summary["complete"] = complete
             self._morning_refresh_summary = summary
+            self._persist_morning_refresh_summary(summary)
 
             elapsed = time.time() - started
             if complete:
@@ -5959,6 +6030,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if not fail_summary.get("missing_keys"):
                 fail_summary["missing_keys"] = ["history", "expiry", "quotes", "chains"]
             self._morning_refresh_summary = fail_summary
+            self._persist_morning_refresh_summary(fail_summary)
             if getattr(self, "_morning_refresh_last_date", None) == session_day:
                 self._morning_refresh_last_date = None
         finally:
