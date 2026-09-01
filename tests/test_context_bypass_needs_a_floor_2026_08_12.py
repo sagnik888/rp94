@@ -111,18 +111,26 @@ def test_market_wide_enforces_the_configured_grade_and_confidence():
 def test_market_wide_needs_an_independently_confirmed_peer():
     """A "market-wide" reversal naming only this index is not market-wide.
 
-    B+ at 60% is the band where ONLY this bypass can admit: too low for
-    high_grade (0.70), one source so not multi_confirmed, and above the B band
-    that b_grade_ok governs.
+    The probe has to sit in a band where ONLY this bypass can admit. That was B+ at
+    60% until 2026-08-31, when the quad-prime floor regained the standard per-grade
+    confidence floors it had always documented but never applied
+    (tests/test_quad_prime_floor_is_monotonic_2026_08_31.py) -- a solo B+ at 60% now
+    clears its own 0.55 floor and no longer isolates this bypass.
+
+    B at 52% restores the isolation, and does so on this guard's OWN terms:
+    market_wide_reversal_min_grade is "B" and min_confidence 0.50, so the bypass still
+    governs the B band exclusively -- rank(B) is below the B+ minimum the standard
+    floor requires, and adx_value=0.0 keeps both b_grade_ok and the structural relief
+    out. The assertion below is unchanged; only the probe moved.
     """
     alone, _s, _r = _decide(
-        _candidate(0.60, grade="B+", peers=("NIFTY",), market_wide_reversal_entry=True)
+        _candidate(0.52, grade="B", peers=("NIFTY",), market_wide_reversal_entry=True)
     )
     none, _s2, _r2 = _decide(
-        _candidate(0.60, grade="B+", peers=(), market_wide_reversal_entry=True)
+        _candidate(0.52, grade="B", peers=(), market_wide_reversal_entry=True)
     )
     with_peer, _s3, _r3 = _decide(
-        _candidate(0.60, grade="B+", peers=("SENSEX",), market_wide_reversal_entry=True)
+        _candidate(0.52, grade="B", peers=("SENSEX",), market_wide_reversal_entry=True)
     )
 
     assert alone is False

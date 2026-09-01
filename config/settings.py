@@ -175,15 +175,77 @@ class Settings(BaseSettings):
     entry_policy_enabled: bool = True
     entry_policy_min_rr: float = 1.5
     entry_policy_expected_move_floor_pct_by_index: dict[str, float] = {
-        # Entry floors are deliberately permissive enough to admit executable
-        # 1.5R opportunities while still rejecting sub-movement noise.  These
-        # percentages are directional expected favourable movement, not an
-        # already-realised spot move.
-        "NIFTY": 0.15,
-        "BANKNIFTY": 0.15,
-        "SENSEX": 0.15,
-        "MIDCPNIFTY": 0.25,
+        # These percentages are directional expected favourable movement, not an
+        # already-realised spot move. They are compared against the 25th PERCENTILE of
+        # the historical forward move (entry_policy_forecast_quantile = 0.25), so the
+        # floor is a statement about the PESSIMISTIC case: "in 75% of analogous setups
+        # we would have got at least this much".
+        #
+        # RECALIBRATED 2026-08-30. The previous values (0.15 / 0.15 / 0.15 / 0.25) were
+        # unreachable -- not rarely, never. Replaying this gate's own computation over
+        # the stored candles, the rolling q25 it reads spans 0.017%-0.063% and its
+        # MAXIMUM over the whole history is:
+        #
+        #     NIFTY 5min 0.0469   BANKNIFTY 5min 0.0662   SENSEX 5min 0.0522
+        #     NIFTY 15min 0.0773  BANKNIFTY 15min 0.1220  MIDCPNIFTY 15min 0.1399
+        #
+        # Every one of those maxima is BELOW the floor it had to clear. Put the other
+        # way, 0.15% sits at the 91st percentile of NIFTY 5min forward moves and 0.25%
+        # at the 96.5th for MIDCPNIFTY -- so the gate demanded that the 25th percentile
+        # clear a level only 3-32% of moves ever reach. This is the LAST gate before an
+        # entry, so what it refused had already passed everything else.
+        #
+        # It went live on 2026-08-28 and the system took ZERO trades that session,
+        # against 5 / 10 / 17 / 14 on the four sessions before it.
+        #
+        # The values below are the 10th percentile of each index's own rolling q25 on
+        # the 5-minute series -- the binding timeframe, since 15min q25 runs roughly
+        # double. They refuse 5-9% of 5min decisions and ~0% of 15min. Deliberately at
+        # the loose end: being too tight is the failure that just happened, and a gate
+        # that refuses the weakest tenth can be tightened later on evidence, whereas one
+        # that refuses everything produces no evidence at all.
+        "NIFTY": 0.023,
+        "BANKNIFTY": 0.029,
+        "SENSEX": 0.022,
+        "MIDCPNIFTY": 0.031,
     }
+    # MAJOR_WIN_GUARD's arming rung, as a share of what the position put at risk.
+    #
+    # It was a flat Rs.3,000 across a 6x lot-size spread, and it had NEVER FIRED on half
+    # the grid: over 26+ sessions the largest peak ever recorded is Rs.2,603 on NIFTY
+    # (0 of 80 lifecycles reached the rung) and Rs.1,556 on BANKNIFTY (0 of 56). The
+    # guard was structurally inoperative on two of four indices, so its health there was
+    # not "good", it was unobserved.
+    #
+    # Cost-normalising it while keeping the Rs.3,000 anchor was measured and REJECTED:
+    # SENSEX's median position costs Rs.9,519 so Rs.3,000 is 31.5% of it, and applying
+    # 31.5% to BANKNIFTY/MIDCPNIFTY (median cost ~Rs.19,500) would raise their rung to
+    # ~Rs.6,140 and make it LESS reachable, not more.
+    #
+    # Calibrated instead on what a win in this book actually looks like. Peak P&L as a
+    # share of position cost, per index, over 193 winning lifecycles:
+    #
+    #     index        p50    p75    p90    p95    max
+    #     NIFTY        3.0    5.7   11.7   15.4   28.6
+    #     BANKNIFTY    1.8    3.4    5.6    9.6   18.6
+    #     SENSEX       3.0    5.4   12.3   13.9   31.3
+    #     MIDCPNIFTY   2.8    5.6   14.0   30.0   59.9
+    #
+    # Each index arms on its OWN p90, so "major win" means the same thing everywhere --
+    # the top decile of that contract's wins -- rather than the same rupee number
+    # meaning six different things. BANKNIFTY is genuinely lower in relative terms and
+    # a pooled percentage leaves it inert, which is why this is per index.
+    #
+    # Falls back to the flat Rs.3,000 when the row cannot be priced, which preserves the
+    # old behaviour rather than arming on an unpriced position.
+    major_win_guard_cost_pct_by_index: dict[str, float] = {
+        "NIFTY": 11.5,
+        "BANKNIFTY": 5.5,
+        "SENSEX": 12.0,
+        "MIDCPNIFTY": 14.0,
+    }
+    major_win_guard_flat_fallback_rs: float = 3000.0
+
     entry_policy_underlying_stop_max_pct_by_index: dict[str, float] = {
         "NIFTY": 0.15,
         "BANKNIFTY": 0.15,
@@ -1280,6 +1342,51 @@ class Settings(BaseSettings):
     # no answer at all. Sampling the path makes the next such question measurable rather
     # than arguable. Bounded three ways in _sample_pnl_path; at a 1.2-minute median hold
     # a typical trade stores ~36 samples.
+    # Ceiling on the Fyers index-history call, which runs on the scanner's event loop
+    # and is the ONLY source of index volume. The SDK takes no timeout and its transport
+    # has no default, so a degraded upstream blocks the loop outright: on 2026-08-31 at
+    # the open it produced 11s / 25s / 45s stalls, dropped the scan cycle from ~740ms to
+    # roughly one per four minutes, and cost 92 dashboard timeouts in nine minutes.
+    #
+    # 8s is deliberately generous against a healthy call (sub-second) -- the aim is to
+    # bound a pathological one, not to trim a slow one, because every miss falls through
+    # to a source that lacks index volume.
+    # Cut a trade that has never printed a positive P&L once it is this old.
+    #
+    # 72 of 204 losing trades in the 61-session rtracker archive never ticked green,
+    # and 0 of 109 winners ever did -- a 72/72 loser with no counterexample, losing
+    # Rs 653 on average against Rs 230 for losers that at least went green first.
+    # The R-multiple loss guard has no time term, so these were held a median of 46
+    # minutes. Replayed tighten-side over 118 exits with a pnl_path: +Rs 3,577, with a
+    # session-clustered bootstrap 95% CI of +Rs 1,537 .. +Rs 5,731.
+    #
+    # 300s sits in the middle of a broad optimum (3-10 minutes all gain +2,840 or more),
+    # so it is not perched on a knife edge.
+    # Minimum grade admitted to the quad-prime raw quality floor on its OWN standard
+    # confidence floor (B+ 0.55, A 0.70, A+ 0.85), without needing a second signal
+    # engine. Before 2026-08-31 no term applied those floors at all, so a solo-source
+    # B+ was unreachable at any confidence and the gate ran backwards between 55% and
+    # 70% -- admitting at 52% and refusing at 68%. Raise to "A" to restore the old
+    # (unintentionally strict) behaviour for B+.
+    # Confidence a 5-minute signal needs to stand on its own, without 15-minute trend
+    # agreement. Was hardcoded to grade_min_confidence("A") = 0.70; 0.65 from 2026-09-01.
+    #
+    # Set it back to 0.70 to restore the previous behaviour exactly -- the parity sweep
+    # in tests/test_quality_verdict_parity_2026_09_01.py runs at that value and proves
+    # the consolidation itself changed nothing.
+    #
+    # Measured caveat: this rule refused zero signals across the 30 sessions in the
+    # rtracker archive, so lowering it has no demonstrated effect. Rejections happen
+    # upstream of it.
+    live_5min_quality_min_confidence: float = 0.65
+
+    quad_prime_raw_standard_floor_min_grade: str = "B+"
+
+    loss_guard_never_green_cut_enabled: bool = True
+    loss_guard_never_green_cut_seconds: float = 300.0
+
+    fyers_history_timeout_seconds: float = 8.0
+
     pnl_path_logging_enabled: bool = True
     pnl_path_min_interval_seconds: float = 2.0
     pnl_path_min_move_rs: float = 50.0
@@ -2237,8 +2344,33 @@ class Settings(BaseSettings):
     position_sizing_min_atr_fraction: float = 0.10 # Stop-distance floor used for sizing only
     position_sizing_min_price_fraction: float = 0.00005 # Absolute fallback when ATR is unavailable
     live_signal_stabilization_seconds: float = 20.0 # Legacy/default anti-flicker window for non-5m/15m paths
-    live_signal_stabilization_seconds_5min: float = 30.0 # Repaint-check buffer before 5min live entry filtering
-    live_signal_stabilization_seconds_15min: float = 30.0 # Repaint-check buffer before 15min live entry filtering
+    # Anti-repaint buffer before a forming signal may be entered. 30.0 -> 15.0 on
+    # 2026-09-01.
+    #
+    # Mined from 24 sessions of live logs, 3,604 recorded repaints ("UT1 arrow vanished
+    # after Ns"), the distribution is tight and stable:
+    #
+    #     p50 3.7s   p90 16.0s   max 62.9s
+    #      5s window catches 61.2%      20s catches 93.6%
+    #     10s catches 80.9%             30s catches 98.8%   <- the old value
+    #     15s catches 88.8%
+    #
+    # Every one of the 24 sessions lands between 84% and 94% caught at 15s -- no session
+    # is an outlier, which is the session-clustered robustness that two earlier threshold
+    # proposals in this codebase failed to show.
+    #
+    # THE COST, stated because only the timing half is measured: repaints reaching the
+    # downstream gates rise from ~1.9/session at 30s to ~16.8/session at 15s, against
+    # roughly 10 accepted entries per session. Most are refused further down, but how
+    # many become bad ENTRIES is NOT measured -- no outcome data exists for signals the
+    # repaint gate refused. 10s was requested and is one edit away (80.9%,
+    # ~28.8/session); it was not taken because it costs another 12 slipped repaints per
+    # session for 5 more seconds, with the cost side still unmeasured.
+    #
+    # Measured effect on the wait: the floor was 33s bar-open-to-entry (30s window +
+    # scan); it becomes ~18s. Median was 90s first-appearance-to-accept.
+    live_signal_stabilization_seconds_5min: float = 15.0 # Repaint-check buffer before 5min live entry filtering
+    live_signal_stabilization_seconds_15min: float = 15.0 # Repaint-check buffer before 15min live entry filtering
     midcap_15min_risky_stabilization_seconds: float = 60.0 # Extra buffer for MIDCPNIFTY 15min risky option signals in chop/weak tape
     midcap_15min_risky_stabilization_min_scans: int = 3 # Require repeated confirmation when MIDCPNIFTY 15min volume/intel is weak
     midcap_15min_risky_stabilization_min_volume_ratio: float = 1.05 # Basic volume floor for MIDCPNIFTY 15min risky stabilization

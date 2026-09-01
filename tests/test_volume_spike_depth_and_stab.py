@@ -33,14 +33,43 @@ def settings():
 
 
 def test_defaults_spike_stab_floor_3s_and_depth_on():
-    # Field defaults (ignore persisted env/json overrides on Settings()).
+    """Field defaults (ignore persisted env/json overrides on Settings()).
+
+    The general window was pinned at 30.0 here as CONTEXT for the spike floor -- the
+    point of this file is that a 1m spike waits 3s while an ordinary signal waits far
+    longer. On 2026-09-01 the general window moved 30.0 -> 15.0, sized from 3,604
+    recorded repaints across 24 sessions (p50 3.7s, p90 16.0s; 15s catches 88.8%), so
+    the literal no longer holds.
+
+    What this file actually cares about is the TIERING, so that is what is asserted now:
+    spike << general << midcap-risky. That is stronger than the literals it replaces --
+    the old form would have passed if the spike floor had been raised to meet a lowered
+    general window, which is precisely the collapse this test exists to prevent.
+    """
     fields = Settings.model_fields
     assert fields["volume_spike_entry_stabilization_seconds"].default == 3.0
     assert fields["volume_spike_entry_stabilization_seconds_min"].default == 3.0
     assert fields["volume_spike_depth_confirm_enabled"].default is True
-    assert fields["live_signal_stabilization_seconds_5min"].default == 30.0
-    assert fields["live_signal_stabilization_seconds_15min"].default == 30.0
-    assert fields["midcap_15min_risky_stabilization_seconds"].default == 60.0
+
+    spike = fields["volume_spike_entry_stabilization_seconds"].default
+    general_5 = fields["live_signal_stabilization_seconds_5min"].default
+    general_15 = fields["live_signal_stabilization_seconds_15min"].default
+    midcap = fields["midcap_15min_risky_stabilization_seconds"].default
+
+    assert general_5 == general_15, "the two general windows drifted apart"
+    assert spike * 2 < general_5, (
+        f"the 1m spike floor ({spike}s) is no longer clearly faster than the general "
+        f"window ({general_5}s); the aggressive path has collapsed into the ordinary one"
+    )
+    assert general_5 < midcap, (
+        f"the general window ({general_5}s) is no longer shorter than the MIDCPNIFTY "
+        f"15min risky-option wait ({midcap}s)"
+    )
+    assert midcap == 60.0
+    assert 15.0 <= general_5 <= 30.0, (
+        f"the general window is {general_5}s, outside the band the 24-session repaint "
+        "distribution supports"
+    )
 
 
 def test_ofr_aligned_buy_sell(settings):

@@ -3108,6 +3108,41 @@ def _forensic_date(raw):
     return cleaned if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned) else None
 
 
+# Identifiers that only ever appear in fixtures. The flight-recorder table shipped with
+# a single hand-written row -- lifecycle_id "LFC-TEST-12345", signal_id "SIG-TEST-999",
+# contract "NIFTY24AUG24500CE", grade A+, pnl +500 -- dated to a real session. Because
+# the endpoint falls back to the most recent available date when none is requested, and
+# that fixture was the ONLY date present, the panel's default view rendered an invented
+# trade as a real lifecycle. A forensics surface that shows fabricated history is worse
+# than one that shows nothing, so these are dropped at the read and the panel is allowed
+# to be honestly empty.
+_FORENSIC_SYNTHETIC_MARKERS = ("TEST-", "-TEST", "FIXTURE", "DUMMY", "SAMPLE-", "LFC-TEST")
+
+
+def _is_synthetic_forensic_row(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    for field in ("lifecycle_id", "signal_id", "trade_id"):
+        value = str(row.get(field) or "").upper()
+        if value and any(marker in value for marker in _FORENSIC_SYNTHETIC_MARKERS):
+            return True
+    return False
+
+
+def _drop_synthetic_forensic_rows(result):
+    """Strip fixture rows from a query result, in place, and report how many went."""
+    if not isinstance(result, dict):
+        return result
+    items = result.get("items")
+    if isinstance(items, list):
+        kept = [row for row in items if not _is_synthetic_forensic_row(row)]
+        dropped = len(items) - len(kept)
+        if dropped:
+            result["items"] = kept
+            result["synthetic_rows_hidden"] = dropped
+    return result
+
+
 @app.get("/api/signal-forensics")
 async def api_signal_forensics(
     date: str | None = None,
@@ -3164,6 +3199,7 @@ async def api_signal_forensics(
             "available_dates": [],
         }
 
+    result = _drop_synthetic_forensic_rows(result)
     result["status"] = "ok"
     result["session_date"] = cleaned_date or (available_dates[0] if available_dates else None)
     result["available_dates"] = available_dates

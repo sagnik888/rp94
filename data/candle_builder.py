@@ -6,6 +6,8 @@ Builds and maintains candle data from tick updates.
 Resamples 1min candles to 5min and 15min.
 """
 
+import time
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -29,10 +31,32 @@ class CandleBuilder:
     Handles market hours filtering and partial candle management.
     """
 
-    def __init__(self, max_candles: int = 2000):
+    def __init__(
+        self,
+        max_candles: int = 2000,
+        resample_min_interval_seconds: float = 0.4,
+    ):
         self.max_candles = max_candles
         import threading
         self._lock = threading.Lock()
+
+        # Floor on how often a FORMING bar is re-aggregated to 5min/15min.
+        #
+        # A closing bar always resamples immediately; this only rate-limits the partial
+        # bar that every tick rewrites. Ticks arrive ~10/s per index and each one
+        # recomputed the same forming bucket, at a cost that is almost entirely fixed
+        # pandas overhead rather than data volume: 2.1ms to aggregate 5 rows into 1, and
+        # 2.5ms to merge that 1 row into a 400-row cache, twice over for 5min and 15min.
+        #
+        # Measured 2026-08-31: the critical section was 14.3ms per tick, 10.5ms of it
+        # this resample, holding CandleBuilder._lock -- 587ms of lock-held time per
+        # second across four indices. py-spy showed 57.5 thread-seconds of blocking in a
+        # 55s capture, 58.6% of ALL scan-path samples queued on this one lock, which is
+        # what made scan latency bimodal: 331-535ms when ticks were sparse, 1.8-2.7s when
+        # they were dense.
+        self._resample_min_interval = max(0.0, float(resample_min_interval_seconds))
+        self._last_resample_at: Dict[str, float] = {}
+        self._pending_resample_touched: Dict[str, pd.Index] = {}
 
         # Store 1min base candles per instrument
         self._candles_1min: Dict[str, pd.DataFrame] = {}
@@ -247,7 +271,9 @@ class CandleBuilder:
             logger.debug(f"📊 Built 1min candle for {instrument} at {finalized.index[0]}")
 
         if partial is not None:
-            self.update_candles(instrument, partial, "1min")
+            # The forming bar only -- a closing bar went through the branch above with
+            # throttling off, so closed buckets are never deferred.
+            self.update_candles(instrument, partial, "1min", throttle_resample=True)
 
     def update_candles(
         self,
@@ -257,6 +283,7 @@ class CandleBuilder:
         *,
         received_at: Optional[datetime] = None,
         mark_receipt: bool = True,
+        throttle_resample: bool = False,
     ):
         """
         Update candle data for an instrument.
@@ -303,16 +330,54 @@ class CandleBuilder:
                     combined = pd.concat([existing, new_data])
                     combined = combined[~combined.index.duplicated(keep='last')]
                     combined = combined.sort_index()
-                    combined = self._restore_zeroed_volume(combined, existing)
-                    combined = self._restore_candle_telemetry(combined, existing)
+                    # Only rows supplied by this update can have been overwritten by
+                    # the keep-last merge.  Scanning every cached candle here made a
+                    # one-row websocket tick do O(history) work while holding _lock.
+                    touched = new_data.index
+                    combined = self._restore_zeroed_volume(combined, existing, touched)
+                    combined = self._restore_candle_telemetry(combined, existing, touched)
                     if len(combined) > self.max_candles:
                         combined = combined.iloc[-self.max_candles:]
                     self._candles_1min[key] = combined
                 else:
                     self._candles_1min[key] = new_data.iloc[-self.max_candles:]
                 
-                # Resample to higher timeframes (Merge instead of Overwrite)
-                self._resample_and_merge(instrument)
+                # Resample to higher timeframes (Merge instead of Overwrite).
+                #
+                # Deferring NEVER drops a row: the labels skipped here are accumulated
+                # and handed to the next resample, and a closing bar always passes
+                # throttle_resample=False, so every finished 1-minute bar flushes the
+                # backlog before anything can read a stale closed bucket. Only the
+                # forming bucket can lag, by at most _resample_min_interval.
+                touched = new_data.index
+                pending = self._pending_resample_touched.get(key)
+                if pending is not None and len(pending):
+                    touched = pending.union(touched)
+                now_mono = time.monotonic()
+                # Never defer the FIRST build of a higher-timeframe frame.
+                #
+                # _resample_and_merge returns early until the 1min frame holds 5 rows, so
+                # the update that crosses that threshold is the one that creates the 5min
+                # and 15min frames at all. Throttling that one leaves get_candles("5min")
+                # returning None until the next bar close -- caught by
+                # tests/test_index_volume_fallback_wiring_2026_08_02.py, which drove five
+                # minutes of ticks and then read an empty frame. Deferring an UPDATE to an
+                # existing aggregate is the optimisation; deferring its construction is a
+                # bug.
+                cold = (
+                    self._candles_5min.get(key) is None
+                    or self._candles_15min.get(key) is None
+                )
+                due = cold or (not throttle_resample) or (
+                    now_mono - self._last_resample_at.get(key, 0.0)
+                    >= self._resample_min_interval
+                )
+                if due:
+                    self._last_resample_at[key] = now_mono
+                    self._pending_resample_touched.pop(key, None)
+                    self._resample_and_merge(instrument, touched_index=touched)
+                else:
+                    self._pending_resample_touched[key] = touched
                 if mark_receipt:
                     self._note_candle_receipt(instrument, "1min", received_at)
                     if instrument in self._candles_5min and self._candles_5min[instrument] is not None:
@@ -364,7 +429,7 @@ class CandleBuilder:
             return self._last_quote_receipt.get(instrument)
 
     @staticmethod
-    def _restore_zeroed_volume(combined, existing):
+    def _restore_zeroed_volume(combined, existing, touched_index=None):
         """Never let a zero-volume bar overwrite a bar that already had real volume.
 
         The Yahoo fallback returns volume=0 for Indian index tickers (verified: ^NSEI /
@@ -380,7 +445,8 @@ class CandleBuilder:
             if "volume" not in getattr(combined, "columns", []) or "volume" not in getattr(existing, "columns", []):
                 return combined
             prior = existing[~existing.index.duplicated(keep="last")]["volume"]
-            overlap = combined.index.intersection(prior.index)
+            candidates = combined.index if touched_index is None else pd.Index(touched_index)
+            overlap = candidates.intersection(combined.index).intersection(prior.index)
             if len(overlap) == 0:
                 return combined
             current = pd.to_numeric(combined.loc[overlap, "volume"], errors="coerce").fillna(0.0)
@@ -409,8 +475,9 @@ class CandleBuilder:
             combined = pd.concat([existing, new_data])
             combined = combined[~combined.index.duplicated(keep='last')]
             combined = combined.sort_index()
-            combined = self._restore_zeroed_volume(combined, existing)
-            combined = self._restore_candle_telemetry(combined, existing)
+            touched = new_data.index if new_data is not None else None
+            combined = self._restore_zeroed_volume(combined, existing, touched)
+            combined = self._restore_candle_telemetry(combined, existing, touched)
             if len(combined) > self.max_candles:
                 combined = combined.iloc[-self.max_candles:]
             return combined
@@ -418,7 +485,7 @@ class CandleBuilder:
         return new_data.iloc[-self.max_candles:] if new_data is not None else None
 
     @staticmethod
-    def _restore_candle_telemetry(combined, existing):
+    def _restore_candle_telemetry(combined, existing, touched_index=None):
         """Keep live telemetry when a historical refresh overlaps a candle.
 
         Historical providers generally return OHLCV only.  Their duplicate row must
@@ -429,17 +496,68 @@ class CandleBuilder:
         if combined is None or existing is None or len(combined) == 0 or len(existing) == 0:
             return combined
         fields = ("tick_count", "volume_basis", "source", "receipt_at", "provider_time")
-        overlap = combined.index.intersection(existing.index)
+        candidates = combined.index if touched_index is None else pd.Index(touched_index)
+        overlap = candidates.intersection(combined.index).intersection(existing.index)
+        if len(overlap) == 0:
+            return combined
+
+        # ONE write per FIELD, not one per (row, field).
+        #
+        # pandas 3.0 made the default string dtype PyArrow-backed, and an Arrow array is
+        # IMMUTABLE: every `combined.loc[idx, field] = prior` on a string column such as
+        # `source` rebuilds that entire column. This function runs on the Kite tick path
+        # (on_ticks -> update_from_tick -> _resample_and_merge -> _merge_candles), so the
+        # cost was paid per tick, holding the GIL, which starves every asyncio loop in
+        # the process.
+        #
+        # Measured on 2026-08-31 with pandas 3.0.2, a history refresh overlapping the
+        # cache: 35ms at 50 overlapping rows, 130ms at 200, 327ms at 500, 670ms at 1000.
+        # The live symptom was a scan cycle of 75.7s, five completed cycles in eleven
+        # minutes, and "Error in periodic trades updater: TimeoutError" every six seconds
+        # as the dashboard's 5s budget was never serviceable. py-spy showed exactly one
+        # active thread in the whole process, GIL-held, inside this call.
+        #
+        # Duplicate index labels make `.loc[idx]` return a FRAME rather than a row, which
+        # this logic does not model, so that case keeps the original per-cell path.
+        indexes_unique = bool(combined.index.is_unique and existing.index.is_unique)
+
+        usable = [f for f in fields if f in combined.columns and f in existing.columns]
+        if not usable:
+            return combined
+
+        def _gather(frame, columns):
+            """{label: {column: value}} for the overlapping labels only.
+
+            `frame.loc[overlap, columns].to_dict("index")` is the obvious spelling and is
+            right when the overlap is large, but it rebuilds a DataFrame of Arrow columns
+            to read a handful of cells: 0.90ms on a 2000-row frame to fetch ONE row, paid
+            twice, on every tick, holding _lock. Below the crossover a positional scalar
+            gather is ~20x cheaper; above it the vectorised slice wins, so keep both.
+            """
+            if len(overlap) > 64:
+                return frame.loc[overlap, columns].to_dict("index")
+            positions = frame.index.get_indexer(overlap)
+            series = {column: frame[column] for column in columns}
+            return {
+                label: {column: values.iloc[position] for column, values in series.items()}
+                for label, position in zip(overlap, positions)
+                if position >= 0
+            }
+
+        old_columns = usable + (["source"] if "source" not in usable and "source" in existing.columns else [])
+        new_columns = usable + (["source"] if "source" not in usable and "source" in combined.columns else [])
+        old_map = _gather(existing, old_columns) if indexes_unique else None
+        new_map = _gather(combined, new_columns) if indexes_unique else None
+
+        pending: dict = {field: {} for field in usable}
         for idx in overlap:
-            old = existing.loc[idx]
-            new = combined.loc[idx]
+            old = old_map[idx] if indexes_unique else existing.loc[idx]
+            new = new_map[idx] if indexes_unique else combined.loc[idx]
             incoming_history = str(new.get("source", "") or "").lower() in {
                 "fyers_history", "history"
             }
             prior_source = str(old.get("source", "") or "").lower()
-            for field in fields:
-                if field not in combined.columns or field not in existing.columns:
-                    continue
+            for field in usable:
                 value = new.get(field)
                 missing = value is None or (isinstance(value, str) and not value.strip())
                 if not missing:
@@ -457,22 +575,95 @@ class CandleBuilder:
                 if missing:
                     prior = old.get(field)
                     if prior is not None:
-                        combined.loc[idx, field] = prior
+                        pending[field][idx] = prior
+
+        for field, updates in pending.items():
+            if not updates:
+                continue
+            # Rebuild the column in Python, then assign it ONCE.
+            #
+            # Writing through `.loc[keys, field]` instead looks equivalent but is not:
+            # pandas resolves the target dtype once for the whole array, so restoring a
+            # NaN into an int64 tick_count raises "Invalid value '[nan]' for dtype
+            # 'int64'" where the old per-cell path silently upcast the column. Letting
+            # the Series constructor infer from the merged values reproduces exactly
+            # that upcast, and costs one column rebuild rather than one per cell.
+            #
+            # Equivalence with the old per-cell implementation -- values AND dtypes,
+            # including the duplicate-index path -- is pinned by
+            # tests/test_candle_telemetry_restore_is_not_quadratic_2026_08_31.py.
+            column = combined[field]
+            values = column.tolist()
+            for position, key in zip(combined.index.get_indexer(list(updates)), updates):
+                if position >= 0:
+                    values[position] = updates[key]
+            try:
+                # Keep the column's own dtype. Left to infer, an all-None object column
+                # becomes float64 and an object column of strings becomes str, which the
+                # per-cell writes never did.
+                rebuilt = pd.Series(values, index=combined.index, dtype=column.dtype)
+            except (TypeError, ValueError):
+                # The dtype genuinely cannot hold a restored value -- a NaN going back
+                # into an int64 tick_count. Inference then reproduces the upcast the old
+                # per-cell path got from pandas for free.
+                rebuilt = pd.Series(values, index=combined.index)
+            combined[field] = rebuilt
         return combined
 
-    def _resample_and_merge(self, instrument: str):
-        """Resample 1min to higher TFs and merge with existing data to preserve history"""
+    @staticmethod
+    def _resample_window(base: pd.DataFrame, touched_index, freq: str) -> pd.DataFrame:
+        """Return complete higher-timeframe buckets affected by ``touched_index``.
+
+        A websocket update normally touches one 1-minute row.  Resampling the entire
+        2,000-5,000 row cache for that row made the tick thread continuously own the
+        GIL and candle lock.  The aggregate can only change in the bucket(s) containing
+        the supplied timestamps, so select those complete buckets with two index
+        searches.  Callers fall back to the full frame for unusual indexes.
+        """
+        if base is None or base.empty or touched_index is None:
+            return base
+        try:
+            if not isinstance(base.index, pd.DatetimeIndex) or not base.index.is_monotonic_increasing:
+                return base
+            touched = pd.DatetimeIndex(touched_index)
+            if touched.empty:
+                return base.iloc[0:0]
+            starts = touched.floor(freq)
+            start = starts.min()
+            end = starts.max() + pd.tseries.frequencies.to_offset(freq)
+            left = int(base.index.searchsorted(start, side="left"))
+            right = int(base.index.searchsorted(end, side="left"))
+            return base.iloc[left:right]
+        except (TypeError, ValueError):
+            # Mixed timezone/index shapes are handled correctly by the established
+            # full resample path; they are history-refresh cases, not the tick hot path.
+            return base
+
+    def _resample_and_merge(self, instrument: str, touched_index=None):
+        """Resample affected 1min buckets and merge them into cached higher frames."""
         key = instrument
         base = self._candles_1min.get(key)
         if base is None or len(base) < 5: return
 
         try:
             # Resample and merge for 5min
-            new_5m = self._resample_ohlcv(base, '5min')
+            existing_5m = self._candles_5min.get(key)
+            source_5m = (
+                base
+                if existing_5m is None or len(existing_5m) == 0
+                else self._resample_window(base, touched_index, "5min")
+            )
+            new_5m = self._resample_ohlcv(source_5m, '5min', basis_source=base)
             self._candles_5min[key] = self._merge_candles(self._candles_5min.get(key), new_5m)
 
             # Resample and merge for 15min
-            new_15m = self._resample_ohlcv(base, '15min')
+            existing_15m = self._candles_15min.get(key)
+            source_15m = (
+                base
+                if existing_15m is None or len(existing_15m) == 0
+                else self._resample_window(base, touched_index, "15min")
+            )
+            new_15m = self._resample_ohlcv(source_15m, '15min', basis_source=base)
             self._candles_15min[key] = self._merge_candles(self._candles_15min.get(key), new_15m)
         except Exception as e:
             logger.error(f"Resample merge error for {instrument}: {e}")
@@ -482,8 +673,14 @@ class CandleBuilder:
         self._resample_and_merge(instrument)
 
     @staticmethod
-    def _resample_ohlcv(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-        """Resample OHLCV data to a higher timeframe"""
+    def _resample_ohlcv(
+        df: pd.DataFrame, freq: str, basis_source: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """Resample OHLCV data to a higher timeframe.
+
+        ``basis_source`` supplies the frame the single-unit volume_basis decision is
+        taken over, when that differs from the rows being aggregated.
+        """
         # Map freq strings to pandas offset aliases
         freq_map = {"5min": "5min", "15min": "15min"}
         pd_freq = freq_map.get(freq, freq)
@@ -508,8 +705,29 @@ class CandleBuilder:
         basis_col = None
         if 'volume_basis' in df.columns:
             basis_col = df['volume_basis']
-            labelled = basis_col[basis_col.astype(str).str.strip().ne('')
-                                 & basis_col.notna()]
+            # The single-unit decision is taken over basis_source -- the WHOLE 1min
+            # cache -- and NOT over df, which since 2026-08-31 may be a narrow window of
+            # only the buckets a tick touched.
+            #
+            # This branch stamps one scalar onto EVERY bucket, including buckets whose
+            # own rows carry no label. So the label set of the input decides what an
+            # unlabelled bucket inherits, and narrowing the input silently changed it:
+            # a 5min bucket with no labelled row came out '' from a window where the
+            # full frame gave it 'ticks'. Caught by a 25-replay tick-stream equivalence
+            # harness, 1 divergence in 25.
+            #
+            # Consumers treat '' as "unknown is not a unit" and skip it, so the effect
+            # was benign -- but the narrowing is a PERFORMANCE change and must not move
+            # a gate input at all. Pinned by
+            # tests/test_candle_restore_is_scoped_to_touched_rows_2026_08_31.py.
+            reference = df
+            if basis_source is not None and 'volume_basis' in getattr(
+                basis_source, 'columns', []
+            ):
+                reference = basis_source
+            reference_col = reference['volume_basis']
+            labelled = reference_col[reference_col.astype(str).str.strip().ne('')
+                                     & reference_col.notna()]
             if labelled.nunique() <= 1:
                 single = str(labelled.iloc[0]) if len(labelled) else ''
             else:
@@ -533,7 +751,10 @@ class CandleBuilder:
                 df = self._candles_15min.get(key)
             else:
                 df = None
-            return df.copy() if df is not None else None
+        # Writers publish by replacing the dict entry; they never mutate an already
+        # published frame.  Taking the stable reference under the lock is sufficient,
+        # and copying after release keeps readers from extending writer lock holds.
+        return df.copy() if df is not None else None
 
     def latest_candle_time(self, instrument: str, timeframe: str):
         """Timestamp of the newest bar, without copying the frame.

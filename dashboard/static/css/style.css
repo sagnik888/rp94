@@ -4560,3 +4560,17 @@ input:checked + .slider-mini:before { transform: translateX(16px); }
   .sf-identity-grid { grid-template-columns: 1fr; }
   .settings-modal:has(#forensicsSettContentView[style*="block"]) { width: 100vw; max-width: 100vw; }
 }
+
+
+/* Backtest-replay headline P&L.
+   A replay total shown in the same green as live money is how a -Rs 1,106 session read
+   as +Rs 6,065 on 2026-08-31. Amber, not green/red: it is not a result, it is a rehearsal. */
+.h-summary-value.replay-value {
+    color: #f0a020;
+    font-style: italic;
+}
+.h-summary-label.replay-label {
+    color: #f0a020;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}

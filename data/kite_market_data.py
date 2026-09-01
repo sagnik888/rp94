@@ -234,7 +234,9 @@ class KiteDataSource:
         try:
             result = fn(api)
         except Exception as exc:
-            if is_kite_auth_failure(exc) and self._auth is not None:
+            # Pass the context: a bare "invalid token" from historical_data is Kite
+            # refusing the instrument token, not the session (see is_kite_auth_failure).
+            if is_kite_auth_failure(exc, context) and self._auth is not None:
                 reason = kite_auth_failure_reason(context, exc)
                 try:
                     self._auth.invalidate(reason, failed_client=api)

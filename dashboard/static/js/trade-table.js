@@ -680,11 +680,28 @@ function updateTradesPanel(trades, simId) {
         });
     }
 
+    // The headline total must say WHICH LANE produced it.
+    //
+    // A restart outside 09:00-15:30 refuses REAL and comes up HISTORICAL, so the header
+    // was showing a backtest replay as "DAILY P&L". On 2026-08-31 that rendered +Rs 6,065
+    // for a session whose live result was -Rs 1,106.50. The lane is decided server-side
+    // in TradeManager.get_dashboard_payload; this only renders it.
+    const isReplay = summary.is_replay === true;
     const pnlEl = document.getElementById('dailyPnl');
     if (pnlEl) {
         const dp = summary.daily_pnl || 0;
         pnlEl.textContent = '₹' + dp.toLocaleString();
-        pnlEl.className = 'h-summary-value ' + (dp >= 0 ? 'green' : 'red');
+        pnlEl.className = 'h-summary-value '
+            + (isReplay ? 'replay-value' : (dp >= 0 ? 'green' : 'red'));
+        pnlEl.title = isReplay
+            ? 'BACKTEST REPLAY - simulated, not live money'
+            : '';
+    }
+    const pnlLabelEl = document.getElementById('dailyPnlLabel');
+    if (pnlLabelEl) {
+        pnlLabelEl.textContent = (summary.pnl_label || 'DAILY P&L') + ':';
+        pnlLabelEl.className = 'h-summary-label' + (isReplay ? ' replay-label' : '');
+        pnlLabelEl.title = pnlEl ? pnlEl.title : '';
     }
     
     const futPnlEl = document.getElementById('futPnl');

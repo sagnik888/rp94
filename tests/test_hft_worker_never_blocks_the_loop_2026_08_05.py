@@ -207,3 +207,100 @@ def test_the_background_refresher_still_does_the_blocking_fetch():
     assert "allow_blocking=True" in src, (
         "nothing does the authoritative premium fetch any more"
     )
+
+
+# ── the flight recorder must not reintroduce the same stall ──────────────────
+#
+# 2026-08-30 gave TradeManager._record_trade_forensics its first caller, in
+# update_trade() -- which runs on the scanner's asyncio loop, the same loop as the 1s
+# scan cycle, the 100ms trade monitor, and every dashboard _call_on_scanner_loop. Its
+# sqlite write takes db.write_lock, so calling it inline is a lock-contended commit on
+# the hot path: exactly the shape this file exists to prevent, and whose visible symptom
+# is a stream of "Error in periodic trades updater: TimeoutError" once
+# _call_on_scanner_loop can no longer be serviced inside its 5s budget.
+#
+# Its sibling, Scanner._emit_forensic_event, already states the rule in its docstring:
+# "DB writes are pushed off the event loop so a slow commit cannot stall the scan cycle."
+
+class _ForensicTrade:
+    id = "T-FORENSIC"
+    is_ghost = False
+    instrument = "NIFTY"
+    timeframe = "5min"
+    direction = "LONG"
+    status = "OPEN"
+    entry_price = 100.0
+    current_price = 110.0
+    lots = 1
+    lot_size = 65
+    pnl = 650.0
+    peak_pnl = 650.0
+    max_drawdown = 0.0
+    trading_symbol = "NIFTY26SEP24500CE"
+    lifecycle_id = "LC-FORENSIC"
+    broker_order_id = ""
+    exit_order_id = ""
+    inst_type = "OPT"
+
+
+def _manager_recording_forensics(monkeypatch, landed):
+    import data.sqlite_db as sqlite_db
+    from trading.trade_manager import TradeManager
+
+    monkeypatch.setattr(
+        sqlite_db.db,
+        "append_signal_lifecycle_events",
+        lambda events: landed.append(threading.current_thread().name) or 0,
+    )
+    manager = TradeManager.__new__(TradeManager)
+    manager.mode = "REAL"
+    return manager
+
+
+def test_the_forensics_write_never_runs_on_the_callers_thread(monkeypatch):
+    """update_trade runs on the scanner loop; a sqlite commit there is the stall."""
+    landed = []
+    manager = _manager_recording_forensics(monkeypatch, landed)
+    caller = threading.current_thread().name
+
+    manager._record_trade_forensics((_ForensicTrade(),))
+
+    deadline = time.time() + 5.0
+    while not landed and time.time() < deadline:
+        time.sleep(0.02)
+
+    assert landed, "the forensics write never happened -- dispatch is silently failing"
+    assert landed[0] != caller, (
+        f"the sqlite write ran on the caller's thread ({caller})"
+    )
+
+
+def test_the_forensics_write_is_dispatched_off_a_running_event_loop(monkeypatch):
+    """The live shape: called from inside the scanner's loop."""
+    import asyncio
+
+    landed = []
+    manager = _manager_recording_forensics(monkeypatch, landed)
+
+    async def drive():
+        manager._record_trade_forensics((_ForensicTrade(),))
+        for _ in range(100):
+            if landed:
+                break
+            await asyncio.sleep(0.02)
+        return threading.current_thread().name
+
+    loop_thread = asyncio.run(drive())
+
+    assert landed, "nothing was written from inside a running loop"
+    assert landed[0] != loop_thread, "the commit ran on the event loop itself"
+
+
+def test_a_failed_dispatch_does_not_silently_drop_every_event(monkeypatch):
+    """asyncio was not imported in this module when the caller was added, so the
+    NameError fell through to a bare `except Exception: pass` and nothing was ever
+    written -- a recorder that looks wired but records nothing."""
+    import trading.trade_manager as trade_manager
+
+    assert hasattr(trade_manager, "asyncio"), "asyncio is not importable in this module"
+    assert hasattr(trade_manager, "threading")

@@ -91,17 +91,63 @@ def test_the_offer_still_happens_in_auto_mode():
     assert offers, "the cascade add was removed rather than gated"
 
 
-def test_trade_manager_still_does_not_know_about_auto_mode():
-    """The premise of this test: the gate MUST live at the scanner call site.
+def test_trade_manager_never_BRANCHES_on_auto_mode():
+    """The gate MUST stay at the scanner call site.
 
-    If trade_manager ever learns about auto_mode, this test's reasoning changes and
-    someone should re-read it rather than trust the gate above.
+    This began life as `"auto_mode" not in src` -- a tripwire whose own docstring said
+    that if trade_manager ever learned about auto_mode, someone should re-read the
+    reasoning rather than trust the gate. On 2026-09-01 it fired, and the reasoning was
+    re-read.
+
+    What changed: forensics needs to stamp each row AUTO or MANUAL, because recording
+    only auto-executed trades left an operator running manually with a permanently empty
+    flight recorder. So `_record_trade_forensics` reads auto_mode as a LABEL.
+
+    That does not touch this test's concern. The hazard is `scale_in_trade` placing a
+    live BUY on a running position with no operator approval, which requires auto_mode to
+    be part of a DECISION. So the assertion is now the property that actually matters --
+    auto_mode may be read, but never branched on -- which is a stronger guard than the
+    string check it replaces: the old version would have passed a decision written as
+    `if not self.auto_mode: return` anywhere in the file, as long as it spelled the
+    attribute differently.
     """
     import trading.trade_manager as tm
 
-    src = inspect.getsource(tm)
-    assert "auto_mode" not in src, (
-        "trade_manager now references auto_mode — re-check where the cascade gate belongs"
+    tree = ast.parse(textwrap.dedent(inspect.getsource(tm)))
+    branches = []
+    for node in ast.walk(tree):
+        test = getattr(node, "test", None)
+        if test is None:
+            continue
+        if isinstance(node, ast.IfExp):
+            continue  # a ternary picking a label is not control flow
+        if "auto_mode" in ast.dump(test):
+            branches.append(type(node).__name__)
+
+    assert not branches, (
+        "trade_manager now BRANCHES on auto_mode "
+        f"({', '.join(branches)}) — the manual-mode gate must stay at the scanner call "
+        "site, or a cascade add can reach the broker without operator approval"
+    )
+
+
+def test_auto_mode_in_trade_manager_is_confined_to_forensics():
+    """And it may only be read where it was allowed in, not spread further."""
+    import trading.trade_manager as tm
+
+    source = inspect.getsource(tm).splitlines()
+    users = []
+    current = ""
+    for line in source:
+        stripped = line.strip()
+        if stripped.startswith("def ") or stripped.startswith("async def "):
+            current = stripped.split("(")[0].replace("async def ", "").replace("def ", "")
+        if "auto_mode" in line:
+            users.append(current)
+
+    assert set(users) <= {"_record_trade_forensics"}, (
+        f"auto_mode is now read in {sorted(set(users))}; it was admitted to "
+        "trade_manager for the forensics stamp only"
     )
 
 

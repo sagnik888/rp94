@@ -132,8 +132,13 @@ def test_option_cross_geometry_rejects_premium_units_that_are_too_large_for_delt
 
 
 def test_hard_floor_and_stop_bounds_cannot_be_weakened_by_configuration():
-    assert effective_expected_move_floor_pct("NIFTY", 0.01) == pytest.approx(0.15)
-    assert effective_expected_move_floor_pct("MIDCPNIFTY", 0.01) == pytest.approx(0.25)
+    """The PROPERTY is the point and it is unchanged: configuration can only tighten.
+    The numbers moved 2026-08-30 because the originals were unreachable -- see
+    tests/test_entry_floor_and_major_win_are_reachable_2026_08_30.py."""
+    assert effective_expected_move_floor_pct("NIFTY", 0.001) == pytest.approx(0.023)
+    assert effective_expected_move_floor_pct("MIDCPNIFTY", 0.001) == pytest.approx(0.031)
+    # and a stricter configured value still wins over the hard floor
+    assert effective_expected_move_floor_pct("NIFTY", 0.40) == pytest.approx(0.40)
     assert effective_underlying_stop_cap_pct("NIFTY", 1.0) == pytest.approx(0.15)
     assert effective_underlying_stop_cap_pct("MIDCPNIFTY", 1.0) == pytest.approx(0.15)
 
@@ -535,13 +540,23 @@ def test_directional_mfe_forecast_has_an_explicit_horizon_version_and_uncertaint
     assert forecast.uncertainty_pct >= 0.0
 
 
-def test_shipped_expected_move_floors_are_the_revised_permissive_values():
+def test_shipped_expected_move_floors_are_reachable_values():
+    """These were 0.15 / 0.15 / 0.15 / 0.25 and were called "permissive". They were not:
+    compared against the 25th percentile of the forward move, every one of them sat
+    ABOVE the largest rolling q25 the stored history has ever produced, so the gate could
+    not pass once on any index. It went live on 2026-08-28 and the book took zero trades
+    that session against 5 / 10 / 17 / 14 on the four before it.
+
+    Recalibrated to the 10th percentile of each index's own rolling q25 on the binding
+    5-minute series. Reachability is asserted separately, against the observed maxima, in
+    tests/test_entry_floor_and_major_win_are_reachable_2026_08_30.py.
+    """
     settings = settings_module.Settings(_env_file=None)
     assert settings.entry_policy_expected_move_floor_pct_by_index == {
-        "NIFTY": 0.15,
-        "BANKNIFTY": 0.15,
-        "SENSEX": 0.15,
-        "MIDCPNIFTY": 0.25,
+        "NIFTY": 0.023,
+        "BANKNIFTY": 0.029,
+        "SENSEX": 0.022,
+        "MIDCPNIFTY": 0.031,
     }
 
 

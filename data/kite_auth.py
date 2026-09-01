@@ -128,11 +128,11 @@ _SHARED: Optional["KiteAuth"] = None
 _SHARED_GUARD = __import__("threading").Lock()
 
 
+# Phrases that can only mean the SESSION is dead, whatever call produced them.
 _AUTH_FAILURE_MARKERS = (
     "invalid access token",
     "incorrect api key or access token",
     "invalid api key",
-    "invalid token",
     "token expired",
     "token is invalid or has expired",
     "access token has expired",
@@ -144,13 +144,34 @@ _AUTH_FAILURE_MARKERS = (
     "login required",
 )
 
+# Kite uses the bare word "token" for two unrelated things, and this is the one phrase
+# that cannot be read on its own: historical_data(instrument_token, ...) rejects an
+# unknown or expired INSTRUMENT token with exactly "invalid token", while a dead
+# session says "Invalid `access_token`" or raises TokenException.
+_AMBIGUOUS_TOKEN_MARKERS = ("invalid token",)
 
-def is_kite_auth_failure(exc: Exception) -> bool:
+# Calls whose leading argument IS an instrument token, so the ambiguous phrase above is
+# a verdict on that argument rather than on the session.
+_INSTRUMENT_TOKEN_CONTEXTS = frozenset({"historical_data"})
+
+
+def is_kite_auth_failure(exc: Exception, context: str = "") -> bool:
     """Return true only when a Kite error proves the session is unusable.
 
     Kite's SDK has emitted both TokenException and InputException for dead sessions.
     InputException alone is not enough: malformed orders and unknown order IDs are
     ordinary terminal rejections and must not tear down a healthy session.
+
+    ``context`` is the SDK call that raised, and it decides the ambiguous case. A bare
+    "invalid token" from ``historical_data`` is Kite refusing the *instrument* token it
+    was handed -- an expired option contract, say -- not a verdict on the access token.
+    Reading it as a dead session tore down a live one and deleted its cached token: the
+    session archiver back-fills contracts from months-old sessions every few minutes, so
+    every login died within ~5 minutes of being issued and the dashboard KITE badge went
+    red while the WebSocket kept ticking on the very token just declared invalid.
+
+    A genuinely dead session is still caught on that path: it arrives as TokenException,
+    or as an InputException naming the access token, both of which are unambiguous.
     """
     name = type(exc).__name__
     if name == "TokenException":
@@ -161,7 +182,11 @@ def is_kite_auth_failure(exc: Exception) -> bool:
     for character in ("`", "_", "-"):
         message = message.replace(character, " ")
     message = " ".join(message.split())
-    return any(marker in message for marker in _AUTH_FAILURE_MARKERS)
+    if any(marker in message for marker in _AUTH_FAILURE_MARKERS):
+        return True
+    if str(context or "").strip() in _INSTRUMENT_TOKEN_CONTEXTS:
+        return False
+    return any(marker in message for marker in _AMBIGUOUS_TOKEN_MARKERS)
 
 
 def kite_auth_failure_reason(context: str, exc: Exception) -> str:

@@ -38,7 +38,18 @@ from engine.signal_quality_policy import confidence_to_grade
 # the grade floor on a TRENDING label borrowed from the 5-minute pocket. It keeps the
 # bypass when it owns a trending label on its own timeframe, which the new own_tf=True
 # half of the grid now pins. Nothing loosened; every changed row got STRICTER.
-LIVEGATE_SHA256 = "3a3b7d0f69f0ba6c056ead4521392467b538b1570dc3ea6fa306f1d35f0bda25"
+# Regenerated 2026-09-01. The live 5-minute confidence floor became a named setting
+# (live_5min_quality_min_confidence) and its default dropped 0.70 -> 0.65 at the
+# operator's request.
+#
+# The change was diffed ROW BY ROW against the previous golden before this constant was
+# touched: 760 of 115,200 rows moved (0.66%), every one of them 5min, at confidence 0.68,
+# with 15-minute agreement False, under INCLUDE_5MIN, and every one False -> True. No row
+# was newly REFUSED and no other timeframe, policy or confidence moved. A golden is only
+# worth regenerating when the diff behind it has been read.
+#
+# previous: 3a3b7d0f69f0ba6c056ead4521392467b538b1570dc3ea6fa306f1d35f0bda25
+LIVEGATE_SHA256 = "c72037c2895d31dfc0ce77c40e94a1c7a1a52b42344fd06afd753a06f17165db"
 
 _INST_METHODS = [
     "_passes_live_trade_ready_gate",

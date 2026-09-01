@@ -14,6 +14,7 @@ import uuid
 import inspect
 import math
 import re
+import asyncio
 import threading
 import time
 import json
@@ -6959,6 +6960,19 @@ class TradeManager:
         trade.peak_pnl = max(trade.peak_pnl, trade.pnl)
         trade.max_drawdown = max(trade.max_drawdown, trade.peak_pnl - trade.pnl)
         self._sample_pnl_path(trade)
+        # The flight recorder, which until now had no caller at all. Both writers -- this
+        # one and Scanner._emit_forensic_event -- were fully built, REAL-mode gated and
+        # deduped, and neither was ever invoked: signal_lifecycle_events held exactly one
+        # row across 24 sessions, and it was a fixture. The dashboard's Signal Forensics
+        # panel has therefore never shown a real lifecycle.
+        #
+        # Here rather than in a per-cycle sweep because this is where the trade's state
+        # actually changes, and it sits beside the sibling telemetry for the same reason.
+        # It takes an iterable, so one trade is a valid batch. Cost is bounded the same
+        # way pnl_path is: _record_trade_forensics keeps a state cache and throttles
+        # marks to a 5s interval / Rs.25 move, and only touches sqlite when that produces
+        # an event.
+        self._record_trade_forensics((trade,))
 
         if recovery_required or getattr(trade, "pending_exit", False):
             now = time.monotonic()
@@ -7995,6 +8009,23 @@ class TradeManager:
         # 3. Calculate Summary based on the EXACT same session pool
         summary = self.get_summary(filtered_trades=display_closed, open_trades=open_trades)
 
+        # Stamp the LANE onto the summary the dashboard headlines.
+        #
+        # get_summary() totals whatever trades this manager holds, which is correct for
+        # whichever mode it is running in -- but the header rendered that total as
+        # "DAILY P&L" with nothing saying which mode produced it. On 2026-08-31 the
+        # process was restarted at 16:46, after the close, so create_system refused REAL
+        # ("outside REAL arming window") and came up HISTORICAL. The replay then showed
+        # +Rs 6,065 under "DAILY P&L" for a session whose live result was -Rs 1,106.50.
+        #
+        # A losing day reading as a winning one is worse than any single bad trade: every
+        # judgement made from that screen is made on a number that is not the money. The
+        # lane is decided HERE, where is_historical is known, rather than inferred in the
+        # browser, so no consumer of this payload can render the total unlabelled.
+        summary["lane"] = "REPLAY" if is_historical else "LIVE"
+        summary["is_replay"] = bool(is_historical)
+        summary["pnl_label"] = "BACKTEST P&L" if is_historical else "DAILY P&L"
+
         # 4. Format already-filtered trades for UI.
         all_formatted = build_dashboard_rows(
             self,
@@ -8482,6 +8513,12 @@ class TradeManager:
                     "lane": str(
                         getattr(trade, "source_lane", "") or ""
                     ),
+                    # AUTO vs MANUAL, so the flight recorder distinguishes a trade the
+                    # system placed from one the operator did. `lane` already means the
+                    # signal's source lane (fast/slow) and must not be overloaded.
+                    "execution_mode": (
+                        "AUTO" if getattr(self, "auto_mode", False) else "MANUAL"
+                    ),
                     "ltp": ltp,
                     "entry_price": float(
                         getattr(trade, "entry_price", 0.0) or 0.0
@@ -8526,8 +8563,37 @@ class TradeManager:
                 pass
 
         if events:
+            # OFF the caller's thread, matching Scanner._emit_forensic_event, whose
+            # docstring states the rule: "DB writes are pushed off the event loop so a
+            # slow commit cannot stall the scan cycle."
+            #
+            # This matters because of where the caller sits. update_trade() runs on the
+            # scanner's asyncio loop -- the same loop that runs the 1s scan cycle, the
+            # 100ms trade monitor, and every dashboard _call_on_scanner_loop. And
+            # append_signal_lifecycle_events takes db.write_lock, so an inline call is a
+            # lock-contended sqlite commit on the hot path. That is precisely the shape
+            # of the 2026-08-05 regression recorded in
+            # tests/test_hft_worker_never_blocks_the_loop_2026_08_05.py, whose visible
+            # symptom was a stream of "Error in periodic trades updater: TimeoutError"
+            # once _call_on_scanner_loop could no longer be serviced inside its 5s budget.
+            #
+            # Forensics is observability only; it may never cost a scan cycle, and the
+            # dispatch failing is not worth a log line on a hot path.
+            batch = list(events)
+
+            def _write() -> None:
+                try:
+                    from data.sqlite_db import db
+                    db.append_signal_lifecycle_events(batch)
+                except Exception:
+                    return
+
             try:
-                from data.sqlite_db import db
-                db.append_signal_lifecycle_events(events)
+                loop = asyncio.get_running_loop()
+                loop.create_task(asyncio.to_thread(_write))
+            except RuntimeError:
+                threading.Thread(
+                    target=_write, name="trade-forensics", daemon=True
+                ).start()
             except Exception:
                 pass

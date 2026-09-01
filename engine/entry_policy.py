@@ -24,11 +24,44 @@ MIN_EXECUTION_RR = 1.5
 # Immutable baseline safety bounds.  Operators may make admission stricter, but a
 # runtime/config reload must never lower the expected-move floor or widen the
 # approved underlying stop ceiling.
+# The floor a configured value can never go BELOW -- effective_expected_move_floor_pct
+# takes max(hard, configured), so configuration can only ever tighten admission. That
+# design is right, and it is exactly why these numbers have to be reachable: a hard
+# floor that the market does not deliver is not a safety rail, it is an off switch that
+# no setting can reopen.
+#
+# RECALIBRATED 2026-08-30. The previous values (0.15 / 0.15 / 0.15 / 0.25) were compared
+# against the 25th PERCENTILE of the historical forward move
+# (entry_policy_forecast_quantile = 0.25). Replaying that computation over the stored
+# candles, the rolling q25 the gate actually reads spans 0.017%-0.063%, and its MAXIMUM
+# across the entire stored history is:
+#
+#     NIFTY  5min 0.0469    BANKNIFTY  5min 0.0662    SENSEX  5min 0.0522
+#     NIFTY 15min 0.0773    BANKNIFTY 15min 0.1220    MIDCPNIFTY 15min 0.1399
+#
+# Every maximum is BELOW the floor it had to clear, so the check could not pass once,
+# on any index, on any timeframe, in any regime. Expressed against the raw distribution:
+# 0.15% is the 91st percentile of NIFTY 5min forward moves and 0.25% is the 96.5th for
+# MIDCPNIFTY, so the gate demanded that the 25th percentile clear a level only 3-32% of
+# moves ever reach. This is the final gate before an entry, so everything it refused had
+# already passed every other check.
+#
+# It went live on 2026-08-28 and the system took ZERO trades that session, against
+# 5 / 10 / 17 / 14 on the four preceding sessions.
+#
+# These are the 10th percentile of each index's own rolling q25 on the 5-minute series,
+# which is the binding timeframe (15min q25 runs roughly double). They refuse 5-9% of
+# 5min decisions and ~0% of 15min. Deliberately at the loose end: too tight is the
+# failure that just happened, and a gate refusing the weakest tenth still produces the
+# evidence needed to tighten it, whereas one refusing everything produces none.
+#
+# Re-derive before changing: replay the q25 the way _forecast_expected_move does over
+# data_store/candles/{INDEX}_{TF}.csv and read the 10th percentile of the rolling series.
 HARD_EXPECTED_MOVE_FLOORS = {
-    "NIFTY": 0.15,
-    "BANKNIFTY": 0.15,
-    "SENSEX": 0.15,
-    "MIDCPNIFTY": 0.25,
+    "NIFTY": 0.023,
+    "BANKNIFTY": 0.029,
+    "SENSEX": 0.022,
+    "MIDCPNIFTY": 0.031,
 }
 HARD_UNDERLYING_STOP_CAPS = {
     "NIFTY": 0.15,

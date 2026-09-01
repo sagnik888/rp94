@@ -732,6 +732,52 @@ class MarketDataProvider:
         logger.debug(f"WS teardown during {context}: socket has no close method")
         return False
 
+    def _call_bounded(self, func, *args, timeout: float, label: str, **kwargs):
+        """Run a synchronous SDK call on a daemon helper and wait only up to ``timeout``.
+
+        Same idiom as shutdown_streams below, for the same reason: broker SDK calls are
+        not uniformly bounded. fyers.history() takes no timeout argument and its
+        transport has no default, so a degraded upstream blocks the CALLER for as long
+        as it likes -- and this particular caller runs on the scanner's asyncio loop.
+
+        Measured live on 2026-08-31, market open: "Prioritizing Fyers history ... to get
+        volume" preceded gaps of 11s, 25s and 45s between consecutive log lines, the
+        scan cycle fell from ~740ms to roughly one cycle per four minutes, and the
+        dashboard's 5s _call_on_scanner_loop budget was missed 92 times in nine minutes.
+
+        Returns (ok, result). ok is False on timeout or on a raise, and the caller then
+        takes the fallback path it already has. A timed-out helper thread is NOT killed
+        -- it cannot be -- but it stops holding the loop, which is the whole point.
+        """
+        outcome: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                outcome["value"] = func(*args, **kwargs)
+                outcome["ok"] = True
+            except Exception as exc:                      # noqa: BLE001 - reported below
+                outcome["error"] = exc
+                outcome["ok"] = False
+
+        worker = threading.Thread(
+            target=_run, name=f"BoundedCall-{label}", daemon=True
+        )
+        started = time.monotonic()
+        worker.start()
+        worker.join(max(0.1, float(timeout or 0.1)))
+        if worker.is_alive():
+            logger.warning(
+                f"⏱️ {label} exceeded {timeout:.1f}s and was abandoned; "
+                "falling through to the next source"
+            )
+            return False, None
+        if not outcome.get("ok"):
+            error = outcome.get("error")
+            if error is not None:
+                logger.debug(f"{label} failed after {time.monotonic()-started:.2f}s: {error}")
+            return False, None
+        return True, outcome.get("value")
+
     def shutdown_streams(self, timeout: float = 3.0) -> bool:
         """Bounded shutdown for the Fyers and Kite market-data sockets.
 
@@ -4381,7 +4427,19 @@ class MarketDataProvider:
                         "range_to": range_to,
                         "cont_flag": "1"
                     }
-                    response = self.fyers.history(data=data)
+                    # Bounded. This runs on the scanner's event loop, and an unbounded
+                    # SDK call here is what stalled the 2026-08-31 open.
+                    _hist_timeout = float(
+                        getattr(get_settings(), "fyers_history_timeout_seconds", 8.0) or 8.0
+                    )
+                    _ok, response = self._call_bounded(
+                        self.fyers.history,
+                        data=data,
+                        timeout=_hist_timeout,
+                        label=f"fyers.history({fyers_symbol} {res})",
+                    )
+                    if not _ok:
+                        response = None
                     # This is the ONLY source of index volume — AngelOne does not supply it
                     # and the Yahoo tertiary reports 0 for index tickers. Every exit below
                     # used to be silent, so when Fyers stopped returning current-day index
@@ -4467,7 +4525,18 @@ class MarketDataProvider:
                         "range_to": range_to,
                         "cont_flag": "1"
                     }
-                    response = self.fyers.history(data=data)
+                    # Bounded for the same reason as the index-history call above: this
+                    # also runs on the scanner's loop and the SDK takes no timeout.
+                    _ok, response = self._call_bounded(
+                        self.fyers.history,
+                        data=data,
+                        timeout=float(
+                            getattr(get_settings(), "fyers_history_timeout_seconds", 8.0) or 8.0
+                        ),
+                        label=f"fyers.history({fyers_symbol} {res})",
+                    )
+                    if not _ok:
+                        response = None
                     if response and response.get('s') == 'ok':
                         candles = response.get('candles', [])
                         if candles:

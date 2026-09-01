@@ -108,7 +108,32 @@
             if (!append) tbody.innerHTML = '';
 
             if (model.items.length === 0 && !append) {
-                tbody.innerHTML = '<tr><td colspan="14" class="sf-empty">No items found</td></tr>';
+                // "No items found" is indistinguishable from a broken tab, and that is
+                // exactly how this read: on 2026-09-01 the whole table held ONE row, the
+                // LFC-TEST-12345 fixture, which the server correctly hides as synthetic.
+                // The response said so -- total 1, synthetic_rows_hidden 1 -- and the UI
+                // showed "No items found", so an empty-by-design surface looked broken.
+                // Forensics records REAL-mode trades only, and none had been taken.
+                let why;
+                if (model.loadError) {
+                    why = 'Could not load forensics: ' + esc(model.loadError);
+                } else if (model.total > 0 && model.syntheticHidden >= model.total) {
+                    why = model.syntheticHidden + ' test row'
+                        + (model.syntheticHidden === 1 ? '' : 's')
+                        + ' hidden. No real trades recorded for ' + esc(model.sessionDate || 'this date')
+                        + ' — forensics records REAL-mode trades only.';
+                } else if (model.total > 0) {
+                    why = 'No rows match the current filters ('
+                        + model.total.toLocaleString('en-IN') + ' event'
+                        + (model.total === 1 ? '' : 's') + ' on this date).';
+                } else if ((model.availableDates || []).length) {
+                    why = 'No events for ' + esc(model.sessionDate || 'this date')
+                        + '. Data exists for: ' + model.availableDates.map(esc).join(', ');
+                } else {
+                    why = 'No forensics recorded yet. Events are written only for '
+                        + 'REAL-mode trades, and none have been taken.';
+                }
+                tbody.innerHTML = '<tr><td colspan="14" class="sf-empty">' + why + '</td></tr>';
             } else {
                 let html = '';
                 model.items.forEach(item => {
@@ -127,7 +152,7 @@
                         <td>${badge(item.phase, toneForPhase(item.phase))}</td>
                         <td>${badge(item.decision, toneForDecision(item.decision))}</td>
                         <td title="${esc(item.reason_text)}"><strong>${esc(item.reason_code)}</strong><br><small class="sf-sub">${esc(item.reason_text)}</small></td>
-                        <td>${esc(item.source)}<br><small class="sf-sub">${esc(item.engine)}/${esc(item.lane)}</small></td>
+                        <td>${badge(item.execution_mode || 'n/a', item.execution_mode === 'AUTO' ? 'pos' : (item.execution_mode === 'MANUAL' ? 'warn' : 'neutral'))}<br><small class="sf-sub">${esc(item.source)} · ${esc(item.engine)}/${esc(item.lane)}</small></td>
                         <td>${badge(item.grade, 'neutral')}<br><small class="sf-sub">${esc(item.confidence)}%</small></td>
                         <td>${esc(item.ltp)}<br><small class="sf-sub">${esc(item.entry_price)}</small></td>
                         <td>${formatDelta(item.initial_stop, item.current_stop)}</td>
@@ -188,6 +213,9 @@
                 model.total = data.total || 0;
                 model.signalTotal = data.signal_total || 0;
                 model.latestId = data.latest_event_id || 0;
+                // The API already explains an empty table; the UI used to discard it.
+                model.syntheticHidden = data.synthetic_rows_hidden || 0;
+                model.loadError = '';
 
                 if (data.session_date) {
                     model.sessionDate = data.session_date;
@@ -207,7 +235,14 @@
                 renderRows(append);
 
             } catch (err) {
+                // A console-only failure is invisible to the operator and reads as an
+                // empty tab, which is the same symptom as having no data. Say which.
                 console.error('Error fetching ledger:', err);
+                model.loadError = (err && err.message) ? err.message : String(err);
+                if (!append) {
+                    model.items = [];
+                    renderRows(false);
+                }
             } finally {
                 inflight = false;
             }

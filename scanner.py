@@ -31,7 +31,12 @@ from data.warm_memory import WarmMemoryStore, dataframe_to_records, records_to_d
 from engine.candidate_normalization import normalize_loaded_exit_candidate
 from engine.multi_timeframe import MultiTimeframeEngine
 from engine.signal_manager import SignalManager
-from engine.signal_quality_policy import is_top_tier_setup
+from engine.quality_verdict import QualityInputs, evaluate_quality
+from engine.signal_quality_policy import (
+    b_grade_min_confidence,
+    is_top_tier_setup,
+    is_trending_regime,
+)
 from intelligence.intelligence_aggregator import IntelligenceAggregator
 from intelligence.memory import IntelligenceMemory
 from intelligence.snapshot_store import MarketIntelSnapshotStore
@@ -159,6 +164,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self.trades = trade_manager
         self.trades.scanner = self
         self.trades.mode = trading_mode
+        # The trade manager stamps forensics rows AUTO/MANUAL and cannot see
+        # the scanner's flag otherwise.
+        self.trades.auto_mode = bool(getattr(self, "auto_mode", False))
         self.trades.ui_logger = self.log_event
         # One broker-boundary authority for every AUTO exposure mutation, including a
         # scale-in or stale-limit replacement on a trade restored after restart. Manual
@@ -1235,6 +1243,94 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.debug(f"Entry intel snapshot skipped: {exc}")
             return {}
 
+    def _record_signal_forensics(self, candidate, trade=None) -> None:
+        """Write the ACCEPTED signal to the forensics flight recorder, AUTO or MANUAL.
+
+        Until 2026-09-01 forensics received rows only from TradeManager, i.e. only from
+        objects that became TRADES. In Manual mode a signal is announced and never
+        becomes one, so an operator running manually had an empty Signal Forensics tab
+        with no way to tell that from a broken one -- the whole table held a single row,
+        the LFC-TEST-12345 fixture, which the server hides.
+
+        This is the acceptance choke point ("Every acceptance route reaches here"), so
+        one row is written per accepted signal in BOTH modes, stamped with which. The
+        trade-level transitions written later by TradeManager carry the same stamp, so
+        the two never have to be told apart by guesswork.
+
+        HISTORICAL is excluded exactly as the trade writer excludes it: a replay must not
+        fill the recorder with rows the operator never traded.
+        """
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return
+        if bool(getattr(self, "is_warmup", False)):
+            return
+        try:
+            now = datetime.now(IST)
+            auto = bool(getattr(self, "auto_mode", False))
+            contract = getattr(candidate, "contract", None)
+            event = {
+                "session_date": now.strftime("%Y-%m-%d"),
+                "event_ts": now.isoformat(timespec="milliseconds"),
+                "lifecycle_id": str(getattr(candidate, "lifecycle_id", "") or ""),
+                "signal_id": str(getattr(candidate, "signal_id", "") or ""),
+                "instrument": str(getattr(candidate, "instrument", "") or "").split()[0],
+                "contract": str(getattr(candidate, "trading_symbol", "") or
+                                (contract or "")),
+                "symbol_token": str(getattr(candidate, "symbol_token", "") or ""),
+                "timeframe": str(getattr(candidate, "timeframe", "") or ""),
+                "direction": str(getattr(candidate, "direction", "") or ""),
+                "phase": "ACCEPTED",
+                # "ACCEPTED" is a value _FORENSIC_DECISIONS already accepts, so the
+                # dashboard's decision filter keeps working. AUTO vs MANUAL belongs in
+                # execution_mode, its own field, not smuggled into this one.
+                "decision": "ACCEPTED",
+                "reason_code": "SIGNAL_ACCEPTED",
+                "reason_text": (
+                    "Accepted and auto-executed" if auto
+                    else "Accepted and displayed for manual execution"
+                ),
+                "source": "scanner",
+                "grade": str(getattr(candidate, "grade", "") or ""),
+                "confidence": float(getattr(candidate, "confidence", 0.0) or 0.0),
+                "engine": str(getattr(candidate, "source_engine", "") or ""),
+                "lane": str(getattr(candidate, "source_lane", "") or ""),
+                "execution_mode": "AUTO" if auto else "MANUAL",
+                "ltp": float(getattr(candidate, "price", 0.0) or 0.0),
+                "entry_price": float(getattr(candidate, "entry_price", 0.0)
+                                     or getattr(candidate, "price", 0.0) or 0.0),
+                "initial_stop": float(getattr(candidate, "stop", 0.0) or 0.0),
+                "current_stop": float(getattr(candidate, "stop", 0.0) or 0.0),
+                "initial_target": float(getattr(candidate, "target", 0.0) or 0.0),
+                "current_target": float(getattr(candidate, "target", 0.0) or 0.0),
+                "quote_source": str(getattr(candidate, "entry_quote_source", "") or ""),
+                "quote_verified": bool(getattr(candidate, "entry_quote_verified", False)),
+            }
+            if not event["lifecycle_id"]:
+                return
+        except Exception as exc:
+            logger.debug(f"Signal forensics event not built: {exc}")
+            return
+
+        def _write() -> None:
+            try:
+                from data.sqlite_db import db
+                db.append_signal_lifecycle_events([event])
+            except Exception:
+                return
+
+        # Off the scan loop, for the same reason the trade-level write is: a slow commit
+        # takes db.write_lock and must never cost a scan cycle. Forensics is
+        # observability; it may not become an entry failure mode.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_write))
+        except RuntimeError:
+            threading.Thread(
+                target=_write, name="signal-forensics", daemon=True
+            ).start()
+        except Exception:
+            pass
+
     def _record_accepted_entry(self, candidate: TradeCandidate, trade=None) -> None:
         """Count each accepted live/manual entry exactly once."""
         self._reset_daily_counters()
@@ -1289,6 +1385,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             decision="ACCEPTED",
             source="session_candidate",
         )
+        self._record_signal_forensics(candidate, trade)
         self._log_opposing_exposure_telemetry(candidate)
         # Immediately refresh the dashboard signal/trade panel on a fresh entry.
         self._notify_trade_event()
@@ -4429,6 +4526,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         if auto_mode is not None:
             self.auto_mode = self._strict_setting_enabled(auto_mode, False)
+            try:
+                self.trades.auto_mode = bool(self.auto_mode)
+            except Exception:
+                pass
             logger.info(f"🔄 Auto Mode: {'ENABLED' if self.auto_mode else 'DISABLED'}")
 
         if inst_pref and inst_pref != self.inst_pref:
@@ -4530,6 +4631,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             self.mode = mode
             self.trades.mode = mode
+            self.trades.auto_mode = bool(getattr(self, "auto_mode", False))
             settings.trading_mode = mode
             logger.info(f"🔄 Mode switched: {old_mode} ➔ {mode}")
 
@@ -9503,13 +9605,49 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         trading_symbol = str(getattr(candidate, "trading_symbol", "") or "").strip()
         symbol_token = str(getattr(candidate, "symbol_token", "") or "").strip()
         quantity = self._entry_shadow_quantity(candidate)
-        if (
-            instrument not in SUPPORTED_ENTRY_INSTRUMENTS
-            or inst_type not in {"OPT", "FUT"}
-            or not trading_symbol
-            or not symbol_token
-            or quantity <= 0
-        ):
+        # RECORD WHY A SIGNAL GOES UNMEASURED, rather than dropping it silently.
+        #
+        # Measured 2026-08-25..2026-09-01, the only sessions with lane stamping: of 312
+        # live signals stopped by exactly ONE gate -- the set where that gate is the only
+        # thing between the signal and a trade -- just 127 (41%) had any recorded
+        # outcome. Without an outcome a gate cannot be judged, so the 185 missing ones
+        # are precisely why no threshold on this system can currently be defended with
+        # evidence.
+        #
+        # Coverage was also wildly uneven by gate (30s repaint 30%, quad-prime 58%),
+        # which points at WHEN in the pipeline the refusal happens rather than at the
+        # gate itself: a signal refused before its option contract is resolved has no
+        # instrument to mark out. That is a hypothesis, and this counter is how it stops
+        # being one -- the skip reason is now attributable per gate instead of inferred.
+        #
+        # Counting only; nothing about entry or rejection changes.
+        skip_reason = ""
+        if instrument not in SUPPORTED_ENTRY_INSTRUMENTS:
+            skip_reason = "unsupported_instrument"
+        elif inst_type not in {"OPT", "FUT"}:
+            skip_reason = "no_inst_type"
+        elif not trading_symbol:
+            skip_reason = "no_trading_symbol"
+        elif not symbol_token:
+            skip_reason = "no_symbol_token"
+        elif quantity <= 0:
+            skip_reason = "no_quantity"
+        if skip_reason:
+            try:
+                book = self._diagnostics.setdefault("entry_shadow_skipped", {})
+                gate = str(getattr(candidate, "live_gate_rejection_reason", "") or "")[:44]
+                bucket = book.setdefault(skip_reason, {})
+                bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+                gates = bucket.setdefault("gates", {})
+                key = gate or str(getattr(candidate, "status", "") or "unknown")[:44]
+                gates[key] = int(gates.get(key, 0) or 0) + 1
+            except Exception:
+                pass
+            logger.debug(
+                f"Entry shadow skipped for {instrument} "
+                f"{getattr(candidate, 'timeframe', '')} "
+                f"{getattr(candidate, 'direction', '')}: {skip_reason}"
+            )
             return
         try:
             lifecycle_id = self._candidate_lifecycle_key(candidate)
@@ -15458,6 +15596,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return 0.0
         return cost if cost > 0 else 0.0
 
+    def _major_win_guard_arm_rs(self, trade_like) -> float:
+        """The peak at which MAJOR_WIN_GUARD arms, sized to THIS contract.
+
+        A flat Rs.3,000 across a 6x lot-size spread meant the guard had never fired on
+        NIFTY or BANKNIFTY in 26+ sessions -- their largest recorded peaks are Rs.2,603
+        and Rs.1,556, both under the rung. Half the grid ran with this protection
+        permanently disarmed, which reads as "it never triggered" rather than as a fault.
+
+        Each index arms on the p90 of its own peak/cost distribution, so a "major win"
+        is the top decile of that contract's wins everywhere. See the settings block for
+        the measurement. Falls back to the flat rupee rung when the row cannot be priced,
+        because arming an unpriced position is worse than leaving it as it was.
+        """
+        settings = get_settings()
+        flat = float(getattr(settings, "major_win_guard_flat_fallback_rs", 3000.0) or 3000.0)
+        try:
+            table = getattr(settings, "major_win_guard_cost_pct_by_index", None) or {}
+            raw = str(getattr(trade_like, "instrument", "") or "").split()
+            if not raw:
+                return flat
+            pct = float(table.get(raw[0].upper(), 0.0) or 0.0)
+            if pct <= 0.0:
+                return flat
+            cost = Scanner._position_cost_rs(trade_like)
+            if cost <= 0.0:
+                return flat
+            return cost * pct / 100.0
+        except (TypeError, ValueError, AttributeError, IndexError) as exc:
+            logger.debug(f"Major-win arm sizing fell back to the flat rung: {exc}")
+            return flat
+
     def _profit_lock_arm_base_rs(self, trade_like, base_rs: float, pct: float) -> float:
         """A lock's arming rung, scaled to the contract it arms on.
 
@@ -19503,7 +19672,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         risk = abs(float(initial_risk_rs or 0.0))
         if pnl >= 0.0:
             return False, "winner — loss guard idle", 0.8
-
         # ── The three guards every other major exit already had (2026-08-16) ──
         # Deliberately BEFORE the R arithmetic so they cover the intel-accelerated
         # path (0.55R / 0.35R) too, which is what actually does most of the firing:
@@ -19557,6 +19725,50 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                    "round trip"), 0.8
             except Exception:
                 pass
+
+        # 4. Never-green accelerator. Deliberately placed AFTER the cost floor above:
+        #    a trade down less than one round trip is not worth a round trip to close,
+        #    whether or not it has ever been green
+        #    (tests/test_early_loss_cut_guards_2026_08_16.py pins that, and it caught
+        #    this rule sitting in front of it).
+        # A trade that has NEVER printed a positive P&L does not recover.
+        #
+        # Measured over the rtracker archive, 61 sessions, 313 deduped exits:
+        #     72 of 204 losing trades never ticked green (peak_pnl == 0)
+        #      0 of 109 winning trades ever did
+        # so "never green" is a 72/72 loser with no counterexample. Those trades also
+        # lose 2.8x harder than the rest: mean Rs -653 against Rs -230.
+        #
+        # The existing threshold below is purely an R-multiple of the loss, with no
+        # time term, so an immediately-wrong trade sits until it bleeds 0.35-1.0R --
+        # a MEDIAN OF 46 MINUTES, up to 156. "EARLY_LOSS_CUT" was not early at all.
+        #
+        # Cutting these at 5 minutes, replayed over the 118 exits that carry a
+        # pnl_path (13 sessions, tighten-side only, applied ALWAYS and not only where
+        # it helps): +Rs 3,577 on a subset that actually realised +Rs 521. Robust from
+        # 3 to 10 minutes (+2,840 .. +3,577), 10 of 13 sessions improved and 1 worsened,
+        # leave-one-session-out minimum +Rs 2,775, and a session-clustered bootstrap
+        # 95% CI of +Rs 1,537 .. +Rs 5,731 with 100% of resamples positive.
+        #
+        # Caveat carried deliberately: that corpus is the virtual lane, and its P&L is
+        # advisory (flat Rs 80 costs, no broker fill). The rule is a TIGHTENING, which
+        # is the only direction pnl_path can measure honestly.
+        if self._setting_enabled(
+            getattr(settings, "loss_guard_never_green_cut_enabled", True), True
+        ):
+            peak_so_far = float(getattr(trade_like, "peak_pnl", 0.0) or 0.0)
+            if peak_so_far <= 0.0:
+                grace = float(
+                    getattr(settings, "loss_guard_never_green_cut_seconds", 300.0) or 300.0
+                )
+                age = self._trade_like_age_seconds(trade_like, latest_time)
+                if age is not None and float(age) >= grace:
+                    return (
+                        True,
+                        f"EARLY_LOSS_CUT never-green {float(age)/60.0:.1f}m "
+                        f">= {grace/60.0:.1f}m (peak never above 0)",
+                        0.0,
+                    )
 
         if risk <= 0.0:
             # Fall back to TradeManager stop distance when risk not provided.
@@ -23521,10 +23733,71 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # special context that still has to clear quad_prime_raw_min_confidence.
         market_wide_ok, _market_wide_note = self._market_wide_candidate_quality(candidate)
         cascade_entry = bool(one_way_cascade and confidence >= min_conf)
+
+        # The standard grade floors, which this gate never actually applied.
+        #
+        # b_grade_entry_allowed() governs the B BAND only and returns False the moment
+        # confidence reaches the B+ threshold -- its docstring says so outright:
+        # "It governs the B band only; B+/A/A+ use the standard confidence floors."
+        # Those floors existed (B+ 0.55, A 0.70, A+ 0.85) but no term here ever read
+        # them, so the only paths left for a SOLO-source signal were high_grade
+        # (A-grade at >= 0.70) and multi_confirmed (>= 2 signal ENGINES). A solo B+ had
+        # no admission path at ANY confidence.
+        #
+        # The result was a gate that ran BACKWARDS across 55-70%. For one engine:
+        #     52% -> admitted (b_grade_ok)
+        #     60% -> rejected
+        #     68% -> rejected
+        #     90% -> rejected unless the grade was A/A+
+        # Raising confidence made the system LESS willing to trade.
+        #
+        # Two 2026-08-31 signals sat exactly in that dead zone and both were profitable
+        # in a parallel build running the same scanner:
+        #     BANKNIFTY 57300CE 11:45  B+ conf 67.9%  +Rs 2,323
+        #     MIDCPNIFTY 14875PE 13:56 B+ conf 67.2%  +Rs   532
+        # Restoring the documented floors is what admits them; note that keeping the
+        # B-band structural conditions (trending regime, ADX >= 25) would NOT have --
+        # MIDCPNIFTY carried ADX 21.6 in a VOLATILE regime.
+        #
+        # This is a LOOSENING of entry admission, so it is bounded deliberately: B+ or
+        # better only, each grade still held to its own standard floor, and both the
+        # minimum grade and the floors remain settings.
+        standard_floor_grade = str(
+            getattr(settings, "quad_prime_raw_standard_floor_min_grade", "B+") or "B+"
+        )
+        standard_floor_ok = bool(
+            grade_rank >= SignalProcessor._grade_rank(standard_floor_grade)
+            and confidence >= SignalProcessor._grade_min_confidence(grade)
+        )
+
+        # `structural_relief_ok` was here and has been REMOVED. It was added to repair a
+        # non-monotonicity that only ever existed in UNREACHABLE states.
+        #
+        # Grade is not an independent input: GRADE_BANDS in signal_quality_policy makes it
+        # a pure bucket of confidence (A+ >= 0.85, A >= 0.70, B+ >= 0.55, B >= 0.40) and
+        # signal_manager assigns it with confidence_to_grade(). So "A at 54%" and
+        # "C at 95%" -- the ladder reversals that motivated the term, and the guard-rail
+        # cases that appeared to justify it -- cannot occur. Swept over REACHABLE states
+        # only, admission is already monotonic in every regime without it, and it adds
+        # ZERO admissions the other terms do not already grant.
+        #
+        # It was NOT a safety hole, and an earlier version of this comment wrongly said
+        # it was. The term required confidence >= 0.50, and a C-grade is confidence < 0.40
+        # by construction, so it could never admit one. The "C at 95%" case that made it
+        # look dangerous is the same unreachable state that made it look necessary.
+        #
+        # Removal is therefore pure dead-code elimination, and provably behaviour-neutral:
+        # the gate was swept WITH and WITHOUT the term over 1,248,000 reachable states
+        # (regime x ADX x 15m agreement x source count x every context flag x confidence)
+        # and not one decision differed.
+        #
+        # The real defect -- a solo-source B+ having no admission path between 0.55 and
+        # 0.70 -- is fixed by `standard_floor_ok` above, and that fix stands on its own.
         allowed = bool(
             high_grade
             or multi_confirmed
             or b_grade_ok
+            or standard_floor_ok
             or (market_wide and market_wide_ok)
             or cascade_entry
             or exceptional_spike
@@ -24326,15 +24599,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if stored is not None:
             return bool(stored)
         expected = 1 if str(getattr(candidate, "direction", "") or "").upper() == "LONG" else -1
-        key = f"{getattr(candidate, 'instrument', '')}_15min"
+        # Normalised the way scanner.py:1277 normalises the same field. The two sites
+        # read one value and disagreed about whether it can carry a suffix; if it ever
+        # does, the key misses `mtf.engines`, state is None, and this returns False --
+        # silently closing the whole 5min lane for that index.
+        raw_instrument = str(getattr(candidate, "instrument", "") or "").split()
+        key = f"{raw_instrument[0] if raw_instrument else ''}_15min"
         try:
             engine = getattr(getattr(self, "mtf", None), "engines", {}).get(key)
             state = engine.get_state(key) if engine else None
+            if engine is None or state is None:
+                # ABSENCE, not disagreement. Still refuses -- a 5min entry should be
+                # 15m-aligned -- but says so, instead of looking like "no signal today".
+                self.log_signal_decision_once(
+                    f"15m-state-unavailable|{key}|{getattr(candidate, 'timeframe', '')}",
+                    f"{key}: 15-minute state unavailable, so 5min entries for it are "
+                    f"refused as 15m-misaligned (missing engine, not a disagreeing trend).",
+                    "warning",
+                )
+                setattr(candidate, "trend_15m_state", "unavailable")
+                setattr(candidate, "trend_15m_agrees", False)
+                return False
             position = int(getattr(state, "position", 0) or 0)
             agrees = position == expected
             setattr(candidate, "trend_15m_agrees", agrees)
+            setattr(candidate, "trend_15m_state", "agrees" if agrees else "disagrees")
             return agrees
-        except Exception:
+        except Exception as exc:
+            # Was a bare `except Exception: return False`, which converted any lookup
+            # failure into a permanent, unlogged refusal of 72% of the book.
+            logger.debug(f"15m trend lookup failed for {key}, refusing closed: {exc}")
+            setattr(candidate, "trend_15m_state", "unavailable")
             return False
 
     def _passes_candidate_grade_preference(self, candidate: TradeCandidate) -> Tuple[bool, str]:
@@ -24866,8 +25161,54 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._set_scalp_lock(candidate, True)
             return True
 
-        if regime == "UNKNOWN" and confidence < SignalProcessor._grade_min_confidence("A"):
-            return self._gate_block(candidate, f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; UNKNOWN regime requires A/A+ (confidence >= 0.70).")
+        # ── QUALITY ─────────────────────────────────────────────────────────────
+        # One decision, one place, one reason code. Until 2026-09-01 the quality
+        # question -- "is this signal good enough?" -- was answered by six separate
+        # checks strung through this function, each reading some mixture of grade,
+        # confidence, regime, ADX and 15m agreement, and each able to veto alone.
+        # Whichever fired first became the recorded reason and hid the others, so the
+        # same (grade, confidence) cell was rejected by four different gates depending
+        # only on evaluation order.
+        #
+        # engine/quality_verdict.py now holds those rules. This release is PARITY: the
+        # evaluator was swept against the logic it replaced over 282,240 combinations of
+        # regime x timeframe x instrument x ADX x 15m agreement x impulse x risky x
+        # choppy x confidence, with zero differing decisions
+        # (tests/test_quality_verdict_parity_2026_09_01.py). Behaviour is unchanged; what
+        # changes is that the decision is now readable, and carries a route and a stable
+        # reason code instead of a formatted sentence.
+        #
+        # Evaluated ONCE, here, before the market-location gate -- because that gate
+        # mutates the candidate (appends reasons, arms scalp lock) and the original order
+        # ran the UNKNOWN-regime refusal ahead of it. Splitting the CHECK of the verdict
+        # around the location gate preserves that ordering exactly without evaluating
+        # quality twice.
+        quality = evaluate_quality(
+            QualityInputs(
+                timeframe=timeframe,
+                inst_type=inst_type,
+                confidence=confidence,
+                regime=regime,
+                adx_value=float(adx_val or 0.0),
+                trend_15m_agrees=self._candidate_15m_trend_agrees(candidate),
+                impulse_confirmed=bool(getattr(candidate, "impulse_confirmed", False)),
+                risky_regime=bool(risky_regime),
+                is_choppy=bool(is_choppy),
+                grade=str(getattr(candidate, "grade", "") or ""),
+            ),
+            settings,
+        )
+        try:
+            candidate.quality_verdict = quality
+        except Exception:
+            pass  # a lightweight facade candidate must not break the gate
+
+        if not quality.allowed and quality.route == "unknown_regime":
+            return self._gate_block(
+                candidate,
+                f"Live Gate: blocked {candidate.instrument} {timeframe} "
+                f"{candidate.direction}; {quality.reason}",
+            )
 
         location_ok, location_reason = self._market_location_entry_gate(candidate)
         # Fix 4: a late entry protects first profit even when well-located.
@@ -24888,84 +25229,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 f"{candidate.direction} in reduced-risk scalp-lock mode; {location_reason}"
             )
 
-        # Dedicated B-grade path: a B-band signal (conf 0.40-0.55) may trade ONLY in a
-        # trending/breakout regime with 15m alignment and ADX momentum (>=25), FUT or OPT.
-        # Higher tiers (B+/A/A+) skip this and use the standard floors below.
-        if confidence < SignalProcessor._grade_min_confidence("B+"):
-            if SignalProcessor._b_grade_entry_allowed(
-                confidence,
-                regime,
-                trend_15m_agrees=self._candidate_15m_trend_agrees(candidate),
-                adx_value=float(adx_val or 0.0),
-                settings=settings,
-            ):
-                return True
+        if not quality.allowed:
             return self._gate_block(
                 candidate,
-                f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; "
-                f"B-grade requires trending regime + 15m alignment + ADX>=25 at confidence>=0.50 "
-                f"({candidate.grade}, {confidence:.0%}).",
-            )
-
-        # 5min is a timing/exit timeframe in live mode. It must be exceptional to become a trade signal.
-        if timeframe == "5min":
-            min_conf = SignalProcessor._relaxed_threshold(
-                float(getattr(settings, "ut_5min_option_min_confidence", 0.70) or 0.70),
-                settings,
-            )
-            trend_15m_agrees = self._candidate_15m_trend_agrees(candidate)
-            grade_conf_ok = confidence >= max(SignalProcessor._grade_min_confidence("A"), min_conf)
-            if risky_regime and inst_type == "OPT":
-                risky_min_conf = max(min_conf, 0.70)
-                impulse_confirmed = bool(getattr(candidate, "impulse_confirmed", False))
-                if confidence < risky_min_conf or not (trend_15m_agrees or impulse_confirmed):
-                    return self._gate_block(
-                        candidate,
-                        # regime sits INSIDE the brackets with the other readings.
-                        # It is re-derived every scan cycle, and both _gate_block_family
-                        # and gate_edge_report.reason_family cut the identity at the
-                        # first bracket -- so a label that drifts CHOPPY -> VOLATILE
-                        # mid-signal (both are choppy_regimes, so this gate keeps
-                        # firing) would mint a second family for one gate and split its
-                        # n. Readings go in brackets; the gate's name does not.
-                        f"Live Gate: blocked {candidate.instrument} {timeframe} option; "
-                        f"risky regime requires >= {risky_min_conf:.0%} plus 15min "
-                        f"agreement or confirmed impulse ({regime}, {candidate.grade}, "
-                        f"{confidence:.0%}, agree={trend_15m_agrees}, "
-                        f"impulse={impulse_confirmed}).",
-                    )
-            if not (grade_conf_ok or trend_15m_agrees):
-                return self._gate_block(
-                    candidate,
-                    f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; "
-                    f"needs A/A+ with >= {min_conf:.0%}, or 15min trend agreement "
-                    f"({candidate.grade}, {confidence:.0%}, agree={trend_15m_agrees}).",
-                )
-            if is_choppy and not (grade_conf_ok or trend_15m_agrees):
-                return self._gate_block(
-                    candidate,
-                    f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; "
-                    f"choppy regime needs A/A+ with >= {min_conf:.0%}, or 15min trend agreement.",
-                )
-
-        # Options decay badly in range-bound sessions, so choppy options need A/A+ or very high confidence.
-        if is_choppy and inst_type == "OPT" and confidence < min(max(SignalProcessor._grade_min_confidence("A"), SignalProcessor._relaxed_threshold(0.72, settings)), SignalProcessor._relaxed_threshold(SignalProcessor._choppy_confidence_gate(settings), settings)):
-            return self._gate_block(
-                candidate,
-                f"Live Gate: blocked {candidate.instrument} {inst_type} {candidate.direction}; "
-                f"range/choppy regime allows only A/A+ option setups or very high confidence.",
-            )
-
-        # Never promote weak B-grade live/manual rows in choppy markets unless confidence is exceptional.
-        # Baseline parity before leniency: confidence >= 0.72 for A/A+ choppy setups.
-        # Baseline parity before leniency: confidence >= 0.72 or exceptional confidence bypasses choppy options.
-        if is_choppy and confidence < min(SignalProcessor._grade_min_confidence("A"), SignalProcessor._relaxed_threshold(SignalProcessor._choppy_confidence_gate(settings), settings)):
-            return self._gate_block(
-                candidate,
-                # Same reason as the message above: grade and regime are both
-                # per-signal readings, so they belong inside the brackets.
-                f"Live Gate: blocked {candidate.instrument} {candidate.direction}; "
-                f"grade is too weak for this regime ({candidate.grade}, {regime}).",
+                f"Live Gate: blocked {candidate.instrument} {timeframe} "
+                f"{candidate.direction}; {quality.reason} [{quality.reason_code}]",
             )
 
         return True
@@ -25861,12 +26129,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     )
                     continue
 
-            if peak_gain_pct >= 10.0 and (current_gain_pct < peak_gain_pct * 0.40 or current_gain_pct < 2.0):
+            # `or current_gain_pct < 2.0` removed 2026-08-30: it was unreachable as a
+            # sole trigger. The rule is already gated on peak_gain_pct >= 10.0, so
+            # peak_gain_pct * 0.40 is never below 4.0, and {current < 2.0} is a strict
+            # subset of {current < 4.0}. Checked exhaustively over 39.8M (peak, current)
+            # pairs in the reachable domain: zero cases where it decided anything the
+            # first disjunct had not already decided. Removing it changes no behaviour
+            # and stops the rule reading as if it has a breakeven floor that it does not.
+            if peak_gain_pct >= 10.0 and current_gain_pct < peak_gain_pct * 0.40:
                 create_exit(previous, float(current_price), "LOW_GAIN_PROTECT", f"Low-gain protection peak {peak_gain_pct:.1f}%, current {current_gain_pct:.1f}%")
                 continue
 
             ladder_peak = Scanner._profit_ladder_pnl(self, previous, previous_peak, qty)
-            if ladder_peak >= 3000.0 and current_pnl_rs < previous_peak * 0.75:
+            if ladder_peak >= self._major_win_guard_arm_rs(previous) and current_pnl_rs < previous_peak * 0.75:
                 should_exit, guard_context = (
                     self._should_exit_major_win_guard(
                         previous,
@@ -32818,14 +33093,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             # Rule 2: Low-Gain Protection (If gain was > 10% but reversed)
             if peak_gain_pct >= 10.0:
-                # If gain drops below 40% of peak or falls near BE (+2% floor)
-                if current_gain_pct < (peak_gain_pct * 0.40) or current_gain_pct < 2.0:
+                # If gain drops below 40% of peak. The old `or current_gain_pct < 2.0`
+                # "BE floor" was removed 2026-08-30 as unreachable: the enclosing gate is
+                # peak_gain_pct >= 10.0, so peak_gain_pct * 0.40 >= 4.0 and anything under
+                # 2.0 is already under 4.0. Verified over 39.8M pairs -- it never once
+                # decided on its own. Behaviour-identical; the rule no longer advertises a
+                # breakeven floor it never had.
+                if current_gain_pct < (peak_gain_pct * 0.40):
                     logger.warning(f"🚨 Low-Gain Protection Hit for {trade.instrument}: Peak {peak_gain_pct:.1f}%, Current {current_gain_pct:.1f}%")
                     self._close_and_record(tid, opt_val, "LOW_GAIN_PROTECT", exit_time=latest_time)
                     continue
 
-            # Rule 3: Major Win Protection (Peak >= Rs.3000)
-            if Scanner._profit_ladder_pnl(self, trade, trade.peak_pnl, qty) >= 3000.0:
+            # Rule 3: Major Win Protection. The rung is sized to the contract -- a flat
+            # Rs.3,000 had never once fired on NIFTY or BANKNIFTY. See
+            # _major_win_guard_arm_rs.
+            if Scanner._profit_ladder_pnl(self, trade, trade.peak_pnl, qty) >= self._major_win_guard_arm_rs(trade):
                 if current_pnl_rs < (trade.peak_pnl * 0.75):
                     should_exit, guard_context = (
                         self._should_exit_major_win_guard(

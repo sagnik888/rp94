@@ -86,7 +86,17 @@ def reason_family(reason: Any) -> str:
     # "<reading>% below <floor>%" -> "below <floor>%": drop the measurement, keep
     # the configured floor. Trailing zeros are normalised too, so one gate does not
     # split into "58%" and "58.000%" families over a formatting change.
-    text = re.sub(r"\b\d+(?:\.\d+)?\s*%\s+below\b", "below", text)
+    # The copula matters. This started as "<reading>% below <floor>%", which is how the
+    # confidence gates phrase it. engine/entry_policy.py's final-entry gate says
+    # "<reading>% IS below <floor>%", and the bare rule did not match across the verb --
+    # so on 2026-08-28 one gate that refused ALL SEVEN of the session's final entries
+    # fragmented into seven families of n=1, every one stamped "not actionable", which is
+    # exactly the failure this function exists to prevent.
+    text = re.sub(
+        r"\b\d+(?:\.\d+)?\s*%\s+(?:is\s+|was\s+|are\s+|were\s+)?below\b",
+        "below",
+        text,
+    )
     text = re.sub(r"\b(\d+)\.0+\s*%", lambda m: f"{m.group(1)}%", text)
     text = re.sub(r"\s+", " ", text).strip(" -,;")
     return text[:52] or "(unstated)"
@@ -257,13 +267,29 @@ def build(days: List[str]) -> Dict[str, Any]:
         })
     summary.sort(key=lambda r: (r["edge_ratio"] is None, -(r["edge_ratio"] or 0)))
 
-    taken = [r for r in rows if str(r.get("decision") or "") == "EXIT"]
+    # Deduped, because one position can emit SEVERAL EXIT rows and this line is the
+    # only number in the report that is not already counted distinct. On 2026-08-14 one
+    # lifecycle emitted 8 EXIT rows and the raw sum printed "trades 21, realised
+    # Rs.-1,125" for a session that was actually 14 trades and +Rs.353 -- the tool
+    # reported a LOSS where there was a WIN, in a report used to judge gates.
+    #
+    # The archive has been clean since 2026-08-20 (intelligence/rtracker.py derives the
+    # EXIT id from the lifecycle), but every window reaching further back still carries
+    # the old duplicates, so this cannot be left to the writer alone.
+    exit_rows = [r for r in rows if str(r.get("decision") or "") == "EXIT"]
+    taken = list({
+        (str(r.get("lifecycle_id") or ""), str(r.get("entry_timestamp") or "")): r
+        for r in exit_rows
+    }.values())
+    raw_exit_rows = len(exit_rows)
     realised = sum(float(r.get("pnl") or 0.0) for r in taken)
     return {
         "days": days,
         "rows_read": len(rows),
         "distinct_rejected_signals": len(distinct_signals(rows, "REJECTED")),
         "trades": len(taken),
+        # Kept so a future duplicate regression is visible rather than silently absorbed.
+        "raw_exit_rows": raw_exit_rows,
         "realised_pnl": round(realised, 2),
         "families": summary,
     }
@@ -273,8 +299,13 @@ def render(report: Dict[str, Any]) -> str:
     lines = [
         f"gate edge report — {', '.join(report['days'])}",
         f"  rows read {report['rows_read']}, distinct rejected signals "
-        f"{report['distinct_rejected_signals']}, trades {report['trades']}, "
-        f"realised Rs.{report['realised_pnl']:+.0f}",
+        f"{report['distinct_rejected_signals']}, trades {report['trades']}"
+        + (
+            f" (from {report['raw_exit_rows']} raw exit rows)"
+            if report.get("raw_exit_rows", 0) != report["trades"]
+            else ""
+        )
+        + f", realised Rs.{report['realised_pnl']:+.0f}",
         "",
         "  edge_ratio = median MFE / median MAE of what the gate REFUSED.",
         "  >1 it refused signals with more upside than heat; <1 it earned its place.",

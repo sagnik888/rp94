@@ -5519,9 +5519,43 @@ class SignalProcessor:
             is_actionable=best_grade in ["A+", "A", "B+", "B"],
         )
         state_15m = (getattr(mtf_result, "results_15min", None) or {}).get("state", {}) or {}
+        # "The 15m engine has no state" and "the 15m trend disagrees" both collapse to
+        # position 0, and 0 never equals +/-1, so both produce trend_15m_agrees=False.
+        # In REAL mode that flag alone closes the entire 5min lane -- swept exhaustively,
+        # 0 of 5,775 (confidence x ADX x intel x IV x premium) combinations pass with it
+        # False, in every one of the seven regimes. 5min carries 181 of 252 recorded
+        # entries, 72% of the book.
+        #
+        # The failure mode is not the refusal, which is the design intent -- a 5min entry
+        # SHOULD be 15m-aligned. It is that a cold start, a 15m engine that failed to
+        # build, or a lookup that raised is INVISIBLE: no decision row is written, so the
+        # dashboard reads "no 5min signal today" rather than "the 15m state is missing".
+        #
+        # Admission is deliberately unchanged here. This only separates the two cases and
+        # says the silent one out loud. A position of 0 with real state is a legitimate
+        # "15m is flat", which is a genuine disagreement, not an absence.
+        fifteen_min_available = bool(state_15m) and state_15m.get("position") is not None
         position_15m = int(state_15m.get("position") or 0)
         direction_position = 1 if best_sig.signal_type == "BUY" else -1
         trend_15m_agrees = position_15m == direction_position
+        try:
+            setattr(
+                best_sig,
+                "trend_15m_state",
+                "agrees" if trend_15m_agrees
+                else ("unavailable" if not fifteen_min_available else "disagrees"),
+            )
+            if not fifteen_min_available and scanner is not None:
+                day = getattr(getattr(best_sig, "timestamp", None), "date", lambda: "")()
+                scanner.log_signal_decision_once(
+                    f"15m-state-unavailable|{instrument}|{best_tf}|{day}",
+                    f"{instrument} {best_tf}: 15-minute state unavailable, so every "
+                    f"5min entry for it is refused as 15m-misaligned. This is a missing "
+                    f"engine or a cold start, not a disagreeing trend.",
+                    "warning",
+                )
+        except Exception as exc:  # telemetry may never cost a signal
+            logger.debug(f"15m availability note skipped for {instrument}: {exc}")
         adx_value = float(getattr(best_sig, "adx_value", 0.0) or 0.0)
         volume_spike_entry = bool(getattr(best_sig, "volume_spike_entry", False))
         volume_spike_metrics = dict(getattr(best_sig, "volume_spike_metrics", {}) or {})

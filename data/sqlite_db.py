@@ -645,10 +645,20 @@ class DatabaseManager:
                     drawdown            REAL,
                     quote_source        TEXT,
                     quote_verified      INTEGER,
+                    execution_mode      TEXT,
                     payload_json        TEXT,
                     state_fingerprint   TEXT
                 )
             ''')
+            # AUTO vs MANUAL. The forensics surface showed nothing for weeks because it
+            # only ever received rows for trades, and in Manual mode a signal is
+            # announced and never becomes a trade -- so an operator running manually had
+            # an empty flight recorder with no way to tell that from a broken one.
+            self._ensure_columns(
+                cursor,
+                "signal_lifecycle_events",
+                {"execution_mode": "TEXT"},
+            )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_forensics_session "
                 "ON signal_lifecycle_events(session_date, event_id DESC)"
@@ -1164,10 +1174,10 @@ class DatabaseManager:
                         reason_code, reason_text, source, grade, confidence, engine,
                         lane, ltp, entry_price, initial_stop, current_stop, initial_target,
                         current_target, pnl, peak_pnl, drawdown, quote_source,
-                        quote_verified, payload_json, state_fingerprint
+                        quote_verified, execution_mode, payload_json, state_fingerprint
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -1200,6 +1210,7 @@ class DatabaseManager:
                         event.get("drawdown"),
                         event.get("quote_source"),
                         1 if event.get("quote_verified") else 0,
+                        str(event.get("execution_mode") or "") or None,
                         payload_json,
                         fp,
                     ),
@@ -1245,6 +1256,7 @@ class DatabaseManager:
                     event.get("peak_pnl"), event.get("drawdown"),
                     event.get("quote_source"),
                     1 if event.get("quote_verified") else 0,
+                    str(event.get("execution_mode") or "") or None,
                     payload_json, fp,
                 ))
             if not to_insert:
@@ -1258,10 +1270,10 @@ class DatabaseManager:
                         reason_code, reason_text, source, grade, confidence, engine,
                         lane, ltp, entry_price, initial_stop, current_stop, initial_target,
                         current_target, pnl, peak_pnl, drawdown, quote_source,
-                        quote_verified, payload_json, state_fingerprint
+                        quote_verified, execution_mode, payload_json, state_fingerprint
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     to_insert,

@@ -820,6 +820,7 @@ def start_session_archiver_scheduler(data_provider=None):
         completed: set[str] = set()
         attempted: set[str] = set()
         last_provider_wait_reason = ""
+        announced_market_hours_defer = False
         while True:
             now = datetime.now(IST)
             today_run = _ist_at(now.date(), run_at)
@@ -828,6 +829,35 @@ def start_session_archiver_scheduler(data_provider=None):
                 target = today_run if now < today_run else _ist_at(now.date() + timedelta(days=1), run_at)
                 time.sleep(max(30.0, (target - now).total_seconds()))
                 continue
+            # Nothing here can succeed before the close, so do not pay for any of it.
+            #
+            # The child refuses heavy archive IO during market hours and exits non-zero,
+            # which this loop reported as "Session archive failed" every five minutes --
+            # 73 and 80 times in the 2026-08-24 and 2026-08-25 sessions alone. Worse, the
+            # back-fill below runs BEFORE the child and re-fetches EXPIRED option
+            # contracts, which is the "Kite historical_data failed: InputException:
+            # invalid token" burst in the log (that phrase means the INSTRUMENT token,
+            # not the broker session -- the session is fine).
+            #
+            # Deferring costs nothing: the child would have refused anyway. The day is
+            # deliberately NOT added to `attempted`, so it still archives after the close
+            # exactly as before -- the fail-closed guard in
+            # tests/test_postmarket_archive_fail_closed_2026_08_22.py is untouched.
+            try:
+                from scripts.archive_session_data import market_hours_now as _market_open
+                _defer = bool(_market_open())
+            except Exception:
+                _defer = False          # never let this guard block archiving
+            if _defer:
+                if not announced_market_hours_defer:
+                    logger.info(
+                        f"Session archive for {session_day} deferred until after the close."
+                    )
+                    announced_market_hours_defer = True
+                time.sleep(300.0)
+                continue
+            announced_market_hours_defer = False
+
             # BACK-FILL FIRST, in this process, because this is where the broker
             # session lives. The archiver runs as a child with no auth, so it can only
             # copy what the live cache already holds -- and for OPTION contracts the

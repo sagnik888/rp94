@@ -294,3 +294,89 @@ def test_window_bars_counts_only_what_the_close_left():
     assert window_bars(candles, "NIFTY", "2026-08-12", "2026-08-12 15:00") == 6
     assert window_bars(candles, "NIFTY", "2026-08-12", None) == 0
     assert window_bars({}, "NIFTY", "2026-08-12", "2026-08-12 15:00") == 0
+
+
+# ── the copula ───────────────────────────────────────────────────────────────
+#
+# The "<reading>% below <floor>%" rule landed 2026-08-25 for the confidence gates.
+# engine/entry_policy.py's final-entry gate phrases the same shape with a verb --
+# "<reading>% IS below <floor>%" -- and the bare rule did not match across it. On
+# 2026-08-28 that gate refused ALL SEVEN of the session's final entries and fragmented
+# into seven families of n=1, every one stamped "not actionable": the exact failure
+# reason_family exists to prevent, reintroduced by a phrasing nobody had seen yet.
+
+@pytest.mark.parametrize("reason,expected", [
+    ("directional expected favorable move 0.0447% is below 0.1500% floor",
+     "directional expected favorable move below 0.1500% fl"),
+    ("directional expected favorable move 0.0291% is below 0.1500% floor",
+     "directional expected favorable move below 0.1500% fl"),
+    ("B+ 55.9% was below 58.000% confidence gate", "B+ below 58% confidence gate"),
+    ("readings 12.5% are below 20.000% floor", "readings below 20% floor"),
+])
+def test_a_copula_between_the_reading_and_below_does_not_split_the_family(reason, expected):
+    assert reason_family(reason) == expected
+
+
+def test_the_copula_rule_still_separates_distinct_floors():
+    """Collapsing the reading must not collapse the thresholds either side of it."""
+    a = reason_family("directional expected favorable move 0.0447% is below 0.1500% floor")
+    b = reason_family("directional expected favorable move 0.0451% is below 0.2500% floor")
+
+    assert a != b, "two different floors were merged into one family"
+
+
+# ── trades and realised P&L must be deduped like everything else ─────────────
+#
+# Every rejection family in this report is counted DISTINCT -- that is the tool's whole
+# premise. `trades` and `realised` were summed from RAW EXIT rows, and one position can
+# emit several. On 2026-08-14 a single lifecycle emitted 8 EXIT rows and the report
+# printed "trades 21, realised Rs.-1,125" for a session that was 14 trades and +Rs.353.
+# It reported a LOSS where there was a WIN, in the report used to judge gate thresholds.
+
+def _exit_row(lifecycle, entry_ts, pnl):
+    return {
+        "decision": "EXIT", "lifecycle_id": lifecycle, "entry_timestamp": entry_ts,
+        "pnl": pnl, "instrument": "NIFTY", "timeframe": "5min", "direction": "LONG",
+        "date": "2026-08-14", "signal_timestamp": "2026-08-14 12:37:00", "reason": "",
+    }
+
+
+def test_one_position_emitting_many_exit_rows_counts_once(monkeypatch):
+    import scripts.gate_edge_report as ger
+
+    rows = [_exit_row("LC-1", "2026-08-14T12:37:25.534426", 353.0) for _ in range(8)]
+    rows.append(_exit_row("LC-2", "2026-08-14T13:01:00.000000", -100.0))
+    monkeypatch.setattr(ger, "load_events", lambda days: rows)
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+
+    report = ger.build(["2026-08-14"])
+
+    assert report["trades"] == 2, "duplicate EXIT rows were counted as separate trades"
+    assert report["realised_pnl"] == pytest.approx(253.0)
+    assert report["raw_exit_rows"] == 9
+
+
+def test_the_raw_row_count_is_kept_so_a_regression_stays_visible(monkeypatch):
+    """Silently absorbing duplicates would hide the writer regressing again."""
+    import scripts.gate_edge_report as ger
+
+    rows = [_exit_row("LC-1", "2026-08-14T12:37:25", 10.0) for _ in range(3)]
+    monkeypatch.setattr(ger, "load_events", lambda days: rows)
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+
+    rendered = ger.render(ger.build(["2026-08-14"]))
+
+    assert "trades 1 (from 3 raw exit rows)" in rendered
+
+
+def test_no_duplicates_means_no_noise_in_the_header(monkeypatch):
+    import scripts.gate_edge_report as ger
+
+    rows = [_exit_row("LC-1", "t1", 10.0), _exit_row("LC-2", "t2", 20.0)]
+    monkeypatch.setattr(ger, "load_events", lambda days: rows)
+    monkeypatch.setattr(ger, "load_candles", lambda days: {})
+
+    rendered = ger.render(ger.build(["2026-08-14"]))
+
+    assert "trades 2," in rendered
+    assert "raw exit rows" not in rendered
