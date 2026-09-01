@@ -3,8 +3,7 @@ setlocal EnableDelayedExpansion
 title UT1 Index Trading System - Advanced Launcher
 color 0B
 
-:: Console log lines carry emoji. Without UTF-8 they arrive as mojibake or as
-:: backslash escapes.
+:: Console log lines carry emoji. Without UTF-8 they arrive as mojibake or as backslash escapes.
 chcp 65001 >nul
 
 echo ========================================================
@@ -29,7 +28,7 @@ if %errorlevel% neq 0 (
 if not exist "venv\Scripts\activate.bat" (
     echo [INFO] Virtual environment 'venv' not found. Creating one now...
     python -m venv venv
-    if %errorlevel% neq 0 (
+    if !errorlevel! neq 0 (
         echo [ERROR] Failed to create virtual environment.
         pause
         exit /b
@@ -71,30 +70,34 @@ echo [INFO] Verifying dependencies...
 if %errorlevel% neq 0 (
     echo [INFO] Missing core dependencies. Installing from requirements.txt...
     "%PY%" -m pip install -r requirements.txt
-    if %errorlevel% neq 0 (
+    if !errorlevel! neq 0 (
         echo [ERROR] Failed to install dependencies. Check your internet connection.
         pause
         exit /b
     )
 )
 
+set "DASHBOARD_URL=http://127.0.0.1:8500/"
+set "DASHBOARD_PORT=8500"
+
 :: 6. Pre-flight: ensure the dashboard port is free (stale instance check)
-echo [INFO] Checking port 8500 for a stale instance...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\preflight_port.ps1" -Port 8500
-if %errorlevel% neq 0 (
-    echo [INFO] Launch aborted ^(port 8500 still in use or left running by choice^).
-    pause
-    exit /b
+echo [INFO] Checking port %DASHBOARD_PORT% for a stale instance...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -LocalPort %DASHBOARD_PORT% -State Listen -ErrorAction SilentlyContinue) { exit 0 } exit 1" >nul 2>&1
+if not errorlevel 1 (
+    echo [WARNING] Port %DASHBOARD_PORT% is already in use. UT1 may already be running.
+    echo [INFO] Opening existing dashboard at %DASHBOARD_URL%
+    if /I not "%UTBOT_SKIP_BROWSER%"=="1" start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "%DASHBOARD_URL%" -Port %DASHBOARD_PORT%
+    goto done
 )
 
 :: 7. Launch the Server
 echo ========================================================
 echo [INFO] Starting Backend Server (main.py)...
-echo [INFO] Dashboard will be available at http://127.0.0.1:8500/
+echo [INFO] Dashboard will be available at %DASHBOARD_URL%
 echo ========================================================
 
 :: Open the browser only after the API has live dashboard state, not just an open port.
-start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "http://127.0.0.1:8500/" -Port 8500
+if /I not "%UTBOT_SKIP_BROWSER%"=="1" start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\open_dashboard_when_ready.ps1" -Url "%DASHBOARD_URL%" -Port %DASHBOARD_PORT%
 
 :: Start the python process
 :: stderr is TEED to a file, not just the console. On 2026-08-24 the process died at
@@ -106,15 +109,19 @@ start "" /B powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\op
 for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value 2^>nul') do set "_LDT=%%I"
 set "_STAMP=%_LDT:~0,8%_%_LDT:~8,6%"
 if not exist "logs" mkdir "logs"
-echo [INFO] stderr -> logs\startup_stderr_%_STAMP%.log
+echo [INFO] stderr -^> logs\startup_stderr_%_STAMP%.log
 "%PY%" main.py 2> "logs\startup_stderr_%_STAMP%.log"
+set "APP_EXIT=!ERRORLEVEL!"
 
 :: 8. Error Handling
 echo.
 echo ========================================================
 echo [WARNING] The server process has terminated or crashed.
-echo [WARNING] Exit code: %ERRORLEVEL%
+echo [WARNING] Exit code: %APP_EXIT%
 echo [WARNING] Check logs\startup_stderr_%_STAMP%.log for anything the
 echo [WARNING] logger never got to write (MemoryError, fatal, OOM kill).
 echo ========================================================
-pause
+
+:done
+if /I not "%UTBOT_NO_PAUSE%"=="1" pause
+exit /b %APP_EXIT%
