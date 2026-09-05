@@ -90,7 +90,9 @@ class CandleBuilder:
             return False
         last = self._latest_prices.get(instrument, 0.0)
         if last and last > 0:
-            return abs(float(price) - last) / last <= self._MAX_PRICE_DEVIATION
+            is_index = instrument in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+            max_dev = 0.03 if is_index else self._MAX_PRICE_DEVIATION
+            return abs(float(price) - last) / last <= max_dev
         return True
 
     def update_latest_price(self, instrument: str, price: float):
@@ -294,6 +296,12 @@ class CandleBuilder:
         # ── Mandatory Normalization ──
         # Ensure all columns are lowercase to prevent 'KeyError: close'
         new_data.columns = [c.lower() for c in new_data.columns]
+        # Provider retries can repeat the final bar.  Normalise it before it reaches
+        # either the cold-store branch or telemetry restoration: duplicate labels make
+        # pandas `.loc[label]` return a frame/series and used to raise an ambiguous truth
+        # value error on the next merge.  Last-write wins is already the merge contract.
+        if not new_data.index.is_unique:
+            new_data = new_data[~new_data.index.duplicated(keep="last")].sort_index()
 
         # Relative cross-index leak guard for batch candles (replaces hardcoded
         # absolute thresholds). Drop rows whose close deviates implausibly from the
@@ -314,7 +322,9 @@ class CandleBuilder:
                 except Exception:
                     ref = 0.0
             if ref and ref > 0 and not pd.isna(ref):
-                valid_rows = (new_data['close'] - ref).abs() / ref <= self._MAX_PRICE_DEVIATION
+                is_index = instrument in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+                max_dev = 0.03 if is_index else self._MAX_PRICE_DEVIATION
+                valid_rows = (new_data['close'] - ref).abs() / ref <= max_dev
                 if not valid_rows.all():
                     logger.warning(f"⚠️ Filtering {int((~valid_rows).sum())} implausible rows for {instrument} (cross-index leak guard)")
                     new_data = new_data[valid_rows]
@@ -372,17 +382,20 @@ class CandleBuilder:
                     now_mono - self._last_resample_at.get(key, 0.0)
                     >= self._resample_min_interval
                 )
+                updated_timeframes = set()
                 if due:
                     self._last_resample_at[key] = now_mono
                     self._pending_resample_touched.pop(key, None)
-                    self._resample_and_merge(instrument, touched_index=touched)
+                    updated_timeframes = self._resample_and_merge(
+                        instrument, touched_index=touched
+                    )
                 else:
                     self._pending_resample_touched[key] = touched
                 if mark_receipt:
                     self._note_candle_receipt(instrument, "1min", received_at)
-                    if instrument in self._candles_5min and self._candles_5min[instrument] is not None:
+                    if "5min" in updated_timeframes:
                         self._note_candle_receipt(instrument, "5min", received_at)
-                    if instrument in self._candles_15min and self._candles_15min[instrument] is not None:
+                    if "15min" in updated_timeframes:
                         self._note_candle_receipt(instrument, "15min", received_at)
 
             elif timeframe == "5min":
@@ -470,6 +483,10 @@ class CandleBuilder:
 
         existing = to_ist_naive(existing)
         new_data = to_ist_naive(new_data)
+        if new_data is not None and not new_data.index.is_unique:
+            new_data = new_data[~new_data.index.duplicated(keep="last")].sort_index()
+        if existing is not None and not existing.index.is_unique:
+            existing = existing[~existing.index.duplicated(keep="last")].sort_index()
 
         if existing is not None and len(existing) > 0:
             combined = pd.concat([existing, new_data])
@@ -495,6 +512,14 @@ class CandleBuilder:
         """
         if combined is None or existing is None or len(combined) == 0 or len(existing) == 0:
             return combined
+        # Legacy cache files and direct callers can still contain repeated timestamps.
+        # Repair them locally before scalar/vectorised lookup rather than preserving the
+        # old ambiguous-Series crash.  This uses the same last-write merge semantics as
+        # update_candles and never mutates the caller's existing cache frame.
+        if not combined.index.is_unique:
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        if not existing.index.is_unique:
+            existing = existing[~existing.index.duplicated(keep="last")].sort_index()
         fields = ("tick_count", "volume_basis", "source", "receipt_at", "provider_time")
         candidates = combined.index if touched_index is None else pd.Index(touched_index)
         overlap = candidates.intersection(combined.index).intersection(existing.index)
@@ -640,33 +665,42 @@ class CandleBuilder:
             return base
 
     def _resample_and_merge(self, instrument: str, touched_index=None):
-        """Resample affected 1min buckets and merge them into cached higher frames."""
+        """Resample affected buckets and return the frames successfully mutated.
+
+        Receipt timestamps are a freshness claim.  Callers advance a 5m/15m receipt only
+        for names returned here, never merely because an old aggregate happens to exist.
+        """
         key = instrument
         base = self._candles_1min.get(key)
-        if base is None or len(base) < 5: return
-
-        try:
-            # Resample and merge for 5min
-            existing_5m = self._candles_5min.get(key)
-            source_5m = (
-                base
-                if existing_5m is None or len(existing_5m) == 0
-                else self._resample_window(base, touched_index, "5min")
-            )
-            new_5m = self._resample_ohlcv(source_5m, '5min', basis_source=base)
-            self._candles_5min[key] = self._merge_candles(self._candles_5min.get(key), new_5m)
-
-            # Resample and merge for 15min
-            existing_15m = self._candles_15min.get(key)
-            source_15m = (
-                base
-                if existing_15m is None or len(existing_15m) == 0
-                else self._resample_window(base, touched_index, "15min")
-            )
-            new_15m = self._resample_ohlcv(source_15m, '15min', basis_source=base)
-            self._candles_15min[key] = self._merge_candles(self._candles_15min.get(key), new_15m)
-        except Exception as e:
-            logger.error(f"Resample merge error for {instrument}: {e}")
+        if base is None or len(base) < 5:
+            return set()
+        updated = set()
+        for timeframe in ("5min", "15min"):
+            try:
+                existing = (
+                    self._candles_5min.get(key)
+                    if timeframe == "5min"
+                    else self._candles_15min.get(key)
+                )
+                source = (
+                    base
+                    if existing is None or len(existing) == 0
+                    else self._resample_window(base, touched_index, timeframe)
+                )
+                if source is None or source.empty:
+                    continue
+                resampled = self._resample_ohlcv(source, timeframe, basis_source=base)
+                if resampled is None or resampled.empty:
+                    continue
+                merged = self._merge_candles(existing, resampled)
+                if timeframe == "5min":
+                    self._candles_5min[key] = merged
+                else:
+                    self._candles_15min[key] = merged
+                updated.add(timeframe)
+            except Exception as exc:
+                logger.error(f"Resample merge error for {instrument} {timeframe}: {exc}")
+        return updated
 
     def _resample(self, instrument: str):
         """Old resample - kept for backward compatibility if needed internally"""

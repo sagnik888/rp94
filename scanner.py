@@ -31,9 +31,13 @@ from data.warm_memory import WarmMemoryStore, dataframe_to_records, records_to_d
 from engine.candidate_normalization import normalize_loaded_exit_candidate
 from engine.multi_timeframe import MultiTimeframeEngine
 from engine.signal_manager import SignalManager
-from engine.quality_verdict import QualityInputs, evaluate_quality
+from engine.quality_verdict import (
+    POLICY_VERSION,
+    QualityInputs,
+    evaluate_quality,
+    policy_configuration_hash,
+)
 from engine.signal_quality_policy import (
-    b_grade_min_confidence,
     is_top_tier_setup,
     is_trending_regime,
 )
@@ -138,6 +142,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     LATE_RECLAIM_BASKET_INDICES = {"NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"}
 
     """Continuous scanning engine — optimized, best-signal selection"""
+
+    @staticmethod
+    def _startup_auto_mode(trading_mode: str, configured_auto_mode: Any) -> bool:
+        """Allow persisted Auto only for offline replay, never broker-capable startup.
+
+        REAL/PAPER processes must begin manual and earn Auto authority through the
+        guarded dashboard command in that same process.  This closes the short race
+        between ``scanner.run()`` starting and the premarket worker disarming a stale
+        AUTO_MODE value loaded from .env.
+        """
+        return (
+            str(trading_mode or "").strip().upper() == "HISTORICAL"
+            and bool(configured_auto_mode)
+        )
 
     def __init__(
         self,
@@ -269,7 +287,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Keep startup light: historical mode hydrates only the latest session
         # until the user expands the window from the dashboard/settings.
         self.backtest_days = 1
-        self.auto_mode = False
+        configured_auto_mode = getattr(settings, "auto_mode", False)
+        self.auto_mode = self._startup_auto_mode(trading_mode, configured_auto_mode)
+        self.trades.auto_mode = bool(self.auto_mode)
+        if bool(configured_auto_mode) and not self.auto_mode:
+            # Keep the singleton consistent with runtime truth. save_to_env also
+            # persists this authority as False, so an operator-approved Auto session
+            # can never arm the next process implicitly.
+            settings.auto_mode = False
+            logger.warning(
+                "Ignored persisted Auto Mode during broker-capable startup; "
+                "manual re-authorization is required for this process."
+            )
         self.inst_pref = getattr(settings, "inst_pref", "AUTO")
         self.max_trades_per_index = int(getattr(settings, "max_trades_per_index", 5))
         self.max_consecutive_losses = int(getattr(settings, "max_consecutive_losses", 3))
@@ -1304,6 +1333,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "current_target": float(getattr(candidate, "target", 0.0) or 0.0),
                 "quote_source": str(getattr(candidate, "entry_quote_source", "") or ""),
                 "quote_verified": bool(getattr(candidate, "entry_quote_verified", False)),
+                "payload": {
+                    "quality": dict(getattr(candidate, "quality_verdict", {}) or {}),
+                },
             }
             if not event["lifecycle_id"]:
                 return
@@ -1463,15 +1495,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # the rejected outcome on the immutable lifecycle instead of silently retaining
         # the earlier ACK as an accepted trade.
         exit_reason = str(getattr(trade, "exit_reason", "") or "").upper()
-        source = (
-            "entry_submission_guard"
-            if exit_reason == "ENTRY_SUBMISSION_GUARD"
-            else (
-                "stale_entry_invalidated"
-                if exit_reason == "SIGNAL_INVALIDATED"
-                else "broker_entry_result"
-            )
-        )
+        if exit_reason == "ENTRY_SUBMISSION_GUARD":
+            source = "entry_submission_guard"
+        elif exit_reason == "ENTRY_MARGIN_PREFLIGHT":
+            source = "entry_margin_preflight"
+        elif exit_reason == "SIGNAL_INVALIDATED":
+            source = "stale_entry_invalidated"
+        else:
+            source = "broker_entry_result"
         self._rtracker_record_candidate(
             trade,
             decision="REJECTED",
@@ -1564,6 +1595,36 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 return True
         return False
 
+    def _apply_trade_manager_entry_refusal(
+        self,
+        candidate: TradeCandidate,
+        outcome: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Keep a pre-submission refusal out of the filled-trade lifecycle."""
+        outcome = outcome if isinstance(outcome, dict) else {}
+        code = str(outcome.get("code") or "").upper()
+        if code == "ENTRY_MARGIN_PREFLIGHT":
+            reason = str(outcome.get("reason") or "insufficient funds for entry")
+            candidate.status = "REJECTED - INSUFFICIENT FUNDS"
+            setattr(candidate, "exit_reason", "ENTRY_MARGIN_PREFLIGHT")
+            source = "entry_margin_preflight"
+        else:
+            reason = str(
+                outcome.get("reason")
+                or "TradeManager entry check failed (Risk/Capital/Capacity)"
+            )
+            candidate.status = "REJECTED - TRADE MANAGER"
+            source = "trade_manager_gate"
+        setattr(candidate, "accepted_by_gate", False)
+        self._rtracker_record_candidate(
+            candidate,
+            decision="REJECTED",
+            reason=reason,
+            source=source,
+        )
+        self._remember_trade_candidates([candidate])
+        return reason
+
     async def _handle_broker_entry_result(
         self,
         candidate: TradeCandidate,
@@ -1619,6 +1680,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     f"Auto submission guard blocked {candidate.instrument} "
                     f"{candidate.direction}: {rejection_reason}. Signal was not counted "
                     "as an accepted trade."
+                )
+            elif str(getattr(trade, "exit_reason", "") or "").upper() == "ENTRY_MARGIN_PREFLIGHT":
+                candidate.status = "REJECTED - INSUFFICIENT FUNDS"
+                setattr(candidate, "exit_reason", "ENTRY_MARGIN_PREFLIGHT")
+                rejection_reason = guard_reason or "Insufficient funds for broker entry"
+                rejection_source = "entry_margin_preflight"
+                log_message = (
+                    f"Entry margin preflight rejected {candidate.instrument} "
+                    f"{candidate.direction}: {rejection_reason}. No order was sent "
+                    "and the signal was not counted as an accepted trade."
                 )
             elif str(getattr(trade, "exit_reason", "") or "").upper() == "SIGNAL_INVALIDATED":
                 candidate.status = "REJECTED - SIGNAL INVALIDATED"
@@ -1829,19 +1900,32 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return {}
         execution_status = str(getattr(trade, "execution_status", "") or "").upper()
         exit_pending = bool(getattr(trade, "pending_exit", False)) or execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
-        price = float(
-            getattr(trade, "current_price", 0.0)
-            or getattr(candidate, "current_price", 0.0)
-            or getattr(candidate, "price", 0.0)
-            or getattr(trade, "entry_price", 0.0)
-            or 0.0
-        )
+        # Only the open trade's current mark is a quote.  Candidate price/entry are
+        # signal-time values and must not be smuggled into the EXIT payload as though
+        # they were live market data; zero is now a valid request for a broker MARKET
+        # close and lets TradeManager use its explicitly-labelled accounting fallback.
+        price = float(getattr(trade, "current_price", 0.0) or 0.0)
+        quote_free_market_exit = self._quote_free_broker_exit_available(trade)
         return {
             "manual_entry_executed": True,
             "manual_exit_trade_id": str(getattr(trade, "id", "") or ""),
             "manual_exit_price": price,
-            "manual_exit_enabled": bool(getattr(trade, "id", "") and price > 0 and not exit_pending),
-            "manual_exit_status": "exit_pending" if exit_pending else "ready",
+            # A market close does not need a quote.  Price is only the local accounting
+            # mark until the broker reconciliation supplies the actual fill; disabling
+            # the operator's EXIT button because a degraded feed has no mark strands an
+            # otherwise closable position for exactly the situation in which a manual
+            # escape hatch matters most.
+            "manual_exit_quote_available": price > 0,
+            "manual_exit_enabled": bool(
+                getattr(trade, "id", "")
+                and not exit_pending
+                and (price > 0 or quote_free_market_exit)
+            ),
+            "manual_exit_status": (
+                "exit_pending"
+                if exit_pending
+                else ("ready" if price > 0 or quote_free_market_exit else "quote_unavailable")
+            ),
             "manual_exit_execution_status": execution_status,
         }
 
@@ -1857,6 +1941,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return "entry_not_confirmed"
         return "trade_manager_rejected"
 
+    def _quote_free_broker_exit_available(self, trade) -> bool:
+        """True only when a MARKET order will produce an authoritative broker fill."""
+        manager = getattr(self, "trades", None)
+        if (
+            str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or trade is None
+            or bool(getattr(trade, "is_ghost", False))
+            or not str(getattr(trade, "symbol_token", "") or "").strip()
+            or not getattr(manager, "broker", None)
+        ):
+            return False
+        permitted = getattr(manager, "_live_orders_permitted", None)
+        try:
+            return bool(callable(permitted) and permitted())
+        except Exception:
+            return False
+
     async def close_dashboard_trade(
         self,
         trade_id: str,
@@ -1868,25 +1969,39 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         trade = getattr(getattr(self, "trades", None), "open_trades", {}).get(tid)
         if trade is None:
             return {"status": "blocked", "reason": "trade_not_found", "trade_id": tid}
-        exit_price = float(
+        quoted_exit_price = float(
             price
             or getattr(trade, "current_price", 0.0)
             or getattr(trade, "exit_price", 0.0)
-            or getattr(trade, "entry_price", 0.0)
             or 0.0
         )
-        if exit_price <= 0:
-            return {"status": "blocked", "reason": "quote_unavailable", "trade_id": tid}
+        quote_available = quoted_exit_price > 0
+        if not quote_available and not self._quote_free_broker_exit_available(trade):
+            await self._publish_trade_payload_now()
+            return {
+                "trade_id": tid,
+                "status": "blocked",
+                "reason": "quote_unavailable",
+            }
+        # The manager needs a local mark for interim accounting.  Entry is an explicit
+        # fallback only; it is never presented as a current quote or sent to the broker.
+        exit_price = quoted_exit_price or float(getattr(trade, "entry_price", 0.0) or 0.0)
 
         accepted = self.trades.close_trade(tid, exit_price, reason)
         if accepted:
-            self.log_event(f"Manual dashboard EXIT submitted: {tid} @ {exit_price:.2f}", "trade")
+            mark_note = (
+                f" @ {exit_price:.2f}"
+                if quote_available
+                else " @ MARKET (quote unavailable; broker fill will reconcile)"
+            )
+            self.log_event(f"Manual dashboard EXIT submitted: {tid}{mark_note}", "trade")
             await self._publish_trade_payload_now()
             self._notify_trade_event()
             return {
                 "trade_id": tid,
                 "status": "submitted",
                 "exit_price": exit_price,
+                "quote_available": quote_available,
             }
         await self._publish_trade_payload_now()
         return {
@@ -1970,6 +2085,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "inst_pref": self._strict_instrument_pref(),
             }
 
+        quality_ok, quality_reason, quality_source = self._current_manual_admission_decision(
+            candidate,
+            lane="MANUAL_DASHBOARD_SUBMIT",
+        )
+        if not quality_ok:
+            candidate.status = "BLOCKED - CURRENT QUALITY POLICY"
+            setattr(candidate, "accepted_by_gate", False)
+            self._rtracker_record_candidate(
+                candidate,
+                decision="REJECTED",
+                reason=quality_reason,
+                source=quality_source,
+            )
+            self._remember_trade_candidates([candidate])
+            await self._publish_trade_payload_now()
+            return {"status": "blocked", "reason": quality_reason}
+
         self._ensure_trade_like_initial_stop(candidate)
         execution_touch_quote = self._candidate_execution_touch_quote(candidate)
         exec_price, exec_stop, exec_target = self._execution_levels(
@@ -2008,6 +2140,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 execution_loop,
             )
 
+        entry_refusal_outcome: Dict[str, Any] = {}
         trade = self.trades.open_trade(
             instrument=candidate.instrument,
             timeframe=candidate.timeframe,
@@ -2047,6 +2180,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             geometry_verified=bool(getattr(candidate, "geometry_verified", False)),
             expected_move_forecast=dict(getattr(candidate, "expected_move_forecast", {}) or {}),
             entry_policy_verdict=dict(getattr(candidate, "entry_policy_verdict", {}) or {}),
+            quality_verdict=dict(getattr(candidate, "quality_verdict", {}) or {}),
             is_explosive_bypass=bool(getattr(candidate, "is_explosive_bypass", False)),
             is_reversion_scalp=bool(getattr(candidate, "is_reversion_scalp", False)),
             is_recovery=False,
@@ -2073,9 +2207,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             execution_touch_quote=execution_touch_quote,
             on_execution_result=on_execution_result,
             lifecycle_id=self._candidate_lifecycle_key(candidate),
+            entry_refusal_outcome=entry_refusal_outcome,
         )
         if not trade:
-            return {"status": "blocked", "reason": "trade_manager_rejected"}
+            reason = self._apply_trade_manager_entry_refusal(
+                candidate, entry_refusal_outcome
+            )
+            await self._publish_trade_payload_now()
+            return {"status": "blocked", "reason": reason}
 
         trade.is_live = (self.mode == "REAL")
         candidate.status = "ORDER PENDING"
@@ -4307,6 +4446,76 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         requested_mode = str(mode or "").upper()
         current_mode = str(getattr(self, "mode", "") or "").upper()
+
+        # Readiness must be evaluated against the identity that this request is about
+        # to install, not against the old equal-sized index list.  A two-index warmup
+        # for NIFTY/BANKNIFTY does not establish option-chain readiness for a requested
+        # SENSEX/MIDCPNIFTY pair merely because both lists have length two.
+        current_active_indices = list(getattr(self, "active_indices", []) or [])
+        proposed_active_indices = list(current_active_indices)
+        if active_indices is not None:
+            proposed_active_indices = list(dict.fromkeys(
+                str(name or "").upper()
+                for name in list(active_indices or [])
+                if str(name or "").upper() in SUPPORTED_ENTRY_INSTRUMENTS
+            ))
+            if not proposed_active_indices:
+                self._last_configure_block_reason = "at least one supported active index is required"
+                return False
+
+        # Both REAL-mode gates run before this method mutates the live singleton.  Build
+        # the settings identity the request is ABOUT to install so risk validation cannot
+        # certify yesterday's capital split and then atomically install an invalid one.
+        # ``copy.copy`` is intentional: Settings is a Pydantic model whose fields are
+        # scalar/list configuration values; a shallow model copy preserves its methods
+        # without touching the process-wide singleton.
+        proposed_settings = copy.copy(settings)
+        proposed_numeric_settings = {
+            "capital_total": capital_total,
+            "capital_fut": capital_fut,
+            "capital_opt": capital_opt,
+            "risk_fut_pct": risk_fut_pct,
+            "risk_opt_pct": risk_opt_pct,
+            "fut_cost": fut_cost,
+            "opt_cost": opt_cost,
+            "futures_sl_pct": futures_sl_pct,
+            "options_sl_pct": options_sl_pct,
+        }
+        for setting_name, requested_value in proposed_numeric_settings.items():
+            if requested_value is not None:
+                setattr(proposed_settings, setting_name, float(requested_value))
+        if active_indices is not None:
+            proposed_settings.active_indices = list(proposed_active_indices)
+
+        # These advanced settings participate directly in safe-mode/readiness decisions.
+        # Stage them too when they arrive through ``kwargs``; unrelated strategy knobs do
+        # not force an expensive broker/chain revalidation while Auto is already armed.
+        readiness_setting_names = {
+            "auto_option_chain_min_strikes",
+            "auto_risk_sizing_enabled",
+            "calendar_coverage_warn_days",
+            "entry_funds_assumed_atm_premium",
+            "entry_funds_warning_floor",
+            "intelligence_cache_ttl_seconds",
+            "kite_api_key",
+            "kite_api_secret",
+            "kite_registered_ip",
+            "max_trade_loss_abs",
+        }
+        for setting_name in readiness_setting_names:
+            requested_value = kwargs.get(setting_name)
+            if requested_value is not None and hasattr(proposed_settings, setting_name):
+                setattr(proposed_settings, setting_name, requested_value)
+
+        readiness_inputs_changed = bool(active_indices is not None) or any(
+            value is not None for value in proposed_numeric_settings.values()
+        ) or any(kwargs.get(name) is not None for name in readiness_setting_names)
+
+        readiness_kwargs = (
+            {"active_indices": proposed_active_indices}
+            if active_indices is not None
+            else {}
+        )
         if requested_mode == "REAL" and current_mode != "REAL":
             if not real_mode_confirmed():
                 self._last_configure_block_reason = "explicit REAL confirmation required"
@@ -4314,7 +4523,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if self.on_notification:
                     self.on_notification("REAL mode blocked. Confirm YES to switch to REAL.", "error")
                 return False
-            readiness = validate_real_mode_readiness(settings, getattr(self, "data", None))
+
+            # Warm option chains so production_safe_mode_required passes configure()
+            dp = getattr(self, "data", None)
+            indices_to_warm = proposed_active_indices if proposed_active_indices is not None else getattr(proposed_settings, "active_indices", [])
+            if dp and hasattr(dp, "get_option_chain"):
+                for idx in (indices_to_warm or []):
+                    if str(idx).strip():
+                        try:
+                            dp.get_option_chain(str(idx).strip())
+                        except Exception:
+                            pass
+
+            readiness = validate_real_mode_readiness(
+                proposed_settings,
+                getattr(self, "data", None),
+                **readiness_kwargs,
+            )
             self._surface_readiness_warnings(readiness)
             if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
                 blockers = readiness.get("blockers") or ["readiness failed"]
@@ -4350,11 +4575,24 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 )
             return False
 
-        if (
-            auto_mode is not None
-            and self._strict_setting_enabled(auto_mode, False)
-            and (requested_mode or current_mode) == "REAL"
-        ):
+        current_auto_mode = bool(getattr(self, "auto_mode", False))
+        proposed_auto_mode = (
+            self._strict_setting_enabled(auto_mode, False)
+            if auto_mode is not None
+            else current_auto_mode
+        )
+        target_is_real = (requested_mode or current_mode) == "REAL"
+        explicitly_requested_real_auto = bool(
+            auto_mode is not None and proposed_auto_mode and target_is_real
+        )
+        entering_real_with_auto = bool(
+            requested_mode == "REAL" and current_mode != "REAL" and proposed_auto_mode
+        )
+        revalidating_armed_auto = bool(
+            current_auto_mode and proposed_auto_mode and target_is_real and readiness_inputs_changed
+        )
+
+        if explicitly_requested_real_auto:
             verification_text = str(real_mode_verification or kwargs.get("real_mode_verification", "")).strip().upper()
             if not confirm_real_mode or verification_text not in {"YES", "REAL"}:
                 self._last_configure_block_reason = "explicit REAL auto-execution confirmation required"
@@ -4365,6 +4603,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         "error",
                     )
                 return False
+
+        if explicitly_requested_real_auto or entering_real_with_auto or revalidating_armed_auto:
             # Audit fix (HIGH-2): the HISTORICAL→REAL readiness gate above only runs when
             # requested_mode=="REAL" and we are not already REAL. By the time a human
             # toggles Auto Mode, the 09:00 premarket worker has usually already armed REAL,
@@ -4373,11 +4613,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # connectivity / warmup / feed freshness here before enabling auto-execution.
             if current_mode == "REAL" or requested_mode == "REAL":
                 readiness = validate_real_mode_readiness(
-                    settings,
+                    proposed_settings,
                     getattr(self, "data", None),
                     require_option_chains=True,
+                    **readiness_kwargs,
                 )
-                morning_blockers = self._auto_execution_morning_readiness_blockers()
+                morning_blockers = self._auto_execution_morning_readiness_blockers(
+                    active_indices=proposed_active_indices,
+                )
                 resource_blocker_fn = getattr(self, "_auto_execution_resource_blockers", None)
                 resource_blockers = list(resource_blocker_fn() or []) if callable(resource_blocker_fn) else []
                 morning_blockers = list(morning_blockers or []) + resource_blockers
@@ -4526,6 +4769,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         if auto_mode is not None:
             self.auto_mode = self._strict_setting_enabled(auto_mode, False)
+            settings.auto_mode = self.auto_mode
             try:
                 self.trades.auto_mode = bool(self.auto_mode)
             except Exception:
@@ -4615,12 +4859,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
 
         if active_indices is not None and active_indices != self.active_indices:
-            requested_indices = [
-                str(name or "").upper()
-                for name in list(active_indices or [])
-                if str(name or "").upper() in SUPPORTED_ENTRY_INSTRUMENTS
-            ]
-            self.active_indices = list(dict.fromkeys(requested_indices))
+            self.active_indices = list(proposed_active_indices)
             settings.active_indices = list(self.active_indices)
             needs_full_refresh = True
             logger.info(f"🔄 Active Indices updated: {self.active_indices}")
@@ -5213,8 +5452,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def _auto_execution_morning_readiness_blockers(
         self,
         now_ist: Optional[datetime] = None,
+        *,
+        active_indices: Optional[List[str]] = None,
     ) -> List[str]:
-        """Require today's complete 4-index warmup before unattended REAL execution."""
+        """Require today's complete warmup for the exact REAL execution universe."""
         now_ist = now_ist or datetime.now(IST)
         if now_ist.tzinfo is None:
             now_ist = IST.localize(now_ist)
@@ -5230,9 +5471,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             summary = self._restored_morning_refresh_summary(session_day)
         if not summary:
             return [f"morning readiness unavailable for {session_day}"]
-        active_count = max(1, len(list(getattr(self, "active_indices", []) or [])))
-        complete, missing = self._evaluate_morning_refresh_quality(summary, active_count)
-        if complete and bool(summary.get("complete")):
+        required_indices = list(
+            dict.fromkeys(
+                str(name or "").upper()
+                for name in (
+                    active_indices
+                    if active_indices is not None
+                    else list(getattr(self, "active_indices", []) or [])
+                )
+                if str(name or "").strip()
+            )
+        )
+        complete, missing = self._evaluate_morning_refresh_quality(
+            summary,
+            required_indices,
+        )
+        # The per-request evaluator is the authority here. ``summary.complete`` describes
+        # the universe that the refresh worker originally attempted, which may include a
+        # now-disabled index.  Requiring that global bit made a fully warmed named subset
+        # impossible to arm until an unrelated contract recovered.
+        if complete:
             return []
         detail = ", ".join(str(item) for item in (missing or summary.get("missing_keys") or []))
         return [
@@ -5243,11 +5501,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def _evaluate_morning_refresh_quality(
         self,
         summary: Dict[str, Any],
-        n_indices: int,
+        required_indices: Any,
     ) -> Tuple[bool, List[str]]:
-        """Return (complete, missing_keys) against configured thresholds."""
+        """Return (complete, missing_keys) against configured thresholds.
+
+        ``required_indices`` normally contains the requested index names.  The integer
+        form remains supported for older callers/tests, but a named universe is what
+        protects AUTO execution: counts alone cannot prove that the requested contracts
+        were warmed.
+        """
         settings = get_settings()
-        n_indices = max(1, int(n_indices or 1))
+        if isinstance(required_indices, int):
+            n_indices = max(1, int(required_indices or 1))
+            required_names: List[str] = []
+        else:
+            required_names = list(
+                dict.fromkeys(
+                    str(name or "").upper()
+                    for name in list(required_indices or [])
+                    if str(name or "").strip()
+                )
+            )
+            n_indices = max(1, len(required_names))
         missing: List[str] = []
 
         if self._setting_enabled(getattr(settings, "morning_refresh_require_history", True), True):
@@ -5256,28 +5531,55 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if self._setting_enabled(getattr(settings, "morning_refresh_require_expiry", True), True):
             if not bool(summary.get("expiry")):
                 missing.append("expiry")
-        if self._setting_enabled(getattr(settings, "morning_refresh_require_all_quotes", True), True):
-            if int(summary.get("index_quotes") or 0) < n_indices:
+        require_quotes = self._setting_enabled(
+            getattr(settings, "morning_refresh_require_all_quotes", True), True
+        )
+        require_chains = self._setting_enabled(
+            getattr(settings, "morning_refresh_require_all_chains", True), True
+        )
+
+        per_idx = summary.get("indices") or {}
+        if not isinstance(per_idx, dict):
+            per_idx = {}
+
+        # With a named universe, aggregate counters can be stale or describe a
+        # different equal-sized set.  Count the named rows instead, then name every
+        # missing identity so the operator knows what must be re-warmed.
+        if require_quotes:
+            if required_names:
+                quote_count = sum(
+                    bool((per_idx.get(name) or {}).get("quote"))
+                    for name in required_names
+                )
+                if quote_count < len(required_names):
+                    missing.append("quotes")
+            elif int(summary.get("index_quotes") or 0) < n_indices:
                 missing.append("quotes")
-        if self._setting_enabled(getattr(settings, "morning_refresh_require_all_chains", True), True):
-            if int(summary.get("chains") or 0) < n_indices:
+        if require_chains:
+            if required_names:
+                chain_count = sum(
+                    bool((per_idx.get(name) or {}).get("chain"))
+                    for name in required_names
+                )
+                if chain_count < len(required_names):
+                    missing.append("chains")
+            elif int(summary.get("chains") or 0) < n_indices:
                 missing.append("chains")
         if self._setting_enabled(getattr(settings, "morning_refresh_require_vix", False), False):
             if not bool(summary.get("vix")):
                 missing.append("vix")
 
-        # Per-index gaps (for partial re-warm)
-        per_idx = summary.get("indices") or {}
-        if isinstance(per_idx, dict):
-            for name, row in per_idx.items():
-                if not isinstance(row, dict):
-                    continue
-                if self._setting_enabled(getattr(settings, "morning_refresh_require_all_quotes", True), True):
-                    if not row.get("quote"):
-                        missing.append(f"quote:{name}")
-                if self._setting_enabled(getattr(settings, "morning_refresh_require_all_chains", True), True):
-                    if not row.get("chain"):
-                        missing.append(f"chain:{name}")
+        # Per-index gaps (for partial re-warm).  Do not let an old disabled index block
+        # a new, fully-warmed selection; when a universe is named, it is authoritative.
+        names_to_check = required_names or list(per_idx)
+        for name in names_to_check:
+            row = per_idx.get(name)
+            if not isinstance(row, dict):
+                row = {}
+            if require_quotes and not row.get("quote"):
+                missing.append(f"quote:{name}")
+            if require_chains and not row.get("chain"):
+                missing.append(f"chain:{name}")
 
         # De-dupe while preserving order
         seen = set()
@@ -5631,6 +5933,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     k: v for k, v in self.config.get("indices", {}).items() if k in self.active_indices
                 }
             n_active = len(active_indices) or 1
+            # Persist identity alongside counts.  A later AUTO arm can then prove that
+            # the requested contracts, rather than merely the same number of contracts,
+            # were refreshed for this session.
+            summary["active_indices"] = sorted(active_indices)
             for name in active_indices:
                 summary["indices"].setdefault(
                     name, {"quote": False, "chain": False, "intel": False, "fut": False}
@@ -5986,7 +6292,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     1 for r in summary["indices"].values() if isinstance(r, dict) and r.get("intel")
                 )
 
-            complete, missing = self._evaluate_morning_refresh_quality(summary, n_active)
+            complete, missing = self._evaluate_morning_refresh_quality(
+                summary,
+                list(active_indices),
+            )
             summary["missing_keys"] = missing
             summary["complete"] = complete
             self._morning_refresh_summary = summary
@@ -8544,6 +8853,160 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     # nothing surfaced it. This is that missing surface.
     _VOLUME_DEGRADED_SOURCES = {"kite_index_futures", "none", ""}
 
+    def _recent_cash_volume_evidence(
+        self,
+        instrument: str,
+        candle_frame: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        """Evidence that the ratio inputs are fresh, homogeneous Fyers cash bars.
+
+        Fyers's index quote/WebSocket payload can omit cumulative volume while its
+        historical endpoint continues to publish complete one-minute cash-volume bars.
+        Those bars are what every ratio gate actually reads.  Health and rtracker must
+        therefore describe their provenance instead of declaring the unrelated futures
+        fallback to be the threshold source.
+        """
+        result: Dict[str, Any] = {
+            "bars_checked": 0,
+            "positive_bars": 0,
+            "positive_cash_bars": 0,
+            "dry": False,
+            "cash_comparable": False,
+            "completed_cash_volume_fresh": False,
+            "intrabar_volume_available": False,
+            "latest_volume": 0.0,
+            "latest_source": "",
+            "latest_basis": "",
+            "latest_bar_comparable": False,
+            "source": "",
+            "basis": "",
+            "cash_volume": 0.0,
+            "cash_bar_at": None,
+            "latest_bar_at": None,
+            "latest_bar_age_seconds": None,
+            "bar_age_seconds": None,
+        }
+        df = candle_frame
+        if df is None:
+            candles = getattr(self, "candles", None)
+            if candles is None or not hasattr(candles, "get_candles"):
+                return result
+            try:
+                df = candles.get_candles(instrument, "1min")
+            except Exception:
+                return result
+        if df is None or "volume" not in getattr(df, "columns", []) or df.empty:
+            return result
+
+        recent = df.tail(10)
+        result["bars_checked"] = int(len(recent))
+        try:
+            volumes = pd.to_numeric(recent["volume"], errors="coerce").fillna(0.0)
+            result["positive_bars"] = int((volumes > 0.0).sum())
+            result["dry"] = bool(len(recent) >= 5 and float(volumes.abs().sum()) <= 0.0)
+            result["latest_volume"] = float(volumes.iloc[-1])
+        except Exception:
+            return result
+
+        def _clean_text(value: Any) -> str:
+            text = str(value).strip()
+            return "" if text.lower() in {"", "nan", "none", "nat"} else text
+
+        def _row_source(row: Any) -> str:
+            return _clean_text(
+                row.get("source", row.get("data_source", row.get("candle_source", "")))
+            )
+
+        now_ist = datetime.now(IST).replace(tzinfo=None)
+        current_minute = now_ist.replace(second=0, microsecond=0)
+        last = recent.iloc[-1]
+        result["latest_source"] = _row_source(last)
+        result["latest_basis"] = _clean_text(last.get("volume_basis", ""))
+        latest = self._one_min_timestamp(recent.index[-1])
+        if latest is not None:
+            result["latest_bar_at"] = latest.isoformat()
+            latest_age = (now_ist - latest).total_seconds()
+            result["latest_bar_age_seconds"] = round(latest_age, 3)
+        else:
+            latest_age = float("inf")
+        latest_is_forming = bool(
+            latest is not None
+            and current_minute <= latest <= now_ist + timedelta(seconds=1)
+        )
+
+        try:
+            history_ttl = float(
+                getattr(get_settings(), "live_1min_history_cache_ttl_seconds", 45.0)
+                or 45.0
+            )
+        except (TypeError, ValueError):
+            history_ttl = 45.0
+        max_age = max(180.0, history_ttl * 3.0)
+        homogeneous = self._volume_window_is_homogeneous(recent)
+
+        # The last row is normally the forming live_tick candle.  Fyers index ticks can
+        # carry price but no cumulative cash volume, while the immediately preceding REST
+        # bars are complete and usable.  Do not let that zero/blank forming row erase the
+        # threshold evidence, and equally do not relabel it as measured intrabar volume.
+        cash_position: Optional[int] = len(recent) - 1
+        if latest_is_forming:
+            cash_position -= 1
+        if cash_position < 0:
+            cash_position = None
+
+        # Count the measured completed baseline, but judge freshness/provenance using the
+        # newest completed row itself.  Searching farther backward for any positive row
+        # would hide a zero or unknown-provenance completed bar immediately before now.
+        completed_end = (cash_position + 1) if cash_position is not None else 0
+        for position in range(completed_end):
+            row = recent.iloc[position]
+            basis = _clean_text(row.get("volume_basis", "")).lower()
+            if float(volumes.iloc[position]) > 0.0 and basis == "fyers_index":
+                result["positive_cash_bars"] += 1
+
+        cash_age = float("inf")
+        cash_stamp: Optional[datetime] = None
+        if cash_position is not None:
+            cash_row = recent.iloc[cash_position]
+            cash_stamp = self._one_min_timestamp(recent.index[cash_position])
+            result["source"] = _row_source(cash_row)
+            result["basis"] = _clean_text(cash_row.get("volume_basis", ""))
+            result["cash_volume"] = float(volumes.iloc[cash_position])
+            if cash_stamp is not None:
+                result["cash_bar_at"] = cash_stamp.isoformat()
+                cash_age = (now_ist - cash_stamp).total_seconds()
+                result["bar_age_seconds"] = round(cash_age, 3)
+        else:
+            # Preserve the latest row's provenance for a useful degraded diagnostic.
+            result["source"] = result["latest_source"]
+            result["basis"] = result["latest_basis"]
+            result["bar_age_seconds"] = result["latest_bar_age_seconds"]
+
+        result["latest_bar_comparable"] = bool(
+            result["latest_volume"] > 0.0
+            and result["latest_basis"].strip().lower() == "fyers_index"
+            and homogeneous
+            and -1.0 <= latest_age <= max_age
+        )
+        result["intrabar_volume_available"] = bool(
+            result["latest_bar_comparable"]
+            and latest_is_forming
+            and "history" not in result["latest_source"].lower()
+        )
+        result["cash_comparable"] = bool(
+            result["positive_cash_bars"] >= 5
+            and result["cash_volume"] > 0.0
+            and result["basis"].strip().lower() == "fyers_index"
+            and homogeneous
+            and -1.0 <= cash_age <= max_age
+        )
+        result["completed_cash_volume_fresh"] = bool(
+            result["cash_comparable"]
+            and cash_stamp is not None
+            and cash_stamp < current_minute
+        )
+        return result
+
     def _recent_candle_volume(self, instrument: str):
         """(bars_checked, is_dry) for the 1min series the volume gates actually read.
 
@@ -8551,23 +9014,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         of a feed outage as the ENGINE sees it, regardless of what any quote endpoint
         says. Too few bars is not dry: that is a warm-up, not an outage.
         """
-        candles = getattr(self, "candles", None)
-        if candles is None or not hasattr(candles, "get_candles"):
-            return 0, False
-        try:
-            df = candles.get_candles(instrument, "1min")
-        except Exception:
-            return 0, False
-        if df is None or "volume" not in getattr(df, "columns", []):
-            return 0, False
-        recent = df.tail(10)
-        bars = int(len(recent))
-        if bars < 5:
-            return bars, False
-        try:
-            return bars, bool(float(pd.to_numeric(recent["volume"], errors="coerce").fillna(0).abs().sum()) <= 0.0)
-        except Exception:
-            return bars, False
+        evidence = self._recent_cash_volume_evidence(instrument)
+        return int(evidence["bars_checked"]), bool(evidence["dry"])
 
     def volume_source_health(self, probe_broker: bool = True) -> Dict[str, Any]:
         """Per-instrument volume provenance, for the dashboard and the watchdog.
@@ -8701,14 +9149,71 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # read the candles. During the 2026-07-27 outage the Fyers quote cache was
             # fine while the candle series was all zeros — a health check built on the
             # quote alone reports all-green through the exact failure it exists to catch.
-            bars, dry = self._recent_candle_volume(name)
+            candle_evidence = self._recent_cash_volume_evidence(name)
+            bars = int(candle_evidence["bars_checked"])
+            dry = bool(candle_evidence["dry"])
+            row["fyers_stream_online"] = bool(row["fyers_online"])
+            row["fyers_history_volume_fresh"] = bool(
+                candle_evidence["cash_comparable"]
+                and "history" in str(candle_evidence["source"]).lower()
+            )
+            row["completed_cash_volume_fresh"] = bool(
+                candle_evidence["completed_cash_volume_fresh"]
+            )
+            row["intrabar_volume_available"] = bool(
+                candle_evidence["intrabar_volume_available"]
+            )
+            row["latest_candle_source"] = str(candle_evidence["latest_source"] or "")
+            row["latest_candle_volume_basis"] = str(
+                candle_evidence["latest_basis"] or ""
+            )
+            row["latest_candle_volume"] = float(
+                candle_evidence["latest_volume"] or 0.0
+            )
+            row["latest_candle_age_seconds"] = candle_evidence[
+                "latest_bar_age_seconds"
+            ]
+            row["candle_volume_source"] = str(candle_evidence["source"] or "")
+            row["candle_volume_basis"] = str(candle_evidence["basis"] or "")
+            row["candle_volume_age_seconds"] = candle_evidence["bar_age_seconds"]
+            if candle_evidence["cash_comparable"]:
+                # The fallback can still provide useful futures/OI confirmation, but it
+                # is not the source being compared to share-calibrated thresholds.  The
+                # fresh Fyers 1m bars are, so report that fact and stop the false outage.
+                row.update({
+                    "source": str(candle_evidence["source"] or "fyers_history"),
+                    "unit": "shares",
+                    "volume": float(candle_evidence["cash_volume"] or 0.0),
+                    "comparable_to_thresholds": True,
+                    "volume_available": True,
+                    "volume_source": str(candle_evidence["source"] or "fyers_history"),
+                    "volume_basis": "fyers_index",
+                    "volume_unit": "shares",
+                    "volume_comparable": True,
+                    "volume_unavailable_reason": "",
+                    "fyers_online": True,
+                    "confirmation": (
+                        "history_cash_with_futures_confirmation"
+                        if row["futures_available"]
+                        else "history_cash"
+                    ),
+                })
+            row["threshold_volume_available"] = bool(
+                candle_evidence["cash_comparable"]
+            )
             row["candle_bars_checked"] = bars
             row["candle_volume_dry"] = dry
+            source = str(row.get("source") or "none")
             row["degraded"] = bool(source in self._VOLUME_DEGRADED_SOURCES or dry)
             if row["degraded"]:
                 degraded.append(name)
             rows[name] = row
 
+        threshold_warming = [
+            name
+            for name, row in rows.items()
+            if not bool(row.get("threshold_volume_available"))
+        ]
         return {
             "instruments": rows,
             "degraded": degraded,
@@ -8717,13 +9222,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # point of a fallback — so "everything looks fine" is exactly how the
             # last outage hid. Say plainly which feed is actually in play.
             "summary": (
-                "All indices on Fyers cash volume"
-                if not degraded
+                "No active indices configured"
+                if not rows
                 else (
-                    "Volume degraded for: "
-                    + ", ".join(
-                        f"{n}({'candles dry' if rows[n]['candle_volume_dry'] else rows[n]['source']})"
-                        for n in degraded
+                    "All active indices have fresh comparable Fyers cash-volume bars"
+                    if not degraded and not threshold_warming
+                    else (
+                        "Volume sources online; completed cash-volume thresholds warming for: "
+                        + ", ".join(threshold_warming)
+                        if not degraded
+                        else (
+                            "Volume degraded for: "
+                            + ", ".join(
+                                f"{n}({'candles dry' if rows[n]['candle_volume_dry'] else rows[n]['source']})"
+                                for n in degraded
+                            )
+                        )
                     )
                 )
             ),
@@ -8792,6 +9306,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 candle_volume_basis = ""
                 candle_source = ""
 
+        candle_evidence = self._recent_cash_volume_evidence(name, candle_1min)
+
         # In-memory ONLY. This runs per instrument on the 1s scan interval, so calling
         # get_index_activity here meant a Fyers REST probe plus a Kite quote per index
         # EVERY SECOND, blocking the event loop — the scan cycle, the LTP worker, the
@@ -8806,44 +9322,75 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         on_futures = fallback_at > 0 and (time.time() - fallback_at) <= 120.0
 
         diag_tick_count = int(float((diag or {}).get("tick_count_current_minute") or 0))
-        volume_available = bool(latest_volume > 0.0 or (diag or {}).get("volume_available"))
+        intrabar_volume_available = bool(
+            candle_evidence["intrabar_volume_available"]
+        )
+        # A provider's cumulative total can remain fresh after a price-only tick creates
+        # the forming candle.  It proves feed provenance, not that this bar has a volume
+        # numerator.  The pre-candle predictor interprets ``volume_available=True`` as a
+        # measured current ratio, so only the actual forming row may set these two flags.
+        volume_available = intrabar_volume_available
         comparable_cash = bool(
-            volume_available
-            and not on_futures
-            and (
-                volume_source == "fyers_index"
-                or candle_volume_basis.lower() == "fyers_index"
-                or bool((diag or {}).get("volume_comparable"))
+            candle_evidence["cash_comparable"]
+            or (
+                volume_available
+                and not on_futures
+                and (
+                    volume_source == "fyers_index"
+                    or candle_volume_basis.lower() == "fyers_index"
+                    or bool((diag or {}).get("volume_comparable"))
+                )
             )
         )
         unavailable_reason = ""
-        if not comparable_cash:
-            unavailable_reason = str(
-                (diag or {}).get("volume_unavailable_reason")
-                or (
-                    "cash_index_volume_unavailable; futures_confirmation_only"
-                    if on_futures
-                    else "no_positive_cash_index_volume"
+        if not volume_available:
+            if candle_evidence["cash_comparable"]:
+                unavailable_reason = (
+                    "current_intrabar_cash_volume_unavailable; "
+                    "completed_cash_thresholds_available"
                 )
-            )
+            else:
+                unavailable_reason = str(
+                    (diag or {}).get("volume_unavailable_reason")
+                    or (
+                        "cash_index_volume_unavailable; futures_confirmation_only"
+                        if on_futures
+                        else "no_positive_cash_index_volume"
+                    )
+                )
         return {
             "instrument": name,
             "volume_available": volume_available,
-            "volume_reliable": bool(latest_volume > 0.0 or (diag or {}).get("volume_reliable")),
+            "volume_reliable": bool(intrabar_volume_available and comparable_cash),
+            "intrabar_volume_available": intrabar_volume_available,
+            "threshold_volume_available": bool(candle_evidence["cash_comparable"]),
+            "completed_cash_volume_fresh": bool(
+                candle_evidence["completed_cash_volume_fresh"]
+            ),
             "volume_source": str(
-                (diag or {}).get("volume_source")
-                or volume_source
-                or candle_source
-                or "none"
+                candle_evidence["source"]
+                if candle_evidence["cash_comparable"]
+                else (
+                    (diag or {}).get("volume_source")
+                    or volume_source
+                    or candle_source
+                    or "none"
+                )
             ),
             "volume_basis": str(
-                (diag or {}).get("volume_basis")
-                or candle_volume_basis
-                or "unavailable"
+                "fyers_index"
+                if candle_evidence["cash_comparable"]
+                else (
+                    (diag or {}).get("volume_basis")
+                    or candle_volume_basis
+                    or "unavailable"
+                )
             ),
             "volume_key": str((diag or {}).get("volume_key") or ""),
             "volume_fields": dict((diag or {}).get("volume_fields") or {}),
             "latest_1min_volume": round(latest_volume, 4),
+            "latest_1min_volume_source": str(candle_evidence["latest_source"] or ""),
+            "latest_1min_volume_basis": str(candle_evidence["latest_basis"] or ""),
             "tick_count_current_minute": max(diag_tick_count, candle_tick_count),
             "candle_tick_count": candle_tick_count,
             # Was hardcoded False, so the one diagnostic that could have revealed the
@@ -8864,6 +9411,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "volume_comparable_to_thresholds": comparable_cash,
             "volume_unavailable_reason": unavailable_reason,
             "cumulative_volume": cum_volume,
+            "cash_candle_bar_age_seconds": candle_evidence["bar_age_seconds"],
+            "latest_candle_bar_age_seconds": candle_evidence[
+                "latest_bar_age_seconds"
+            ],
         }
 
     def _log_pre_candle_prediction(self, instrument: str, timeframe: str, prediction: Dict[str, Any]) -> None:
@@ -9302,12 +9853,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         max_quote_age = max_quote_age_next if is_rollover else max_quote_age_current
         key = trade.symbol_token
         now = time.time()
-        cached = self._premium_cache.get(key)
-        if cached and now - cached.get("time", 0.0) <= ttl:
-            cached_price = float(cached.get("price") or 0.0)
-            if self._option_premium_quote_plausible(trade, cached_price):
-                return cached_price
-            self._premium_cache.pop(key, None)
         exchange = "BFO" if "SENSEX" in trade.trading_symbol.upper() else "NFO"
 
         # Subscribe as soon as a tradeable contract is resolved. The method is
@@ -9340,6 +9885,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 setattr(trade, "quote_source", "contract_ws_cache")
                 setattr(trade, "quote_verified", True)
                 return price
+
+        # _premium_cache holds slower chain/REST fallbacks. It must not mask a newer
+        # websocket mark for its 2s TTL; that silently turned a 100ms manager into a 2s
+        # sampled manager and hid target/stop touches followed by a fast rebound.
+        cached = self._premium_cache.get(key)
+        if cached and now - cached.get("time", 0.0) <= ttl:
+            cached_price = float(cached.get("price") or 0.0)
+            if self._option_premium_quote_plausible(trade, cached_price):
+                return cached_price
+            self._premium_cache.pop(key, None)
 
         # Everything above is memory-only. Everything below makes an HTTPS call, so on
         # the 100ms trade-monitor path it is dispatched off-thread instead: the caller
@@ -10256,6 +10811,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "status": "COMPLETED" if outcome["outcome_available"] else "UNAVAILABLE",
             "reason": str(watch.get("decision_group") or ""),
             "source": "entry_policy_executable_shadow",
+            "run_mode": "REAL",
+            "evidence_domain": "LIVE_SHADOW_OUTCOME",
             "source_lane": str(watch.get("source_lane") or ""),
             "contract": {
                 "trading_symbol": str(watch.get("trading_symbol") or ""),
@@ -10641,6 +11198,111 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     ages.append(age)
         return min(ages) if ages else None
 
+    def _trade_contract_tick_path(
+        self, trade
+    ) -> List[Tuple[float, Optional[datetime]]]:
+        """Consume this trade's exact ordered ticks since its previous monitor pass."""
+        reader = getattr(getattr(self, "data", None), "get_contract_ticks_since", None)
+        token = str(getattr(trade, "symbol_token", "") or "").strip()
+        if not token or not callable(reader):
+            return []
+
+        cursor_token = str(getattr(trade, "_contract_tick_cursor_token", "") or "")
+        cursor = int(getattr(trade, "_contract_tick_cursor", 0) or 0) if cursor_token == token else 0
+        entry_time = getattr(trade, "entry_time", None) or getattr(trade, "signal_time", None)
+        not_before = 0.0
+        if isinstance(entry_time, datetime):
+            try:
+                aware_entry = (
+                    IST.localize(entry_time)
+                    if entry_time.tzinfo is None
+                    else entry_time.astimezone(IST)
+                )
+                not_before = float(aware_entry.timestamp())
+            except Exception:
+                not_before = 0.0
+        try:
+            ticks, newest_cursor, overflowed = reader(
+                token,
+                after_sequence=cursor,
+                not_before=not_before,
+            )
+        except Exception as exc:
+            logger.debug(f"Contract tick path read failed for {token}: {exc}")
+            return []
+
+        setattr(trade, "_contract_tick_pending_token", token)
+        setattr(trade, "_contract_tick_pending_cursor", int(newest_cursor or cursor))
+        if overflowed:
+            marker = f"{token}:{cursor}:{newest_cursor}"
+            if getattr(trade, "_last_contract_tick_overflow", "") != marker:
+                setattr(trade, "_last_contract_tick_overflow", marker)
+                logger.warning(
+                    f"Contract tick history overflow for {getattr(trade, 'trading_symbol', token)}; "
+                    "retained ordered tail still evaluated, broker stop remains authoritative"
+                )
+
+        path: List[Tuple[float, Optional[datetime]]] = []
+        is_option = str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
+        for raw in ticks or []:
+            try:
+                price = float(raw[1])
+                received_at = float(raw[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if price <= 0 or (
+                is_option and not self._option_premium_quote_plausible(trade, price)
+            ):
+                continue
+            observed_at = datetime.fromtimestamp(received_at, IST).replace(tzinfo=None)
+            path.append((price, observed_at))
+        return path
+
+    @staticmethod
+    def _commit_trade_contract_tick_path(trade) -> None:
+        """Advance tick cursor only after corresponding management pass succeeded."""
+        token = str(getattr(trade, "_contract_tick_pending_token", "") or "")
+        if not token:
+            return
+        cursor = int(getattr(trade, "_contract_tick_pending_cursor", 0) or 0)
+        setattr(trade, "_contract_tick_cursor_token", token)
+        setattr(trade, "_contract_tick_cursor", cursor)
+        setattr(trade, "_contract_tick_pending_token", "")
+        setattr(trade, "_contract_tick_pending_cursor", 0)
+
+    @staticmethod
+    def _first_contract_exit_touch(
+        trade,
+        path: List[Tuple[float, Optional[datetime]]],
+        stop: Optional[float] = None,
+        target: Optional[float] = None,
+    ) -> Optional[Tuple[str, float, Optional[datetime]]]:
+        """First stop/target crossing in an exact contract tick path."""
+        inst_type = str(getattr(trade, "inst_type", "") or "").upper()
+        direction = str(getattr(trade, "direction", "LONG") or "LONG").upper()
+        stop = float(
+            getattr(trade, "current_stop", 0.0) if stop is None else stop
+        )
+        target = float(getattr(trade, "target", 0.0) if target is None else target)
+        runner = bool(getattr(trade, "runner_mode", False))
+        for price, observed_at in path or []:
+            price = float(price or 0.0)
+            if price <= 0:
+                continue
+            if inst_type == "OPT" or direction == "LONG":
+                stop_hit = stop > 0 and price <= stop
+                target_hit = not runner and target > 0 and price >= target
+            else:
+                stop_hit = stop > 0 and price >= stop
+                target_hit = not runner and target > 0 and price <= target
+            if stop_hit or target_hit:
+                return (
+                    "TRAILING_STOP" if stop_hit else "TARGET_HIT",
+                    price,
+                    observed_at,
+                )
+        return None
+
     @staticmethod
     def _normalize_contract_symbol(value) -> str:
         text = str(value or "").upper().strip()
@@ -11004,7 +11666,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "warning",
         )
 
-    def _get_live_fut_ltp_cached(self, trade) -> Optional[float]:
+    def _get_live_fut_ltp_cached(self, trade, allow_blocking: bool = True) -> Optional[float]:
         if not getattr(trade, "symbol_token", "") or not getattr(trade, "trading_symbol", ""):
             return None
         ttl = 2.0
@@ -11014,22 +11676,50 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not isinstance(cache, dict):
             cache = {}
             self._candidate_ltp_cache = cache
+
+        provider = getattr(self, "data", None)
+
+        # Check websocket first on fast path
+        if provider and hasattr(provider, "_ws_cache"):
+            ws_entry = provider._ws_cache.get(str(trade.symbol_token))
+            if isinstance(ws_entry, dict) and "ltp" in ws_entry:
+                ws_time = float(ws_entry.get("time", 0.0) or 0.0)
+                if now - ws_time <= ttl:
+                    price = float(ws_entry["ltp"])
+                    if price > 0:
+                        cache[key] = {"price": price, "time": ws_time}
+                        return price
+
+        # Candidate cache is a fallback, not a shield over fresher contract ticks.
         cached = cache.get(key)
         if cached and now - cached.get("time", 0.0) <= ttl:
             return cached.get("price")
 
+        # The scanner's fast path must never wait on a REST quote.  It may use a
+        # bounded recent mark, while the ordinary quote refresh remains available to
+        # non-time-critical callers.
+        if not allow_blocking:
+            return None
+
         exchange = "BFO" if "SENSEX" in trade.trading_symbol.upper() else "NFO"
-        get_ltp = getattr(getattr(self, "data", None), "get_ltp", None)
+        get_ltp = getattr(provider, "get_ltp", None)
         if not callable(get_ltp):
-            return cached.get("price") if cached else None
+            return None
         try:
             price = get_ltp(exchange, trade.trading_symbol, trade.symbol_token)
             if price and price > 0:
-                cache[key] = {"price": float(price), "time": now}
-                return float(price)
+                # get_ltp returns float, but provider tracks its age in _last_ltp_time
+                last_time = float(getattr(provider, "_last_ltp_time", now))
+                if now - last_time <= ttl:
+                    cache[key] = {"price": float(price), "time": last_time}
+                    return float(price)
+                else:
+                    logger.debug(f"FUT LTP {price} for {trade.trading_symbol} rejected as stale (age: {now - last_time:.1f}s)")
         except Exception as e:
             logger.debug(f"FUT LTP fetch failed for {trade.trading_symbol}: {e}")
-        return cached.get("price") if cached else None
+        # A failed refresh must not promote an arbitrarily old futures quote into an
+        # executable trade-management mark.  Missing fresh price pauses this pass.
+        return None
 
     def _configured_option_sl_pct(self) -> float:
         """Current per-trade option premium SL cap, preferring scanner state."""
@@ -11263,11 +11953,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         opt_sl_pct = Scanner._configured_option_sl_pct(self)
 
-        # Keep the legacy choppy/ranging breathing behavior from SignalProcessor,
-        # but only after the saved setting has been corrected to mean per-trade SL.
-        regime = Scanner._candidate_market_regime(self, candidate)
-        if is_risky_regime(regime):
-            opt_sl_pct = max(opt_sl_pct, 15.0)
+        # `options_sl_pct` is a hard premium-risk cap.  Regime logic may select
+        # fewer/better-qualified entries, but cannot widen that loss limit.
 
         # The expiry-day gamma clamp is applied LAST so it actually binds. It used to sit
         # above the risky-regime floor, which then raised the stop straight back to 15% —
@@ -11595,12 +12282,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             or ""
         ).strip()
         source_lower = source.lower()
+        source_role = str(quote.get("source_role") or "").strip().lower()
         source_ok = bool(
             source
             and source_lower not in {"unavailable", "unknown", "previous_close"}
             and not source_lower.startswith("yahoo")
             and not source_lower.endswith("_stale")
-            and str(quote.get("source_role") or "").lower() != "delayed"
+            # Fyers remains context/failover data; it never authorizes a REAL entry.
+            # Re-check at the final geometry seam because Kite may go stale after the
+            # candidate-construction source gate and before broker submission.
+            and source_role == "primary"
         )
         if not (
             price > 0
@@ -11695,6 +12386,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             else:
                 risk = abs(underlying_entry - underlying_stop)
                 reward = abs(underlying_target - underlying_entry)
+            # The signal and submission quotes may both be valid primary-broker ticks
+            # yet differ as the market moves. Preserve the setup's reward distance, but
+            # never carry an old absolute risk onto a new spot if that would breach the
+            # index/regime percentage ceiling. The final policy can therefore keep its
+            # strict comparison instead of rounding a real overage away.
+            cap_pct = self._entry_policy_underlying_stop_cap_pct(
+                instrument,
+                str(getattr(holder, "market_regime", "") or "UNKNOWN"),
+            )
+            max_risk = current_spot * (cap_pct / 100.0)
+            if max_risk > 0:
+                risk = min(risk, max_risk)
             underlying_entry = current_spot
             if direction == "SHORT":
                 underlying_stop = current_spot + risk
@@ -12182,9 +12885,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if self.mode != "REAL":
                 return df
 
-            today = datetime.now(IST).date()
+            session_day = pd.Timestamp(self._get_current_session_day()).date()
             idx_dates = pd.Series(df.index.date, index=df.index)
-            today_df = df[idx_dates == today]
+            today_df = df[idx_dates == session_day]
             warmup_bars = {"1min": 180, "5min": 60, "15min": 40}.get(timeframe, 60)
             fallback_bars = {"1min": 360, "5min": 120, "15min": 80}.get(timeframe, 120)
             if today_df.empty:
@@ -12192,9 +12895,80 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             warmup_df = df[df.index < today_df.index[0]].tail(warmup_bars)
             window = pd.concat([warmup_df, today_df])
             return window[~window.index.duplicated(keep="last")].sort_index()
-        except Exception as e:
-            logger.debug(f"Live analysis window fallback for {timeframe}: {e}")
+        except Exception as exc:
+            logger.debug(f"Live analysis window fallback for {timeframe}: {exc}")
             return df
+
+    def _prepare_live_signal_data(
+        self,
+        instrument: str,
+        timeframe: str,
+        df: Optional[pd.DataFrame],
+    ) -> Optional[pd.DataFrame]:
+        """Fail closed while today's 5-minute signal engine is under-warmed.
+
+        Prior-session candles may warm indicators, but they must not preserve yesterday's
+        arrow/state as a live signal. Until the active session has the configured number
+        of completed 5-minute bars, invalidate every result/data/state cache for this key.
+        """
+        window = self._live_analysis_window(df, timeframe)
+        if (
+            str(getattr(self, "mode", "") or "").upper() != "REAL"
+            or str(timeframe or "").lower() != "5min"
+            or window is None
+            or getattr(window, "empty", True)
+        ):
+            return window
+
+        key = f"{instrument}_{timeframe}"
+        try:
+            session_day = pd.Timestamp(self._get_current_session_day()).date()
+            index = window.index
+            if not isinstance(index, pd.DatetimeIndex):
+                raise ValueError("signal frame has no DatetimeIndex")
+            if index.tz is not None:
+                index = index.tz_convert(IST).tz_localize(None)
+            today_count = int(sum(value == session_day for value in index.date))
+            required = max(
+                1,
+                int(getattr(get_settings(), "live_signal_5min_warmup_bars", 12) or 12),
+            )
+        except Exception as exc:
+            logger.debug(f"Live signal warmup check failed for {key}: {exc}")
+            today_count, required = 0, 12
+
+        ready = today_count >= required
+        if not hasattr(self, "_live_signal_warmup_ready"):
+            self._live_signal_warmup_ready = {}
+        self._live_signal_warmup_ready[key] = ready
+        if ready:
+            return window
+
+        for attr in ("_cached_results", "_cached_result_metadata", "_last_signal_time", "_last_signal_identity"):
+            store = getattr(self, attr, None)
+            if isinstance(store, dict):
+                store.pop(key, None)
+        candidate_cache = getattr(self, "_candidate_process_cache", None)
+        if isinstance(candidate_cache, dict):
+            candidate_cache.pop(instrument, None)
+        mtf = getattr(self, "mtf", None)
+        for attr in ("_result_cache", "_data_hash", "_data_cache"):
+            store = getattr(mtf, attr, None)
+            if isinstance(store, dict):
+                store.pop(key, None)
+        engine = getattr(getattr(mtf, "engines", {}), "get", lambda *_: None)(key)
+        states = getattr(engine, "_states", None)
+        if isinstance(states, dict):
+            states.pop(key, None)
+        try:
+            self.log_signal_decision_once(
+                f"{key}|live-warmup|{today_count}/{required}",
+                f"Live {key} signal engine waiting for warmup ({today_count}/{required} bars); stale state cleared.",
+                "info",
+            )
+        except Exception:
+            pass
+        return None
 
     def _previous_close_for(self, instrument: str) -> float:
         name = str(instrument or "").upper()
@@ -12931,7 +13705,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         for tf in ["1min", "5min", "15min"]:
             data = self.candles.get_candles(name, tf)
             if data is not None:
-                data = self._live_analysis_window(data, tf)
+                data = self._prepare_live_signal_data(name, tf, data)
             # Missing/underfilled is a real input state, not permission to keep the
             # previous arrow alive.  MultiTimeframeEngine records and invalidates it.
             self.mtf.update_data(name, tf, data)
@@ -13024,6 +13798,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             and (now - cached_intel_time) < intel_ttl
         )
 
+        intel_computed_this_pass = False
         if intel_is_fresh:
             intel_result = cached_intel
         else:
@@ -13086,6 +13861,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     anchor_regime=contexts.get("anchor_regime"),
                     breadth_context=contexts.get("breadth_context"),
                 )
+                intel_computed_this_pass = True
                 if self._intel_result_cacheable(intel_result):
                     self._cache_timeframe_intel(name, "5min", intel_result, at=now, mirror_legacy=True)
                     self._record_instrument_iv(name, intel_result, iv_as_of)
@@ -13118,6 +13894,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception as e:
                 import traceback
                 logger.error(f"Intelligence analysis failed for {name}: {e}\n{traceback.format_exc()}")
+                # analyze() may have returned and a later cache/telemetry action may
+                # have failed. The fallback below is still the old snapshot, so it must
+                # never inherit this pass's freshness flag.
+                intel_computed_this_pass = False
                 intel_result = cached_intel or {
                     "pcr": {"pcr": 1.0, "signal": "NEUTRAL"},
                     "oi": {"signal": "NEUTRAL", "cumulative_analysis": {}},
@@ -13169,18 +13949,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         intel_score = aggregate_intelligence_score(intel_result.get("aggregate", {}))
         regime = intel_result.get("regime", {}).get("regime", "UNKNOWN")
-        if self._intel_result_cacheable(intel_result):
+        if self._intel_result_cacheable(intel_result) and intel_computed_this_pass:
             # `at=now` only when this is a FRESH computation. On the cache-hit path
             # intel_result IS cached_intel, and re-stamping it renewed the TTL on every
             # read — a 90s bound that a 1s scan loop could push out indefinitely, so
             # intel had no enforced age at all. Preserve the original stamp instead:
             # _get_timeframe_intel already returns a hit without re-caching, which is
             # the correct pattern.
-            self._cache_timeframe_intel(
-                name, "5min", intel_result,
-                at=(cached_intel_time if intel_is_fresh else now),
-                mirror_legacy=True,
-            )
+            self._cache_timeframe_intel(name, "5min", intel_result, at=now, mirror_legacy=True)
         else:
             self.latest_regimes[name] = str(regime or "UNKNOWN").upper()
 
@@ -13551,6 +14327,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ),
             "expected_move_forecast": dict(getattr(candidate, "expected_move_forecast", {}) or {}),
             "entry_policy_verdict": dict(getattr(candidate, "entry_policy_verdict", {}) or {}),
+            "quality_verdict": dict(getattr(candidate, "quality_verdict", {}) or {}),
             "scalp_lock_mode": bool(getattr(candidate, "scalp_lock_mode", False)),
             "location_risk": str(getattr(candidate, "location_risk", "") or ""),
             "location_position_pct": float(getattr(candidate, "location_position_pct", 0.0) or 0.0),
@@ -13561,6 +14338,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "impulse_confirmed": bool(getattr(candidate, "impulse_confirmed", False)),
             "is_explosive_bypass": bool(getattr(candidate, "is_explosive_bypass", False)),
             "power_move": bool(getattr(candidate, "power_move", False)),
+            "trend_15m_agrees": bool(getattr(candidate, "trend_15m_agrees", False)),
+            "volume_ratio": float(getattr(candidate, "volume_ratio", 0.0) or 0.0),
+            "range_atr_ratio": float(getattr(candidate, "range_atr_ratio", 0.0) or 0.0),
+            "close_location": float(getattr(candidate, "close_location", 0.0) or 0.0),
             "fifteen_min_choppy_scalp_entry": bool(getattr(candidate, "fifteen_min_choppy_scalp_entry", False)),
             "market_wide_reversal_entry": bool(getattr(candidate, "market_wide_reversal_entry", False)),
             "one_way_cascade_entry": bool(getattr(candidate, "one_way_cascade_entry", False)),
@@ -15647,12 +16428,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     @staticmethod
     def _position_cost_rs(trade_like) -> float:
-        """What this contract actually put at risk: premium x quantity.
+        """Return the usable profit-lock sizing basis in rupees.
 
-        Every rupee threshold in the profit-lock stack is really a statement about
-        breathing room, and breathing room only means something relative to this. The
-        four indices span 6x on lot size alone (SENSEX 20, MIDCPNIFTY 120), so a flat
-        rupee line is a different instruction on each of them.
+        Options consume premium, so their basis is premium x quantity.  Futures do not:
+        multiplying an index future's 25,000-ish entry by its lot quantity mistakes
+        notional for risk and creates 50k+ lock thresholds that can never arm.  For a
+        future the correct comparable basis is its frozen entry-stop risk (or the
+        original stop distance x quantity when that frozen value is unavailable).
+
+        A row without a usable futures stop returns zero so callers take their existing
+        conservative flat fallback rather than inventing a giant notional threshold.
         """
         if trade_like is None:
             return 0.0
@@ -15663,6 +16448,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 lots = int(getattr(trade_like, "lots", 0) or 0)
                 lot_size = int(getattr(trade_like, "lot_size", 0) or 0)
                 qty = lots * lot_size
+            inst_type = str(getattr(trade_like, "inst_type", "OPT") or "OPT").upper()
+            if inst_type in {"FUT", "FUTURE", "FUTURES"}:
+                frozen_risk = float(getattr(trade_like, "frozen_initial_risk_rs", 0.0) or 0.0)
+                if frozen_risk > 0:
+                    return frozen_risk
+                stop = float(
+                    getattr(trade_like, "initial_stop", 0.0)
+                    or getattr(trade_like, "trailing_stop", 0.0)
+                    or getattr(trade_like, "current_stop", 0.0)
+                    or 0.0
+                )
+                risk = abs(entry - stop) * float(qty) if entry > 0 and stop > 0 else 0.0
+                return risk if risk > 0 else 0.0
             cost = entry * float(qty)
         except (TypeError, ValueError):
             return 0.0
@@ -15684,6 +16482,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         settings = get_settings()
         flat = float(getattr(settings, "major_win_guard_flat_fallback_rs", 3000.0) or 3000.0)
         try:
+            inst_type = str(getattr(trade_like, "inst_type", "OPT") or "OPT").upper()
+            if inst_type in {"FUT", "FUTURE", "FUTURES"}:
+                initial_risk = Scanner._position_cost_rs(trade_like)
+                r_multiple = float(
+                    getattr(settings, "major_win_guard_futures_r_multiple", 1.50) or 1.50
+                )
+                if initial_risk <= 0.0 or r_multiple <= 0.0:
+                    return flat
+                return max(flat, initial_risk * r_multiple)
             table = getattr(settings, "major_win_guard_cost_pct_by_index", None) or {}
             raw = str(getattr(trade_like, "instrument", "") or "").split()
             if not raw:
@@ -21150,6 +21957,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "price_action_verdict",
             "price_action_score",
             "adx_value",
+            "trend_15m_agrees",
             "impulse_confirmed",
             "is_explosive_bypass",
             "entry_spot",
@@ -21170,11 +21978,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "location_risk",
             "location_position_pct",
             "location_decision",
+            # These describe the ENTRY carried by this lifecycle.  Dropping them on
+            # the EXIT row made an admitted manual signal look rejected after it
+            # closed and stripped the evidence needed to audit that admission.
+            "accepted_by_gate",
+            "watch_only",
         ):
             if hasattr(entry_candidate, attr):
                 setattr(exit_candidate, attr, getattr(entry_candidate, attr))
         if hasattr(entry_candidate, "source_engines"):
             setattr(exit_candidate, "source_engines", list(getattr(entry_candidate, "source_engines", []) or []))
+        if hasattr(entry_candidate, "quality_verdict"):
+            setattr(
+                exit_candidate,
+                "quality_verdict",
+                copy.deepcopy(getattr(entry_candidate, "quality_verdict", {}) or {}),
+            )
         # Copied, not referenced: the entry row keeps accumulating samples on some exit
         # routes, and a shared list would let the recorded path grow after the exit.
         if hasattr(entry_candidate, "pnl_path"):
@@ -21303,6 +22122,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 geometry_schema=str(payload.get("geometry_schema") or "dual_price_geometry.v1"),
                 expected_move_forecast=dict(payload.get("expected_move_forecast") or {}),
                 entry_policy_verdict=dict(payload.get("entry_policy_verdict") or {}),
+                quality_verdict=dict(payload.get("quality_verdict") or {}),
                 signal_timestamp=signal_ts,
                 current_price=float(payload.get("current_price") or payload.get("price") or 0.0),
                 pnl=float(payload.get("pnl") or 0.0),
@@ -21313,6 +22133,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 impulse_confirmed=bool(payload.get("impulse_confirmed") or False),
                 is_explosive_bypass=bool(payload.get("is_explosive_bypass") or False),
                 power_move=bool(payload.get("power_move") or False),
+                volume_ratio=float(payload.get("volume_ratio") or 0.0),
+                range_atr_ratio=float(payload.get("range_atr_ratio") or 0.0),
+                close_location=float(payload.get("close_location") or 0.0),
                 fifteen_min_choppy_scalp_entry=bool(payload.get("fifteen_min_choppy_scalp_entry") or False),
                 source_engine=str(payload.get("source_engine") or ""),
                 source_engines=list(payload.get("source_engines") or []),
@@ -21425,6 +22248,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             setattr(candidate, "data_provenance", str(payload.get("data_provenance") or ""))
             setattr(candidate, "price_action_verdict", str(payload.get("price_action_verdict") or ""))
             setattr(candidate, "price_action_score", float(payload.get("price_action_score") or 0.0))
+            setattr(candidate, "trend_15m_agrees", bool(payload.get("trend_15m_agrees") or False))
             setattr(
                 candidate,
                 "signal_fire_mode",
@@ -21515,7 +22339,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if action == "EXIT":
             return True
         if bool(getattr(candidate, "accepted_by_gate", False)):
-            return True
+            return self._restored_entry_quality_is_current(candidate)
         signal_ts = getattr(candidate, "signal_timestamp", None)
         if not signal_ts:
             return False
@@ -21524,6 +22348,79 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not self._signal_in_restart_recovery_window(signal_ts, getattr(candidate, "timeframe", "5min")):
             return False
         return True
+
+    def _restored_entry_quality_is_current(self, candidate: TradeCandidate) -> bool:
+        """Fence accepted restart rows to the current canonical quality policy.
+
+        A persisted ``accepted_by_gate`` bit is not permanent execution authority. A
+        matching allowed verdict is reusable; an older configuration is replayed from
+        the exact evidence saved inside its structured checks. Legacy rows with no
+        auditable evidence fail closed. EXIT rows never call this helper.
+        """
+        settings = get_settings()
+        quality = getattr(candidate, "quality_verdict", {}) or {}
+        if not isinstance(quality, dict):
+            return False
+        current_hash = policy_configuration_hash(settings)
+        if (
+            bool(quality.get("allowed"))
+            and str(quality.get("policy_version") or "") == POLICY_VERSION
+            and str(quality.get("configuration_hash") or "") == current_hash
+        ):
+            return True
+
+        checks = quality.get("checks") or {}
+        if not isinstance(checks, dict) or not checks:
+            return False
+        regime = str(
+            checks.get("regime")
+            or getattr(candidate, "market_regime", "")
+            or "UNKNOWN"
+        )
+        risky = regime.upper() in {
+            "CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN",
+        }
+        try:
+            verdict = evaluate_quality(
+                QualityInputs(
+                    timeframe=str(
+                        checks.get("timeframe")
+                        or getattr(candidate, "timeframe", "")
+                        or ""
+                    ),
+                    inst_type=str(
+                        checks.get("inst_type")
+                        or getattr(candidate, "inst_type", "")
+                        or ""
+                    ),
+                    confidence=float(
+                        checks.get("confidence", getattr(candidate, "confidence", 0.0))
+                        or 0.0
+                    ),
+                    regime=regime,
+                    adx_value=float(checks.get("adx", 0.0) or 0.0),
+                    trend_15m_agrees=bool(checks.get("trend_15m_agrees", False)),
+                    impulse_confirmed=bool(checks.get("impulse_confirmed", False)),
+                    risky_regime=risky,
+                    is_choppy=risky,
+                    grade=str(
+                        checks.get("grade")
+                        or getattr(candidate, "grade", "")
+                        or ""
+                    ),
+                    source_count=max(1, int(checks.get("source_count", 1) or 1)),
+                    volume_confirmed=bool(checks.get("volume_confirmed", False)),
+                    volume_ratio=float(checks.get("volume_ratio", 0.0) or 0.0),
+                    power_move=bool(checks.get("power_move", False)),
+                    lane="RESTORE",
+                    direction=str(getattr(candidate, "direction", "") or ""),
+                ),
+                settings,
+            )
+        except (TypeError, ValueError):
+            return False
+        candidate.quality_verdict = verdict.to_dict()
+        return bool(verdict.allowed)
 
     def _signal_in_restart_recovery_window(
         self,
@@ -21833,8 +22730,40 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             session_day, rows = pending
             try:
                 await asyncio.to_thread(db.save_session_signals, session_day, rows)
+                self._last_session_persist_error = ""
             except Exception as exc:
-                logger.debug(f"Failed to persist session trade candidates to DB: {exc}")
+                self._last_session_persist_error = str(exc)
+                logger.error(f"Failed to persist session trade candidates to DB: {exc}")
+
+    async def flush_session_trade_candidates(self) -> None:
+        """Persist and drain the latest session ledger before graceful shutdown.
+
+        Routine scan updates remain coalesced so SQLite work never blocks the
+        scanner loop.  Shutdown is different: the newest in-memory ENTRY/EXIT
+        transition must be durable before that loop is allowed to unwind.
+        Retry once so a transient SQLite failure cannot silently discard the
+        final transition; a repeated failure is surfaced to the shutdown path.
+        """
+        if getattr(self, "mode", "") == "HISTORICAL":
+            return
+
+        last_error = ""
+        for _attempt in range(2):
+            self._last_session_persist_error = ""
+            self._persist_session_trade_candidates()
+            task = getattr(self, "_session_persist_task", None)
+            if task is not None:
+                await asyncio.shield(task)
+
+            last_error = str(getattr(self, "_last_session_persist_error", "") or "")
+            pending = getattr(self, "_session_persist_pending", None)
+            if not last_error and pending is None:
+                return
+
+        raise RuntimeError(
+            "session signal ledger did not flush before shutdown"
+            + (f": {last_error}" if last_error else "")
+        )
 
     def _cleanup_old_session_candidates(self) -> None:
         """Remove session candidate files older than 30 days to manage disk space."""
@@ -22006,6 +22935,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tracker = getattr(self, "rtracker", None)
         if tracker is None:
             return
+        run_mode = str(getattr(self, "mode", "") or "").strip().upper()
+        # RTracker is the production decision/outcome evidence ledger. Historical,
+        # replay and paper candidates have no executable live quote/fill semantics and
+        # must never be mixed into it. In particular, each HISTORICAL startup replayed
+        # the prior session and appended a fresh batch of REJECTED rows, inflating the
+        # denominator on every restart. Keep those rows in the historical dashboard
+        # books only. An absent mode is allowed for isolated compatibility callers and
+        # unit harnesses; every production Scanner sets one explicitly.
+        if run_mode and run_mode != "REAL":
+            return
         # Freeze identity on the first telemetry touch.  Without this, an early
         # CANDIDATE/REJECTED row can receive rtracker's fallback UUID while the
         # later session serializer assigns a different id, orphaning the EXIT.
@@ -22014,6 +22953,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             setattr(candidate, "lifecycle_id", lifecycle_id)
         except Exception as exc:
             logger.debug(f"Candidate lifecycle assignment skipped: {exc}")
+        # Stamp quality at the telemetry boundary as well as the final live gate.
+        # Upstream NO_ENTRY, stale, resource-pressure and session-bias rejects can be
+        # recorded before reaching that gate; without this fallback the rejected
+        # population has no policy route/hash and cannot support a false-negative audit.
+        try:
+            action = str(getattr(candidate, "action", "ENTRY") or "ENTRY").upper()
+            existing_quality = getattr(candidate, "quality_verdict", {}) or {}
+            if action != "EXIT" and not isinstance(existing_quality, dict):
+                existing_quality = {}
+            if action != "EXIT" and not existing_quality:
+                regime = self._get_trade_regime(candidate, default="UNKNOWN")
+                risky = str(regime or "UNKNOWN").upper() in {
+                    "CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN",
+                }
+                self._quality_verdict_for_candidate(
+                    candidate,
+                    regime=regime,
+                    risky_regime=risky,
+                    is_choppy=risky,
+                    lane="TELEMETRY",
+                )
+        except Exception as exc:
+            # Measurement must never suppress the decision row.
+            logger.debug(f"Decision quality verdict snapshot skipped: {exc}")
         # Record what the gate actually judged. Measured over the 66,027-row
         # archive: volume.volume_ratio populated on 19 rows (0.0%), regime.adx
         # 5.1%, aggregate.score_norm 1.0%, and entry_intel on 0 of 65,423 REJECTED
@@ -22058,6 +23021,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         record_candidate = candidate
         record_decision = str(decision or "")
         record_extra = dict(extra or {})
+        record_extra.setdefault("run_mode", run_mode or "UNSPECIFIED")
+        record_extra.setdefault("evidence_domain", "LIVE_DECISION")
         # Session candidates describe the *decision to request* an exit.  In REAL
         # mode the broker-managed Trade remains open until a confirmed fill is
         # reconciled, and only that final Trade contains authoritative price, charges
@@ -23570,9 +24535,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if getattr(candidate, "action", "ENTRY") != "EXIT":
                 continue
             entry = entries_by_lifecycle.get(self._candidate_lifecycle_key(candidate))
-            old_entry_ts = getattr(candidate, "entry_timestamp", None)
+            old_inherited = (
+                getattr(candidate, "entry_timestamp", None),
+                bool(getattr(candidate, "accepted_by_gate", False)),
+                bool(getattr(candidate, "watch_only", False)),
+                copy.deepcopy(getattr(candidate, "quality_verdict", {}) or {}),
+            )
             self._inherit_exit_entry_metadata(candidate, entry)
-            if getattr(candidate, "entry_timestamp", None) != old_entry_ts:
+            new_inherited = (
+                getattr(candidate, "entry_timestamp", None),
+                bool(getattr(candidate, "accepted_by_gate", False)),
+                bool(getattr(candidate, "watch_only", False)),
+                copy.deepcopy(getattr(candidate, "quality_verdict", {}) or {}),
+            )
+            if new_inherited != old_inherited:
                 repaired = True
         if repaired:
             self._persist_session_trade_candidates()
@@ -23669,52 +24645,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     cleaned.append(part)
         return set(cleaned)
 
-    def _market_wide_candidate_quality(self, candidate: TradeCandidate) -> Tuple[bool, str]:
-        """Minimum local quality required before cross-index relief is considered.
-
-        Ported back from restore_point_51, where the raw-entry floor read
-        `market_wide and market_wide_ok`. This build had lost the helper entirely,
-        leaving the flag bare, so a market-wide reversal carried ANY signal past the
-        quality floor — 2026-08-12 admitted grade C at 12% and 13%, both dead inside
-        90 seconds, while the same gate refused a B+ at 67% minutes later.
-
-        Peer names live under `core_indices`/`indices` in this build's context
-        (restore_point_51 called them `peer_indices`); all three are read so the
-        guard travels with either shape. A context that names no OTHER index is not
-        evidence of a market-wide move — but an absent/malformed context is missing
-        evidence, not disproof, so it leaves the grade and confidence bars to decide
-        rather than blocking outright.
-        """
-        settings = get_settings()
-        try:
-            confidence = float(getattr(candidate, "confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        grade = str(getattr(candidate, "grade", "") or "")
-        min_grade = str(getattr(settings, "market_wide_reversal_min_grade", "B+") or "B+").upper()
-        min_conf = float(getattr(settings, "market_wide_reversal_min_confidence", 0.60) or 0.60)
-
-        context = getattr(candidate, "market_wide_reversal_context", None)
-        if isinstance(context, dict):
-            peers: List[Any] = []
-            for key in ("peer_indices", "core_indices", "indices"):
-                value = context.get(key)
-                if isinstance(value, (list, tuple, set)):
-                    peers.extend(value)
-            candidate_base = str(getattr(candidate, "instrument", "") or "").split()[0].upper()
-            independent = {
-                str(peer or "").split()[0].upper()
-                for peer in peers
-                if str(peer or "").strip()
-            } - {candidate_base}
-            if not independent:
-                return False, "market-wide reversal lacks an independently confirmed peer"
-        if SignalProcessor._grade_rank(grade) < SignalProcessor._grade_rank(min_grade):
-            return False, f"market-wide reversal needs {min_grade}+ local grade"
-        if confidence < min_conf:
-            return False, f"market-wide reversal needs >= {min_conf:.0%} local confidence"
-        return True, "market-wide reversal quality confirmed"
-
     def _quad_prime_raw_entry_decision(
         self,
         candidate: TradeCandidate,
@@ -23723,6 +24653,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         confidence: float,
         risky_regime: bool,
         momentum_override: bool,
+        quality=None,
     ) -> Tuple[bool, bool, str]:
         """Classify Quad Prime raw entries before they bypass the normal live gate.
 
@@ -23732,188 +24663,45 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         weak solo flips back out and letting trend-quality raw entries run.
         """
         settings = get_settings()
-        sources = self._quad_union_sources(candidate)
-        source_count = len(sources)
-        grade = str(getattr(candidate, "grade", "") or "")
-        grade_rank = SignalProcessor._grade_rank(grade)
-        timeframe = str(getattr(candidate, "timeframe", "") or "")
-        try:
-            adx_val = float(getattr(candidate, "adx_value", 0.0) or 0.0)
-        except Exception:
-            adx_val = 0.0
-        try:
-            intel_abs = abs(float(getattr(candidate, "intelligence_score", 0.0) or 0.0))
-        except Exception:
-            intel_abs = 0.0
-
-        min_conf = float(getattr(settings, "quad_prime_raw_min_confidence", 0.50) or 0.50)
-        multi_min_conf = float(
-            getattr(settings, "quad_prime_raw_multi_source_min_confidence", 0.55) or 0.55
-        )
-        runner_min_conf = float(
-            getattr(settings, "quad_prime_raw_runner_min_confidence", 0.70) or 0.70
-        )
-        trend_15m_agrees = self._candidate_15m_trend_agrees(candidate)
-        volume_spike = bool(getattr(candidate, "volume_spike_entry", False))
-        power_move = bool(getattr(candidate, "power_move", False))
-        market_wide = bool(getattr(candidate, "market_wide_reversal_entry", False))
-        one_way_cascade = bool(getattr(candidate, "one_way_cascade_entry", False))
-        multi_confirmed = source_count >= 2 and grade_rank >= 2 and confidence >= multi_min_conf
-        high_grade = grade_rank >= SignalProcessor._grade_rank("A") and confidence >= runner_min_conf
-        b_grade_ok = SignalProcessor._b_grade_entry_allowed(
-            confidence,
-            regime,
-            trend_15m_agrees=trend_15m_agrees,
-            adx_value=adx_val,
-            settings=settings,
-        )
-        # The intelligence leg has to point the SAME WAY as the trade. It read
-        # `intel_abs >= 0.70` -- abs() of a SIGNED score -- so intelligence of -0.80,
-        # i.e. strongly bearish, satisfied the bar for a LONG. It sits in an OR beside
-        # adx and trend_15m_agrees, so it could carry the whole leg on its own, and
-        # exceptional_spike has no grade floor: a C-grade at the 50% minimum with a
-        # volume spike and intelligence arguing the opposite way was admitted.
-        #
-        # The sibling site at 20417 uses the same abs() safely because it is AND-ed
-        # with trend_agrees, which already establishes direction. This one had nothing.
-        # Signed comparison per the convention at 22511 and 22583.
-        spike_min_intel = float(
-            getattr(settings, "quad_prime_raw_spike_min_intel_score", 0.70) or 0.70
-        )
-        signed_intel = self._candidate_signed_intelligence(candidate)
-        intel_aligned = (
-            signed_intel >= spike_min_intel
-            if self._candidate_signal_type(candidate) == "BUY"
-            else signed_intel <= -spike_min_intel
-        )
-        exceptional_spike = bool(
-            (power_move or volume_spike or momentum_override)
-            and confidence >= min_conf
-            and (adx_val >= 25.0 or intel_aligned or trend_15m_agrees)
-        )
-        # A market-wide reversal / one-way cascade is CONTEXT: it answers "may we be
-        # positioned this way right now", which is why it was introduced — to relax
-        # the opposite-EXPOSURE block for a cycle. It says nothing about whether this
-        # particular signal is worth trading, so it may not also serve as the quality
-        # floor. Every other term here already carries a confidence bar (0.70 / 0.55 /
-        # 0.50 / 0.50); these two carried none, so any flip admitted anything.
-        #
-        # 2026-08-12 12:42: NIFTY (C, 12%) and SENSEX (C, 13%), solo-source, trend15
-        # disagreeing, both admitted on this flag alone and both dead inside 90s for
-        # -Rs.268 and -Rs.155. At 12:44 the same gate refused MIDCPNIFTY at B+/67%
-        # with ADX 30 and trend15 agreeing. exceptional_spike is the template: a
-        # special context that still has to clear quad_prime_raw_min_confidence.
-        market_wide_ok, _market_wide_note = self._market_wide_candidate_quality(candidate)
-        cascade_entry = bool(one_way_cascade and confidence >= min_conf)
-
-        # The standard grade floors, which this gate never actually applied.
-        #
-        # b_grade_entry_allowed() governs the B BAND only and returns False the moment
-        # confidence reaches the B+ threshold -- its docstring says so outright:
-        # "It governs the B band only; B+/A/A+ use the standard confidence floors."
-        # Those floors existed (B+ 0.55, A 0.70, A+ 0.85) but no term here ever read
-        # them, so the only paths left for a SOLO-source signal were high_grade
-        # (A-grade at >= 0.70) and multi_confirmed (>= 2 signal ENGINES). A solo B+ had
-        # no admission path at ANY confidence.
-        #
-        # The result was a gate that ran BACKWARDS across 55-70%. For one engine:
-        #     52% -> admitted (b_grade_ok)
-        #     60% -> rejected
-        #     68% -> rejected
-        #     90% -> rejected unless the grade was A/A+
-        # Raising confidence made the system LESS willing to trade.
-        #
-        # Two 2026-08-31 signals sat exactly in that dead zone and both were profitable
-        # in a parallel build running the same scanner:
-        #     BANKNIFTY 57300CE 11:45  B+ conf 67.9%  +Rs 2,323
-        #     MIDCPNIFTY 14875PE 13:56 B+ conf 67.2%  +Rs   532
-        # Restoring the documented floors is what admits them; note that keeping the
-        # B-band structural conditions (trending regime, ADX >= 25) would NOT have --
-        # MIDCPNIFTY carried ADX 21.6 in a VOLATILE regime.
-        #
-        # This is a LOOSENING of entry admission, so it is bounded deliberately: B+ or
-        # better only, each grade still held to its own standard floor, and both the
-        # minimum grade and the floors remain settings.
-        standard_floor_grade = str(
-            getattr(settings, "quad_prime_raw_standard_floor_min_grade", "B+") or "B+"
-        )
-        standard_floor_ok = bool(
-            grade_rank >= SignalProcessor._grade_rank(standard_floor_grade)
-            and confidence >= SignalProcessor._grade_min_confidence(grade)
-        )
-
-        # `structural_relief_ok` was here and has been REMOVED. It was added to repair a
-        # non-monotonicity that only ever existed in UNREACHABLE states.
-        #
-        # Grade is not an independent input: GRADE_BANDS in signal_quality_policy makes it
-        # a pure bucket of confidence (A+ >= 0.85, A >= 0.70, B+ >= 0.55, B >= 0.40) and
-        # signal_manager assigns it with confidence_to_grade(). So "A at 54%" and
-        # "C at 95%" -- the ladder reversals that motivated the term, and the guard-rail
-        # cases that appeared to justify it -- cannot occur. Swept over REACHABLE states
-        # only, admission is already monotonic in every regime without it, and it adds
-        # ZERO admissions the other terms do not already grant.
-        #
-        # It was NOT a safety hole, and an earlier version of this comment wrongly said
-        # it was. The term required confidence >= 0.50, and a C-grade is confidence < 0.40
-        # by construction, so it could never admit one. The "C at 95%" case that made it
-        # look dangerous is the same unreachable state that made it look necessary.
-        #
-        # Removal is therefore pure dead-code elimination, and provably behaviour-neutral:
-        # the gate was swept WITH and WITHOUT the term over 1,248,000 reachable states
-        # (regime x ADX x 15m agreement x source count x every context flag x confidence)
-        # and not one decision differed.
-        #
-        # The real defect -- a solo-source B+ having no admission path between 0.55 and
-        # 0.70 -- is fixed by `standard_floor_ok` above, and that fix stands on its own.
-        allowed = bool(
-            high_grade
-            or multi_confirmed
-            or b_grade_ok
-            or standard_floor_ok
-            or (market_wide and market_wide_ok)
-            or cascade_entry
-            or exceptional_spike
-        )
-        if not allowed:
-            context = (
-                f"solo_sources={source_count}, grade={grade}, conf={confidence:.0%}, "
-                f"adx={adx_val:.1f}, intel={signed_intel:+.2f}, "
-                f"trend15={trend_15m_agrees}, risky={risky_regime}"
+        # Raw provenance changes the runner/scalp handling, not the quality floor.  The
+        # old body below had its own grade disjuncts and could therefore admit a solo B+
+        # with ADX 10/no trend/no volume before the common evaluator ever ran.  Evaluate
+        # the same policy first even when this helper is called directly by a test or a
+        # legacy lane.
+        if quality is None:
+            quality = self._quality_verdict_for_candidate(
+                candidate,
+                regime=regime,
+                risky_regime=risky_regime,
+                is_choppy=bool(risky_regime and not momentum_override),
+                lane="RAW",
             )
-            return False, True, f"quad-prime raw quality floor failed ({context})"
-
-        strong_momentum_context = bool(
-            trend_15m_agrees
+        if not quality.allowed:
+            return False, True, f"{quality.reason} [{quality.reason_code}]"
+        source_count = max(1, len(self._quad_union_sources(candidate) or []))
+        timeframe = str(getattr(candidate, "timeframe", "") or "")
+        confidence = float(confidence or 0.0)
+        trend_15m_agrees = self._candidate_15m_trend_agrees(candidate)
+        adx_val = float(getattr(candidate, "adx_value", 0.0) or 0.0)
+        high_confidence = confidence >= float(
+            getattr(settings, "live_5min_quality_min_confidence", 0.70) or 0.70
+        )
+        runner = bool(
+            high_confidence
+            and trend_15m_agrees
             and (
                 is_trending_regime(regime)
                 or adx_val >= float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-                or confidence >= 0.85
+                or timeframe == "15min"
             )
+            and not bool(getattr(candidate, "market_wide_reversal_entry", False))
+            and not bool(getattr(candidate, "one_way_cascade_entry", False))
         )
-        trend_runner = bool(
-            self._setting_enabled(getattr(settings, "trend_entry_skip_scalp_lock", True), True)
-            and strong_momentum_context
-        )
-        runner_quality = bool(high_grade or (multi_confirmed and confidence >= multi_min_conf))
-        runner = bool(
-            runner_quality
-            and (trend_runner or timeframe == "15min" or not risky_regime)
-            and not (market_wide or one_way_cascade or (exceptional_spike and not high_grade))
-        )
-        if one_way_cascade:
-            return True, False, (
-                f"quad-prime one-way cascade runner entry ({source_count} source(s), "
-                f"{grade}, {confidence:.0%})"
-            )
-        if runner:
-            return True, False, (
-                f"quad-prime runner raw entry ({source_count} source(s), "
-                f"{grade}, {confidence:.0%}, trend15={trend_15m_agrees})"
-            )
-
-        return True, True, (
-            f"quad-prime scalp raw entry ({source_count} source(s), "
-            f"{grade}, {confidence:.0%}, trend15={trend_15m_agrees})"
+        route = str(quality.route or "quality")
+        return True, not runner, (
+            f"quad-prime raw {route} entry ({source_count} source(s), "
+            f"{getattr(candidate, 'grade', '')}, {confidence:.0%}, "
+            f"trend15={trend_15m_agrees}, runner={runner})"
         )
 
     def _quad_union_pnl_context(self, row, current_price: float) -> Tuple[float, float, float]:
@@ -24705,80 +25493,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return False
 
     def _passes_candidate_grade_preference(self, candidate: TradeCandidate) -> Tuple[bool, str]:
-        """Apply grade preference without undoing an explicit 5m/15m agreement."""
+        """Apply only an explicit operator request for an A/A+ book.
+
+        AUTO/B/B+ are all delegated to the canonical evidence verdict.  Repeating a
+        B+ floor here used to reject candidates before ADX/trend/volume/source evidence
+        could be evaluated, and the legacy overrides below could grant the opposite.
+        """
         settings = get_settings()
         grade_pref = self._normalize_signal_grade_preference(
             getattr(settings, "signal_grade_preference", "auto")
         )
+        if grade_pref not in {"A", "A+"}:
+            return True, "canonical quality policy owns B+ eligibility"
+
         grade_hierarchy = {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4}
         raw_grade = str(getattr(candidate, "grade", "") or "")
         base_grade = raw_grade.split()[0] if raw_grade else "C"
         sig_rank = grade_hierarchy.get(base_grade, 0)
-
-        if getattr(candidate, "quad_union_entry", False) or getattr(candidate, "raw_union_entry", False):
-            return True, "quad-union raw entry after repaint buffer"
-
-        if getattr(candidate, "power_move", False):
-            return True, "power-move override (data-confirmed)"
-        if getattr(candidate, "one_way_cascade_entry", False):
-            return True, "one-way cascade runner override"
-        if getattr(candidate, "missed_signal_reentry", False):
-            return True, "missed-signal re-entry support override"
-        if getattr(candidate, "late_session_reclaim_entry", False):
-            return True, "late-session synchronized directional-move override"
-        if getattr(candidate, "market_wide_reversal_entry", False):
-            return True, "market-wide reversal override"
-
-        if str(getattr(candidate, "timeframe", "") or "") == "5min" and self._candidate_15m_trend_agrees(candidate):
-            return True, "15min trend agreement override"
-
-        # The candidate's OWN timeframe, not the instrument-keyed 5-minute label.
-        # latest_regimes[instrument] IS the 5-minute regime (see its declaration), and
-        # 5m/15m labels disagree in 83% of same-timestamp pairs.
-        current_regime = self._get_trade_regime(candidate, default="UNKNOWN")
-
-        # Qualifying B-grade (trending + 15m alignment + ADX momentum) bypasses the
-        # grade-preference floor; the strict live gate still enforces the full rule.
-        #
-        # This is a PRIVILEGE — it admits a B-band signal that the floor would refuse —
-        # so it must rest on the candidate's own-timeframe regime. _get_trade_regime
-        # falls back to the 5-minute label so tightening always has something to work
-        # with, and _trade_regime_is_own_timeframe exists precisely to stop that
-        # borrowed label granting anything: "it must NOT be used to grant a privilege:
-        # a 15-minute trade could otherwise enter runner mode on a 5-minute regime."
-        # The rule was enforced for runner mode and not here.
-        if self._trade_regime_is_own_timeframe(candidate) and SignalProcessor._b_grade_entry_allowed(
-            float(getattr(candidate, "confidence", 0.0) or 0.0),
-            current_regime,
-            trend_15m_agrees=self._candidate_15m_trend_agrees(candidate),
-            adx_value=float(getattr(candidate, "adx_value", 0.0) or 0.0),
-            settings=settings,
-        ):
-            return True, "qualifying B-grade (trending+align+ADX)"
-        regime_adaptation = self._setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-        is_choppy = regime_adaptation and current_regime in {
-            "CHOPPY",
-            "SIDEWAYS",
-            "MEAN_REVERTING",
-            "RANGING",
-            "VOLATILE",
-            "UNKNOWN",
-        }
-        if grade_pref == "B":
-            min_rank = 1 if candidate.inst_type == "FUT" else 2
-        elif grade_pref == "B+":
-            min_rank = 2
-        elif grade_pref == "A":
-            min_rank = 3
-        elif grade_pref == "A+":
-            min_rank = 4
-        else:
-            min_rank = 3 if is_choppy else 2
-
-        if sig_rank >= min_rank or "Recovered" in raw_grade or "EOD" in raw_grade:
+        min_rank = grade_hierarchy[grade_pref]
+        if sig_rank >= min_rank:
             return True, ""
-        reason = f"Low Grade: {raw_grade}" if sig_rank < 1 else f"Below Grade Pref ({grade_pref})"
-        return False, reason
+        return False, f"Below explicit operator grade preference ({grade_pref})"
 
     @staticmethod
     def _gate_block_reason(message: str) -> str:
@@ -25015,6 +25750,152 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 trade.premium_target = target
         return allowed, reason
 
+    def _quality_verdict_for_candidate(
+        self,
+        candidate: TradeCandidate,
+        *,
+        regime: str = "",
+        risky_regime: Optional[bool] = None,
+        is_choppy: Optional[bool] = None,
+        lane: str = "LIVE",
+    ):
+        """Evaluate and persist the one quality verdict for a candidate.
+
+        This is intentionally usable by raw, normal, recovery and test facades.  It
+        carries the same full JSON-safe object forward to the dashboard/session,
+        forensics and rtracker instead of attaching an opaque transient dataclass.
+        """
+        settings = get_settings()
+        resolved_regime = str(regime or self._get_trade_regime(candidate, default="UNKNOWN") or "UNKNOWN")
+        try:
+            source_engines = list(getattr(candidate, "source_engines", []) or [])
+        except Exception:
+            source_engines = []
+        if bool(getattr(candidate, "quad_union_entry", False)) or bool(
+            getattr(candidate, "raw_union_entry", False)
+        ):
+            try:
+                source_count = len(self._quad_union_sources(candidate) or [])
+            except Exception:
+                source_count = len(source_engines)
+        else:
+            source_count = len(source_engines)
+        source_count = max(1, source_count)
+        try:
+            volume_ratio = float(getattr(candidate, "volume_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            volume_ratio = 0.0
+        impulse = bool(getattr(candidate, "impulse_confirmed", False)) or bool(
+            getattr(candidate, "is_explosive_bypass", False)
+        )
+        verdict = evaluate_quality(
+            QualityInputs(
+                timeframe=str(getattr(candidate, "timeframe", "") or ""),
+                inst_type=str(getattr(candidate, "inst_type", "") or ""),
+                confidence=float(getattr(candidate, "confidence", 0.0) or 0.0),
+                regime=resolved_regime,
+                adx_value=float(getattr(candidate, "adx_value", 0.0) or 0.0),
+                trend_15m_agrees=bool(self._candidate_15m_trend_agrees(candidate)),
+                impulse_confirmed=impulse,
+                risky_regime=bool(risky_regime) if risky_regime is not None else False,
+                is_choppy=bool(is_choppy) if is_choppy is not None else False,
+                grade=str(getattr(candidate, "grade", "") or ""),
+                source_count=source_count,
+                volume_confirmed=bool(getattr(candidate, "volume_spike_entry", False)),
+                volume_ratio=volume_ratio,
+                power_move=bool(getattr(candidate, "power_move", False)),
+                # Entry flags alone are not quality evidence: legacy/tests may carry
+                # them without having run a detector. Each production detector stamps
+                # enabled=True only after its breadth/range/timing rules pass.
+                market_shift_confirmed=any(
+                    bool(getattr(candidate, flag, False))
+                    and isinstance(getattr(candidate, context, None), dict)
+                    and getattr(candidate, context, {}).get("enabled") is True
+                    for flag, context in (
+                        ("market_wide_reversal_entry", "market_wide_reversal_context"),
+                        ("market_ltp_shock_entry", "market_ltp_shock_context"),
+                        ("one_way_cascade_entry", "one_way_cascade_context"),
+                        ("late_session_reclaim_entry", "late_session_reclaim_context"),
+                    )
+                ),
+                lane=str(lane or "LIVE"),
+                direction=str(getattr(candidate, "direction", "") or ""),
+            ),
+            settings,
+        )
+        payload = verdict.to_dict()
+        try:
+            candidate.quality_verdict = payload
+        except Exception:
+            pass
+        return verdict
+
+    def _candidate_quality_context(self, candidate: TradeCandidate) -> Tuple[str, bool, bool, bool]:
+        """Resolve the regime flags used by every current-candidate quality fence."""
+        settings = get_settings()
+        regime = self._get_trade_regime(candidate, default="UNKNOWN")
+        # _get_trade_regime intentionally borrows the 5-minute label for exit/risk
+        # management when a higher-timeframe label is missing. Admission is a privilege,
+        # so missing own-timeframe evidence must remain UNKNOWN instead of inheriting a
+        # potentially opposite 5-minute pocket.
+        if not self._trade_regime_is_own_timeframe(candidate):
+            regime = "UNKNOWN"
+        try:
+            adx_value = float(getattr(candidate, "adx_value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            adx_value = 0.0
+        momentum_threshold = float(
+            getattr(settings, "momentum_override_threshold", 25.0) or 25.0
+        )
+        momentum_override = bool(
+            getattr(candidate, "impulse_confirmed", False)
+            and getattr(candidate, "is_explosive_bypass", False)
+            and adx_value >= momentum_threshold
+        )
+        risky_regimes = {
+            "CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN",
+        }
+        regime_adaptation = self._setting_enabled(
+            getattr(settings, "ut_regime_adaptation", True), True
+        )
+        risky_regime = bool(regime_adaptation and str(regime).upper() in risky_regimes)
+        return str(regime), risky_regime, bool(risky_regime and not momentum_override), momentum_override
+
+    def _current_quality_verdict_for_candidate(
+        self,
+        candidate: TradeCandidate,
+        *,
+        lane: str,
+    ):
+        """Re-evaluate after an execution-relevant mutation or delayed submit."""
+        regime, risky_regime, is_choppy, _ = self._candidate_quality_context(candidate)
+        return self._quality_verdict_for_candidate(
+            candidate,
+            regime=regime,
+            risky_regime=risky_regime,
+            is_choppy=is_choppy,
+            lane=lane,
+        )
+
+    def _current_manual_admission_decision(
+        self,
+        candidate: TradeCandidate,
+        *,
+        lane: str,
+    ) -> Tuple[bool, str, str]:
+        """Recheck operator preference and canonical evidence at delayed submit time."""
+        grade_allowed, grade_reason = self._passes_candidate_grade_preference(candidate)
+        if not grade_allowed:
+            return False, grade_reason, "manual_grade_preference"
+        verdict = self._current_quality_verdict_for_candidate(candidate, lane=lane)
+        if not verdict.allowed:
+            return (
+                False,
+                f"{verdict.reason} [{verdict.reason_code}]",
+                "manual_quality_gate",
+            )
+        return True, "", ""
+
     def _passes_live_trade_ready_gate(self, candidate: TradeCandidate) -> bool:
         """Final live/manual gate before a signal is allowed into the session ledger."""
         if getattr(self, "mode", "") == "HISTORICAL":
@@ -25096,23 +25977,47 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # Own-timeframe regime; latest_regimes[instrument] is the 5-minute label. Here it
         # drives the choppy VETO, so a borrowed label is conservative in one direction but
         # can also fail to veto a chop-bound 15-minute entry when the 5-minute pocket trends.
-        regime = self._get_trade_regime(candidate, default="UNKNOWN")
+        # Unbound calls keep the gate usable by lightweight scanner facades used by
+        # replay/parity tests while still executing the production implementation.
+        regime, risky_regime, is_choppy, momentum_override = Scanner._candidate_quality_context(
+            self, candidate
+        )
         # Intraday Momentum Override
         adx_val = getattr(candidate, "adx_value", 0.0)
         momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-        momentum_override = bool(
-            getattr(candidate, "impulse_confirmed", False)
-            and getattr(candidate, "is_explosive_bypass", False)
-            and float(adx_val or 0.0) >= momentum_threshold
-        )
-        choppy_regimes = {"CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN"}
-        regime_adaptation = self._setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-        risky_regime = regime_adaptation and (regime in choppy_regimes)
-        is_choppy = risky_regime and not momentum_override
         if momentum_override and risky_regime:
             logger.info(f"🚀 [OVERRIDE] Live Choppy regime bypassed due to strong ADX ({adx_val:.1f} >= {momentum_threshold})")
         timeframe = str(getattr(candidate, "timeframe", "") or "")
         inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
+
+        # This guard refreshes the 15-minute intelligence/ADX reading on the candidate.
+        # Do that before quality is evaluated so the verdict can neither pass stale-high
+        # ADX nor reject stale-low ADX and then mutate its own evidence afterward.
+        choppy_scalp_guard = getattr(self, "_fifteen_min_choppy_scalp_context", None)
+        choppy_scalp_ok, choppy_scalp_reason = (
+            choppy_scalp_guard(candidate, regime)
+            if callable(choppy_scalp_guard)
+            else (True, "")
+        )
+
+        # Evaluate quality before any raw or named override can return.  Overrides may
+        # adjust risk treatment (runner/scalp), but cannot make an unevidenced B+/B/C
+        # tradable.  This also leaves a structured rejection on the candidate when a
+        # later non-quality safety gate declines it.
+        quality = Scanner._quality_verdict_for_candidate(
+            self,
+            candidate,
+            regime=regime,
+            risky_regime=risky_regime,
+            is_choppy=is_choppy,
+            lane="LIVE",
+        )
+        if not quality.allowed:
+            return self._gate_block(
+                candidate,
+                f"Live Gate: blocked {candidate.instrument} {timeframe} "
+                f"{candidate.direction}; {quality.reason} [{quality.reason_code}]",
+            )
 
         if not self._passes_timeframe_entry_policy(candidate):
             return False
@@ -25125,17 +26030,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; {late_block_reason}.",
             )
 
-        choppy_scalp_guard = getattr(self, "_fifteen_min_choppy_scalp_context", None)
-        choppy_scalp_ok, choppy_scalp_reason = (
-            choppy_scalp_guard(candidate, regime)
-            if callable(choppy_scalp_guard)
-            else (True, "")
-        )
         if not choppy_scalp_ok:
-            return self._gate_block(
-                candidate,
-                f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; {choppy_scalp_reason}.",
-            )
+            # The enhanced 15m-chop read controls scalp-lock treatment; it is not a
+            # second quality authority.  The canonical verdict above already judged the
+            # refreshed ADX plus trend/volume/source evidence.  Persist the advisory so
+            # the tracker can evaluate it prospectively without blocking the setup.
+            setattr(candidate, "fifteen_min_choppy_scalp_advisory", choppy_scalp_reason)
 
         if getattr(candidate, "quad_union_entry", False) or getattr(candidate, "raw_union_entry", False):
             source = str(getattr(candidate, "source_engine", "") or "quad_union")
@@ -25145,6 +26045,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 confidence=confidence,
                 risky_regime=risky_regime,
                 momentum_override=momentum_override,
+                quality=quality,
             )
             if not raw_allowed:
                 return self._gate_block(
@@ -25233,55 +26134,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._set_scalp_lock(candidate, True)
             return True
 
-        # ── QUALITY ─────────────────────────────────────────────────────────────
-        # One decision, one place, one reason code. Until 2026-09-01 the quality
-        # question -- "is this signal good enough?" -- was answered by six separate
-        # checks strung through this function, each reading some mixture of grade,
-        # confidence, regime, ADX and 15m agreement, and each able to veto alone.
-        # Whichever fired first became the recorded reason and hid the others, so the
-        # same (grade, confidence) cell was rejected by four different gates depending
-        # only on evaluation order.
-        #
-        # engine/quality_verdict.py now holds those rules. This release is PARITY: the
-        # evaluator was swept against the logic it replaced over 282,240 combinations of
-        # regime x timeframe x instrument x ADX x 15m agreement x impulse x risky x
-        # choppy x confidence, with zero differing decisions
-        # (tests/test_quality_verdict_parity_2026_09_01.py). Behaviour is unchanged; what
-        # changes is that the decision is now readable, and carries a route and a stable
-        # reason code instead of a formatted sentence.
-        #
-        # Evaluated ONCE, here, before the market-location gate -- because that gate
-        # mutates the candidate (appends reasons, arms scalp lock) and the original order
-        # ran the UNKNOWN-regime refusal ahead of it. Splitting the CHECK of the verdict
-        # around the location gate preserves that ordering exactly without evaluating
-        # quality twice.
-        quality = evaluate_quality(
-            QualityInputs(
-                timeframe=timeframe,
-                inst_type=inst_type,
-                confidence=confidence,
-                regime=regime,
-                adx_value=float(adx_val or 0.0),
-                trend_15m_agrees=self._candidate_15m_trend_agrees(candidate),
-                impulse_confirmed=bool(getattr(candidate, "impulse_confirmed", False)),
-                risky_regime=bool(risky_regime),
-                is_choppy=bool(is_choppy),
-                grade=str(getattr(candidate, "grade", "") or ""),
-            ),
-            settings,
-        )
-        try:
-            candidate.quality_verdict = quality
-        except Exception:
-            pass  # a lightweight facade candidate must not break the gate
-
-        if not quality.allowed and quality.route == "unknown_regime":
-            return self._gate_block(
-                candidate,
-                f"Live Gate: blocked {candidate.instrument} {timeframe} "
-                f"{candidate.direction}; {quality.reason}",
-            )
-
         location_ok, location_reason = self._market_location_entry_gate(candidate)
         # Fix 4: a late entry protects first profit even when well-located.
         self._set_scalp_lock(candidate, bool(getattr(candidate, "scalp_lock_mode", False)))
@@ -25299,13 +26151,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.info(
                 f"Live Gate: allowing confirmed impulse {candidate.instrument} {timeframe} "
                 f"{candidate.direction} in reduced-risk scalp-lock mode; {location_reason}"
-            )
-
-        if not quality.allowed:
-            return self._gate_block(
-                candidate,
-                f"Live Gate: blocked {candidate.instrument} {timeframe} "
-                f"{candidate.direction}; {quality.reason} [{quality.reason_code}]",
             )
 
         return True
@@ -26606,7 +27451,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     changed = True
                     continue
                 if bool(getattr(candidate, "accepted_by_gate", False)):
-                    continue
+                    if self._restored_entry_quality_is_current(candidate):
+                        continue
+                    setattr(candidate, "accepted_by_gate", False)
                 if self._passes_live_trade_ready_gate(candidate):
                     continue
                 entry_ts = getattr(candidate, "signal_timestamp", None)
@@ -27080,9 +27927,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # because the whole market turned, and were then vetoed here for lacking a
         # single instrument's intel alignment — 2026-08-12 14:36, three MIDCPNIFTY
         # 15min LONGs refused mid-reversal on a -0.00 reading. A market-wide entry
-        # has already cleared B+ grade, 60% confidence and an independently
-        # confirmed peer (_market_wide_candidate_quality), which is more evidence
-        # than this guard asks of anything else it lets through.
+        # has already cleared the canonical B+ evidence-first quality verdict; this
+        # guard may classify the route but cannot create a second admission path.
         if (
             bool(getattr(candidate, "market_wide_reversal_entry", False))
             or bool(getattr(candidate, "market_ltp_shock_entry", False))
@@ -30760,32 +31606,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     except Exception:
                         pass
 
-                # â”€â”€ Grade Preference Filter â”€â”€
-                settings = get_settings()
-                grade_pref = self._normalize_signal_grade_preference(getattr(settings, "signal_grade_preference", "auto"))
-
-                grade_hierarchy = {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4}
-                base_grade = sig.grade.split()[0] if isinstance(sig.grade, str) else "C"
-                sig_rank = grade_hierarchy.get(base_grade, 0)
-
-                # Dynamic Regime-Aware minimum grade preference
-                current_regime = self.latest_regimes.get(sig.instrument, "UNKNOWN")
-                regime_adaptation = self._setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-                is_choppy = regime_adaptation and current_regime in {"CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN"}
-
-                if grade_pref == "B":
-                    # Futures allow B (Rank 1), Options require B+ (Rank 2)
-                    min_rank = 1 if sig.inst_type == "FUT" else 2
-                elif grade_pref == "B+":
-                    min_rank = 2
-                elif grade_pref == "A":
-                    min_rank = 3
-                elif grade_pref == "A+":
-                    min_rank = 4
-                else: # auto
-                    # Dynamic upgrade to A/A+ under chops, baseline is B+
-                    min_rank = 3 if is_choppy else 2
-
+                # Only an explicit A/A+ operator preference is checked here. AUTO/B/B+
+                # flow to the canonical evidence verdict below.
                 grade_allowed, grade_preference_reason = self._passes_candidate_grade_preference(sig)
                 if not grade_allowed:
                     reason_str = ", ".join(sig.reasons) if sig.reasons else "Low confidence"
@@ -30895,6 +31717,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     continue
 
                 # Per-Instrument Safety (Cross-TF Complementary Rule)
+                quality_inst_type_before_concurrency = str(
+                    getattr(sig, "inst_type", "") or ""
+                ).upper()
                 if not self._prepare_candidate_for_concurrency(sig):
                     # A duplicate on a chart that is already working is not noise to throw
                     # away — it is the cascade confirming itself. Before dropping it, offer
@@ -30945,6 +31770,47 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         source="concurrency_gate",
                     )
                     continue
+
+                quality_inst_type_after_concurrency = str(
+                    getattr(sig, "inst_type", "") or ""
+                ).upper()
+                if quality_inst_type_after_concurrency != quality_inst_type_before_concurrency:
+                    # Concurrency may turn a FUT signal into its OPT complement (or the
+                    # reverse).  The first verdict describes the pre-route product, so it
+                    # cannot be carried into persistence or broker submission unchanged.
+                    routed_quality = self._current_quality_verdict_for_candidate(
+                        sig,
+                        lane="LIVE_POST_ROUTE",
+                    )
+                    if not routed_quality.allowed:
+                        rejection_reason = (
+                            f"Post-route quality blocked {quality_inst_type_before_concurrency}→"
+                            f"{quality_inst_type_after_concurrency}: {routed_quality.reason} "
+                            f"[{routed_quality.reason_code}]"
+                        )
+                        setattr(sig, "live_gate_rejection_reason", rejection_reason)
+                        setattr(sig, "live_gate_rejection_source", "post_route_quality_gate")
+                        self._rtracker_record_candidate(
+                            sig,
+                            decision="REJECTED",
+                            reason=rejection_reason,
+                            source="post_route_quality_gate",
+                        )
+                        self._remember_missed_reentry_seed(
+                            sig,
+                            reason=rejection_reason,
+                            source="post_route_quality_gate",
+                        )
+                        continue
+                    if not self._candidate_quote_ready_for_lifecycle(sig):
+                        sig.status = "QUOTE UNAVAILABLE"
+                        self._rtracker_record_candidate(
+                            sig,
+                            decision="REJECTED",
+                            reason="Quote unavailable after concurrency product conversion",
+                            source="post_route_quote_gate",
+                        )
+                        continue
 
                 # Per-bucket concurrent capacity: normal 4x2, rare burst 4x3 only
                 # with all-index 95%+/volume/ADX confirmation.
@@ -31053,6 +31919,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             if not pref_ok:
                                                 candidate_sig.status = f"BLOCKED - {self._strict_instrument_pref()} PREF ({pref_why})"
                                                 return
+                                            quality_ok, quality_why, quality_source = self._current_manual_admission_decision(
+                                                candidate_sig,
+                                                lane="MANUAL_TOAST_SUBMIT",
+                                            )
+                                            if not quality_ok:
+                                                candidate_sig.status = "BLOCKED - CURRENT QUALITY POLICY"
+                                                setattr(candidate_sig, "accepted_by_gate", False)
+                                                self._rtracker_record_candidate(
+                                                    candidate_sig,
+                                                    decision="REJECTED",
+                                                    reason=quality_why,
+                                                    source=quality_source,
+                                                )
+                                                return
                                         execution_touch_quote = self._candidate_execution_touch_quote(candidate_sig)
                                         exec_price, exec_stop, exec_target = self._execution_levels(
                                             candidate_sig,
@@ -31083,6 +31963,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                                 execution_loop,
                                             )
 
+                                        entry_refusal_outcome: Dict[str, Any] = {}
                                         trade = self.trades.open_trade(
                                             instrument=candidate_sig.instrument, timeframe=candidate_sig.timeframe, direction=candidate_sig.direction,
                                             price=exec_price, trailing_stop=exec_stop,
@@ -31117,6 +31998,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             geometry_verified=bool(getattr(candidate_sig, "geometry_verified", False)),
                                             expected_move_forecast=dict(getattr(candidate_sig, "expected_move_forecast", {}) or {}),
                                             entry_policy_verdict=dict(getattr(candidate_sig, "entry_policy_verdict", {}) or {}),
+                                            quality_verdict=dict(getattr(candidate_sig, "quality_verdict", {}) or {}),
                                             is_explosive_bypass=bool(getattr(candidate_sig, "is_explosive_bypass", False)),
                                             is_reversion_scalp=bool(getattr(candidate_sig, "is_reversion_scalp", False)),
                                             is_recovery=False,
@@ -31138,10 +32020,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                             execution_touch_quote=execution_touch_quote,
                                             on_execution_result=on_execution_result,
                                             lifecycle_id=self._candidate_lifecycle_key(candidate_sig),
+                                            entry_refusal_outcome=entry_refusal_outcome,
                                         )
                                         if trade:
                                             trade.is_live = (self.mode == "REAL")
                                             candidate_sig.status = "ORDER PENDING" if not is_ghost else "GHOST WATCH"
+                                            asyncio.create_task(self._publish_trade_payload_now())
+                                        else:
+                                            self._apply_trade_manager_entry_refusal(
+                                                candidate_sig, entry_refusal_outcome
+                                            )
                                             asyncio.create_task(self._publish_trade_payload_now())
                                             
                                     return do_execute
@@ -31249,6 +32137,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         )
                         continue
 
+                    entry_refusal_outcome: Dict[str, Any] = {}
                     trade = self.trades.open_trade(
                         instrument=sig.instrument, timeframe=sig.timeframe, direction=sig.direction,
                         price=exec_price, trailing_stop=exec_stop,
@@ -31283,6 +32172,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         geometry_verified=bool(getattr(sig, "geometry_verified", False)),
                         expected_move_forecast=dict(getattr(sig, "expected_move_forecast", {}) or {}),
                         entry_policy_verdict=dict(getattr(sig, "entry_policy_verdict", {}) or {}),
+                        quality_verdict=dict(getattr(sig, "quality_verdict", {}) or {}),
                         is_reversion_scalp=bool(getattr(sig, "is_reversion_scalp", False)),
                         # A fresh entry is NEVER a recovery. This passed is_warmup, which
                         # only means the scanner is still loading data — unrelated. When
@@ -31312,6 +32202,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         on_execution_result=on_execution_result,
                         lifecycle_id=self._candidate_lifecycle_key(sig),
                         entry_submission_guard=self._queued_auto_entry_submission_guard,
+                        entry_refusal_outcome=entry_refusal_outcome,
                     )
 
                     if trade:
@@ -31322,22 +32213,17 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         await self._publish_trade_payload_now()
                         open_count += 1
                         continue
-
-                    if trade:
-                        self._close_superseded_session_entries([sig])
-                        self._latest_trade_candidates[sig.instrument] = [sig]
-                        setattr(sig, "accepted_by_gate", True)
-                        self._mark_candidate_accepted_time(sig, getattr(trade, "entry_time", None))
-                        accepted_candidates.append(sig)
-                        self._record_accepted_entry(sig, trade)
-                        self._remember_trade_candidates([sig])
-                        await self._publish_trade_payload_now()
-                        open_count += 1
-
-                        self._notify(
-                            f"{'🟢' if sig.direction == 'LONG' else '🔴'} {sig.direction} {sig.instrument} "
-                            f"@ {sig.price:.2f} | Conf: {sig.confidence:.0%} | TF: {sig.timeframe}",
-                            "buy" if sig.direction == "LONG" else "sell"
+                    else:
+                        ts = getattr(sig, "signal_timestamp", None)
+                        ts_key = ts.isoformat(timespec="seconds") if ts else ""
+                        rejection_reason = self._apply_trade_manager_entry_refusal(
+                            sig, entry_refusal_outcome
+                        )
+                        self.log_signal_decision_once(
+                            f"{sig.instrument}|{sig.timeframe}|{sig.direction}|{ts_key}|trade-manager",
+                            f"Signal rejected: {sig.instrument} {sig.direction} "
+                            f"{sig.timeframe} - {rejection_reason}",
+                            "trade",
                         )
                 else:
                     ts = getattr(sig, "signal_timestamp", None)
@@ -32251,16 +33137,49 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ).upper() in {"EXIT_PENDING", "PARTIAL_EXIT", "RECOVERY_REQUIRED"}:
                 continue
 
-            price = self.candles.get_latest_price(trade.instrument)
-            if price is None or price <= 0: continue
+            observed_contract_ticks = self._trade_contract_tick_path(trade)
+            contract_stop_before_cycle = float(
+                getattr(trade, "current_stop", 0.0) or 0.0
+            )
             real_premium = None
             real_fut_price = None
             quote_verified = True
             is_fut_trade = getattr(trade, "inst_type", "FUT") == "FUT"
-            if getattr(trade, "inst_type", "FUT") == "OPT":
+            # A futures contract quote is an executable mark in its own right.  Do not
+            # discard it merely because the underlying/index spot feed is temporarily
+            # absent. Conversely, no fresh contract quote and no spot means no safe
+            # price for this pass.
+            price = self.candles.get_latest_price(trade.instrument)
+            if is_fut_trade:
+                real_fut_price = self._get_live_fut_ltp_cached(
+                    trade, allow_blocking=allow_blocking
+                )
+                if observed_contract_ticks:
+                    # Exact socket path is newer than a slower fallback cache.
+                    real_fut_price = float(observed_contract_ticks[-1][0])
+                if (price is None or price <= 0) and not (real_fut_price and real_fut_price > 0):
+                    continue
+                if price is None or price <= 0:
+                    price = float(real_fut_price)
+            elif getattr(trade, "inst_type", "FUT") == "OPT":
                 real_premium = self._get_live_premium_cached(trade, allow_blocking=allow_blocking)
-            elif is_fut_trade:
-                real_fut_price = self._get_live_fut_ltp_cached(trade)
+                if observed_contract_ticks:
+                    # Preserve exact newest contract mark even when a 2s REST/chain
+                    # fallback exists. The full path is passed below for hidden touches.
+                    real_premium = float(observed_contract_ticks[-1][0])
+                if price is None or price <= 0:
+                    if not (real_premium and real_premium > 0):
+                        continue
+                    # Contract premium remains executable while index spot is briefly
+                    # unavailable. Hold underlying geometry at entry; premium-led core
+                    # stop/target management continues from exact ticks.
+                    price = float(
+                        getattr(trade, "underlying_entry", 0.0)
+                        or getattr(trade, "entry_spot", 0.0)
+                        or 0.0
+                    )
+            elif price is None or price <= 0:
+                continue
             
             # Update current_price
             trade_price = float(price)
@@ -32294,6 +33213,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     real_premium = float(mark)
 
             opt_val = trade.current_price if getattr(trade, "inst_type", "FUT") == "OPT" else trade_price
+            observed_prices = [float(item[0]) for item in observed_contract_ticks]
+            if observed_prices:
+                observed_favorable_price = (
+                    max(observed_prices)
+                    if getattr(trade, "inst_type", "FUT") == "OPT"
+                    or str(getattr(trade, "direction", "LONG") or "LONG").upper() == "LONG"
+                    else min(observed_prices)
+                )
+            else:
+                observed_favorable_price = float(opt_val or 0.0)
 
             # Define conversion helpers for this trade
             def prem_to_spot(prem_val):
@@ -32338,7 +33267,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     current_time=latest_time,
                     real_premium=float(opt_val or 0.0),
                     quote_verified=False,
+                    allow_broker_protection=allow_blocking,
+                    observed_contract_ticks=observed_contract_ticks,
                 )
+                self._commit_trade_contract_tick_path(trade)
                 continue
 
             # Live unrealized for distress reversion + intel exit voting.
@@ -32674,14 +33606,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     if trade.inst_type == "OPT":
                         target_distance = abs(trade.target - trade.entry_price)
                         threshold_t1 = target_distance * runner_unlock_ratio
-                        current_move = abs(trade.current_price - trade.entry_price)
-                        is_correct_direction = trade.current_price > trade.entry_price
+                        current_move = max(
+                            0.0,
+                            float(trade.current_price or 0.0) - float(trade.entry_price or 0.0),
+                            float(observed_favorable_price or 0.0) - float(trade.entry_price or 0.0),
+                        )
+                        is_correct_direction = current_move > 0.0
                     else:
                         target_distance = abs(trade.target - ref_entry)
                         threshold_t1 = target_distance * runner_unlock_ratio
                         target_current = price if trade.inst_type == "OPT" else trade_price
-                        current_move = abs(target_current - ref_entry)
-                        is_correct_direction = (trade.direction == "LONG" and target_current > ref_entry) or                                              (trade.direction == "SHORT" and target_current < ref_entry)
+                        current_move = max(
+                            0.0,
+                            (max(float(target_current), observed_favorable_price) - ref_entry)
+                            if trade.direction == "LONG"
+                            else (ref_entry - min(float(target_current), observed_favorable_price)),
+                        )
+                        is_correct_direction = current_move > 0.0
 
                     reached_t1 = is_correct_direction and current_move >= threshold_t1
                     # Big-move ride: engage the runner EARLY (before target) for a proven
@@ -32720,9 +33661,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # ── Runner Mode Trailing (90% Gain Lock) ──
                 if getattr(trade, 'runner_mode', False):
                     if trade.inst_type == "OPT":
-                        current_gain_pts = max(0, (trade.current_price - trade.entry_price))
+                        current_gain_pts = max(
+                            0.0,
+                            trade.current_price - trade.entry_price,
+                            observed_favorable_price - trade.entry_price,
+                        )
                     else:
-                        current_gain_pts = max(0, abs(trade_price - trade.entry_price))
+                        current_gain_pts = max(
+                            0.0,
+                            (max(trade_price, observed_favorable_price) - trade.entry_price)
+                            if trade.direction == "LONG"
+                            else (trade.entry_price - min(trade_price, observed_favorable_price)),
+                        )
 
                     if cascade_runner:
                         locked_gain_pts = current_gain_pts * runner_lock_pct
@@ -32804,9 +33754,27 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             else:
                 candle_extreme_pnl = 0.0
 
+            tick_extreme_pnl = 0.0
+            if observed_prices and qty > 0:
+                if trade.inst_type == "OPT":
+                    tick_extreme_pnl = (observed_favorable_price - entry_val) * qty
+                elif trade.direction == "LONG":
+                    tick_extreme_pnl = (
+                        observed_favorable_price - entry_val
+                    ) * qty * inst_mult
+                else:
+                    tick_extreme_pnl = (
+                        entry_val - observed_favorable_price
+                    ) * qty * inst_mult
+
             # Update peak PnL from sampled LTP plus intrabar candle extremes.
             inst_mult_peak = getattr(trade, 'instrument_multiplier', 1.0) if getattr(trade, 'inst_type', 'FUT') != 'OPT' else 1.0
-            trade.peak_pnl = max(getattr(trade, 'peak_pnl', 0.0), current_pnl_rs, candle_extreme_pnl)
+            trade.peak_pnl = max(
+                getattr(trade, 'peak_pnl', 0.0),
+                current_pnl_rs,
+                candle_extreme_pnl,
+                tick_extreme_pnl,
+            )
             peak_gain_pct = (trade.peak_pnl / (entry_val * qty * inst_mult_peak)) * 100.0 if entry_val > 0 and qty > 0 and inst_mult_peak > 0 else 0
 
             lock_dir = "LONG" if trade.inst_type == "OPT" else trade.direction
@@ -33296,20 +34264,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             if not self.auto_mode:
                 manual_trigger = ""
+                manual_exit_price = float(opt_val)
+                manual_exit_time = latest_time
+                contract_touch = self._first_contract_exit_touch(
+                    trade,
+                    observed_contract_ticks,
+                    stop=contract_stop_before_cycle,
+                    target=float(getattr(trade, "target", 0.0) or 0.0),
+                )
+                if contract_touch is not None:
+                    manual_trigger, manual_exit_price, manual_exit_time = contract_touch
                 if trade.inst_type == "OPT":
-                    if trade.current_price <= trade.current_stop:
+                    manual_option_stop = float(spot_to_prem(new_stop) or 0.0)
+                    if not manual_trigger and trade.current_price <= manual_option_stop:
                         manual_trigger = "TRAILING_STOP"
-                    elif trade.target > 0 and trade.current_price >= trade.target:
+                    elif not manual_trigger and trade.target > 0 and trade.current_price >= trade.target:
                         manual_trigger = "TARGET_HIT"
                 elif trade.direction == "LONG":
-                    if trade_price <= new_stop:
+                    if not manual_trigger and trade_price <= new_stop:
                         manual_trigger = "TRAILING_STOP"
-                    elif trade.target > 0 and trade_price >= trade.target:
+                    elif not manual_trigger and trade.target > 0 and trade_price >= trade.target:
                         manual_trigger = "TARGET_HIT"
                 else:
-                    if trade_price >= new_stop:
+                    if not manual_trigger and trade_price >= new_stop:
                         manual_trigger = "TRAILING_STOP"
-                    elif trade.target > 0 and trade_price <= trade.target:
+                    elif not manual_trigger and trade.target > 0 and trade_price <= trade.target:
                         manual_trigger = "TARGET_HIT"
                 if manual_trigger:
                     recovery_action = handle_live_recovery_watch(manual_trigger)
@@ -33320,10 +34299,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         setattr(trade, "_manual_exit_alert_marker", marker)
                         self._close_and_record(
                             tid,
-                            opt_val,
+                            manual_exit_price,
                             manual_trigger,
-                            exit_time=latest_time,
+                            exit_time=manual_exit_time,
                         )
+                self._commit_trade_contract_tick_path(trade)
                 continue
 
             auto_stop_trigger = False
@@ -33350,7 +34330,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 real_premium=real_premium,
                 real_fut_price=real_fut_price,
                 quote_verified=quote_verified,
+                allow_broker_protection=allow_blocking,
+                observed_contract_ticks=observed_contract_ticks,
             )
+            self._commit_trade_contract_tick_path(trade)
             if tid not in self.trades.open_trades:
                 # Trade was closed by update_trade (SL or Target)
                 # Find it in closed_trades to record metrics
@@ -33388,6 +34371,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     def stop(self):
         self._save_warm_memory(force=True)
         self._persist_entry_shadow_book()
+        # Schedule a final snapshot.  dashboard.shutdown_scanner awaits the
+        # corresponding drain on this scanner-owned event loop.
+        self._persist_session_trade_candidates()
         try:
             self.generate_daily_signal_report()
         except Exception as exc:
