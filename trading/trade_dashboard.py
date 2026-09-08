@@ -106,6 +106,10 @@ def _serialize_trade_row(manager: Any, trade: Any) -> Dict[str, Any]:
 
     return {
         "id": trade.id,
+        # The signal tracker and TradeManager describe the same executed idea in
+        # different stores.  Preserve their canonical join key so the payload builder
+        # can prefer the broker-backed row instead of rendering both as two trades.
+        "lifecycle_id": str(getattr(trade, "lifecycle_id", "") or trade.id or ""),
         "status": trade.status,
         "execution_status": trade.execution_status,
         "execution_error": trade.execution_error,

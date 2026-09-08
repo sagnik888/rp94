@@ -192,8 +192,48 @@ class KiteDataSource:
                 self._historical_rest_failure_reason = str(reason or "historical REST failed")[:300]
                 self._historical_rest_failure_count += 1
 
-    def _call(self, context: str, fn, default=None):
-        historical_sequence = self._begin_historical_rest_call(context)
+    def _call(
+        self,
+        context: str,
+        fn,
+        default=None,
+        *,
+        call_outcome: Optional[Dict[str, Any]] = None,
+        record_historical_health: bool = True,
+    ):
+        """Invoke Kite and optionally return evidence for this exact call.
+
+        ``historical_rest_status`` is intentionally provider-wide because it drives the
+        live source-health surface.  Archive repair runs beside the scanner, however, so
+        reading that shared status after a request can observe a different thread's
+        result.  ``call_outcome`` is populated on the request's own control path, while
+        ``record_historical_health=False`` keeps an expired archive-only instrument from
+        making the live candle source look unhealthy.
+        """
+        historical_sequence = (
+            self._begin_historical_rest_call(context)
+            if record_historical_health
+            else 0
+        )
+
+        def _finish(value, *, ok: bool, reason: str = ""):
+            observed_at = _time.time()
+            self._record_historical_rest_result(
+                historical_sequence,
+                ok=ok,
+                reason=reason,
+                observed_at=observed_at,
+            )
+            if call_outcome is not None:
+                call_outcome.clear()
+                call_outcome.update({
+                    "ok": bool(ok),
+                    "reason": str(reason or ""),
+                    "context": str(context or ""),
+                    "observed_at": observed_at,
+                })
+            return value
+
         if self._auth is not None:
             status_fn = getattr(self._auth, "status", None)
             if callable(status_fn):
@@ -201,23 +241,21 @@ class KiteDataSource:
                     status = status_fn() or {}
                     if status.get("auth_required") and getattr(self._auth, "kite", None) is None:
                         self._kite = None
-                        self._record_historical_rest_result(
-                            historical_sequence,
+                        return _finish(
+                            default,
                             ok=False,
                             reason="authentication required",
                         )
-                        return default
                 except Exception:
                     pass
         api = self.kite
         if api is None:
             logger.debug(f"Kite {context} skipped: no authenticated session")
-            self._record_historical_rest_result(
-                historical_sequence,
+            return _finish(
+                default,
                 ok=False,
                 reason="no authenticated session",
             )
-            return default
         now_ts = _time.time()
         if self._throttled(context, now_ts):
             # Returning `default` is what the exception path already did on a throttle;
@@ -225,12 +263,11 @@ class KiteDataSource:
             # allowed to drain instead of being kept open by the retry.
             logger.debug(f"Kite {context} skipped: throttled for another "
                          f"{self._throttle_until[context] - now_ts:.1f}s")
-            self._record_historical_rest_result(
-                historical_sequence,
+            return _finish(
+                default,
                 ok=False,
                 reason="historical REST throttled",
             )
-            return default
         try:
             result = fn(api)
         except Exception as exc:
@@ -245,11 +282,7 @@ class KiteDataSource:
                     self._auth.invalidate(reason)
                 if self._kite is api:
                     self._kite = None
-            self._record_historical_rest_result(
-                historical_sequence,
-                ok=False,
-                reason=f"{type(exc).__name__}: {exc}",
-            )
+            failure = f"{type(exc).__name__}: {exc}"
             if self._is_throttle(exc):
                 cooldown = self._mark_throttled(context, now_ts)
                 logger.warning(
@@ -258,10 +291,9 @@ class KiteDataSource:
                 )
             else:
                 logger.warning(f"Kite {context} failed: {type(exc).__name__}: {exc}")
-            return default
+            return _finish(default, ok=False, reason=failure)
         self._clear_throttle(context)
-        self._record_historical_rest_result(historical_sequence, ok=True)
-        return result
+        return _finish(result, ok=True)
 
     def historical_rest_status(
         self,
@@ -810,6 +842,8 @@ class KiteDataSource:
     def get_historical(
         self, instrument_token: int, interval: str, days_back: int = 15,
         oi: bool = False, to_date: Optional[datetime] = None,
+        *, call_outcome: Optional[Dict[str, Any]] = None,
+        record_health: bool = True,
     ) -> pd.DataFrame:
         """OHLCV candles. Empty frame on failure — never partial or fabricated."""
         token = int(instrument_token or 0)
@@ -825,6 +859,8 @@ class KiteDataSource:
             "historical_data",
             lambda api: api.historical_data(token, start, end, kite_interval, oi=oi),
             default=None,
+            call_outcome=call_outcome,
+            record_historical_health=record_health,
         )
         if not rows:
             return pd.DataFrame()

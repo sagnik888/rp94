@@ -1,13 +1,7 @@
-"""
-Behavior-parity guard for the grading/confidence consolidation.
+"""Golden grid for canonical quality and option-product routing helpers.
 
-Grade is bucket(confidence); the gates were refactored to drop the redundant
-`rank AND/OR conf` double-checks in favour of confidence-only thresholds. With
-`live_filter_leniency_pct == 0.0` (production setting) this MUST be exactly
-behavior-neutral. This test pins a golden hash over a 61,440-cell grid of
-consistent (grade == bucket(confidence)) inputs.
-
-If you intentionally change a confidence floor, regenerate GOLDEN_SHA256.
+Grade is bucket(confidence), B/C never enter, lanes share one quality verdict, and
+ADX/intelligence cannot be counted again as a synthetic impulse confirmation.
 """
 
 import hashlib
@@ -23,17 +17,9 @@ from engine.signal_quality_policy import (
     passes_quality_gate,
 )
 
-# Updated after the deliberate B-grade rule + 15m-UNKNOWN(0.85->0.70) + 5m-choppy-OPT
-# (0.65->0.70) changes. Regenerated 2026-06-23 for the 5min trend-CONTINUATION path
-# (live_5min_trend_continuation_enabled): admits 240 strong-trend 5min cells
-# (trending regime + ADX>=28 + 15m-aligned) previously rejected, so the system
-# stops missing big directional moves. Diff audited: all 240 are False->True,
-# all 5min, all trending regimes, all ADX>=28, all 15m-agree.
-# Unchanged. The five intelligence gates were briefly rebased to 0.107-0.134 on
-# 2026-08-08 (Option A) and then restored to these values when the aggregator moved to a
-# weight-normalised score (Option B), on which the original 0.60-0.75 read as written.
-# The hash returning to its pre-Option-A value is the proof the gates are byte-identical.
-GOLDEN_SHA256 = "a1948c1b9530535be6554e64e0b9057c5549386a797a35e5dfa89fbb2b4eb351"
+# Regenerated 2026-09-02 after retiring B-band option routing and removing implicit
+# ADX+trend+intel -> impulse double-counting from the canonical compatibility wrapper.
+GOLDEN_SHA256 = "f60dddb100e5c8f33684baebddef9a0cfef103e6aa1471f17ee6aa6a2d949fb9"
 
 _CONFS = [0.30, 0.42, 0.50, 0.54, 0.58, 0.62, 0.68, 0.72, 0.80, 0.88]
 _REGIMES = ["TRENDING_UP", "TRENDING_DOWN", "BREAKOUT_UP", "RANGING",
@@ -71,6 +57,16 @@ def test_gate_behavior_parity_golden():
         rows.append((conf, regime, tf, inst, mode, adx, intel, score, tr, im, pol, q, o))
 
     assert len(rows) == 61440
+    assert not [row for row in rows if row[0] < 0.55 and (row[-2] or row[-1])], (
+        "a B/C row crossed either quality admission or option routing"
+    )
+    lane_groups = {}
+    for row in rows:
+        lane_key = row[:4] + row[5:11]
+        lane_groups.setdefault(lane_key, set()).add(row[-2])
+    assert all(len(decisions) == 1 for decisions in lane_groups.values()), (
+        "quality verdict differs between REAL and HISTORICAL lanes"
+    )
     digest = hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
     assert digest == GOLDEN_SHA256, (
         "Gate behavior changed vs golden snapshot. If intentional, regenerate "

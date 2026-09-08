@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Mapping, Optional
 
-from loguru import logger
-
 from config.settings import get_settings
 from engine.intelligence_score import normalize_intelligence_score
 from engine.market_regime import is_risky_regime, is_trending_regime
@@ -257,8 +255,12 @@ def five_min_true_impulse_allowed(
     60% exception exists only for known regimes with strong ADX/intel and
     healthy option premium context.
     """
-    rank = grade_rank(grade)
     conf = float(confidence or 0.0)
+    supplied_grade = str(grade or "").split()[0]
+    canonical_grade = confidence_to_grade(conf)
+    if supplied_grade in {"C", "B", "B+", "A", "A+"} and supplied_grade != canonical_grade:
+        return False
+    rank = grade_rank(canonical_grade)
     min_conf = relaxed_threshold(
         float(getattr(settings, "live_5min_bplus_min_confidence", 0.70) or 0.70),
         settings,
@@ -675,41 +677,6 @@ def volume_spike_entry_confirmed(
     )
 
 
-def b_grade_min_confidence(settings) -> float:
-    """Top-of-band floor a B-grade signal must reach to be eligible to trade."""
-    return float(getattr(settings, "live_b_grade_min_confidence", 0.50) or 0.50)
-
-
-def b_grade_entry_allowed(
-    confidence: float,
-    regime: str,
-    *,
-    trend_15m_agrees: bool,
-    adx_value: float,
-    settings,
-) -> bool:
-    """Strict, dedicated B-grade allowance.
-
-    B (confidence 0.40-0.55) may trade ONLY when:
-      * confidence >= b_grade floor (0.50, top of the B band),
-      * the 15-minute trend agrees with the signal direction,
-      * ADX momentum >= momentum_override_threshold (default 25),
-      * the regime is trending/breakout (NOT choppy/ranging/volatile/unknown).
-    It governs the B band only; B+/A/A+ use the standard confidence floors.
-    """
-    conf = float(confidence or 0.0)
-    if conf < relaxed_threshold(b_grade_min_confidence(settings), settings):
-        return False
-    if conf >= grade_min_confidence("B+"):
-        return False  # not a B-band signal; standard floors apply
-    if not is_trending_regime(regime):
-        return False
-    if not trend_15m_agrees:
-        return False
-    momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-    return float(adx_value or 0.0) >= momentum_threshold
-
-
 def option_grade_allowed(
     grade: str,
     confidence: float,
@@ -727,9 +694,21 @@ def option_grade_allowed(
     close_location: float = 0.0,
     trend_15m_agrees: bool = False,
 ) -> bool:
+    """Return product-routing suitability; never grant entry admission.
+
+    The canonical quality verdict is the only admission authority. Keeping this
+    helper at the same B+ floor prevents an ineligible B/C candidate from taking a
+    misleading option-quality route before the final verdict rejects it.
+    """
+    conf = float(confidence or 0.0)
+    supplied_grade = str(grade or "").split()[0]
+    canonical_grade = confidence_to_grade(conf)
+    if supplied_grade in {"C", "B", "B+", "A", "A+"} and supplied_grade != canonical_grade:
+        return False
+    if conf < grade_min_confidence("B+"):
+        return False
     # Grade == bucket(confidence), so every `rank >= N` check is just a
     # confidence threshold (grade_min_confidence). Expressed confidence-only.
-    conf = float(confidence or 0.0)
     settings = get_settings()
     more_results = (
         setting_enabled(getattr(settings, "ut_backtest_more_results", True), True)
@@ -750,22 +729,13 @@ def option_grade_allowed(
         )
     if str(timeframe or "") == "15min" and fifteen_min_momentum_ok:
         return True
-    # B-band options are allowed only in trending/breakout regimes with momentum.
-    # (15m alignment is enforced by the entry gate, which has that signal.)
-    if conf < grade_min_confidence("B+"):
-        momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-        return (
-            is_trending_regime(regime)
-            and conf >= relaxed_threshold(b_grade_min_confidence(settings), settings)
-            and float(adx_value or 0.0) >= momentum_threshold
+    if str(timeframe or "") == "15min":
+        return conf >= fifteen_min_confidence_floor(
+            settings,
+            regime,
+            adx_value=adx_value,
+            intel_score=intel_score,
         )
-    if str(timeframe or "") == "15min" and conf >= fifteen_min_confidence_floor(
-        settings,
-        regime,
-        adx_value=adx_value,
-        intel_score=intel_score,
-    ):
-        return True
     if is_choppy_regime(regime):
         if str(mode or "").upper() == "REAL" and five_min_true_impulse:
             return True
@@ -798,137 +768,55 @@ def passes_quality_gate(
     volume_ratio: float = 0.0,
     range_atr_ratio: float = 0.0,
     close_location: float = 0.0,
-) -> bool:
-    # Grade == bucket(confidence): all gates below are confidence-only.
-    momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-    momentum_override = adx_value >= momentum_threshold
-    explosive_move = (
-        momentum_override
-        and trend_15m_agrees
-        and abs(normalize_intelligence_score(intel_score)) >= 0.70
-    )
+    source_count: int = 1,
+    impulse_confirmed: bool = False,
+    power_move: bool = False,
+    return_verdict: bool = False,
+):
+    """Compatibility wrapper for the one versioned quality evaluator.
+
+    The old implementation was a separate live/replay policy with a historical-only
+    relaxation.  Retaining that split made a backtest incapable of validating the live
+    gate.  Import lazily to avoid the module-level helper import cycle.
+    """
+    from engine.quality_verdict import QualityInputs, evaluate_quality
+
+    # ADX, trend and intelligence are separate observations. Inferring an impulse
+    # from their conjunction would count the same evidence twice; only an explicitly
+    # measured structural impulse (or power move) is a confirmation leg.
+    impulse = bool(impulse_confirmed)
     regime_adaptation = setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-    choppy = regime_adaptation and is_choppy_regime(regime) and not explosive_move
-    if explosive_move and is_choppy_regime(regime):
-        log_override = logger.debug if str(mode or "").upper() == "HISTORICAL" else logger.info
-        log_override(
-            f"[OVERRIDE] Choppy regime bypassed due to strong ADX "
-            f"({adx_value:.1f} >= {momentum_threshold})"
-        )
-    more_results = (
-        setting_enabled(getattr(settings, "ut_backtest_more_results", True), True)
-        and str(mode or "").upper() == "HISTORICAL"
+    # Match Scanner's quality taxonomy exactly.  ``is_risky_regime`` also treats some
+    # BREAKOUT aliases as risky for trailing/exit purposes; that is a distinct question
+    # and must not turn a breakout entry into a historical-only quality veto.
+    risky = bool(
+        regime_adaptation
+        and str(regime or "").upper()
+        in {"CHOPPY", "SIDEWAYS", "MEAN_REVERTING", "RANGING", "VOLATILE", "UNKNOWN"}
     )
-    # Dedicated B-grade allowance: trending + 15m alignment + ADX momentum only.
-    b_ok = b_grade_entry_allowed(
-        confidence,
-        regime,
-        trend_15m_agrees=trend_15m_agrees,
-        adx_value=adx_value,
-        settings=settings,
-    )
-    fifteen_min_ok = False
-    fifteen_min_momentum_ok = False
-    if tf == "15min":
-        fifteen_min_momentum_ok = bool(fifteen_min_momentum_override)
-        if fifteen_min_momentum_override is None:
-            fifteen_min_momentum_ok = fifteen_min_momentum_override_allowed(
-                confidence,
-                settings,
-                volume_ratio=volume_ratio,
-                range_atr_ratio=range_atr_ratio,
-                close_location=close_location,
-                adx_value=adx_value,
-                intel_score=intel_score,
-                trend_15m_agrees=trend_15m_agrees,
-                regime=regime,
-            )
-        fifteen_min_min_conf = fifteen_min_confidence_floor(
-            settings,
-            regime,
-            adx_value=adx_value,
-            intel_score=intel_score,
-        )
-        fifteen_min_ok = confidence >= fifteen_min_min_conf or fifteen_min_momentum_ok
-        if str(mode or "").upper() == "REAL" and not fifteen_min_ok and not b_ok:
-            return False
-
-    policy = str(getattr(settings, "ut_timeframe_entry_policy", "PRIMARY_15") or "PRIMARY_15").upper()
-    if policy == "PRIMARY_15" and tf == "5min":
-        return False
-
-    five_min_impulse = False
-    if tf == "5min":
-        minimum_confidence = max(
-            relaxed_threshold(
-                float(getattr(settings, "ut_5min_option_min_confidence", 0.60) or 0.60),
-                settings,
-            ),
-            relaxed_threshold(
-                float(getattr(settings, "live_5min_bplus_min_confidence", 0.70) or 0.70),
-                settings,
-            ),
-        )
-        if more_results:
-            minimum_confidence = min(minimum_confidence, relaxed_threshold(0.72, settings))
-        five_min_impulse = five_min_true_impulse_allowed(
-            grade,
-            confidence,
-            settings,
-            trend_15m_agrees=trend_15m_agrees,
-            impulse_confirmed=explosive_move,
-            explosive_bypass=explosive_move,
-            extreme_exhaustion=False,
+    volume_confirmed = bool(float(volume_ratio or 0.0) >= float(
+        getattr(settings, "quality_policy_min_volume_ratio", 1.20) or 1.20
+    ))
+    if bool(fifteen_min_momentum_override):
+        impulse = True
+    verdict = evaluate_quality(
+        QualityInputs(
+            timeframe=tf,
+            inst_type=inst_type,
+            confidence=confidence,
             regime=regime,
             adx_value=adx_value,
-            intel_score=intel_score,
-            iv_percentile=iv_percentile,
-            chain_quality=chain_quality,
-            option_premium_ok=option_premium_ok,
-        )
-        grade_confidence_ok = confidence >= max(grade_min_confidence("B+"), minimum_confidence)
-        if not (b_ok or five_min_impulse or (more_results and (grade_confidence_ok or trend_15m_agrees or explosive_move))):
-            return False
-        if choppy and not five_min_impulse:
-            return False
-
-    if (
-        more_results
-        and choppy
-        and inst_type == "OPT"
-        and not explosive_move
-        and not five_min_impulse
-        and not fifteen_min_ok
-        and confidence < min(
-            max(grade_min_confidence("B+"), relaxed_threshold(0.58, settings)),
-            relaxed_threshold(0.72, settings),
-        )
-    ):
-        return False
-    if (
-        not more_results
-        and choppy
-        and inst_type == "OPT"
-        and not explosive_move
-        and not five_min_impulse
-        and not fifteen_min_ok
-        and confidence < min(
-            max(grade_min_confidence("A"), relaxed_threshold(0.72, settings)),
-            relaxed_threshold(0.90, settings),
-        )
-    ):
-        return False
-    if more_results and choppy and confidence < min(grade_min_confidence("B"), relaxed_threshold(0.62, settings)):
-        return False
-    if (
-        not more_results
-        and choppy
-        and not five_min_impulse
-        and not fifteen_min_ok
-        and confidence < min(
-            grade_min_confidence("A"),
-            relaxed_threshold(choppy_confidence_gate(settings), settings),
-        )
-    ):
-        return False
-    return True
+            trend_15m_agrees=trend_15m_agrees,
+            impulse_confirmed=impulse,
+            risky_regime=risky,
+            is_choppy=risky and not impulse,
+            grade=grade,
+            source_count=max(1, int(source_count or 1)),
+            volume_confirmed=volume_confirmed,
+            volume_ratio=volume_ratio,
+            power_move=bool(power_move),
+            lane=str(mode or "REPLAY").upper(),
+        ),
+        settings,
+    )
+    return verdict if return_verdict else bool(verdict)

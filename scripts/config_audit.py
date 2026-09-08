@@ -25,8 +25,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+# ``python scripts/config_audit.py`` makes ``scripts`` (not the repository
+# root) the first import location.  Keep the documented direct invocation
+# usable without requiring callers to set PYTHONPATH manually.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Keys whose divergence is expected operator setup, not a behaviour surprise.
 _INFRA_HINTS = (

@@ -160,6 +160,20 @@ def test_the_column_exists_and_round_trips():
     )
 
 
+def test_manual_and_auto_states_do_not_share_a_dedup_fingerprint():
+    """A mode transition is forensic evidence, not a duplicate row."""
+    from data.sqlite_db import DatabaseManager
+
+    base = {
+        "lifecycle_id": "LC-MODE", "phase": "ACCEPTED", "decision": "ACCEPTED",
+        "reason_code": "SIGNAL_ACCEPTED", "reason_text": "accepted",
+        "current_stop": 100.0, "current_target": 120.0, "pnl": 0.0,
+    }
+    manual = DatabaseManager._forensic_fingerprint({**base, "execution_mode": "MANUAL"})
+    auto = DatabaseManager._forensic_fingerprint({**base, "execution_mode": "AUTO"})
+    assert manual != auto
+
+
 def test_the_ledger_shows_the_mode():
     """A stamp the operator cannot see does not answer the question that was asked."""
     from pathlib import Path

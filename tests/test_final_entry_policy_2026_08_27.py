@@ -20,6 +20,7 @@ from engine.entry_policy import (
     effective_underlying_stop_cap_pct,
     evaluate_final_entry_policy,
 )
+from engine.signal_processor import TradeCandidate
 from intelligence.rtracker import RegimeTracker
 from scanner import Scanner
 from trading.trade_manager import IST, Trade, TradeManager
@@ -103,6 +104,20 @@ def test_one_point_four_nine_nine_r_is_rejected():
     verdict = _verdict(geometry, _forecast(now), now)
     assert verdict.allowed is False
     assert dict(verdict.checks)["execution_rr"] is False
+
+
+def test_underlying_stop_cap_is_strict_at_the_fourth_decimal_place():
+    now = datetime(2026, 8, 27, 10, 0)
+    exact = _geometry(now, underlying_stop=25_000.0 * (1.0 - 0.0015))
+    over = _geometry(now, underlying_stop=25_000.0 * (1.0 - 0.0015004))
+
+    exact_verdict = _verdict(exact, _forecast(now), now)
+    over_verdict = _verdict(over, _forecast(now), now)
+
+    assert exact_verdict.allowed is True
+    assert dict(exact_verdict.checks)["underlying_stop_cap"] is True
+    assert over_verdict.allowed is False
+    assert dict(over_verdict.checks)["underlying_stop_cap"] is False
 
 
 def test_option_cross_geometry_requires_a_bounded_conversion_ratio():
@@ -911,6 +926,71 @@ def test_broker_queue_refreshes_underlying_geometry_instead_of_reusing_a_stale_s
     assert trade.geometry_observed_at == now.isoformat()
 
 
+def test_material_primary_ltp_rebase_clamps_ranging_risk_to_fresh_spot(monkeypatch):
+    """A >0.015% move between two valid observations must use fresh Kite geometry."""
+    now = datetime(2026, 8, 27, 10, 0)
+    old_spot = 24_101.45
+    fresh_kite_spot = 24_094.15
+    assert abs(old_spot - fresh_kite_spot) / old_spot * 100.0 > 0.015
+
+    monkeypatch.setattr(
+        scanner_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            entry_policy_underlying_stop_max_pct_by_index={"NIFTY": 0.15}
+        ),
+    )
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    scanner.data = SimpleNamespace(
+        get_cached_index_quote_snapshot=lambda instrument: {
+            "spot_price": fresh_kite_spot,
+            "quote_age_seconds": 0.0,
+            "is_fresh": True,
+            "source": "kite_ws",
+            "source_role": "primary",
+        }
+    )
+    candidate = TradeCandidate(
+        instrument="NIFTY",
+        direction="LONG",
+        price=100.0,
+        stop=96.0,
+        target=106.0,
+        lots=1,
+        lot_size=65,
+        grade="B+",
+        confidence=0.60,
+        timeframe="5min",
+        inst_type="OPT",
+        option_type="CE",
+        atm_strike=24_100.0,
+        multiplier=0.5,
+        trading_symbol="NIFTYTESTCE",
+        symbol_token="TOKEN-NIFTY",
+        underlying_entry=old_spot,
+        underlying_stop=old_spot - (old_spot * 0.001),
+        underlying_target=old_spot + 48.0,
+        geometry_observed_at=(now - timedelta(seconds=2)).isoformat(),
+        geometry_source="signal_processor.dual_geometry",
+        geometry_verified=True,
+    )
+    candidate.market_regime = "RANGING"
+
+    geometry = scanner._entry_execution_geometry(
+        candidate,
+        (candidate.price, candidate.stop, candidate.target),
+        phase="auto_pre_submit",
+        observed_at=now,
+    )
+
+    assert geometry.underlying_entry == pytest.approx(fresh_kite_spot)
+    rebased_risk = geometry.underlying_entry - geometry.underlying_stop
+    assert rebased_risk <= 24.09415 + 1e-8
+    assert rebased_risk == pytest.approx(24.09415, abs=1e-8)
+    assert "underlying:kite_ws" in geometry.source
+
+
 def test_real_broker_queue_does_not_restamp_a_stale_underlying_quote(monkeypatch):
     now = datetime(2026, 8, 27, 10, 0)
     monkeypatch.setattr(
@@ -965,6 +1045,23 @@ def test_real_broker_queue_does_not_restamp_a_stale_underlying_quote(monkeypatch
     assert verdict.allowed is False
     assert dict(verdict.checks)["finite_verified_geometry"] is False
     assert trade.geometry_observed_at == (now - timedelta(seconds=1)).isoformat()
+
+
+def test_real_entry_geometry_refuses_fresh_fyers_failover_authority():
+    now = datetime(2026, 8, 27, 10, 0)
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    scanner.data = SimpleNamespace(
+        get_cached_index_quote_snapshot=lambda instrument: {
+            "spot_price": 24_094.15,
+            "quote_age_seconds": 0.01,
+            "is_fresh": True,
+            "source": "fyers_ws",
+            "source_role": "failover",
+        }
+    )
+
+    assert scanner._entry_policy_live_index_quote("NIFTY", now) == (0.0, "", "")
 
 
 def test_broker_queue_reprices_the_contract_touch_and_hands_it_to_submission():
@@ -1122,7 +1219,7 @@ def test_actual_fill_policy_fails_closed_when_broker_fill_price_is_unverified():
     assert "unavailable or unverified" in reason
 
 
-def test_one_minute_support_can_confirm_a_fifteen_minute_structure_break(monkeypatch):
+def test_fresh_fifteen_minute_trade_does_not_exit_on_local_one_minute_break(monkeypatch):
     monkeypatch.setattr(
         scanner_module,
         "get_settings",
@@ -1148,8 +1245,8 @@ def test_one_minute_support_can_confirm_a_fifteen_minute_structure_break(monkeyp
     allowed, reason = scanner._fifteen_min_one_min_support_exit_decision(
         trade, 25_000.0, datetime.now(IST)
     )
-    assert allowed is True
-    assert "emergency 1m" in reason
+    assert allowed is False
+    assert "fresh trade" in reason
 
 
 def test_rtracker_volume_records_availability_source_and_basis(tmp_path):

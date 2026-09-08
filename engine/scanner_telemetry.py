@@ -546,15 +546,15 @@ class ScannerTelemetryMixin:
             ram_total = ram_pct = commit_pct = commit_total = commit_available = 0.0
             sampled_at = 0.0
 
-        ram_limit = max(1.0, min(100.0, setting_float("auto_resource_ram_block_pct", 94.0)))
+        ram_limit = max(1.0, min(100.0, setting_float("auto_resource_ram_block_pct", 98.0)))
         commit_limit = max(
-            1.0, min(100.0, setting_float("auto_resource_commit_block_pct", 92.0))
+            1.0, min(100.0, setting_float("auto_resource_commit_block_pct", 96.0))
         )
         min_commit_available = max(
             0.0, setting_float("auto_resource_commit_min_available_mb", 1024.0)
         )
         hysteresis = max(
-            0.0, min(20.0, setting_float("auto_resource_clear_hysteresis_pct", 4.0))
+            0.0, min(20.0, setting_float("auto_resource_clear_hysteresis_pct", 2.0))
         )
         max_age = max(
             0.1, setting_float("auto_resource_sample_max_age_seconds", 5.0)
@@ -1036,11 +1036,11 @@ class ScannerTelemetryMixin:
         single_core_cpu_pct = float(metrics.get("process_cpu_single_core_pct") or 0.0)
         ram_critical = max(
             1.0,
-            min(100.0, configured_float("auto_resource_ram_block_pct", 94.0)),
+            min(100.0, configured_float("auto_resource_ram_block_pct", 98.0)),
         )
         commit_critical = max(
             1.0,
-            min(100.0, configured_float("auto_resource_commit_block_pct", 92.0)),
+            min(100.0, configured_float("auto_resource_commit_block_pct", 96.0)),
         )
         commit_available_critical = max(
             0.0,
@@ -1048,7 +1048,7 @@ class ScannerTelemetryMixin:
         )
         resource_hysteresis = max(
             0.0,
-            configured_float("auto_resource_clear_hysteresis_pct", 4.0),
+            configured_float("auto_resource_clear_hysteresis_pct", 2.0),
         )
         ram_warn = max(0.0, ram_critical - resource_hysteresis)
         commit_warn = max(0.0, commit_critical - resource_hysteresis)

@@ -281,13 +281,18 @@ def test_the_block_can_be_turned_off(monkeypatch):
     assert s._opposite_direction_stack_block(_candidate("LONG"), [_open("SHORT")]) == ""
 
 
-def test_the_guard_itself_blocks_the_opposite_stack():
+def test_the_guard_itself_blocks_the_opposite_stack(monkeypatch):
     """Drive _prepare_candidate_for_concurrency, not just the helper.
 
-    ut_concurrency_guard is OFF in the live config, so the guard short-circuits to True
-    right after the per-index cap. The direction check has to land BEFORE that or it is
-    wired to nothing.
+    With the optional cross-timeframe complement rule explicitly OFF, the direction
+    check still has to run before the relaxed-path return or it is wired to nothing.
     """
+    real = scanner_module.get_settings()
+    monkeypatch.setattr(
+        scanner_module,
+        "get_settings",
+        lambda: SimpleNamespace(**{**vars(real), "ut_concurrency_guard": False}),
+    )
     s = Scanner.__new__(Scanner)
     s.trades = SimpleNamespace(open_trades={"t1": _open("SHORT", tf="15min")})
     s._active_session_entry_candidates = lambda *a, **k: []
@@ -306,7 +311,13 @@ def test_the_guard_itself_blocks_the_opposite_stack():
     )
 
 
-def test_the_guard_still_admits_a_same_direction_stack():
+def test_the_guard_still_admits_a_same_direction_stack(monkeypatch):
+    real = scanner_module.get_settings()
+    monkeypatch.setattr(
+        scanner_module,
+        "get_settings",
+        lambda: SimpleNamespace(**{**vars(real), "ut_concurrency_guard": False}),
+    )
     s = Scanner.__new__(Scanner)
     s.trades = SimpleNamespace(open_trades={"t1": _open("LONG", tf="15min")})
     s._active_session_entry_candidates = lambda *a, **k: []

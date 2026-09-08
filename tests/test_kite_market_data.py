@@ -207,6 +207,28 @@ def test_historical_failure_returns_empty_never_partial():
     assert isinstance(frame, pd.DataFrame) and frame.empty
 
 
+def test_archive_history_has_call_local_evidence_without_poisoning_live_health():
+    class InputException(Exception):
+        pass
+
+    src = _source(_Kite(historical=InputException("invalid token")))
+    outcome = {}
+
+    frame = src.get_historical(
+        12345,
+        "1min",
+        call_outcome=outcome,
+        record_health=False,
+    )
+
+    assert frame.empty
+    assert outcome["ok"] is False
+    assert outcome["reason"] == "InputException: invalid token"
+    status = src.historical_rest_status()
+    assert status["kite_historical_rest_last_call_ok"] is None
+    assert status["kite_historical_rest_failure"] == ""
+
+
 def test_input_auth_failure_invalidates_shared_session():
     class InputException(Exception):
         pass

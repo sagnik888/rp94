@@ -8,7 +8,7 @@ import main
 import scripts.archive_session_data as archive
 
 
-def test_archive_cli_returns_failure_for_a_skipped_day(monkeypatch):
+def test_archive_cli_returns_failure_for_a_skipped_day(monkeypatch, capsys):
     monkeypatch.setattr(archive.sys, "argv", ["archive_session_data.py", "1999-01-01", "--quiet"])
     monkeypatch.setattr(
         archive,
@@ -20,9 +20,10 @@ def test_archive_cli_returns_failure_for_a_skipped_day(monkeypatch):
         archive.main()
 
     assert exc.value.code == 2
+    assert "[archive-result]" in capsys.readouterr().err
 
 
-def test_archive_cli_returns_failure_for_incomplete_manifest(monkeypatch):
+def test_archive_cli_returns_failure_for_incomplete_manifest(monkeypatch, capsys):
     monkeypatch.setattr(archive.sys, "argv", ["archive_session_data.py", "2026-08-21", "--quiet"])
     monkeypatch.setattr(
         archive,
@@ -34,6 +35,44 @@ def test_archive_cli_returns_failure_for_incomplete_manifest(monkeypatch):
         archive.main()
 
     assert exc.value.code == 2
+    output = capsys.readouterr().err
+    assert "[archive-result]" in output
+    assert '"complete": false' in output.lower()
+
+
+def test_archive_normalizes_malformed_prior_repair_metadata(monkeypatch, tmp_path):
+    day = "2026-08-21"
+    candles = tmp_path / "candles"
+    events = tmp_path / "events"
+    archived = tmp_path / "archive"
+    candles.mkdir()
+    events.mkdir()
+    (events / f"{day}.jsonl").write_text(
+        json.dumps({"contract": {"trading_symbol": "A"}}) + "\n",
+        encoding="utf-8",
+    )
+    prior = archived / day / "manifest.json"
+    prior.parent.mkdir(parents=True)
+    prior.write_text(
+        json.dumps(
+            {"repair_status": {"attempts": "corrupt", "missing_contracts": ["A"]}}
+        ),
+        encoding="utf-8",
+    )
+    for index in archive.INDICES:
+        for timeframe in ("1min", "5min", "15min"):
+            (candles / f"{index}_{timeframe}.csv").write_text("placeholder", encoding="utf-8")
+
+    frame = pd.DataFrame({"timestamp": [f"{day} 09:15:00"], "close": [1.0]})
+    monkeypatch.setattr(archive, "CANDLES", candles)
+    monkeypatch.setattr(archive, "EVENTS", events)
+    monkeypatch.setattr(archive, "ARCHIVE", archived)
+    monkeypatch.setattr(archive, "day_slice", lambda *_args, **_kwargs: frame)
+
+    manifest = archive.archive_day(day, force=True, quiet=True)
+
+    assert manifest["repair_status"]["attempts"] == 0
+    assert manifest["repair_status"]["missing_contracts"]["A"]["state"] == "retryable"
 
 
 def test_archive_tracks_exact_symbols_when_one_symbol_has_two_files_and_one_has_none(

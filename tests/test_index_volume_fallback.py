@@ -82,11 +82,12 @@ def test_fallback_engages_when_the_fyers_reading_goes_stale():
     assert stale["source"] == "kite_index_futures"
 
 
-def test_the_fallback_declares_that_thresholds_no_longer_apply():
-    """Contracts vs constituent shares differ by ~1000x; a silent swap is a wrong trade."""
+def test_the_fallback_never_claims_cash_threshold_compatibility():
+    """A contracts ratio needs its own baseline; it is not a cash-volume substitute."""
     activity = _provider(fyers_volume=None).get_index_activity("NIFTY")
     assert activity["unit"] == "contracts"
     assert activity["comparable_to_thresholds"] is False
+    assert activity["volume_comparable"] is False
     assert activity["confirmation"] == "fallback_only"
 
 

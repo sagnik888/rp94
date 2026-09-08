@@ -1,6 +1,5 @@
 from collections import deque
 from datetime import datetime, timedelta
-import importlib.util
 from pathlib import Path
 import threading
 import time
@@ -427,21 +426,18 @@ def test_live_clock_skew_blocks_entries_and_requirements_are_reproducible(monkey
     requirements = Path("requirements.txt").read_text(encoding="utf-8")
     assert "\x00" not in requirements
     assert ">=" not in requirements
-    # The retired broker's SDK was removed on 2026-08-05. It was pinned solely so a dead
-    # import in data/market_data.py would resolve; that import constructed nothing and is
-    # gone, so the pin would now install a package no code can reach.
-    assert "smartapi-python" not in requirements
+    # AngelOne is a narrow index-price fallback. Exact pinning keeps the runtime
+    # reproducible; order execution and volume remain outside that adapter.
+    assert "smartapi-python==1.5.5" in requirements
     assert "kiteconnect==5.2.1" in requirements
     assert Path(".python-version").read_text(encoding="utf-8").strip() == "3.13.9"
 
 
-def test_quarantined_tests_are_explicit_and_fixed_at_twelve():
-    path = Path("tests/conftest.py")
-    spec = importlib.util.spec_from_file_location("suite_conftest_policy", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert len(module._QUARANTINED) == 12
-    assert all("rolled-back feature" in reason or "superseded" in reason for reason in module._QUARANTINED.values())
+def test_no_tests_are_hidden_by_a_collection_time_quarantine():
+    import tests.conftest as conftest
+
+    assert not hasattr(conftest, "_QUARANTINED")
+    assert not hasattr(conftest, "pytest_collection_modifyitems")
 
 
 def test_trade_loss_cap_is_clamped_to_segment_daily_budget():

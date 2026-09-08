@@ -366,6 +366,9 @@ class ScannerChartMixin:
     ) -> Dict:
         """Ensure chart snapshots have UT1 trailing-stop/state data."""
         result = dict(result or {})
+        # Keep chart calculation independent from _prepare_live_signal_data(). That
+        # method owns entry readiness and clears state before the first session bar;
+        # applying it here removes every display overlay during closed/pre-open hours.
         if result.get("trailing_stop") and result.get("state"):
             return result
 

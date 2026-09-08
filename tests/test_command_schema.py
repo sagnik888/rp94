@@ -406,7 +406,10 @@ def test_command_specific_checks_retained():
     assert v({"cmd": "set_power", "state": "MAYBE"}) == "invalid_state"
     assert v({"cmd": "close_trade", "trade_id": "", "price": 1}) == "invalid_trade_id"
     assert v({"cmd": "close_trade", "trade_id": "T1", "price": -1}) == "invalid_price"
-    assert v({"cmd": "close_trade", "trade_id": "T1", "price": 0}) == "invalid_price"
+    # A broker MARKET exit has no price parameter.  Zero/omitted is an allowed local
+    # accounting mark when the quote feed is degraded; negative/NaN is still rejected.
+    assert v({"cmd": "close_trade", "trade_id": "T1", "price": 0}) is None
+    assert v({"cmd": "close_trade", "trade_id": "T1"}) is None
     assert v({"cmd": "update_fyers_token", "auth_code": "x" * 5000}) == "invalid_auth_code"
 
 

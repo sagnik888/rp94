@@ -322,12 +322,13 @@ class CandleBuilder:
                 except Exception:
                     ref = 0.0
             if ref and ref > 0 and not pd.isna(ref):
-                is_index = instrument in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
-                max_dev = 0.03 if is_index else self._MAX_PRICE_DEVIATION
-                valid_rows = (new_data['close'] - ref).abs() / ref <= max_dev
-                if not valid_rows.all():
-                    logger.warning(f"⚠️ Filtering {int((~valid_rows).sum())} implausible rows for {instrument} (cross-index leak guard)")
-                    new_data = new_data[valid_rows]
+                if len(new_data) < 20:
+                    is_index = instrument in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+                    max_dev = 0.03 if is_index else self._MAX_PRICE_DEVIATION
+                    valid_rows = (new_data['close'] - ref).abs() / ref <= max_dev
+                    if not valid_rows.all():
+                        logger.warning(f"⚠️ Filtering {int((~valid_rows).sum())} implausible rows for {instrument} (cross-index leak guard)")
+                        new_data = new_data[valid_rows]
 
         if new_data.empty:
             return

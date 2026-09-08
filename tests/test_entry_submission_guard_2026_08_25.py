@@ -22,7 +22,9 @@ class _Broker:
         self.released = []
         self.cancel_calls = []
 
-    def preflight_entry_margin(self, **_kwargs):
+    def preflight_entry_margin(self, **kwargs):
+        if not kwargs.get("reserve", True):
+            return {"ok": True, "reservation_id": ""}
         reservation_id = f"R{len(self.reservations) + 1}"
         self.reservations.append(reservation_id)
         return {"ok": True, "reservation_id": reservation_id}
@@ -85,7 +87,15 @@ def _manager(broker, guard=None):
     return manager
 
 
-def _open(manager, *, exec_type="A", lifecycle_id="", callback=None, guard=None):
+def _open(
+    manager,
+    *,
+    exec_type="A",
+    lifecycle_id="",
+    callback=None,
+    guard=None,
+    entry_refusal_outcome=None,
+):
     return manager.open_trade(
         instrument="NIFTY",
         timeframe="5min",
@@ -104,6 +114,7 @@ def _open(manager, *, exec_type="A", lifecycle_id="", callback=None, guard=None)
         lifecycle_id=lifecycle_id,
         on_execution_result=callback,
         entry_submission_guard=guard,
+        entry_refusal_outcome=entry_refusal_outcome,
     )
 
 
@@ -140,6 +151,78 @@ def test_guard_blocks_before_first_broker_call_releases_margin_and_keeps_lifecyc
     assert trade.execution_status == "REJECTED"
     assert trade.exit_reason == "ENTRY_SUBMISSION_GUARD"
     assert "critical host pressure" in trade.execution_error
+    assert callbacks == [False]
+
+
+def test_known_insufficient_funds_refuses_before_creating_or_logging_a_trade():
+    class _UnderfundedBroker(_Broker):
+        def cached_entry_margin_refusal(self, **_kwargs):
+            return self.preflight_entry_margin()
+
+        def preflight_entry_margin(self, **_kwargs):
+            return {
+                "ok": False,
+                "reservation_id": "",
+                "basis": "KITE_ORDER_MARGIN",
+                "available": 15_000.90,
+                "required": 24_762.0,
+                "limitation": (
+                    "insufficient funds: 27,238.20 required (incl 10% buffer), "
+                    "15,000.90 available"
+                ),
+            }
+
+    broker = _UnderfundedBroker()
+    manager = _manager(broker)
+    refusal = {}
+
+    trade = _open(manager, entry_refusal_outcome=refusal)
+
+    assert trade is None
+    assert broker.place_calls == []
+    assert manager.open_trades == {}
+    assert manager.closed_trades == []
+    assert refusal == {
+        "code": "ENTRY_MARGIN_PREFLIGHT",
+        "reason": (
+            "insufficient funds: 27,238.20 required (incl 10% buffer), "
+            "15,000.90 available"
+        ),
+        "basis": "KITE_ORDER_MARGIN",
+        "available": 15_000.90,
+        "required": 24_762.0,
+    }
+
+
+def test_a_funds_race_is_a_zero_fill_margin_rejection_not_a_broker_error():
+    class _FundsChangedBroker(_Broker):
+        def preflight_entry_margin(self, **kwargs):
+            if not kwargs.get("reserve", True):
+                return {"ok": True, "reservation_id": ""}
+            return {
+                "ok": False,
+                "reservation_id": "",
+                "basis": "KITE_ORDER_MARGIN",
+                "limitation": "insufficient funds after another entry reserved cash",
+            }
+
+    broker = _FundsChangedBroker()
+    callbacks = []
+    manager = _manager(broker)
+
+    trade = _open(
+        manager,
+        callback=lambda _trade, accepted: callbacks.append(accepted),
+    )
+
+    assert trade is not None
+    assert broker.place_calls == []
+    assert trade.execution_status == "REJECTED"
+    assert trade.exit_reason == "ENTRY_MARGIN_PREFLIGHT"
+    assert "insufficient funds" in trade.execution_error
+    assert trade.broker_order_id == ""
+    assert trade.to_dict()["pnl"] == 0.0
+    assert trade.to_dict()["charges"] == 0.0
     assert callbacks == [False]
 
 
@@ -475,6 +558,83 @@ def test_scanner_preserves_submission_guard_reason_in_rejected_signal_telemetry(
         }
     ]
     assert "critical host pressure" in logged[0][0]
+
+
+def test_scanner_labels_a_late_margin_refusal_as_no_order_sent():
+    from scanner import Scanner
+
+    scanner = Scanner.__new__(Scanner)
+    recorded = []
+    logged = []
+    scanner._rtracker_record_candidate = lambda candidate, **kwargs: recorded.append(kwargs)
+    scanner._forget_signal_display_rows = lambda _candidate: None
+    scanner.log_event = lambda message, category: logged.append((message, category))
+
+    async def publish():
+        return None
+
+    scanner._publish_trade_payload_now = publish
+    candidate = SimpleNamespace(
+        instrument="MIDCPNIFTY",
+        direction="LONG",
+        accepted_by_gate=False,
+        status="ORDER PENDING",
+    )
+    trade = SimpleNamespace(
+        exit_reason="ENTRY_MARGIN_PREFLIGHT",
+        execution_error=(
+            "ENTRY_MARGIN_PREFLIGHT: insufficient funds: 27,238.20 required, "
+            "15,000.90 available"
+        ),
+    )
+
+    asyncio.run(scanner._handle_broker_entry_result(candidate, trade, False))
+
+    assert candidate.status == "REJECTED - INSUFFICIENT FUNDS"
+    assert candidate.exit_reason == "ENTRY_MARGIN_PREFLIGHT"
+    assert recorded == [
+        {
+            "decision": "REJECTED",
+            "reason": trade.execution_error,
+            "source": "entry_margin_preflight",
+        }
+    ]
+    assert "No order was sent" in logged[0][0]
+
+
+def test_scanner_preserves_an_early_margin_refusal_in_candidate_telemetry():
+    from scanner import Scanner
+
+    scanner = Scanner.__new__(Scanner)
+    recorded = []
+    remembered = []
+    scanner._rtracker_record_candidate = lambda candidate, **kwargs: recorded.append(kwargs)
+    scanner._remember_trade_candidates = lambda candidates: remembered.extend(candidates)
+    candidate = SimpleNamespace(
+        instrument="MIDCPNIFTY",
+        direction="LONG",
+        accepted_by_gate=True,
+        status="ORDER PENDING",
+    )
+    outcome = {
+        "code": "ENTRY_MARGIN_PREFLIGHT",
+        "reason": "insufficient funds: 27,238.20 required, 15,000.90 available",
+    }
+
+    reason = scanner._apply_trade_manager_entry_refusal(candidate, outcome)
+
+    assert reason == outcome["reason"]
+    assert candidate.accepted_by_gate is False
+    assert candidate.status == "REJECTED - INSUFFICIENT FUNDS"
+    assert candidate.exit_reason == "ENTRY_MARGIN_PREFLIGHT"
+    assert remembered == [candidate]
+    assert recorded == [
+        {
+            "decision": "REJECTED",
+            "reason": outcome["reason"],
+            "source": "entry_margin_preflight",
+        }
+    ]
 
 
 def test_cancelled_stale_entry_is_not_market_replaced_when_guard_turns_false():

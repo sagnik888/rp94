@@ -132,3 +132,24 @@ def test_rtracker_records_candidate_and_generates_weekly_report(tmp_path):
     assert result["weekly_reports"]
     assert (tmp_path / "reports" / "2026-W28.json").exists()
     assert (tmp_path / "reports" / "rtracker_1_week_summary.md").exists()
+
+
+def test_rtracker_promotes_run_mode_and_evidence_domain_to_top_level(tmp_path):
+    tracker = RegimeTracker(tmp_path, enabled=True, max_weeks=1)
+    candidate = SimpleNamespace(
+        instrument="NIFTY",
+        timeframe="5min",
+        direction="LONG",
+        signal_timestamp=datetime(2026, 7, 8, 10, 0),
+    )
+
+    event = tracker._event_from_candidate(
+        candidate,
+        decision="REJECTED",
+        reason="test",
+        source="unit",
+        extra={"run_mode": "REAL", "evidence_domain": "LIVE_DECISION"},
+    )
+
+    assert event["run_mode"] == "REAL"
+    assert event["evidence_domain"] == "LIVE_DECISION"

@@ -845,15 +845,18 @@ def test_market_wide_reversal_live_gate_bypasses_single_index_location_block(mon
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     candidate = _location_candidate(
         instrument="NIFTY",
-        grade="C",
-        confidence=0.25,
+        grade="B+",
+        confidence=0.60,
         trend_15m_agrees=False,
+        impulse_confirmed=True,
+        adx_value=25.0,
+        volume_ratio=1.30,
         market_wide_reversal_entry=True,
     )
 
     assert scanner._passes_candidate_grade_preference(candidate) == (
         True,
-        "market-wide reversal override",
+        "canonical quality policy owns B+ eligibility",
     )
     assert scanner._passes_live_trade_ready_gate(candidate) is True
     assert candidate.scalp_lock_mode is True
@@ -965,10 +968,11 @@ def test_choppy_5min_option_live_gate_requires_trend_and_impulse():
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
     scanner._setting_enabled = lambda value, default=True: True
     candidate = _location_candidate(
-        grade="B+",
+        grade="A",
         confidence=0.70,
         timeframe="5min",
         inst_type="OPT",
+        adx_value=30.0,
         impulse_confirmed=False,
         trend_15m_agrees=False,
     )
@@ -984,7 +988,7 @@ def test_choppy_5min_option_live_gate_requires_trend_and_impulse():
     assert scanner._passes_live_trade_ready_gate(candidate) is True
 
 
-def test_choppy_5min_option_live_gate_allows_special_bplus_a_aplus_sixty_exception():
+def test_choppy_5min_option_live_gate_allows_confirmed_bplus_sixty_setup():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
@@ -992,23 +996,23 @@ def test_choppy_5min_option_live_gate_allows_special_bplus_a_aplus_sixty_excepti
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
     scanner._setting_enabled = lambda value, default=True: True
-    for grade in ("B+", "A", "A+"):
-        candidate = _location_candidate(
-            grade=grade,
-            confidence=0.60,
-            timeframe="5min",
-            inst_type="OPT",
-            impulse_confirmed=False,
-            is_explosive_bypass=False,
-            trend_15m_agrees=True,
-            intelligence_score=0.20,
-            adx_value=30.0,
-        )
-        candidate.iv_percentile = 65.0
-        candidate.chain_quality = {"score": 60, "stale": False}
-        candidate.option_premium_ok = True
+    candidate = _location_candidate(
+        grade="B+",
+        confidence=0.60,
+        timeframe="5min",
+        inst_type="OPT",
+        impulse_confirmed=False,
+        is_explosive_bypass=False,
+        trend_15m_agrees=True,
+        intelligence_score=0.20,
+        adx_value=30.0,
+        volume_ratio=1.30,
+    )
+    candidate.iv_percentile = 65.0
+    candidate.chain_quality = {"score": 60, "stale": False}
+    candidate.option_premium_ok = True
 
-        assert scanner._passes_live_trade_ready_gate(candidate) is True
+    assert scanner._passes_live_trade_ready_gate(candidate) is True
 
 
 def test_choppy_5min_special_bplus_sixty_blocks_bad_premium_health():
@@ -1084,7 +1088,7 @@ def test_choppy_5min_special_sixty_ignores_stale_premium_ok_without_iv():
     assert scanner._passes_live_trade_ready_gate(candidate) is False
 
 
-def test_choppy_15min_b_uses_15min_floor_not_5min_choppy_gate(monkeypatch):
+def test_choppy_15min_bplus_uses_canonical_evidence_gate(monkeypatch):
     from config.settings import get_settings
 
     settings = get_settings()
@@ -1095,20 +1099,25 @@ def test_choppy_15min_b_uses_15min_floor_not_5min_choppy_gate(monkeypatch):
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
     scanner._setting_enabled = lambda value, default=True: True
+    scanner._fifteen_min_choppy_scalp_context = lambda candidate, regime: (True, "")
     candidate = _location_candidate(
-        grade="B",
+        grade="B+",
         confidence=0.62,
         timeframe="15min",
         inst_type="OPT",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        volume_ratio=1.30,
     )
 
     assert scanner._passes_candidate_grade_preference(candidate) == (
         True,
-        "15min B-or-better confidence floor override",
+        "canonical quality policy owns B+ eligibility",
     )
     assert scanner._passes_live_trade_ready_gate(candidate) is True
 
@@ -1123,10 +1132,12 @@ def test_15min_live_gate_blocks_below_independent_floor(monkeypatch):
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
     scanner._setting_enabled = lambda value, default=True: True
+    scanner._fifteen_min_choppy_scalp_context = lambda candidate, regime: (True, "")
     candidate = _location_candidate(
         grade="B",
         confidence=0.61,
@@ -1137,7 +1148,7 @@ def test_15min_live_gate_blocks_below_independent_floor(monkeypatch):
     assert scanner._passes_live_trade_ready_gate(candidate) is False
 
 
-def test_15min_live_gate_allows_lower_trending_momentum_floor(monkeypatch):
+def test_15min_live_gate_allows_confirmed_bplus_at_lower_floor(monkeypatch):
     from config.settings import get_settings
 
     settings = get_settings()
@@ -1150,26 +1161,68 @@ def test_15min_live_gate_allows_lower_trending_momentum_floor(monkeypatch):
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
     scanner._setting_enabled = lambda value, default=True: True
+    scanner._fifteen_min_choppy_scalp_context = lambda candidate, regime: (True, "")
     candidate = _location_candidate(
-        grade="B",
+        grade="B+",
         confidence=0.58,
         timeframe="15min",
         inst_type="OPT",
-        adx_value=24.0,
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        volume_ratio=1.30,
     )
 
     assert scanner._passes_candidate_grade_preference(candidate) == (
         True,
-        "15min B-or-better confidence floor override",
+        "canonical quality policy owns B+ eligibility",
     )
     assert scanner._passes_live_trade_ready_gate(candidate) is True
 
 
-def test_unknown_regime_allows_only_a_or_aplus_at_75_confidence():
+def test_15min_quality_uses_the_fresh_adx_read_before_its_verdict():
+    def scanner_with_refresh(fresh_adx):
+        scanner = Scanner.__new__(Scanner)
+        scanner.mode = "REAL"
+        scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+        scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
+        scanner._passes_timeframe_entry_policy = lambda candidate: True
+        scanner._market_location_entry_gate = lambda candidate: (True, "")
+        scanner._candidate_15m_trend_agrees = lambda candidate: True
+        scanner._setting_enabled = lambda value, default=True: True
+
+        def refresh(candidate, regime):
+            candidate.adx_value = fresh_adx
+            return True, ""
+
+        scanner._fifteen_min_choppy_scalp_context = refresh
+        return scanner
+
+    def candidate_with_adx(adx_value):
+        return _location_candidate(
+            grade="A",
+            confidence=0.75,
+            timeframe="15min",
+            inst_type="OPT",
+            adx_value=adx_value,
+            trend_15m_agrees=True,
+            volume_ratio=1.30,
+        )
+
+    stale_high = candidate_with_adx(30.0)
+    assert scanner_with_refresh(10.0)._passes_live_trade_ready_gate(stale_high) is False
+    assert stale_high.quality_verdict["checks"]["adx"] == 10.0
+
+    stale_low = candidate_with_adx(10.0)
+    assert scanner_with_refresh(30.0)._passes_live_trade_ready_gate(stale_low) is True
+    assert stale_low.quality_verdict["checks"]["adx"] == 30.0
+
+
+def test_unknown_regime_requires_a_confidence_and_three_confirmations():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "UNKNOWN"}
@@ -1183,12 +1236,20 @@ def test_unknown_regime_allows_only_a_or_aplus_at_75_confidence():
         confidence=0.75,
         timeframe="15min",
         inst_type="FUT",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        impulse_confirmed=True,
+        volume_ratio=1.30,
     )
     low_conf = _location_candidate(
-        grade="A",
-        confidence=0.74,
+        grade="B+",
+        confidence=0.69,
         timeframe="15min",
         inst_type="FUT",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        impulse_confirmed=True,
+        volume_ratio=1.30,
     )
     weak_grade = _location_candidate(
         grade="B",
@@ -1401,11 +1462,14 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
             scanner = _late_reclaim_scanner(frames, signal_ts)
             scanner.mode = "REAL"
             scanner.latest_regimes = {name: "RANGING" for name in all_indices}
+            scanner._timeframe_regimes = {
+                f"{instrument}_15min": "RANGING"
+            }
             scanner._late_entry_scalp_active = lambda _candidate: False
             scanner._passes_timeframe_entry_policy = lambda _candidate: True
             scanner._late_session_entry_block_reason = lambda _candidate: ""
             scanner._market_location_entry_gate = lambda _candidate: (True, "")
-            scanner._candidate_15m_trend_agrees = lambda _candidate: False
+            scanner._candidate_15m_trend_agrees = lambda _candidate: True
             scanner.log_signal_decision_once = lambda *_args, **_kwargs: None
             candidate = _location_candidate(
                 instrument=instrument,
@@ -1415,6 +1479,9 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
                 direction="LONG",
                 grade="A+",
                 confidence=0.90,
+                adx_value=25.0,
+                trend_15m_agrees=True,
+                volume_ratio=1.30,
                 signal_timestamp=signal_ts,
                 # Above fifteen_min_choppy_scalp_min_intel_score (0.35 since 2026-08-11) so the
         # VOLUME condition under test is what blocks, not the intel floor. Was 0.24 when

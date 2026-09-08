@@ -308,6 +308,9 @@ class Trade:
     entry_policy_actual_rr: float = 0.0
     entry_policy_underlying_stop_pct: float = 0.0
     entry_policy_version: str = ""
+    # Full versioned signal-quality evidence, kept as JSON-compatible data so the
+    # ACCEPTED decision and eventual EXIT can be attributed to the same gate route.
+    quality_verdict: Dict[str, Any] = field(default_factory=dict)
     exit_price: float = 0.0
     exit_time: Optional[datetime] = None
     exit_reason: str = ""
@@ -572,6 +575,11 @@ class Trade:
             "expected_move_data_as_of": self.expected_move_data_as_of,
             "expected_move_model_version": self.expected_move_model_version,
             "expected_move_source": self.expected_move_source,
+            # Ephemeral monitor view. Rebuilt from live marks after every restart;
+            # intentionally not persisted as immutable entry-policy evidence.
+            "live_expected_move_forecast": dict(
+                getattr(self, "live_expected_move_forecast", {}) or {}
+            ),
             "entry_policy_allowed": self.entry_policy_allowed,
             "entry_policy_phase": self.entry_policy_phase,
             "entry_policy_checked_at": self.entry_policy_checked_at,
@@ -579,6 +587,7 @@ class Trade:
             "entry_policy_actual_rr": self.entry_policy_actual_rr,
             "entry_policy_underlying_stop_pct": self.entry_policy_underlying_stop_pct,
             "entry_policy_version": self.entry_policy_version,
+            "quality_verdict": dict(self.quality_verdict or {}),
             "instrument_multiplier": self.instrument_multiplier,
             "peak_pnl": self.peak_pnl,
             "max_drawdown": self.max_drawdown,
@@ -694,6 +703,25 @@ class Trade:
         # Extract base instrument name (strip strike info like "NIFTY 24100 CE" -> "NIFTY")
         raw_instrument = data.get("instrument", "")
         base_instrument = raw_instrument.split()[0] if raw_instrument else ""
+        # Older persisted rows predate `inst_type`.  A CE/PE contract is
+        # unambiguously a long-premium option even when its signal direction is
+        # SHORT (bought PE).  Defaulting that row to FUT makes recovery, P&L and
+        # exit-side logic treat a live option as a short future.
+        raw_inst_type = str(data.get("inst_type") or "").strip().upper()
+        if raw_inst_type not in {"OPT", "FUT"}:
+            option_type = str(data.get("option_type") or "").strip().upper()
+            contract_text = " ".join(
+                str(data.get(key) or "").upper()
+                for key in ("trading_symbol", "instrument")
+            )
+            raw_inst_type = (
+                "OPT"
+                if option_type in {"CE", "PE"}
+                or " CE" in contract_text
+                or " PE" in contract_text
+                or contract_text.endswith(("CE", "PE"))
+                else "FUT"
+            )
         entry_intelligence_score = data.get("entry_intelligence_score")
         if entry_intelligence_score is None:
             # Rows written before the explicit entry field used intelligence_score
@@ -717,7 +745,7 @@ class Trade:
             target=data.get("target", 0.0),
             rr_ratio=data.get("rr_ratio", 1.5),
             confidence=data.get("confidence", 0.0),
-            inst_type=data.get("inst_type", "FUT"),
+            inst_type=raw_inst_type,
             instrument_multiplier=data.get("instrument_multiplier", 1.0),
             exec_type=data.get("exec_type", "A"),
             status=data.get("status", "CLOSED"),
@@ -787,6 +815,7 @@ class Trade:
                 data.get("entry_policy_underlying_stop_pct") or 0.0
             ),
             entry_policy_version=str(data.get("entry_policy_version") or ""),
+            quality_verdict=dict(data.get("quality_verdict") or {}),
             exit_price=data.get("exit_price", data.get("current_price", 0.0)),
             exit_time=exit_time,
             exit_reason=data.get("exit_reason", ""),
@@ -1611,15 +1640,37 @@ class TradeManager:
                 gross = (trade.exit_price - trade.entry_price) * sized
             else:
                 gross = (trade.entry_price - trade.exit_price) * sized
-            trade.charges = estimate_trade_charges(
-                trade.entry_price,
-                trade.exit_price,
-                sized,
-                trade.inst_type,
-                get_settings(),
-                trade.instrument_multiplier,
-                instrument=trade.instrument,
+            settings = get_settings()
+            exact_broker_fill_pair = bool(
+                getattr(self, "mode", "HISTORICAL") == "REAL"
+                and str(getattr(trade, "broker_order_id", "") or "").strip()
+                and str(
+                    getattr(trade, "exit_order_id", "")
+                    or getattr(trade, "protective_order_id", "")
+                    or ""
+                ).strip()
+                and trade.entry_price > 0
+                and trade.exit_price > 0
             )
+            if exact_broker_fill_pair:
+                # Entry/exit are actual broker fills, so their difference already
+                # contains realised slippage.  Adding the simulation slippage model
+                # again double-counts it.  Statutory/broker charges are not present in
+                # Kite's price P&L, so retain the configured flat round-trip estimate.
+                configured_cost = getattr(
+                    settings, "opt_cost" if trade.inst_type == "OPT" else "fut_cost", 0.0
+                )
+                trade.charges = max(0.0, float(configured_cost or 0.0))
+            else:
+                trade.charges = estimate_trade_charges(
+                    trade.entry_price,
+                    trade.exit_price,
+                    sized,
+                    trade.inst_type,
+                    settings,
+                    trade.instrument_multiplier,
+                    instrument=trade.instrument,
+                )
             # Charges come off BOTH branches (2026-08-16). Kite's position `realised` is
             # a price-based figure — brokerage, STT, exchange and GST are reported
             # separately and are not in it — so taking it verbatim booked every
@@ -1628,10 +1679,17 @@ class TradeManager:
             # thrown away. Both numbers feed the daily-loss breaker, so the two branches
             # disagreeing meant the breaker's threshold meant different things depending
             # on which code path happened to close the trade.
+            # A freshly-flat position snapshot can report realised=0 briefly.  When
+            # both tracked order fills exist, their own prices are stronger per-trade
+            # evidence than that delayed/cumulative contract-level field.
             trade.pnl = (
-                float(realised_pnl) - trade.charges
-                if realised_pnl is not None
-                else gross - trade.charges
+                gross - trade.charges
+                if exact_broker_fill_pair
+                else (
+                    float(realised_pnl) - trade.charges
+                    if realised_pnl is not None
+                    else gross - trade.charges
+                )
             )
             if callable(on_trade_closed) and terminal_lifecycle:
                 # Add before removing from open_trades. At every observable instant
@@ -2756,7 +2814,15 @@ class TradeManager:
             return "UNKNOWN", "", None
         return ("FOUND", oid, None) if oid else ("NONE", "", None)
 
-    def _entry_margin_verdict(self, symbol: str, qty: int, side: str, price: float):
+    def _entry_margin_verdict(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        price: float,
+        *,
+        reserve: bool = True,
+    ):
         """Can this entry be funded? None when the broker cannot answer.
 
         Deliberately fail-OPEN: a missing or erroring margin endpoint must never stop
@@ -2771,6 +2837,7 @@ class TradeManager:
             verdict = preflight(
                 symbol=symbol, qty=int(qty or 0), side=str(side or "BUY"),
                 product_type=self.product_type, price=float(price or 0.0),
+                reserve=bool(reserve),
             ) or {}
         except Exception as exc:
             logger.debug(f"Entry margin preflight unavailable for {symbol}: {exc}")
@@ -5398,6 +5465,44 @@ class TradeManager:
                     closed += 1
                 continue
             if (
+                bool(getattr(trade, "pending_exit", False))
+                and str(getattr(trade, "execution_status", "") or "").upper()
+                == "RECOVERY_REQUIRED"
+            ):
+                # A lost exit acknowledgement is neither permission to submit another
+                # MARKET order nor a reason to abandon a known live position forever.
+                # First reconcile the exact tags. Only a broker-confirmed
+                # absence proves that the original exit never reached the exchange.
+                recovered_exit_id = self._recover_order_id_from_tag(trade, "FULL_EXIT") or self._recover_order_id_from_tag(trade, "RECOVERY_EXIT")
+                if recovered_exit_id:
+                    trade.exit_order_id = recovered_exit_id
+                    trade.execution_status = "EXIT_PENDING"
+                    trade.execution_error = "Recovered ambiguous exit from broker order tag"
+                    changed = True
+                else:
+                    tagged_state = self._tagged_exit_state(trade, "FULL_EXIT")
+                    recovery_state = self._tagged_exit_state(trade, "RECOVERY_EXIT")
+                    if tagged_state == "ABSENT" and recovery_state == "ABSENT":
+                        trade.pending_exit = False
+                        trade.execution_status = "OPEN"
+                        trade.execution_error = (
+                            "Ambiguous exit was absent from authoritative broker order book; "
+                            "submitting one recovery exit"
+                        )
+                        changed = True
+                        # The position snapshot above proves this trade still owns a
+                        # quantity, and the tag lookup proves no original full exit is
+                        # resting. emergency_flatten_trade uses a distinct recovery tag
+                        # and retains its normal protection/cancel safeguards.
+                        if not self.emergency_flatten_trade(
+                            trade, "AMBIGUOUS_EXIT_ORDER_ABSENT"
+                        ):
+                            self.ensure_broker_protection(trade, allocated_qty)
+                        continue
+                    # FOUND / AMBIGUOUS / UNKNOWN are intentionally held. Any of them
+                    # could still represent a live broker exit; retrying would over-sell.
+                    continue
+            if (
                 trade.execution_status in {
                     "ENTRY_PENDING",
                     "ENTRY_SUBMITTED",
@@ -5526,6 +5631,41 @@ class TradeManager:
                     )
                 if filled_qty < expected_qty:
                     self._withdraw_stale_entry_remainder(trade, filled_qty, expected_qty)
+            elif (
+                trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
+                and allocated_qty >= expected_qty
+            ):
+                # The position has not changed, but its owned exit can still have a
+                # definitive terminal non-fill.  Previously this full-size case was
+                # examined only when quantity had already fallen (the partial-exit
+                # branch below), so a CANCELLED/REJECTED recovered exit remained
+                # pending forever. COMPLETE deliberately remains non-retryable: a
+                # delayed positions snapshot can still be stale after a real fill.
+                verdict = self._abandoned_exit_verdict(trade)
+                if verdict == "DEAD":
+                    trade.pending_exit = False
+                    trade.exit_order_id = ""
+                    trade.execution_status = "OPEN"
+                    trade.execution_error = (
+                        "Broker confirmed the pending exit was cancelled/rejected; "
+                        "submitting recovery exit for the reconciled remaining quantity"
+                    )
+                    changed = True
+                    if not self.emergency_flatten_trade(
+                        trade, "EXIT_ORDER_CONFIRMED_DEAD"
+                    ):
+                        self.ensure_broker_protection(trade, allocated_qty)
+                    continue
+                if verdict == "UNKNOWN":
+                    if not hasattr(self, "_full_exit_unknown_logged"):
+                        self._full_exit_unknown_logged = set()
+                    if trade.id not in self._full_exit_unknown_logged:
+                        self._full_exit_unknown_logged.add(trade.id)
+                        logger.warning(
+                            f"Cannot determine whether full exit {trade.exit_order_id} for "
+                            f"{trade.trading_symbol} is still working; holding the position "
+                            "to avoid a duplicate exit."
+                        )
             elif (
                 trade.execution_status in {"EXIT_PENDING", "PARTIAL_EXIT"}
                 and allocated_qty < expected_qty
@@ -6310,10 +6450,12 @@ class TradeManager:
         geometry_verified: bool = False,
         expected_move_forecast: Optional[Dict[str, Any]] = None,
         entry_policy_verdict: Optional[Dict[str, Any]] = None,
+        quality_verdict: Optional[Dict[str, Any]] = None,
         execution_touch_quote: Optional[Dict[str, Any]] = None,
         on_execution_result: Optional[Callable[[Trade, bool], None]] = None,
         lifecycle_id: str = "",
         entry_submission_guard: Optional[Callable[[Trade], Any]] = None,
+        entry_refusal_outcome: Optional[Dict[str, Any]] = None,
     ) -> Optional[Trade]:
         """Open a new trade and execute via broker"""
         if entry_time is not None:
@@ -6379,6 +6521,47 @@ class TradeManager:
                 logger.warning(f"Entry refused by projected stop-risk budget: {risk_reason}")
                 self._log_ui(f"Entry refused: {risk_reason}", "warning")
                 return None
+
+            # ── Non-blocking early funds refusal ────────────────────────────
+            # Margin/order endpoints are network calls. This method runs on the shared
+            # scan loop, so it may consult only a broker-provided *cached refusal* here.
+            # The definitive preflight (and its concurrency reservation) runs once in
+            # _place_bg_body. A cached approval is intentionally never trusted.
+            _is_warmup = getattr(self, "is_warmup", False)
+            if (self._live_orders_permitted() and self.broker and trading_symbol
+                    and not is_ghost and not _is_warmup and not is_recovery):
+                _order_side = "BUY" if inst_type == "OPT" else ("BUY" if direction == "LONG" else "SELL")
+                _qty = int(lots or 1) * int(lot_size or 1)
+                _cached_refusal = getattr(self.broker, "cached_entry_margin_refusal", None)
+                _early_verdict = None
+                if callable(_cached_refusal):
+                    try:
+                        _early_verdict = _cached_refusal(
+                            symbol=trading_symbol, qty=_qty, side=_order_side,
+                            product_type=self.product_type, price=float(price or 0.0),
+                        )
+                    except Exception as exc:
+                        logger.debug(f"Cached funds refusal unavailable for {trading_symbol}: {exc}")
+                if _early_verdict is not None and not _early_verdict.get("ok", True):
+                    _limitation = (
+                        _early_verdict.get("limitation")
+                        or _early_verdict.get("reason")
+                        or "insufficient margin"
+                    )
+                    if isinstance(entry_refusal_outcome, dict):
+                        entry_refusal_outcome.update({
+                            "code": "ENTRY_MARGIN_PREFLIGHT",
+                            "reason": str(_limitation),
+                            "basis": str(_early_verdict.get("basis") or ""),
+                            "available": _early_verdict.get("available"),
+                            "required": _early_verdict.get("required"),
+                        })
+                    logger.warning(
+                        f"Entry refused on margin preflight: {trading_symbol} x{_qty}: {_limitation}"
+                    )
+                    self._log_ui(f"Entry refused (funds): {_limitation}", "warning")
+                    return None
+
             known_ids = set(self.open_trades)
             known_ids.update(str(trade.id) for trade in self.closed_trades)
             while True:
@@ -6468,6 +6651,7 @@ class TradeManager:
             entry_policy_actual_rr=float(policy.get("actual_rr") or 0.0),
             entry_policy_underlying_stop_pct=float(policy.get("underlying_stop_pct") or 0.0),
             entry_policy_version=str(policy.get("policy_version") or ""),
+            quality_verdict=dict(quality_verdict or {}),
             is_ghost=is_ghost,
             is_recovery=bool(is_recovery),
             is_reversion_scalp=is_reversion_scalp,
@@ -6544,9 +6728,10 @@ class TradeManager:
                 # Collected so a definitive rejection can hand all of them back at once.
                 reservations: List[str] = []
                 guard_rejection_reason = ""
+                margin_rejection_reason = ""
 
                 def place_order():
-                    nonlocal guard_rejection_reason
+                    nonlocal guard_rejection_reason, margin_rejection_reason
                     # Ask the broker whether this order can be funded BEFORE sending it.
                     # preflight_entry_margin was written for exactly this and had no
                     # caller, so an underfunded account fired a doomed order per signal
@@ -6557,10 +6742,14 @@ class TradeManager:
                         trading_symbol, trade.quantity, order_side, price
                     )
                     if preflight is not None and not preflight.get("ok", True):
-                        raise BrokerOrderRejected(
+                        margin_rejection_reason = str(
                             preflight.get("limitation")
                             or preflight.get("reason")
-                            or "entry margin preflight failed",
+                            or "entry margin preflight failed"
+                        )
+                        raise BrokerOrderRejected(
+                            margin_rejection_reason,
+                            code="ENTRY_MARGIN_PREFLIGHT",
                             terminal=True,
                         )
                     # An approved preflight has RESERVED this order's margin so a
@@ -6719,24 +6908,37 @@ class TradeManager:
                 # branch above deliberately does NOT reach here.
                 self._release_margin_reservations(reservations)
                 guard_blocked = bool(guard_rejection_reason)
-                msg = (
-                    f"❌ Entry submission guard rejected {trading_symbol}: "
-                    f"{guard_rejection_reason}"
-                    if guard_blocked
-                    else (
+                margin_blocked = bool(margin_rejection_reason)
+                if guard_blocked:
+                    msg = (
+                        f"❌ Entry submission guard rejected {trading_symbol}: "
+                        f"{guard_rejection_reason}"
+                    )
+                elif margin_blocked:
+                    msg = (
+                        f"❌ Entry margin preflight rejected {trading_symbol}: "
+                        f"{margin_rejection_reason}"
+                    )
+                else:
+                    msg = (
                         f"❌ Broker entry failed for {trading_symbol} after "
                         f"{attempts} attempts: {error}"
                     )
-                )
                 logger.error(msg)
                 self._log_ui(msg, "error")
-                if not guard_blocked:
+                if not guard_blocked and not margin_blocked:
                     self._alert_blocking_broker_condition(error)
                 with self._lock:
                     if trade.id in self.open_trades:
                         trade.status = "CLOSED"
                         trade.exit_reason = (
-                            "ENTRY_SUBMISSION_GUARD" if guard_blocked else "BROKER_ERROR"
+                            "ENTRY_SUBMISSION_GUARD"
+                            if guard_blocked
+                            else (
+                                "ENTRY_MARGIN_PREFLIGHT"
+                                if margin_blocked
+                                else "BROKER_ERROR"
+                            )
                         )
                         trade.exit_time = datetime.now(IST)
                         trade.exit_price = trade.entry_price
@@ -6845,10 +7047,13 @@ class TradeManager:
         real_premium: Optional[float] = None,
         real_fut_price: Optional[float] = None,
         quote_verified: Optional[bool] = None,
+        allow_broker_protection: bool = True,
+        observed_contract_ticks: Optional[List[Tuple[float, Optional[datetime]]]] = None,
     ):
         """
         Update trade with latest price and trailing stop from 1-min data.
-        Automatically closes trade if trailing stop is hit.
+        Automatically closes trade if trailing stop is hit. ``observed_contract_ticks``
+        carries exact, ordered websocket prices hidden between sampled monitor passes.
         """
         trade = self.open_trades.get(trade_id)
         if not trade or trade.status != "OPEN":
@@ -6868,6 +7073,57 @@ class TradeManager:
         # If it's an option, current_price is the synthetic premium. 
         # Premium change = (Spot Change * Signed Delta)
         is_option = trade.inst_type == "OPT" or "CE" in getattr(trade, 'trading_symbol', '') or "PE" in getattr(trade, 'trading_symbol', '')
+        # Snapshot levels before this pass tightens the trail. Historical ticks must not
+        # be tested against a stop that did not exist when they arrived.
+        active_stop_before_update = float(getattr(trade, "current_stop", 0.0) or 0.0)
+        active_target_before_update = float(getattr(trade, "target", 0.0) or 0.0)
+        runner_before_update = bool(getattr(trade, "runner_mode", False))
+        observed_exit_touch = None
+        if observed_contract_ticks and quote_verified is not False:
+            for raw_tick in observed_contract_ticks:
+                try:
+                    observed_price = float(raw_tick[0] if isinstance(raw_tick, (tuple, list)) else raw_tick)
+                    observed_at = (
+                        raw_tick[1]
+                        if isinstance(raw_tick, (tuple, list)) and len(raw_tick) > 1
+                        else current_time
+                    )
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if observed_price <= 0:
+                    continue
+                if is_option and not self._option_premium_quote_plausible(
+                    trade, observed_price, current_spot
+                ):
+                    continue
+                if is_option:
+                    stop_hit = active_stop_before_update > 0 and observed_price <= active_stop_before_update
+                    target_hit = (
+                        not runner_before_update
+                        and active_target_before_update > 0
+                        and observed_price >= active_target_before_update
+                    )
+                elif trade.direction == "LONG":
+                    stop_hit = active_stop_before_update > 0 and observed_price <= active_stop_before_update
+                    target_hit = (
+                        not runner_before_update
+                        and active_target_before_update > 0
+                        and observed_price >= active_target_before_update
+                    )
+                else:
+                    stop_hit = active_stop_before_update > 0 and observed_price >= active_stop_before_update
+                    target_hit = (
+                        not runner_before_update
+                        and active_target_before_update > 0
+                        and observed_price <= active_target_before_update
+                    )
+                if stop_hit or target_hit:
+                    observed_exit_touch = (
+                        "TRAILING_STOP" if stop_hit else "TARGET_HIT",
+                        observed_price,
+                        observed_at,
+                    )
+                    break
         
         if is_option:
             if (
@@ -6935,7 +7191,13 @@ class TradeManager:
                         trade.current_stop = incoming_stop
 
         if int(getattr(trade, "broker_quantity", 0) or 0) > 0:
-            self.ensure_broker_protection(trade, trade.broker_quantity)
+            if allow_broker_protection:
+                self.ensure_broker_protection(trade, trade.broker_quantity)
+            else:
+                # REST/order-book work belongs to PositionSync, never to the shared
+                # scanner/HFT loop. Wake it immediately rather than waiting for its
+                # normal interval, while preserving the same protection authority.
+                self.nudge_position_sync()
             if recovery_required:
                 self._maybe_auto_flatten_unprotected(
                     trade,
@@ -6992,7 +7254,15 @@ class TradeManager:
         # Early loss-guard backstop (R2): use scanner-published loss_guard_cut_r
         # when present (intel-accelerated); else base 0.8R settings.
         cut_override = getattr(trade, "loss_guard_cut_r", None)
-        if self._early_loss_cut_min_hold_met(trade) and self._early_loss_cut_hit(
+        if observed_exit_touch is not None:
+            touch_reason, touch_price, touch_time = observed_exit_touch
+            self.close_trade(
+                trade_id,
+                touch_price,
+                touch_reason,
+                exit_time=touch_time if isinstance(touch_time, datetime) else current_time,
+            )
+        elif self._early_loss_cut_min_hold_met(trade) and self._early_loss_cut_hit(
             trade, cut_r_override=cut_override
         ):
             self.close_trade(
@@ -7452,7 +7722,9 @@ class TradeManager:
                 not requires_broker_exit or self._confirmed_broker_quantity(trade) <= 0
             ):
                 return False
-            if requires_broker_exit and (not self.broker or not trade.symbol_token):
+            if requires_broker_exit and (
+                not self._live_orders_permitted() or not self.broker or not trade.symbol_token
+            ):
                 trade.execution_status = "RECOVERY_REQUIRED"
                 trade.execution_error = (
                     "REAL position cannot be closed without broker access and symbol token"
@@ -7482,7 +7754,9 @@ class TradeManager:
             if self._entry_still_confirming(trade):
                 if not requires_broker_exit or self._confirmed_broker_quantity(trade) <= 0:
                     return False
-            if requires_broker_exit and (not self.broker or not trade.symbol_token):
+            if requires_broker_exit and (
+                not self._live_orders_permitted() or not self.broker or not trade.symbol_token
+            ):
                 trade.execution_status = "RECOVERY_REQUIRED"
                 trade.execution_error = (
                     "REAL position cannot be closed without broker access and symbol token"
@@ -7492,7 +7766,12 @@ class TradeManager:
                 if on_exit_result:
                     on_exit_result(trade, False)
                 return False
-            trade.exit_price = float(exit_price or trade.current_price or trade.entry_price)
+            measured_exit = float(exit_price or trade.current_price or 0.0)
+            if measured_exit <= 0.0 and not requires_broker_exit:
+                # A local/historical/ghost close has no later broker reconciliation.
+                # Refuse to manufacture a zero-P&L fill from the entry price.
+                return False
+            trade.exit_price = measured_exit or float(trade.entry_price or 0.0)
             trade.current_price = trade.exit_price
             trade.exit_time = exit_time or datetime.now(IST)
             trade.exit_reason = reason
@@ -8471,6 +8750,19 @@ class TradeManager:
                 lifecycle_id = str(
                     getattr(trade, "lifecycle_id", "") or trade.id
                 )
+                exec_type = str(
+                    getattr(trade, "exec_type", "A") or "A"
+                ).upper()
+                quality_verdict = getattr(trade, "quality_verdict", {}) or {}
+                if not isinstance(quality_verdict, dict):
+                    quality_verdict = {}
+                else:
+                    # The forensic writer JSON-encodes payload later. Normalising here
+                    # keeps observability best-effort even if a caller attached a
+                    # datetime or another otherwise non-JSON-native diagnostic value.
+                    quality_verdict = json.loads(
+                        json.dumps(quality_verdict, default=str)
+                    )
                 events.append({
                     "session_date": (
                         getattr(trade, "entry_time", datetime.now(_IST))
@@ -8513,11 +8805,12 @@ class TradeManager:
                     "lane": str(
                         getattr(trade, "source_lane", "") or ""
                     ),
-                    # AUTO vs MANUAL, so the flight recorder distinguishes a trade the
-                    # system placed from one the operator did. `lane` already means the
-                    # signal's source lane (fast/slow) and must not be overloaded.
+                    # This is frozen entry provenance, not current UI state. Auto Mode
+                    # can be toggled while a position remains open; consulting the
+                    # manager would relabel later lifecycle events for the same trade.
+                    # `lane` already means the signal's source lane and stays separate.
                     "execution_mode": (
-                        "AUTO" if getattr(self, "auto_mode", False) else "MANUAL"
+                        "MANUAL" if exec_type in {"M", "MANUAL"} else "AUTO"
                     ),
                     "ltp": ltp,
                     "entry_price": float(
@@ -8557,6 +8850,7 @@ class TradeManager:
                         "exit_order_id": getattr(
                             trade, "exit_order_id", ""
                         ),
+                        "quality_verdict": quality_verdict,
                     },
                 })
             except Exception:

@@ -1,13 +1,8 @@
-"""
-Behavior-parity guard for the scanner LIVE gate consolidation.
+"""Golden matrix for the canonical scanner LIVE quality/safety funnel.
 
-`_passes_live_trade_ready_gate` / `_passes_candidate_grade_preference` had the
-same redundant `grade_rank AND/OR confidence` double-checks as the policy gate.
-They were collapsed to confidence-only. With `live_filter_leniency_pct == 0.0`
-this MUST be exactly behavior-neutral over consistent (grade == bucket(conf))
-inputs. Golden hash over a 115,200-cell grid.
-
-If you intentionally change a live floor, regenerate LIVEGATE_SHA256.
+Every consistent grade/confidence input must return a decision, never an exception.
+The hash pins the current B+ evidence floor, explicit A/A+ operator preference and
+own-timeframe regime behavior over a 115,200-cell grid.
 """
 
 import hashlib
@@ -15,41 +10,16 @@ import itertools
 import json
 from types import SimpleNamespace
 
+from loguru import logger
+
 from scanner import Scanner
 from config.settings import get_settings
 from engine.signal_quality_policy import confidence_to_grade
 
-# Updated after the deliberate B-grade rule + 15m-UNKNOWN(0.85->0.70)
-# and current advanced gate/volume-spike behavior changes.
-# Now a regression guard for the CURRENT intended live-gate behavior.
-#
-# Regenerated 2026-08-09 for the own-timeframe regime fix. The grid also DOUBLED
-# (57,600 -> 115,200) because `own_tf` was added as a dimension, so the hash would have
-# changed regardless. The behaviour delta was measured against the old grid shape before
-# regenerating:
-#
-#     rows changed .................. 576 of 57,600 (1.00%)
-#     all on timeframe .............. 15min (5min: 0 changed)
-#     all in gate ................... grade-preference (live gate: 0 changed)
-#     transition .................... True -> False, in every case
-#     regimes affected .............. TRENDING_UP (288), BREAKOUT_UP (288)
-#
-# That is exactly the intended scope: a 15-minute B-grade candidate no longer bypasses
-# the grade floor on a TRENDING label borrowed from the 5-minute pocket. It keeps the
-# bypass when it owns a trending label on its own timeframe, which the new own_tf=True
-# half of the grid now pins. Nothing loosened; every changed row got STRICTER.
-# Regenerated 2026-09-01. The live 5-minute confidence floor became a named setting
-# (live_5min_quality_min_confidence) and its default dropped 0.70 -> 0.65 at the
-# operator's request.
-#
-# The change was diffed ROW BY ROW against the previous golden before this constant was
-# touched: 760 of 115,200 rows moved (0.66%), every one of them 5min, at confidence 0.68,
-# with 15-minute agreement False, under INCLUDE_5MIN, and every one False -> True. No row
-# was newly REFUSED and no other timeframe, policy or confidence moved. A golden is only
-# worth regenerating when the diff behind it has been read.
-#
-# previous: 3a3b7d0f69f0ba6c056ead4521392467b538b1570dc3ea6fa306f1d35f0bda25
-LIVEGATE_SHA256 = "c72037c2895d31dfc0ce77c40e94a1c7a1a52b42344fd06afd753a06f17165db"
+# Regenerated 2026-09-02 after removing the B-band admission bypass and making the
+# canonical evidence verdict the only B+ authority. Row-level assertions below first
+# guarantee that an exception cannot be hidden inside a merely updated hash.
+LIVEGATE_SHA256 = "d6cba60e5d23520211f91f1cca7369348728685f332a3e17d74e8b731bb2d537"
 
 _INST_METHODS = [
     "_passes_live_trade_ready_gate",
@@ -101,6 +71,7 @@ def test_live_gate_behavior_parity_golden():
     confs = [0.30, 0.42, 0.50, 0.54, 0.58, 0.62, 0.68, 0.72, 0.80, 0.88]
     regs = ["TRENDING_UP", "BREAKOUT_UP", "RANGING", "VOLATILE", "UNKNOWN", "MOMENTUM"]
     rows = []
+    logger.disable("scanner")
     # own_tf: whether the regime label exists on the CANDIDATE's own timeframe, or only
     # on the instrument-keyed 5-minute one it would be borrowing. Added 2026-08-09 --
     # the matrix previously only ever exercised the borrowed shape, so it could not see
@@ -123,8 +94,17 @@ def test_live_gate_behavior_parity_golden():
         except Exception as e:
             lr = "ERR:" + type(e).__name__
         rows.append((conf, reg, tf, inst, a, adx, im, ex, pref, pol, own_tf, gp, lr))
+    logger.enable("scanner")
 
     assert len(rows) == 115200
+    errors = [row for row in rows if str(row[-2]).startswith("ERR:") or str(row[-1]).startswith("ERR:")]
+    assert not errors, f"live-gate grid raised exceptions: {errors[:3]}"
+    borrowed_15min_admissions = [
+        row for row in rows if row[2] == "15min" and row[10] is False and row[-1] is True
+    ]
+    assert not borrowed_15min_admissions, (
+        "15min admission borrowed a regime label from the 5min pocket"
+    )
     digest = hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
     assert digest == LIVEGATE_SHA256, (
         f"Live-gate behavior changed vs golden. If intentional, regenerate (got {digest})."

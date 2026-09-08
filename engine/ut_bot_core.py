@@ -131,7 +131,7 @@ class UTBotEngine:
         adx_threshold: float = 25.0,
         strict_adx: bool = False,
         session_filter: bool = True,
-        session_start: str = "09:20",
+        session_start: str = "09:15",
         session_end: str = "15:15",
         capital: float = 100000.0,
         risk_pct: float = 1.0,

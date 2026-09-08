@@ -16,6 +16,7 @@ from engine.scanner_historical_results import build_historical_trade_result
 from engine.trade_row_adapter import (
     accounting_pnl,
     hygiene_closed_rows,
+    is_engine_replay_row,
     is_option_dashboard_row,
     is_simulated_history_row,
     normalize_dashboard_accounting_row,
@@ -210,14 +211,47 @@ class ScannerTradePayloadBuilder:
         elif scanner.mode == "HISTORICAL":
             payload["open"] = [r for r in payload.get("open", []) or [] if historical_payload_row_allowed(r)]
             payload["closed"] = [r for r in payload.get("closed", []) or [] if historical_payload_row_allowed(r)]
+            # BACKTEST P&L must describe this engine replay only. TradeManager also
+            # restores broker/session-ledger rows from SQLite; historical recalculation
+            # preserves those records for audit, but mixing them into a fresh replay
+            # makes build comparisons depend on each directory's database contents.
+            # Keep ledger facts persisted; exclude them only from replay accounting.
+            historical_open = list(payload.get("open", []) or [])
+            historical_closed = list(payload.get("closed", []) or [])
+            excluded_open = [row for row in historical_open if not is_engine_replay_row(row)]
+            excluded_closed = [row for row in historical_closed if not is_engine_replay_row(row)]
+            payload["open"] = [row for row in historical_open if is_engine_replay_row(row)]
+            payload["closed"] = [row for row in historical_closed if is_engine_replay_row(row)]
+            payload["meta"] = {
+                **payload.get("meta", {}),
+                "accounting_source": "current_engine_replay",
+                "excluded_session_ledger_rows": len(excluded_open) + len(excluded_closed),
+                "excluded_session_ledger_pnl": round(
+                    sum(accounting_pnl(row) for row in excluded_open + excluded_closed),
+                    2,
+                ),
+            }
 
-        def rebuild_display_accounting() -> None:
+        def rebuild_display_accounting(accounting_lane: Optional[str] = None) -> None:
             """Keep headline metrics identical to the final reconciled dashboard rows.
 
             Always apply shared shadow-free + exact-dedup hygiene so a prior
             TradeManager.get_summary() cannot be overwritten with inflated
             historical FUT_SHADOW / multi-engine replay totals.
             """
+            lane = str(
+                accounting_lane
+                or ("REPLAY" if scanner.mode == "HISTORICAL" else "LIVE")
+            ).upper()
+            is_replay = lane == "REPLAY"
+            is_signal_tracker = lane == "SIGNAL_TRACKER"
+            pnl_label = (
+                "BACKTEST P&L"
+                if is_replay
+                else "SIGNAL P&L"
+                if is_signal_tracker
+                else "DAILY P&L"
+            )
             raw_closed = [
                 normalize_dashboard_accounting_row(row)
                 for row in payload.get("closed", []) or []
@@ -373,6 +407,18 @@ class ScannerTradePayloadBuilder:
             current_dd_pct = round((current_drawdown / capital_total) * 100.0, 2) if capital_total > 0 else 0.0
 
             monetary = {
+                "accounting_basis": {
+                    "lane": lane,
+                    "pnl_label": pnl_label,
+                    "is_live_money": lane == "LIVE",
+                    "description": (
+                        "Accepted signal marks only; no broker fill is implied"
+                        if is_signal_tracker
+                        else "Historical replay; no broker fill is implied"
+                        if is_replay
+                        else "Trade-manager broker/execution ledger"
+                    ),
+                },
                 "capital": {
                     "configured_demat_capital": round(capital_total, 2),
                     "futures_allocation": round(capital_fut, 2),
@@ -415,6 +461,11 @@ class ScannerTradePayloadBuilder:
             }
 
             payload["summary"] = {
+                "lane": lane,
+                "pnl_label": pnl_label,
+                "is_replay": is_replay,
+                "is_signal_tracker": is_signal_tracker,
+                "pnl_is_money": lane == "LIVE",
                 "daily_pnl": round(total_pnl, 2),
                 "fut_pnl": round(sum(accounting_pnl(row) for row in closed_rows + open_rows if not is_option_dashboard_row(row)), 2),
                 "opt_pnl": round(sum(accounting_pnl(row) for row in closed_rows + open_rows if is_option_dashboard_row(row)), 2),
@@ -498,6 +549,20 @@ class ScannerTradePayloadBuilder:
                                     scanner._serialize_trade_candidate(candidate)
                                 )
                             )
+            # A broker-backed TradeManager row is authoritative once a signal has
+            # executed.  The session tracker may continue following the hypothetical
+            # signal after the real position closes; exposing both creates a phantom
+            # second trade and a fictional P&L.  Keep unexecuted/watch-only signals.
+            manager_lifecycles = {
+                str(row.get("lifecycle_id") or "").strip()
+                for row in [*(payload.get("open", []) or []), *(payload.get("closed", []) or [])]
+                if str(row.get("lifecycle_id") or "").strip()
+            }
+            if manager_lifecycles:
+                signal_rows = [
+                    row for row in signal_rows
+                    if str(row.get("lifecycle_id") or "").strip() not in manager_lifecycles
+                ]
             # Show one row per signal lifecycle: its exit when completed, or its
             # entry while still active/watched.
             exit_rows = [r for r in signal_rows if r.get("action") == "EXIT"]
@@ -558,7 +623,7 @@ class ScannerTradePayloadBuilder:
                 try:
                     payload["open"] = active_rows
                     payload["closed"] = exit_rows
-                    rebuild_display_accounting()
+                    rebuild_display_accounting(accounting_lane="SIGNAL_TRACKER")
                 finally:
                     payload["open"] = original_open
                     payload["closed"] = original_closed

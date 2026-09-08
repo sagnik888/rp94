@@ -33,6 +33,7 @@ def _trade(trade_id="t1", **updates):
 
 def test_trade_rows_preserve_timestamps_and_closed_price_rules():
     trade = _trade(
+        lifecycle_id="NIFTY|15min|LONG|2026-06-12T10:00:00",
         status="CLOSED",
         exit_price=112.0,
         current_price=112.0,
@@ -48,6 +49,7 @@ def test_trade_rows_preserve_timestamps_and_closed_price_rules():
     assert row["exit_timestamp"].endswith("+05:30")
     assert row["current_price"] == 0.0
     assert row["exit_price"] == 112.0
+    assert row["lifecycle_id"] == "NIFTY|15min|LONG|2026-06-12T10:00:00"
 
 
 def test_live_option_spot_levels_are_converted_to_premium_levels():

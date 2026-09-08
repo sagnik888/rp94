@@ -1,17 +1,16 @@
-"""A solo-source B+ must have an admission path, and nothing may admit a C-grade.
+"""B+ is eligibility, not unconditional admission; nothing may admit a C-grade.
 
 2026-08-31. An operator running a parallel build reported two profitable trades this
 build refused, both single-engine B+ around 67%:
 
     BANKNIFTY 57300CE 11:45  +Rs 2,323      MIDCPNIFTY 14875PE 13:56  +Rs 532
 
-THE DEFECT. The quad-prime raw quality floor admitted on high_grade (grade >= A and
-conf >= 0.70), multi_confirmed (>= 2 signal ENGINES), or b_grade_ok -- and
-b_grade_entry_allowed governs the B BAND only, returning False the instant confidence
-reaches 0.55, its docstring saying "B+/A/A+ use the standard confidence floors". No term
-in the gate ever read those floors. A solo-source signal anywhere in 0.55-0.699 -- the
-whole B+ band -- therefore had no admission path. `standard_floor_ok` restores the
-documented ladder (B+ 0.55, A 0.70, A+ 0.85).
+THE DEFECT. The raw quality floor previously admitted a B+ purely because it was B+,
+which let ADX-10, unaligned, no-volume signals through in UNKNOWN/ranging/volatile
+regimes.  The corrected ladder is deliberately conservative: B+ at 55--70% is eligible
+only after contemporaneous ADX/trend/independent-confirmation evidence; >=70% may stand
+on its own in a known regime.  Sparse, mixed-basis tracker labels are not used to lower
+that live floor.
 
 TWO THINGS THIS FILE GOT WRONG BEFORE, both found by a second audit:
 
@@ -44,7 +43,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from config.settings import get_settings
+from config.settings import Settings, get_settings
 from engine.signal_quality_policy import confidence_to_grade
 from scanner import Scanner
 
@@ -129,18 +128,22 @@ def test_admission_is_monotonic_in_confidence(regime, adx):
     assert not reversals, f"{regime} adx={adx}: " + "; ".join(reversals[:3])
 
 
-def test_the_b_plus_dead_zone_is_closed():
-    """The genuine defect: a solo source in 0.55-0.70 had no admission path at all."""
+def test_a_weak_solo_b_plus_is_refused_instead_of_unconditionally_admitted():
+    """The audit regression: B+ alone is never the quality evidence."""
     for confidence in (0.55, 0.60, 0.65, 0.679, 0.699):
         assert confidence_to_grade(confidence) == "B+"
         admitted, reason = _gate(confidence, regime="VOLATILE", adx=10.0, sources=1)
-        assert admitted, f"a solo B+ at {confidence:.1%} is still refused: {reason}"
+        assert not admitted, f"weak solo B+ at {confidence:.1%} was admitted: {reason}"
+        assert "BPLUS_RISKY_SETUP_INSUFFICIENT" in reason
 
 
-def test_the_two_refused_signals_are_admitted():
-    """Both single-engine B+ in a non-trending regime, on the real gate."""
-    assert _gate(0.672, regime="VOLATILE", adx=21.6, sources=1)[0]
-    assert _gate(0.679, regime="VOLATILE", adx=25.0, sources=1)[0]
+def test_b_plus_needs_and_accepts_a_good_risky_setup():
+    """Trend + ADX + a second evidence leg is the only lower-confidence route."""
+    assert not _gate(0.679, regime="VOLATILE", adx=25.0, sources=1)[0]
+    assert _gate(
+        0.679, regime="VOLATILE", adx=25.0, sources=1, trend15=True,
+        volume_spike=True,
+    )[0]
 
 
 @pytest.mark.parametrize("regime", REGIMES)
@@ -210,7 +213,20 @@ def test_grade_is_a_bucket_of_confidence():
     assert confidence_to_grade(0.20) == "C"
 
 
-def test_the_minimum_grade_is_a_setting_and_defaults_to_b_plus():
-    assert str(
-        getattr(get_settings(), "quad_prime_raw_standard_floor_min_grade", "")
-    ).upper() == "B+"
+def test_the_canonical_minimum_grade_is_bplus_eligibility():
+    assert confidence_to_grade(0.55) == "B+"
+    assert confidence_to_grade(0.549999) == "B"
+
+
+def test_deprecated_raw_floor_controls_stay_removed_without_harming_monotonicity():
+    retired = {
+        "quad_prime_raw_standard_floor_min_grade",
+        "quad_prime_raw_multi_source_min_confidence",
+        "quad_prime_raw_runner_min_confidence",
+    }
+    assert retired.isdisjoint(Settings.model_fields)
+    ladder = [
+        _gate(c / 100.0, regime="TRENDING_UP", adx=25.0, trend15=True)[0]
+        for c in range(50, 100, 5)
+    ]
+    assert all(not prior or current for prior, current in zip(ladder, ladder[1:])), ladder

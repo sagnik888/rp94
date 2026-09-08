@@ -251,6 +251,29 @@ def test_position_cost_is_premium_times_quantity():
     assert Scanner._position_cost_rs(_T(170.0, 2, 120)) == pytest.approx(40800.0)
 
 
+def test_futures_use_entry_stop_risk_not_full_notional_for_profit_locks():
+    future = _T(25_000.0, 1, 50)
+    future.inst_type = "FUT"
+    future.initial_stop = 24_950.0
+    future.trailing_stop = 24_950.0
+
+    # Old calculation: 25,000 x 50 = Rs.1.25m and a 5% lock floor of Rs.62,500,
+    # which never arms on normal intraday futures P&L.  The actual entry-stop risk is
+    # 50 points x 50 = Rs.2,500.
+    assert Scanner._position_cost_rs(future) == pytest.approx(2_500.0)
+    # The normal round-trip coverage floor remains, but the threshold is reachable.
+    assert _scanner()._profit_lock_floor_rs(future) == pytest.approx(400.0)
+
+
+def test_futures_prefer_the_frozen_entry_risk_when_available():
+    future = _T(25_000.0, 1, 50)
+    future.inst_type = "FUT"
+    future.initial_stop = 24_950.0
+    future.frozen_initial_risk_rs = 3_100.0
+
+    assert Scanner._position_cost_rs(future) == pytest.approx(3_100.0)
+
+
 @pytest.mark.parametrize("bad", [None, 0.0, -1.0])
 def test_position_cost_is_zero_when_it_cannot_be_computed(bad):
     assert Scanner._position_cost_rs(_T(bad, 1, 120)) == 0.0

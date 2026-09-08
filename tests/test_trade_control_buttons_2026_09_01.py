@@ -15,14 +15,11 @@ already_submitted, already_open, instrument_pref_*, quote_unavailable, a policy 
 trade_manager_rejected) and notifyTradeCommandResult surfaces each one in the toast, so
 a blocked entry always says why.
 
-THE ONE GAP FOUND: the open-trade EXIT button had no disabled state and sent
-`Number(row.current_price) || 0`. The server refuses price <= 0 with "invalid_price", so
-whenever a trade had no live price -- a stalled or degraded feed, which this build has
-had -- the operator was shown a clickable EXIT on an OPEN POSITION that could only fail,
-reporting "Exit blocked: invalid_price".
-
-The manual-signal EXIT immediately below it already guarded exactly this
-(`manualExitPrice > 0`, disabled, reason in the tooltip). The two paths now match.
+Quote-free REAL exits are intentionally supported. A close is a MARKET order, and the
+broker fill is authoritative; disabling an emergency exit during the same feed outage
+that removed the quote would trap the operator in an open position. The UI may submit a
+zero local mark, the scanner permits it only when a broker-backed fill can reconcile it,
+and historical/ghost exits still fail closed instead of inventing a fill.
 """
 import re
 from pathlib import Path
@@ -48,37 +45,30 @@ def _control_cell(script):
     return script[start : script.index("\nfunction ", start + 10)]
 
 
-def test_the_open_trade_exit_refuses_to_offer_itself_without_a_price(script):
-    """The gap: an EXIT on an open position that the server can only reject."""
+def test_the_open_trade_exit_remains_available_without_a_quote(script):
+    """A feed outage must not disable a broker-backed emergency MARKET exit."""
     block = _control_cell(script)
     open_trade = block[block.index("if (isOpenTrade)") : block.index("if (isSignalRow)")]
 
-    assert "disabled" in open_trade, (
-        "the open-trade EXIT button has no disabled state, so it stays clickable with "
-        "no live price and fails server-side with invalid_price"
-    )
-    assert "exitPrice > 0" in open_trade, "the price is not guarded before offering EXIT"
-    assert "Exit unavailable" in open_trade, "a disabled EXIT gives the operator no reason"
+    assert "exitPrice > 0" in open_trade
+    assert "Submit MARKET exit; quote unavailable" in open_trade
+    assert "disabled" not in open_trade
 
 
-def test_both_exit_paths_guard_the_price_the_same_way(script):
-    """They sit ten lines apart and disagreed; that is how the gap survived."""
+def test_both_exit_paths_explain_quote_free_market_reconciliation(script):
     block = _control_cell(script)
-    assert block.count("> 0") >= 2, (
-        "only one of the two EXIT paths guards its price"
-    )
-    assert "manualExitPrice > 0" in block
+    assert block.count("Submit MARKET exit; quote unavailable") == 2
+    assert "manual_exit_enabled" in block
 
 
-def test_the_server_still_refuses_a_non_positive_price(server):
-    """The UI guard is a courtesy. The server check is the actual protection."""
-    assert 'if cmd == "close_trade":' in server
-    window = server[server.index('if cmd == "close_trade":') :][:600]
-    assert "invalid_price" in window
-    assert "price <= 0" in window, (
-        "the server no longer refuses a non-positive exit price; the UI guard must not "
-        "become the only thing standing between a bad price and an order"
-    )
+def test_the_server_accepts_zero_but_refuses_invalid_or_negative_marks():
+    from dashboard.server import _valid_command_payload
+
+    base = {"cmd": "close_trade", "trade_id": "T1"}
+    assert _valid_command_payload({**base, "price": 0}) is None
+    assert _valid_command_payload({**base, "price": -0.01}) == "invalid_price"
+    assert _valid_command_payload({**base, "price": float("nan")}) == "invalid_price"
+    assert _valid_command_payload({**base, "price": "bad"}) == "invalid_price"
 
 
 def test_entry_is_offered_only_for_an_accepted_signal(script):

@@ -308,6 +308,26 @@ def test_a_trade_the_ledger_never_knew_writes_nothing(ledger):
     )
 
 
+def test_exact_broker_fill_pair_owns_live_trade_pnl(ledger, monkeypatch):
+    """A delayed zero in Kite's cumulative realised field must not erase fill P&L."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "opt_cost", 80.0)
+    monkeypatch.setattr(settings, "slippage_opt_pct", 0.30)
+    trade = _closed_trade()
+    trade.entry_price = 575.75
+    trade.lot_size = 30
+    trade.broker_quantity = 0
+    manager = _ledger_manager(trade)
+    ledger.record_order_fill("T1-entry", "T1", 30, tradingsymbol=SYMBOL, leg="ENTRY")
+
+    manager._finalize_closed_trade(
+        "T1", trade, 576.0, "BREAKEVEN_STOP", realised_pnl=0.0
+    )
+
+    assert trade.charges == pytest.approx(80.0)
+    assert trade.pnl == pytest.approx((576.0 - 575.75) * 30 - 80.0)
+
+
 def test_final_fill_not_ack_invokes_authoritative_terminal_callback(ledger):
     trade = _closed_trade()
     trade.broker_quantity = 0

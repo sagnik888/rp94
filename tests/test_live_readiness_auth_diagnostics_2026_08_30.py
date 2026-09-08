@@ -317,7 +317,7 @@ def test_fyers_default_active_expiry_reuses_first_valid_chain(monkeypatch):
     assert provider._option_chain_meta["SENSEX"]["active_expiry"] == "03SEP2026"
 
 
-def test_failed_nondefault_active_expiry_refetch_fails_closed(monkeypatch):
+def test_failed_nondefault_active_expiry_refetch_tries_verified_fallback_then_fails_closed(monkeypatch):
     monkeypatch.setattr(
         expiry_manager,
         "expiries",
@@ -340,6 +340,52 @@ def test_failed_nondefault_active_expiry_refetch_fails_closed(monkeypatch):
     assert [call["timestamp"] for call in provider.fyers.calls] == ["", "1777777777"]
     assert "opt_chain_SENSEX" not in provider._opt_chain_cache
     meta = provider._option_chain_meta["SENSEX"]
-    assert meta["fallback"] is False
-    assert meta["expiry_aligned"] is False
-    assert "refetch failed" in meta["unavailable_reason"]
+    assert meta["fallback"] is True
+    assert meta["strike_count"] == 0
+    assert meta["source"] == "angelone"
+
+
+def test_failed_fyers_expiry_alignment_uses_verified_angel_chain(monkeypatch):
+    monkeypatch.setattr(
+        expiry_manager,
+        "expiries",
+        {"SENSEX": {"active_weekly": "03SEP2026"}},
+    )
+    provider = _chain_provider(
+        [
+            _fyers_chain_response(
+                default_date="10-09-2026",
+                active_date="03-09-2026",
+                active_timestamp="1777777777",
+            ),
+            {"s": "error", "message": "temporary provider failure"},
+        ]
+    )
+    provider.get_option_token = lambda _name, strike, side: {
+        "symbol": f"SENSEX26903{int(strike)}{side}",
+        "expiry": "03SEP2026",
+        "strike": int(strike) * 100,
+        "exch_seg": "BFO",
+    }
+
+    def pairs_for(_name, pairs):
+        rows = []
+        for call, _put in pairs:
+            strike = call["strike"] / 100
+            rows.append({
+                "strike": strike,
+                "expiry": "03SEP2026",
+                "CE": {"symbol": f"SENSEX26903{int(strike)}CE", "token": f"c-{strike}", "ltp": 100.0, "oi": 1000.0, "volume": 2000.0},
+                "PE": {"symbol": f"SENSEX26903{int(strike)}PE", "token": f"p-{strike}", "ltp": 110.0, "oi": 1200.0, "volume": 2200.0},
+            })
+        return rows
+
+    provider.angel_index = SimpleNamespace(last_error="", get_option_pairs=pairs_for)
+
+    chain = provider.get_option_chain("SENSEX", "BFO")
+
+    assert len(chain) == 5
+    meta = provider._option_chain_meta["SENSEX"]
+    assert meta["source"] == "angelone_near_atm_realtime"
+    assert meta["auto_certified"] is True
+    assert meta["active_expiry"] == "03SEP2026"

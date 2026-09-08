@@ -106,8 +106,12 @@ if /I not "%UTBOT_SKIP_BROWSER%"=="1" start "" /B powershell -NoProfile -Executi
 :: "Out of Virtual Memory", with three python.exe holding 2.41 / 2.01 / 1.54 GB). A
 :: MemoryError traceback or a Windows fatal message goes to STDERR, which was being
 :: written to a console window that is gone by the time anyone looks. Keep it.
-for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value 2^>nul') do set "_LDT=%%I"
-set "_STAMP=%_LDT:~0,8%_%_LDT:~8,6%"
+:: WMIC is removed from current Windows builds.  When it is absent, substring
+:: expansion of the undefined _LDT produced a literal file named
+:: startup_stderr_~0,8_LDT, hiding the current launch behind an old dated log.
+set "_STAMP="
+for /f "delims=" %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "_STAMP=%%I"
+if not defined _STAMP set "_STAMP=undated_!RANDOM!"
 if not exist "logs" mkdir "logs"
 echo [INFO] stderr -^> logs\startup_stderr_%_STAMP%.log
 "%PY%" main.py 2> "logs\startup_stderr_%_STAMP%.log"

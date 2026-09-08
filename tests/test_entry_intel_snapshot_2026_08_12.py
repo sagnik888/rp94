@@ -273,6 +273,30 @@ def test_exit_inherits_runner_and_lifecycle_provenance():
     assert exit_row.trade_id == "T-1"
 
 
+def test_exit_inherits_a_copy_of_entry_admission_evidence():
+    quality = {
+        "allowed": True,
+        "policy_version": "quality-verdict-test",
+        "checks": {"adx": 27.0, "trend_15m_agrees": True},
+    }
+    entry = SimpleNamespace(
+        quality_verdict=quality,
+        accepted_by_gate=True,
+        watch_only=False,
+        trend_15m_agrees=True,
+    )
+    exit_row = SimpleNamespace()
+
+    Scanner._inherit_exit_entry_metadata(Scanner.__new__(Scanner), exit_row, entry)
+
+    assert exit_row.accepted_by_gate is True
+    assert exit_row.watch_only is False
+    assert exit_row.trend_15m_agrees is True
+    assert exit_row.quality_verdict == quality
+    quality["checks"]["adx"] = 1.0
+    assert exit_row.quality_verdict["checks"]["adx"] == 27.0
+
+
 def test_the_toggle_switches_it_off():
     from config.settings import Settings, get_settings
 

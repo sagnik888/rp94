@@ -88,6 +88,26 @@ def test_the_complete_minutes_are_all_kept(store):
     assert list(saved["volume"]) == [465886, 430065, 890948, 446737]
 
 
+def test_read_only_history_fetch_does_not_create_or_merge_candle_store(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    now = pd.Timestamp("2026-09-02 10:00:30")
+    provider = _provider(_StubFyers(_live_shaped_candles(now)))
+
+    result = provider.get_historical_candles(
+        token=None,
+        exchange="NFO",
+        interval="1min",
+        days_back=1,
+        instrument_name="BANKNIFTY",
+        persist_cache=False,
+    )
+
+    assert not result.empty
+    assert not (tmp_path / "data_store").exists()
+
+
 def test_repeated_fetches_never_shrink_the_store(store):
     """The trim defers a bar; it must never retract one already banked.
 

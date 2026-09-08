@@ -18,11 +18,9 @@ websockets==16.0
 Jinja2==3.1.6
 
 # Broker/data APIs
-# AngelOne/SmartAPI removed 2026-08-05: the SDK import in data/market_data.py was
-# the last runtime reference and it constructed nothing. See trading/broker.py.
+# Price-only tertiary index quote source. It never owns orders or volume.
+smartapi-python==1.5.5
 kiteconnect==5.2.1
-# pyotp was the AngelOne TOTP dependency; its only remaining reference is the
-# engine/apex55/example_usage.py sample, which is not imported by the system.
 pyotp==2.9.0
 pytz==2026.1.post1
 requests==2.31.0

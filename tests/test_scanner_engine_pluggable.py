@@ -404,44 +404,16 @@ def test_historical_engine_switch_queues_full_backtest_rebuild(settings_engine):
     assert reset_calls == [True]
 
 
-def test_trend_engine_relaxes_5min_gates_for_aligned_signal(settings_engine):
-    # Live 2026-06-25: consensus generated MIDCPNIFTY 5min BUY @ A/72%, regime=VOLATILE,
-    # 15m_agrees=True, no impulse/spike/power — repeatedly REJECTED at the 5Min Quality
-    # Gate + Choppy gate. A smoothed trend-engine flip IS the trend confirmation, so a
-    # 15m-aligned, confidence-qualified signal must now clear both gates (utbot unchanged).
-    s = settings_engine
-    s.trend_engine_relaxed_gate = True
-    grade_conf_ok = True
-    trend_15m_agrees = True
-    volume_spike_entry = power_move = true_5min_impulse = impulse_context_confirmed = False
+def test_retired_trend_engine_relaxation_cannot_bypass_canonical_quality():
+    import inspect
 
-    def passes(engine):
-        s.scanner_engine = engine
-        te = str(s.scanner_engine).lower() in {"consensus", "ema", "auto", "quad_union", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"} and bool(s.trend_engine_relaxed_gate)
-        quality = (
-            volume_spike_entry or power_move or true_5min_impulse
-            or (grade_conf_ok and trend_15m_agrees and impulse_context_confirmed)
-            or (te and grade_conf_ok and trend_15m_agrees)
-        )
-        choppy = true_5min_impulse or volume_spike_entry or (te and trend_15m_agrees)
-        return quality and choppy
+    from config.settings import Settings
+    from engine.signal_processor import SignalProcessor
 
-    assert passes("consensus") is True   # the live rejection is now admitted
-    assert passes("ema") is True
-    assert passes("auto") is True        # auto emits consensus/ema flips -> also relaxed
-    assert passes("quad_union") is True  # quad union is raw, but still a trend-engine source set
-    assert passes("adaptive_hybrid") is True
-    assert passes("adaptive_dual") is True
-    assert passes("quality_hybrid") is True
-    assert passes("utbot") is False      # utbot path unchanged — still needs impulse
-
-
-def test_trend_engine_relax_respects_toggle(settings_engine):
-    s = settings_engine
-    s.scanner_engine = "consensus"
-    s.trend_engine_relaxed_gate = False
-    te = str(s.scanner_engine).lower() in {"consensus", "ema"} and bool(s.trend_engine_relaxed_gate)
-    assert te is False  # toggle off -> trend engine gets the strict gate again
+    source = inspect.getsource(SignalProcessor)
+    assert "trend_engine_relaxed_gate" not in source
+    assert "trend_engine_signal" not in source
+    assert "trend_engine_relaxed_gate" not in Settings.model_fields
 
 
 def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor(settings_engine):
@@ -453,6 +425,7 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
     sc = Scanner.__new__(Scanner)
     sc.mode = "REAL"
     sc.latest_regimes = {"NIFTY": "VOLATILE"}
+    sc._timeframe_regimes = {"NIFTY_15min": "VOLATILE"}
     sc._candidate_15m_trend_agrees = lambda candidate: bool(
         getattr(candidate, "trend_15m_agrees", False)
     )
@@ -479,7 +452,10 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
         quad_union_entry=True,
         raw_union_entry=True,
     )
-    assert sc._passes_candidate_grade_preference(candidate) == (True, "quad-union raw entry after repaint buffer")
+    assert sc._passes_candidate_grade_preference(candidate) == (
+        True,
+        "canonical quality policy owns B+ eligibility",
+    )
     assert sc._passes_live_trade_ready_gate(candidate) is False
 
     candidate.grade = "A"
@@ -487,6 +463,7 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
     candidate.source_engine = "utbot+ema"
     candidate.source_engines = ["utbot", "ema"]
     candidate.trend_15m_agrees = True
+    candidate.adx_value = 28.0
 
     assert sc._passes_live_trade_ready_gate(candidate) is True
     assert candidate.scalp_lock_mode is False
@@ -555,18 +532,17 @@ def test_quad_prime_raw_high_grade_trend_entry_runs_not_scalped(settings_engine)
 
 
 def test_quad_prime_raw_weak_but_admissible_entry_stays_scalp(settings_engine):
-    """A weak-but-admissible raw entry (spike-admitted, not high grade) is still
-    admitted with scalp_lock_mode True — the runner path is reserved for quality."""
+    """A confirmed B+ raw setup is admitted but remains a scalp below 70%."""
     settings_engine.scanner_engine = "quad_prime"
     sc = _quad_prime_gate_scanner("TRENDING_UP")
 
     candidate = _quad_prime_raw_candidate(
-        grade="B", confidence=0.60, timeframe="5min",
+        grade="B+", confidence=0.60, timeframe="5min",
         source_engine="utbot", source_engines=["utbot"],
     )
     candidate.adx_value = 27.0
     candidate.trend_15m_agrees = True
-    candidate.volume_spike_entry = True  # admits via exceptional-spike, not quality
+    candidate.volume_spike_entry = True  # independent canonical evidence leg
 
     assert sc._passes_live_trade_ready_gate(candidate) is True
     assert candidate.scalp_lock_mode is True
@@ -809,8 +785,12 @@ def test_quad_prime_raw_entry_bypasses_15m_policy_but_obeys_quality_floor(settin
         candidate.grade = "A"
         candidate.confidence = 0.75
         candidate.adx_value = 28.0
+        candidate.trend_15m_agrees = True
+        candidate.volume_spike_entry = True
         assert sc._passes_live_trade_ready_gate(candidate) is True
-        assert candidate.scalp_lock_mode is True
+        # A/75%, fresh 15m trend and ADX 28 is a confirmed runner even though the
+        # timeframe-policy bypass supplied the raw candidate.
+        assert candidate.scalp_lock_mode is False
     finally:
         settings_engine.ut_timeframe_entry_policy = original_policy
         settings_engine.ut_regime_adaptation = original_adapt

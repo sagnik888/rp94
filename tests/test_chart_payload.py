@@ -84,6 +84,7 @@ def test_chart_snapshot_rebuilds_ut1_state_and_filters_premarket_zero_volume_can
 
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
+    scanner._get_current_session_day = lambda: "2026-06-12"
     scanner.chart_stream_enabled = True
     scanner.active_chart_instrument = "NIFTY"
     scanner.active_chart_tf = "5min"
@@ -210,10 +211,9 @@ def test_adaptive_dual_chart_marks_lane_a_and_apex_lane_b(monkeypatch):
     assert chart["adaptive_dual_chart"]["lane_B_signals"] == 1
 
 
-def test_live_signal_window_waits_for_full_5min_warmup_and_clears_bad_state():
+def test_live_signal_window_waits_for_first_session_bar_and_clears_bad_state():
     previous = _ohlcv_frame(pd.date_range("2026-06-16 14:10", periods=10, freq="5min"))
-    today = _ohlcv_frame(pd.date_range("2026-06-17 09:15", periods=5, freq="5min"), start=200.0)
-    underwarmed = pd.concat([previous, today])
+    underwarmed = previous
     engine = _DummyUtEngine()
     engine._states["NIFTY_5min"] = SimpleNamespace(last_entry_price=24020.7)
 
@@ -246,11 +246,21 @@ def test_live_signal_window_waits_for_full_5min_warmup_and_clears_bad_state():
     assert "NIFTY_5min" not in scanner._last_signal_identity
 
 
-def test_chart_fallback_does_not_run_utbot_when_live_5min_warmup_is_short():
-    previous = _ohlcv_frame(pd.date_range("2026-06-16 14:10", periods=10, freq="5min"))
-    today = _ohlcv_frame(pd.date_range("2026-06-17 09:15", periods=5, freq="5min"), start=200.0)
-    df = pd.concat([previous, today])
-    engine = _DummyUtEngine()
+def test_chart_fallback_keeps_display_indicators_before_first_live_5min_bar():
+    previous = _ohlcv_frame(pd.date_range("2026-06-16 13:40", periods=20, freq="5min"))
+    df = previous
+
+    class _DisplayEngine(_DummyUtEngine):
+        def process(self, df, instrument, timeframe, capital, risk_pct, lots, lot_size):
+            result = super().process(df, instrument, timeframe, capital, risk_pct, lots, lot_size)
+            result["indicator_overlays"] = [{
+                "name": "EMA 9",
+                "color": "#f59e0b",
+                "values": df["close"].astype(float).tolist(),
+            }]
+            return result
+
+    engine = _DisplayEngine()
 
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
@@ -264,5 +274,6 @@ def test_chart_fallback_does_not_run_utbot_when_live_5min_warmup_is_short():
 
     result = scanner._chart_result_for_display("NIFTY", "5min", df, {})
 
-    assert result == {}
-    assert engine.calls == 0
+    assert engine.calls == 1
+    assert len(result["trailing_stop"]) == len(df)
+    assert result["indicator_overlays"][0]["name"] == "EMA 9"

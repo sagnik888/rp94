@@ -411,10 +411,6 @@ _ADVANCED_CONFIG_FIELDS = {
     "stabilization_thrust_min_seconds",
     "stabilization_thrust_range_atr",
     "stabilization_thrust_volume_ratio",
-    "grade_gate_min_rank_override",
-    "grade_gate_allow_c_enabled",
-    "late_trend_entry_guard_enabled",
-    "late_trend_entry_adx_ceiling",
     "range_scaled_budget_enabled",
     "range_scaled_budget_reference_pct",
     "range_scaled_budget_min_trades",
@@ -454,6 +450,7 @@ _ADVANCED_CONFIG_FIELDS = {
     "live_5min_trend_continuation_adx",
     "volume_spike_entry_enabled",
     "one_min_scalping_enabled",
+    "fifteen_min_one_min_support_exit_enabled",
     "volume_spike_entry_min_volume_ratio",
     "volume_spike_entry_min_range_atr_ratio",
     "volume_spike_entry_min_close_location",
@@ -680,8 +677,6 @@ _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
     "entry_intel_snapshot_enabled",
     "stabilization_cascade_latch_enabled",
     "stabilization_thrust_scaling_enabled",
-    "grade_gate_allow_c_enabled",
-    "late_trend_entry_guard_enabled",
     "range_scaled_budget_enabled",
     "missed_signal_reentry_scored_mode_enabled",
     "block_opposite_direction_stack",
@@ -705,6 +700,7 @@ _ADVANCED_BOOLEAN_CONFIG_FIELDS = {
     "live_5min_trend_continuation_enabled",
     "volume_spike_entry_enabled",
     "one_min_scalping_enabled",
+    "fifteen_min_one_min_support_exit_enabled",
     "volume_spike_depth_confirm_enabled",
     "stabilization_momentum_override_enabled",
     "live_15min_momentum_override_enabled",
@@ -776,6 +772,8 @@ _COMMAND_FIELDS: Dict[str, set] = {
     "set_expiry_gamma": {"state"},
     "set_combo_partner_exit": {"state"},
     "execute_signal": {"signal_id", "lifecycle_id"},
+    # ``price`` is an optional accounting mark.  A broker MARKET close has no price
+    # parameter, and a stale quote must not prevent an operator from flattening.
     "close_trade": {"trade_id", "price"},
     "kill_all": {"confirm"},
     "update_fyers_token": {"auth_code"},
@@ -784,8 +782,8 @@ _COMMAND_FIELDS: Dict[str, set] = {
     "system_recalibrate": set(),
 }
 # Known numeric fields that must be finite (and non-negative) when present.
-# Note: 'price' is intentionally NOT here — close_trade has a stricter >0 check that
-# owns it (so it returns "invalid_price", preserving the existing contract).
+# Note: 'price' is intentionally NOT here — close_trade accepts a zero/omitted mark
+# for a MARKET close and validates that contract below.
 _NUMERIC_COMMAND_FIELDS = {
     "capital_total", "capital_fut", "risk_fut_pct", "capital_opt", "risk_opt_pct",
     "futures_sl_pct", "options_sl_pct", "fut_cost", "opt_cost", "backtest_days",
@@ -998,7 +996,9 @@ def _valid_command_payload(msg: Dict[str, Any]) -> Optional[str]:
             price = float(msg.get("price", 0))
         except (TypeError, ValueError):
             return "invalid_price"
-        if not math.isfinite(price) or price <= 0:
+        # MARKET exits do not require a quote.  A non-negative local mark is accepted
+        # for UI/accounting continuity; the broker fill remains authoritative.
+        if not math.isfinite(price) or price < 0:
             return "invalid_price"
     if cmd == "execute_signal":
         signal_id = str(msg.get("signal_id", "") or "").strip()
@@ -1088,6 +1088,15 @@ async def shutdown_scanner():
             result = scanner.stop()
             if inspect.isawaitable(result):
                 await result
+            flush_session_ledger = getattr(
+                scanner,
+                "flush_session_trade_candidates",
+                None,
+            )
+            if callable(flush_session_ledger):
+                result = flush_session_ledger()
+                if inspect.isawaitable(result):
+                    await result
             stop_completed = True
 
         try:
@@ -1596,10 +1605,6 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 stabilization_thrust_min_seconds=msg.get("stabilization_thrust_min_seconds"),
                 stabilization_thrust_range_atr=msg.get("stabilization_thrust_range_atr"),
                 stabilization_thrust_volume_ratio=msg.get("stabilization_thrust_volume_ratio"),
-                grade_gate_min_rank_override=msg.get("grade_gate_min_rank_override"),
-                grade_gate_allow_c_enabled=msg.get("grade_gate_allow_c_enabled"),
-                late_trend_entry_guard_enabled=msg.get("late_trend_entry_guard_enabled"),
-                late_trend_entry_adx_ceiling=msg.get("late_trend_entry_adx_ceiling"),
                 range_scaled_budget_enabled=msg.get("range_scaled_budget_enabled"),
                 range_scaled_budget_reference_pct=msg.get("range_scaled_budget_reference_pct"),
                 range_scaled_budget_min_trades=msg.get("range_scaled_budget_min_trades"),
@@ -1662,6 +1667,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 quality_hybrid_thrust_close_loc=msg.get("quality_hybrid_thrust_close_loc"),
                 volume_spike_entry_enabled=msg.get("volume_spike_entry_enabled"),
                 one_min_scalping_enabled=msg.get("one_min_scalping_enabled"),
+                fifteen_min_one_min_support_exit_enabled=msg.get("fifteen_min_one_min_support_exit_enabled"),
                 volume_spike_entry_min_volume_ratio=msg.get("volume_spike_entry_min_volume_ratio"),
                 volume_spike_entry_min_range_atr_ratio=msg.get("volume_spike_entry_min_range_atr_ratio"),
                 volume_spike_entry_min_close_location=msg.get("volume_spike_entry_min_close_location"),
@@ -3710,4 +3716,3 @@ def _dashboard_heartbeat() -> Dict[str, Any]:
     heartbeat["calculation_lock"] = bool(getattr(scanner_ref, "_calculation_lock", False))
     heartbeat["mode"] = getattr(scanner_ref, "mode", None)
     return heartbeat
-

@@ -92,6 +92,16 @@ def test_a_key_already_in_env_is_still_refreshed(capture, monkeypatch):
     assert "RISK_OPT_PCT" in capture.written
 
 
+def test_auto_execution_authority_is_never_persisted_on(capture, monkeypatch):
+    _existing(monkeypatch, {"AUTO_MODE": "True"})
+    settings = Settings()
+    settings.auto_mode = True
+
+    settings.save_to_env()
+
+    assert capture.written["AUTO_MODE"] == "False"
+
+
 def test_secrets_already_present_are_preserved(capture, monkeypatch):
     from config.settings import PROTECTED_SECRET_ENV_KEYS
 

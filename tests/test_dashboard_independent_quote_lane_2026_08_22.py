@@ -107,7 +107,7 @@ def test_index_quote_badges_are_two_row_contained_and_cache_busted():
     assert "overflow: hidden" in quote_rule
     assert "text-overflow: ellipsis" in quote_rule
     assert "grid-area: quote" in scoped_quote_rule
-    assert "style.css?v=30-forensics-matched" in html
+    assert "style.css?v=32-angelone-badge" in html
 
 
 def test_trade_table_normalizes_iso_time_instead_of_substringing_the_date():
@@ -115,6 +115,6 @@ def test_trade_table_normalizes_iso_time_instead_of_substringing_the_date():
     assert "function normalizeTradeDateTime" in js
     assert "entryClock.timeText" in js
     assert "entryTime.substring(0, 8)" not in js
-    assert 'trade-table.js?v=8-normalized-trade-times' in Path(
+    assert 'trade-table.js?v=9-signal-pnl-basis' in Path(
         "dashboard/static/index.html"
     ).read_text(encoding="utf-8")

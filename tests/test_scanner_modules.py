@@ -1,6 +1,8 @@
 import ast
+import asyncio
 import inspect
 import math
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -16,7 +18,7 @@ from engine.trade_row_adapter import reconcile_legacy_trade_row, trade_row_to_si
 from engine.scanner_recalculation import ScannerRecalculationMixin
 from engine.scanner_telemetry import ScannerTelemetryMixin
 from trading.trade_dashboard import build_dashboard_rows
-from trading.trade_manager import TradeManager
+from trading.trade_manager import IST, TradeManager
 from scanner import Scanner
 
 
@@ -59,6 +61,14 @@ def test_scanner_startup_uses_fast_one_day_window():
     assert "self.backtest_days = 1" in scanner_source
 
 
+def test_broker_capable_startup_never_inherits_persisted_auto_authority():
+    assert Scanner._startup_auto_mode("REAL", True) is False
+    assert Scanner._startup_auto_mode("PAPER", True) is False
+    assert Scanner._startup_auto_mode("MANUAL", True) is False
+    assert Scanner._startup_auto_mode("HISTORICAL", True) is True
+    assert Scanner._startup_auto_mode("HISTORICAL", False) is False
+
+
 def test_empty_session_ledger_persist_is_noop_when_db_rows_exist(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -79,6 +89,96 @@ def test_empty_session_ledger_persist_is_noop_when_db_rows_exist(monkeypatch):
 
     assert calls == []
     assert scanner._last_empty_session_persist_skip == "2026-07-01|2026-07-01|44"
+
+
+def _session_persist_scanner(payload):
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    scanner._session_candidate_day = "2026-09-03"
+    scanner._session_trade_candidates = {"NIFTY": {"row": payload}}
+    scanner._repair_same_side_superseded_session_rows = lambda: False
+    scanner._normalize_loaded_exit_candidate = lambda _candidate: None
+    scanner._serialize_trade_candidate = lambda candidate: dict(candidate)
+    scanner._get_current_session_day = lambda: "2026-09-03"
+    return scanner
+
+
+def test_graceful_session_ledger_drain_persists_latest_coalesced_snapshot(monkeypatch):
+    calls = []
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+
+    def save_session_signals(session_day, rows):
+        calls.append((session_day, [dict(row) for row in rows]))
+        if len(calls) == 1:
+            first_write_started.set()
+            assert release_first_write.wait(timeout=2.0)
+
+    monkeypatch.setattr("scanner.db.save_session_signals", save_session_signals)
+    scanner = _session_persist_scanner(
+        {"id": "entry", "timestamp": "2026-09-03T09:30:00+05:30", "action": "ENTRY"}
+    )
+
+    async def exercise():
+        Scanner._persist_session_trade_candidates(scanner)
+        assert await asyncio.to_thread(first_write_started.wait, 2.0)
+        scanner._session_trade_candidates["NIFTY"]["row"] = {
+            "id": "exit",
+            "timestamp": "2026-09-03T09:35:00+05:30",
+            "action": "EXIT",
+        }
+        Scanner._persist_session_trade_candidates(scanner)
+        release_first_write.set()
+        await Scanner.flush_session_trade_candidates(scanner)
+
+    asyncio.run(exercise())
+
+    assert calls[-1] == (
+        "2026-09-03",
+        [{"id": "exit", "timestamp": "2026-09-03T09:35:00+05:30", "action": "EXIT"}],
+    )
+    assert scanner._session_persist_pending is None
+    assert scanner._session_persist_task.done()
+
+
+def test_graceful_session_ledger_drain_retries_once(monkeypatch):
+    attempts = []
+
+    def save_session_signals(session_day, rows):
+        attempts.append((session_day, [dict(row) for row in rows]))
+        if len(attempts) == 1:
+            raise OSError("transient sqlite failure")
+
+    monkeypatch.setattr("scanner.db.save_session_signals", save_session_signals)
+    scanner = _session_persist_scanner(
+        {"id": "exit", "timestamp": "2026-09-03T09:35:00+05:30", "action": "EXIT"}
+    )
+
+    asyncio.run(Scanner.flush_session_trade_candidates(scanner))
+
+    assert len(attempts) == 2
+    assert attempts[-1][1][0]["action"] == "EXIT"
+    assert scanner._last_session_persist_error == ""
+
+
+def test_scanner_stop_schedules_final_session_ledger_snapshot(monkeypatch):
+    scanner = Scanner.__new__(Scanner)
+    scanner.is_running = True
+    calls = []
+    scanner._save_warm_memory = lambda force=False: calls.append(("warm", force))
+    scanner._persist_entry_shadow_book = lambda: calls.append(("shadow", True))
+    scanner._persist_session_trade_candidates = lambda: calls.append(("session", True))
+    scanner.generate_daily_signal_report = lambda: calls.append(("report", True))
+
+    Scanner.stop(scanner)
+
+    assert calls == [
+        ("warm", True),
+        ("shadow", True),
+        ("session", True),
+        ("report", True),
+    ]
+    assert scanner.is_running is False
 
 
 def test_pre_candle_live_tape_alerts_are_throttled(monkeypatch):
@@ -296,7 +396,8 @@ def test_signal_quality_gate_lives_in_policy_module():
 
     assert "passes_quality_gate" in processor_source
     assert "ut_timeframe_entry_policy" not in processor_source
-    assert "ut_timeframe_entry_policy" in quality_source
+    assert "evaluate_quality" in quality_source
+    assert "ut_timeframe_entry_policy" not in quality_source
 
 
 def test_trade_dashboard_rows_live_in_serializer_module():
@@ -387,6 +488,12 @@ def test_live_dashboard_counts_completed_and_active_session_lifecycles():
     assert payload["meta"]["source"] == "restored_session_signals"
     assert payload["summary"]["total_trades"] == 2
     assert payload["summary"]["daily_pnl"] == 125.0
+    assert payload["summary"]["lane"] == "SIGNAL_TRACKER"
+    assert payload["summary"]["pnl_label"] == "SIGNAL P&L"
+    assert payload["summary"]["pnl_is_money"] is False
+    assert payload["summary"]["is_signal_tracker"] is True
+    assert payload["monetary"]["accounting_basis"]["is_live_money"] is False
+    assert "no broker fill is implied" in payload["monetary"]["accounting_basis"]["description"]
     # Session-row contract: consumers reading only open/closed must still be able
     # to see the session's true row counts via explicit totals.
     assert payload["session_rows_total"] == 2
@@ -395,6 +502,55 @@ def test_live_dashboard_counts_completed_and_active_session_lifecycles():
     assert payload["meta"]["session_rows_total"] == 2
     assert payload["meta"]["session_closed_total"] == 1
     assert payload["meta"]["session_open_total"] == 1
+
+
+def test_live_dashboard_hides_signal_tracker_copy_of_executed_lifecycle():
+    tracked = {
+        "id": "signal-exit",
+        "lifecycle_id": "life-executed",
+        "action": "EXIT",
+        "inst_type": "OPT",
+        "pnl": 1132.53,
+        "exit_reason": "STOP_HIT",
+    }
+    manager_row = {
+        "id": "T0013",
+        "lifecycle_id": "life-executed",
+        "status": "CLOSED",
+        "broker_order_id": "broker-entry",
+        "exit_order_id": "broker-exit",
+        "instrument": "BANKNIFTY 57200 PE",
+        "inst_type": "OPT",
+        "entry_price": 575.75,
+        "exit_price": 576.0,
+        "lots": 1,
+        "lot_size": 30,
+        "pnl": -183.66,
+        "entry_timestamp": IST.localize(datetime(2026, 6, 15, 10, 14)).timestamp(),
+    }
+    scanner = SimpleNamespace(
+        mode="REAL", backtest_days=1, scan_count=1, simulation_id=1,
+        inst_pref="AUTO", active_indices=["BANKNIFTY"],
+        _session_trade_candidates={"BANKNIFTY": {}},
+        _session_candidate_day="2026-06-15",
+        trades=SimpleNamespace(get_dashboard_payload=lambda **kwargs: {
+            "open": [], "closed": [manager_row], "signals": [],
+            "summary": {}, "analytics": {},
+        }),
+        _setting_enabled=lambda value, default: default,
+        _get_current_session_day=lambda: "2026-06-15",
+        _loaded_session_is_current_day=lambda: True,
+        _get_session_trade_candidates=lambda instrument: [tracked],
+        _normalize_loaded_exit_candidate=lambda candidate: False,
+        _serialize_trade_candidate=lambda candidate: dict(candidate),
+    )
+
+    payload = ScannerTradePayloadBuilder(scanner).build()
+
+    assert payload["signals"] == []
+    assert [row["id"] for row in payload["closed"]] == ["T0013"]
+    assert payload["summary"]["total_trades"] == 1
+    assert payload["summary"]["daily_pnl"] == -72.5
 
 
 def test_historical_dashboard_quote_invalid_signal_is_not_accounted_as_loss():

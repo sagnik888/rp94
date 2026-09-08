@@ -525,6 +525,107 @@ def test_dashboard_close_trade_uses_trade_manager_and_publishes_refresh():
     assert published["notified"] == 1
 
 
+def test_dashboard_market_exit_still_submits_without_a_live_quote():
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    published = {"closed": None}
+    trade = SimpleNamespace(
+        id="T0004_NIFTY",
+        status="OPEN",
+        current_price=0.0,
+        exit_price=0.0,
+        entry_price=225.5,
+        pending_exit=False,
+        execution_status="OPEN",
+        symbol_token="12345",
+        is_ghost=False,
+    )
+
+    class Trades:
+        open_trades = {trade.id: trade}
+        broker = object()
+
+        @staticmethod
+        def _live_orders_permitted():
+            return True
+
+        def close_trade(self, trade_id, price, reason):
+            published["closed"] = (trade_id, price, reason)
+            return True
+
+    async def publish():
+        return None
+
+    scanner.trades = Trades()
+    scanner.log_event = lambda *args, **kwargs: None
+    scanner._publish_trade_payload_now = publish
+    scanner._notify_trade_event = lambda: None
+
+    result = asyncio.run(scanner.close_dashboard_trade(trade.id, 0.0))
+
+    assert result["status"] == "submitted"
+    assert result["quote_available"] is False
+    # Entry is only the local accounting fallback; TradeManager's broker close path is
+    # MARKET and does not receive this number as an order price.
+    assert published["closed"] == (trade.id, 225.5, "MANUAL")
+
+
+def test_manual_signal_exit_without_quote_or_broker_fill_is_disabled():
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "REAL"
+    scanner.auto_mode = False
+    signal_ts = datetime(2026, 7, 7, 10, 0)
+    candidate = _supersede_candidate("LONG", signal_ts, option_type="CE")
+    trade = SimpleNamespace(
+        id="T0005_BANKNIFTY",
+        status="OPEN",
+        exec_type="M",
+        instrument="BANKNIFTY",
+        timeframe="5min",
+        direction="LONG",
+        trading_symbol="BANKNIFTY57900CE",
+        option_type="CE",
+        atm_strike=57900,
+        signal_time=signal_ts,
+        entry_time=signal_ts,
+        current_price=0.0,
+        entry_price=100.0,
+        pending_exit=False,
+        execution_status="OPEN",
+    )
+    scanner.trades = SimpleNamespace(open_trades={trade.id: trade})
+
+    state = scanner._manual_signal_exit_state(candidate)
+
+    assert state["manual_exit_enabled"] is False
+    assert state["manual_exit_quote_available"] is False
+    assert state["manual_exit_status"] == "quote_unavailable"
+
+
+def test_dashboard_quote_free_exit_is_blocked_when_no_broker_fill_can_reconcile_it():
+    scanner = Scanner.__new__(Scanner)
+    scanner.mode = "HISTORICAL"
+    trade = SimpleNamespace(
+        id="T_LOCAL", status="OPEN", current_price=0.0, exit_price=0.0,
+        entry_price=225.5, pending_exit=False, execution_status="OPEN",
+        symbol_token="", is_ghost=False,
+    )
+    closed = []
+    scanner.trades = SimpleNamespace(
+        open_trades={trade.id: trade},
+        broker=None,
+        close_trade=lambda *args: closed.append(args) or True,
+    )
+    scanner.log_event = lambda *args, **kwargs: None
+    scanner._publish_trade_payload_now = lambda: asyncio.sleep(0)
+    scanner._notify_trade_event = lambda: None
+
+    result = asyncio.run(scanner.close_dashboard_trade(trade.id, 0.0))
+
+    assert result == {"trade_id": trade.id, "status": "blocked", "reason": "quote_unavailable"}
+    assert closed == []
+
+
 def test_same_direction_refresh_does_not_create_superseded_exit():
     scanner = _supersede_scanner()
     old_ts = datetime(2026, 7, 1, 12, 30)
@@ -628,90 +729,6 @@ def test_legacy_same_direction_superseded_rows_are_scrubbed_from_session_ledger(
     assert all(getattr(row, "signal_timestamp", None) != old_ts for row in rows)
     assert any(getattr(row, "signal_timestamp", None) == refresh_ts for row in rows)
     assert any(getattr(row, "exit_reason", "") == "STOP_HIT" for row in rows)
-
-
-def test_soft_intel_profit_protect_tightens_5min_to_85_percent():
-    scanner = Scanner.__new__(Scanner)
-    scanner._profit_guard_reversal_context = lambda *_args, **_kwargs: {
-        "has_context": True,
-        "fast_reversal": True,
-        "trend_supportive": False,
-        "trend_votes": 0,
-        "reason": "fast adverse 1m reversal",
-    }
-    trade = SimpleNamespace(
-        instrument="BANKNIFTY",
-        timeframe="5min",
-        direction="LONG",
-        price=100.0,
-    )
-    intel = {
-        "aggregate": {"score": -20.0, "signal": "HOLD"},
-        "pcr": {"signal": "NEUTRAL"},
-        "oi": {"signal": "NEUTRAL"},
-        "order_flow": {"signal": "NEUTRAL", "ratio": 1.0},
-    }
-
-    stop, ratio, reason = scanner._soft_intel_profit_protect_floor(
-        trade,
-        "LONG",
-        qty=10,
-        inst_mult=1.0,
-        current_price=110.0,
-        current_pnl=800.0,
-        peak_pnl=1000.0,
-        intel_result=intel,
-        latest_time=datetime(2026, 6, 16, 13, 30),
-    )
-
-    assert ratio == 0.85
-    assert stop == 185.0
-    assert "soft bearish intel" in reason
-
-
-def test_soft_intel_profit_protect_15min_uses_5min_confirmation():
-    scanner = Scanner.__new__(Scanner)
-    seen = {}
-
-    def context(_trade, _price, _latest_time, timeframe="1min"):
-        seen["timeframe"] = timeframe
-        return {
-            "has_context": True,
-            "fast_reversal": False,
-            "trend_supportive": False,
-            "trend_votes": 1,
-            "reason": "5m trend no longer supportive",
-        }
-
-    scanner._profit_guard_reversal_context = context
-    trade = SimpleNamespace(
-        instrument="BANKNIFTY",
-        timeframe="15min",
-        direction="SHORT",
-        price=200.0,
-    )
-    intel = {
-        "aggregate": {"score": 22.0, "signal": "HOLD"},
-        "pcr": {"signal": "NEUTRAL"},
-        "oi": {"signal": "NEUTRAL"},
-        "order_flow": {"signal": "NEUTRAL", "ratio": 1.0},
-    }
-
-    stop, ratio, _ = scanner._soft_intel_profit_protect_floor(
-        trade,
-        "SHORT",
-        qty=10,
-        inst_mult=1.0,
-        current_price=190.0,
-        current_pnl=850.0,
-        peak_pnl=1000.0,
-        intel_result=intel,
-        latest_time=datetime(2026, 6, 16, 13, 30),
-    )
-
-    assert seen["timeframe"] == "5min"
-    assert ratio == 0.80
-    assert stop == 120.0
 
 
 def test_timeframe_intel_cache_reuses_5min_result():
@@ -1918,7 +1935,7 @@ def test_option_live_stop_distance_respects_configured_sl_pct():
     scanner = SimpleNamespace(options_sl_pct=15.0)
 
     assert round(SignalProcessor._option_premium_stop_distance(224.60, scanner, "TRENDING_UP"), 2) == 33.69
-    assert round(SignalProcessor._option_premium_stop_distance(224.60, SimpleNamespace(options_sl_pct=10.0), "RANGING"), 2) == 33.69
+    assert round(SignalProcessor._option_premium_stop_distance(224.60, SimpleNamespace(options_sl_pct=10.0), "RANGING"), 2) == 22.46
 
 
 def test_option_stop_timeframe_atr_aware():

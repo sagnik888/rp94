@@ -1,14 +1,8 @@
-"""The retired broker's SDK must not be a runtime dependency of the live data layer.
+"""AngelOne's price-only fallback must not leak broker secrets.
 
 This file used to assert that logzero's logger was silenced to CRITICAL, because the
-AngelOne SmartAPI SDK logged through logzero and could echo credentials. That SDK is gone:
-data/market_data.py imported SmartConnect and SmartWebSocketV2 into module globals and
-never constructed either, `self.smart_api` is None from __init__ onward so every legacy
-Angel path is unreachable, and HAS_SMARTAPI was written twice and read nowhere.
-
-Silencing a logger no component uses proves nothing. The property worth protecting now is
-the one the old test was standing in for: no retired-broker SDK is imported at runtime,
-so there is no SDK channel for a secret to leak through in the first place.
+AngelOne SmartAPI logs complete failing request headers through logzero. The narrow index
+adapter must be the sole importer and must silence that logger before client creation.
 """
 import pathlib
 import re
@@ -34,15 +28,20 @@ def _production_sources():
             yield name, path
 
 
-def test_no_production_module_imports_the_retired_broker_sdk():
+def test_only_sanitized_adapter_imports_smartapi():
     offenders = []
     for rel, path in _production_sources():
         text = path.read_text(encoding="utf-8", errors="replace")
         if IMPORT_PATTERN.search(text):
             offenders.append(rel)
-    assert offenders == [], (
-        f"the retired AngelOne SDK is still imported at runtime by: {offenders}"
-    )
+    assert offenders == ["data/angelone_market_data.py"]
+
+
+def test_adapter_silences_sdk_and_never_logs_raw_exceptions():
+    source = (ROOT / "data/angelone_market_data.py").read_text(encoding="utf-8")
+    assert "smart_module.logger.setLevel(logging.CRITICAL)" in source
+    assert 'logger.warning(f' not in source
+    assert "logger.exception" not in source
 
 
 def test_the_data_layer_still_redacts_sensitive_text():

@@ -26,6 +26,26 @@ def _setting_enabled(value, default: bool = True) -> bool:
     return bool(value)
 
 
+TIMEFRAME_ENTRY_POLICY_TIMEFRAMES = {
+    "PRIMARY_15": frozenset({"15min"}),
+    "INCLUDE_5MIN": frozenset({"5min", "15min"}),
+    "PRIMARY_5": frozenset({"5min"}),
+    "INCLUDE_1MIN_5MIN": frozenset({"1min", "5min"}),
+    "INCLUDE_1MIN_5MIN_15MIN": frozenset({"1min", "5min", "15min"}),
+}
+
+
+def normalize_timeframe_entry_policy(value: Any) -> str:
+    """Return a supported operator timeframe-entry policy."""
+    policy = str(value or "INCLUDE_5MIN").upper()
+    return policy if policy in TIMEFRAME_ENTRY_POLICY_TIMEFRAMES else "INCLUDE_5MIN"
+
+
+def timeframe_entry_timeframes(value: Any) -> frozenset[str]:
+    """Fresh-entry frames enabled by an operator timeframe policy."""
+    return TIMEFRAME_ENTRY_POLICY_TIMEFRAMES[normalize_timeframe_entry_policy(value)]
+
+
 PROTECTED_SECRET_ENV_KEYS = {
     "ANGELONE_API_KEY",
     "ANGELONE_PASSWORD",
@@ -160,6 +180,7 @@ class Settings(BaseSettings):
 
     # ─── Trading Mode ────────────────────────────────────────
     trading_mode: Literal["HISTORICAL", "REAL"] = "HISTORICAL"
+    auto_mode: bool = False
     strategy_revision: str = "ut1-current"
     strategy_direction_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = "LONG_SHORT"
     # Grade every candidate with independently refreshed intelligence from its OWN
@@ -244,6 +265,14 @@ class Settings(BaseSettings):
         "SENSEX": 12.0,
         "MIDCPNIFTY": 14.0,
     }
+    # Futures are margined instruments: option premium-cost percentages are not a
+    # meaningful denominator. A major futures win arms at this multiple of the frozen
+    # entry-stop risk, with the flat rupee rung retained as a conservative minimum.
+    major_win_guard_futures_r_multiple: float = 1.50
+    # Previous-session bars may warm indicators, but every timeframe starts from a
+    # clean directional state at 09:15. One current-session forming bar is enough for
+    # the strict opening-quality routes; no first-hour 5-minute blackout.
+    live_signal_5min_warmup_bars: int = 1
     major_win_guard_flat_fallback_rs: float = 3000.0
 
     entry_policy_underlying_stop_max_pct_by_index: dict[str, float] = {
@@ -263,7 +292,7 @@ class Settings(BaseSettings):
     entry_policy_forecast_min_samples: int = 30
     entry_policy_forecast_max_samples: int = 480
     entry_policy_forecast_max_age_seconds: float = 90.0
-    entry_policy_geometry_max_age_seconds: float = 10.0
+    entry_policy_geometry_max_age_seconds: float = 15.0
     # Bid/ask shadow mark-outs for BOTH accepted and rejected entry decisions. These
     # rows are research evidence only: they never promote a rule or alter a live order.
     # A bounded, durable pending book survives process restarts and emits one outcome
@@ -334,15 +363,15 @@ class Settings(BaseSettings):
     # Deep loss band (₹): -soft → -deep (fast opposite move + reverse regime).
     post_exit_reversion_loss_band_deep_rs: float = 2000.0
     # Size-of-event gate (OR logic — either band qualifies):
-    #   fast: >= 0.40% over ~5 minutes
-    #   slow: >= 0.50% over ~10 minutes
+    #   fast: >= 0.30% over ~5 minutes
+    #   slow: >= 0.40% over ~10 minutes
     # Micro-chop after tiny exits does not open SNAPBACK.
-    post_exit_reversion_fast_move_pct: float = 0.40
+    post_exit_reversion_fast_move_pct: float = 0.30
     post_exit_reversion_fast_lookback_minutes: float = 5.0
-    post_exit_reversion_slow_move_pct: float = 0.50
+    post_exit_reversion_slow_move_pct: float = 0.40
     post_exit_reversion_slow_lookback_minutes: float = 10.0
     # Legacy aliases (kept for config UI / older saves; dual gate is authoritative).
-    post_exit_reversion_min_move_pct: float = 0.40
+    post_exit_reversion_min_move_pct: float = 0.30
     post_exit_reversion_move_lookback_minutes: float = 5.0
     # Pure SNAPBACK bare-min data confirm (below full SPIKE floors). Ensures the
     # 1min counter-signal is tape-backed, not a naked UT1 flip.
@@ -694,45 +723,23 @@ class Settings(BaseSettings):
     option_contract_min_oi_lots: float = 5.0
     option_contract_min_volume_lots: float = 1.0
     option_contract_min_touch_depth_lots: float = 1.0
-    inst_pref: Literal["FUT", "OPT", "AUTO"] = "AUTO"
+    # Long-premium options are the system's primary product.  FUT and AUTO stay
+    # explicit operator modes; a fresh install must never silently become a
+    # hybrid/FUT book merely because INST_PREF was omitted from its environment.
+    inst_pref: Literal["FUT", "OPT", "AUTO"] = "OPT"
     sl_mode: Literal["NATURAL", "HARDCODED"] = "NATURAL"
     signal_grade_preference: Literal["auto", "B", "B+", "A", "A+"] = "A"
-    # ── Grade-gate A/B levers (2026-08-11) ───────────────────────────────────
-    # Both default OFF: nothing here changes live behaviour until switched on.
-    #
-    # Across 12 live sessions / 106 trades the grade the engine computes did not rank
-    # outcomes: corr(grade rank, pnl) = +0.096, i.e. no information, and what ordering
-    # there was ran the WRONG way — A+ Rs.49/trade and A Rs.48 against B+ Rs.260 and
-    # B Rs.407. Meanwhile grade drove 2,468 "C grade blocked" and 424 "Grade rank below
-    # required 2" rejections in that window, the second and fifth largest reject reasons.
-    #
-    # Note what that sample is: .env pins SIGNAL_GRADE_PREFERENCE='B', so options run at
-    # min_rank 2 and every B row in the book arrived through the fifteen_min_bplus_ok or
-    # power_move exemption. The best-performing grades are therefore precisely the ones
-    # the main gate refused and an OR-branch let past — suggestive, but n=15 across B and
-    # B+ combined, which is far too thin to justify moving a gate that touches every
-    # signal. So these ship off, to be A/B'd once pnl_path data has accumulated.
-    #
-    # -1 keeps signal_grade_preference in charge; 0-4 forces the floor
-    # (C=0, B=1, B+=2, A=3, A+=4).
-    # ── Late-trend entry ceiling (2026-08-11) ────────────────────────────────
-    # A high ADX on a WITH-trend entry says the leg is MATURE, not that it is strong.
-    # Across 47 stored sessions, same direction and same instruments:
-    #   TRENDING_DOWN shorts   median ADX 34.4   win rate  7.1%   (1 win in 14)
-    #   BREAKOUT_DOWN  shorts  median ADX 21.4   win rate 71.4%
-    # and independently the whole ADX>=30 cell runs 32.4%/Rs.41 against 45.8%/Rs.248
-    # for ADX<20. Blocking with-trend entries above the ceiling drops 43 of 240
-    # historical trades worth -Rs.4,033 and moves the book from 40.0%/Rs.197 to
-    # 46.2%/Rs.260. AGAINST-trend entries are deliberately untouched — they are the
-    # mean-reversion side of the same reading and measured positive.
-    late_trend_entry_guard_enabled: bool = True
-    late_trend_entry_adx_ceiling: float = 30.0
-    grade_gate_min_rank_override: int = -1
-    # Lets a C grade continue to the confidence, choppy and quality gates instead of
-    # being refused on grade alone. It does NOT admit the signal — everything downstream
-    # still applies.
-    grade_gate_allow_c_enabled: bool = False
-    ut_timeframe_entry_policy: Literal["PRIMARY_15", "INCLUDE_5MIN"] = "INCLUDE_5MIN"
+    # Quality admission is owned by engine/quality_verdict.py. The former B/C grade
+    # bypass, rank override and fitted late-ADX ceiling were removed rather than left
+    # as dashboard knobs that appear to work. Unknown legacy .env keys are ignored by
+    # model_config below.
+    ut_timeframe_entry_policy: Literal[
+        "PRIMARY_15",
+        "INCLUDE_5MIN",
+        "PRIMARY_5",
+        "INCLUDE_1MIN_5MIN",
+        "INCLUDE_1MIN_5MIN_15MIN",
+    ] = "INCLUDE_5MIN"
     ut_5min_option_min_confidence: float = 0.60
     ut_5min_loss_cooldown_minutes: int = 45
     # Enforces the line above. Until 2026-08-10 that value was read by nothing but two
@@ -755,10 +762,6 @@ class Settings(BaseSettings):
     # guard exists to stop was C grade at 12-13%. The floor every other bypass in
     # that expression already uses separates the two with room to spare, so the bar
     # is set there until the census path exists to justify a higher one.
-    market_wide_reversal_min_grade: Literal["B", "B+", "A", "A+"] = "B"
-    market_wide_reversal_min_confidence: float = 0.50
-    live_b_grade_min_confidence: float = 0.50  # Top-of-band floor for dedicated B-grade entries (trending + 15m align + ADX>=25)
-
     # ─── Confidence calibration (de-saturation) ──────────────
     # The legacy model was confidence = clamp(0.5 + Σpillars, 0, 1), which pinned
     # at 1.0 for any net-positive setup and destroyed ranking power. The logistic
@@ -958,7 +961,16 @@ class Settings(BaseSettings):
     # much profit it takes off one.
     breakeven_stop_enabled: bool = True
     breakeven_stop_arm_rs: float = 100.0
+    # The absolute arm remains the measured small-position floor.  On positions with
+    # known stop geometry, require at least this fraction of initial risk as well; a
+    # fixed Rs.100 was only 0.17R on the 2026-09-07 BANKNIFTY fill and treated a tiny
+    # premium fluctuation as a proven trade.  0.40R matches the existing confirmed-trend
+    # runner handoff: below it normal 5m movement keeps breathing room; at/above it the
+    # runner trail can take ownership. Small legacy projections without geometry still
+    # use the measured absolute floor.
+    breakeven_stop_arm_r_multiple: float = 0.40
     breakeven_stop_floor_rs: float = 80.0
+    breakeven_stop_min_age_seconds: float = 60.0
 
     # ── Peak trail, gated to LARGE peaks only (2026-08-19) ─────────────────────
     # Raises the breakeven stop's exit level from a flat floor to peak*(1-giveback),
@@ -1362,25 +1374,19 @@ class Settings(BaseSettings):
     #
     # 300s sits in the middle of a broad optimum (3-10 minutes all gain +2,840 or more),
     # so it is not perched on a knife edge.
-    # Minimum grade admitted to the quad-prime raw quality floor on its OWN standard
-    # confidence floor (B+ 0.55, A 0.70, A+ 0.85), without needing a second signal
-    # engine. Before 2026-08-31 no term applied those floors at all, so a solo-source
-    # B+ was unreachable at any confidence and the gate ran backwards between 55% and
-    # 70% -- admitting at 52% and refusing at 68%. Raise to "A" to restore the old
-    # (unintentionally strict) behaviour for B+.
-    # Confidence a 5-minute signal needs to stand on its own, without 15-minute trend
-    # agreement. Was hardcoded to grade_min_confidence("A") = 0.70; 0.65 from 2026-09-01.
-    #
-    # Set it back to 0.70 to restore the previous behaviour exactly -- the parity sweep
-    # in tests/test_quality_verdict_parity_2026_09_01.py runs at that value and proves
-    # the consolidation itself changed nothing.
-    #
-    # Measured caveat: this rule refused zero signals across the 30 sessions in the
-    # rtracker archive, so lowering it has no demonstrated effect. Rejections happen
-    # upstream of it.
-    live_5min_quality_min_confidence: float = 0.65
+    # One quality policy for live/recovery/historical/EOD.  A >=70% setup may stand on
+    # its own; B+ (55--70%) is *eligible*, not automatically admitted, and must clear
+    # the explicit evidence routes below.  The old tracker has sparse outcomes and mixed
+    # accounting, so it is not evidence for a lower unconditional live floor.
+    live_5min_quality_min_confidence: float = 0.70
+    quality_policy_bplus_min_confidence: float = 0.55
+    quality_policy_bplus_min_adx: float = 22.0
+    quality_policy_risky_bplus_min_adx: float = 25.0
+    quality_policy_min_volume_ratio: float = 1.20
 
-    quad_prime_raw_standard_floor_min_grade: str = "B+"
+    # Deprecated compatibility input.  The versioned evaluator intentionally ignores
+    # grade as an independent switch because grade is derived from confidence; retaining
+    # this field avoids breaking saved settings while removing its non-monotonic effect.
 
     # Where today's 4-index warmup record is kept so a mid-session restart does not
     # erase it. The auto-execution gate reads this when its in-memory copy is empty;
@@ -1503,7 +1509,10 @@ class Settings(BaseSettings):
     # tape (lock the looser high-vol pct so noise does not shake the runner out) and
     # tighten toward dynamic_rr_runner_lock_pct (currently 0.85) in calm regimes.
     trend_runner_dynamic_lock_enabled: bool = True
-    trend_runner_lock_pct_high_vol: float = 0.85
+    # Keep the original 5-point calm/high-vol separation after the base lock moved
+    # from 0.90 to 0.85. 0.80 locks 80% of peak and gives confirmed volatile runners
+    # 20% retracement room; calm runners retain the tighter 85% lock.
+    trend_runner_lock_pct_high_vol: float = 0.80
     # Big-move gate: the ride/runner engages EARLY (before the fixed target) only when a
     # proven winner is in a strong trend with ADX above this floor — so small gains are
     # banked normally and the ride is reserved for moves with room to run.
@@ -1550,10 +1559,13 @@ class Settings(BaseSettings):
     pullback_hedge_size_fraction: float = 0.5          # hedge lots vs parent lots
     pullback_hedge_max_per_trade: int = 2              # anti-whipsaw churn cap
     pullback_hedge_max_hold_minutes: float = 15.0      # never hold a hedge indefinitely
-    # How old a cached option chain may be and still drive intelligence (OI/PCR/Greeks).
-    # In REAL mode the scan loop deliberately serves the cached chain instead of
-    # re-fetching every cycle; only genuine age should mark it stale, otherwise the
-    # aggregator drops the chain and the panel reports "OPTIONS DATA UNAVAILABLE".
+    # Option-chain clocks have different jobs. Network fetch stays API-safe at 90s;
+    # startup tolerates the four-index warmup; fresh entries use a tighter bound; open
+    # trade management may retain older context while live contract ticks own price risk.
+    option_chain_startup_max_age_seconds: float = 150.0
+    option_chain_entry_max_age_seconds: float = 120.0
+    option_chain_high_vol_entry_max_age_seconds: float = 90.0
+    option_chain_high_vol_percentile: float = 70.0
     option_chain_intelligence_max_age_seconds: float = 300.0
     # ── Stop-out re-entry (2026-07-25) ───────────────────────────────────────
     # A trade stopped out early on a trend day, then the move ran without us. When the
@@ -1901,7 +1913,9 @@ class Settings(BaseSettings):
     # extra rupee backstop per trade is explicitly wanted.
     max_trade_loss_abs: float = 0.0
     dynamic_rr_min: float = 1.5 # Minimum initial RR; final policy recomputes it from execution levels
-    dynamic_rr_max: float = 12.0 # Quality-scaled initial RR ceiling; runner mode can capture larger option moves
+    # Reachable quality ladder tops near 4.92R. 5.0 is an honest global ceiling;
+    # runner mode, not an unreachable 12R initial target, captures exceptional moves.
+    dynamic_rr_max: float = 5.0
     dynamic_rr_runner_unlock_ratio: float = 0.85 # T1 progress before removing hard target (lowered so winners flip to trail-and-ride earlier; was 1.00)
     dynamic_rr_runner_lock_pct: float = 0.85 # Runner-mode trailing lock on open gains
     # 5min/1min entries cannot travel the top of the RR ladder within one short bar's
@@ -1966,6 +1980,12 @@ class Settings(BaseSettings):
     auto_real_mode_premarket_enabled: bool = True
     auto_real_mode_premarket_switch_time: str = "09:00:00"
     auto_real_mode_premarket_retry_seconds: float = 30.0
+    # Explicit unattended-start intent.  REAL processes still begin manual; only a
+    # complete same-day warmup plus the normal broker/option-chain readiness gate can
+    # turn Auto on at/after the live session start.  This remains separate from
+    # ``auto_mode`` because that flag is runtime authority and is deliberately never
+    # persisted across a broker-process restart.
+    auto_real_mode_startup_enabled: bool = False
 
     # ─── Signal engine selector ──────────────────────────────
     # Which raw-signal scanner feeds the pipeline. Default "quad_prime"
@@ -1995,13 +2015,9 @@ class Settings(BaseSettings):
     # Quad Prime raw-entry hygiene: raw source access is allowed, but weak solo flips
     # must not skip all live quality floors or every winner becomes a tiny scalp while
     # low-confidence losers keep wide option stops.
-    quad_prime_raw_min_confidence: float = 0.50
-    quad_prime_raw_multi_source_min_confidence: float = 0.55
-    quad_prime_raw_runner_min_confidence: float = 0.70
     # The intelligence bar the exceptional-spike leg must clear, ALIGNED with the
     # trade's own side. Matches rare_burst_min_intel_score, which uses the same 0.70
     # with the same signed comparison.
-    quad_prime_raw_spike_min_intel_score: float = 0.70
     # ── Engine 10 v2: regime-switched delegation to the proven engines ──
     # v1 re-invented selection from raw arrows and lost 10x to the engines it
     # routed (three 30d backtests Rs.17-21k vs Rs.190k). v2 emits ONLY the two
@@ -2071,7 +2087,6 @@ class Settings(BaseSettings):
     # confidence-qualified trend-engine flip bypasses the impulse-context / choppy
     # confirmation gates (which exist to filter UT1 noise). The confidence floor and
     # 15m-agreement requirement still apply. No effect when scanner_engine == "utbot".
-    trend_engine_relaxed_gate: bool = True
     # Combo engines only: a SOLO UT1 opposite-flip must not exit a live trade by itself —
     # UT1 is the jumpy source, so its exits need the partner (ema/consensus) to confirm.
     # The partner emits its own opposite signal when it flips, so the trade simply rides on
@@ -2158,8 +2173,7 @@ class Settings(BaseSettings):
     ut_dynamic_confidence: bool = True # Enable dynamic confidence threshold
     ut_backtest_more_results: bool = True # Loosen historical-only gates for exploratory backtests
     futures_shadow_enabled: bool = False # Research-only FUT comparison rows for historical AUTO/Hybrid; never places live orders
-    ut_session_start: str = "09:18"
-    ut_early_session_cutoff: str = "09:20" # Stricter 5min-quality window applies only until this time (aligned to session start, not a trading-start delay)
+    ut_session_start: str = "09:15"
     ut_session_end: str = "15:25"
     # ─── Operator session schedule (2026-08-11) ──────────────────────────────
     #   14:55  last 15min entry
@@ -2314,6 +2328,10 @@ class Settings(BaseSettings):
     # which the ghost guard correctly refuses. Keep the deep/history cache long, but
     # let the live 1m index edge refresh on each worker pass.
     live_1min_history_cache_ttl_seconds: float = 45.0
+    # Live index LTP fallback is AngelOne. Yahoo is delayed and therefore disabled by
+    # default; retain an explicit disaster-recovery opt-in for operators who accept a
+    # reference-only badge. Historical candle backfill is configured separately.
+    yahoo_live_price_fallback_enabled: bool = False
     # Broker history request pacing (requests/second). Too aggressive a rate trips
     # AngelOne's history limit, which forces the Yahoo fallback — and Yahoo reports
     # volume=0 for Indian index tickers, killing every volume-gated entry path.
@@ -2508,9 +2526,9 @@ class Settings(BaseSettings):
     # (49%), versus 3 from the strict directional-thrust branch. Turning this ON keeps
     # thrust, cascade, late-reclaim, market-wide-reversal, VWAP and structure while
     # removing the branch that is nearly always true in a trending tape.
-    # Default False: the measured edge against clean signals was NOT significant
-    # (39% vs 50% win rate, median -151, N=56, p=0.21), so this is a deliberate opt-in.
-    stabilization_override_drop_regime_flip: bool = False
+    # Default True: regime alignment alone is lagging context, not reversal proof.
+    # Strict thrust, cascade, late-reclaim, market-wide, VWAP and structure routes stay.
+    stabilization_override_drop_regime_flip: bool = True
     # Refuse a LONG while a SHORT is live on the same index (and vice versa). The rest of
     # the concurrency guard reasons about timeframe, lane, instrument type and count and
     # never once about DIRECTION, so with ut_concurrency_guard off the only limit on
@@ -2640,8 +2658,6 @@ class Settings(BaseSettings):
     fifteen_min_choppy_scalp_min_peak_rs: float = 250.0
     live_5min_bplus_min_confidence: float = 0.70
     live_5min_choppy_min_confidence: float = 0.70
-    live_5min_early_min_confidence: float = 0.70
-    live_5min_pre_close_min_confidence: float = 0.70
     live_5min_special_adx_threshold: float = 30.0
     live_5min_special_bplus_min_confidence: float = 0.60
     live_5min_special_intel_threshold: float = 0.75
@@ -2718,11 +2734,14 @@ class Settings(BaseSettings):
     market_ltp_shock_min_indices: int = 2
     market_ltp_shock_min_core_indices: int = 2
     market_ltp_shock_min_volume_ratio: float = 1.10
+    # Minimum canonical confidence for a strict multi-index market-shift route
+    # to supersede stale regime/15-minute direction. Ordinary signals do not use it.
+    quality_policy_market_shift_min_confidence: float = 0.60
     # Shock engine full-sensitivity IST window (normal min_move applies inside).
-    market_ltp_shock_session_start: str = "14:00"
-    market_ltp_shock_session_end: str = "15:10"
+    market_ltp_shock_session_start: str = "13:00"
+    market_ltp_shock_session_end: str = "15:15"
     # Backward-compat alias used by older guards (same as session_start).
-    market_ltp_shock_session_override_start: str = "14:00"
+    market_ltp_shock_session_override_start: str = "13:00"
     # Outside the window: "strong" = only moves >= outside_strong_move_pct qualify
     # (genuine crash/melt-up bursts); "off" = engine idle outside the window.
     market_ltp_shock_outside_window_mode: str = "strong"
@@ -2795,10 +2814,34 @@ class Settings(BaseSettings):
     pre_candle_flip_veto_enabled: bool = False
     pre_candle_flip_veto_min_confidence: float = 0.70
     # Live 15m positions are monitored by BOTH their own 15m structure and the fast 1m
-    # tape. A 1m wiggle never exits by itself: it must be an emergency reversal or agree
-    # with a broken 15m structure, using the established profit-guard classifier.
+    # tape. The first minute after a fill is shock-only. After that, a completed 1m
+    # reversal needs independent 5m/15m or market-wide evidence plus trade-state proof.
+    # All state thresholds are in R / peak-retention units, so the same policy scales
+    # across indices, futures and option premiums and can be A/B replayed with one toggle.
     fifteen_min_one_min_support_exit_enabled: bool = True
     fifteen_min_one_min_support_min_hold_seconds: float = 15.0
+    fifteen_min_one_min_support_fresh_trade_seconds: float = 60.0
+    fifteen_min_one_min_support_loss_min_r: float = 0.35
+    fifteen_min_one_min_support_stop_near_r: float = 0.35
+    fifteen_min_one_min_support_win_giveback_pct: float = 0.25
+    fifteen_min_one_min_support_lock_buffer_r: float = 0.15
+    fifteen_min_one_min_support_premium_adverse_min_r: float = 0.10
+    fifteen_min_one_min_support_min_confirmations: int = 2
+    # During the first minute, admit a second protective lane below the catastrophic
+    # shock tier only when price risk is already meaningful and three independent,
+    # current sources agree: market breadth, directional volume, and either fresh L1
+    # order flow or an option-chain snapshot captured after the fill.  This keeps the
+    # 60-second candle-noise guard while removing its blind spot for a genuine fast turn.
+    fifteen_min_fast_intelligence_enabled: bool = True
+    fifteen_min_fast_intelligence_min_sources: int = 3
+    fifteen_min_fast_chain_min_votes: int = 2
+    fifteen_min_fast_depth_max_age_seconds: float = 2.0
+    fifteen_min_fast_order_flow_bullish_ratio: float = 1.08
+    fifteen_min_fast_order_flow_bearish_ratio: float = 0.92
+    # Refresh a non-probabilistic live outlook from the immutable entry MFE forecast,
+    # realized underlying move, premium R state and current evidence.  Entry forecast
+    # probability is retained as a baseline; no uncalibrated probability is invented.
+    fifteen_min_live_expected_move_enabled: bool = True
     # A candle must have both a recent transport receipt and a bar clock compatible
     # with the live evaluation time before it can drive an early exit.
     early_exit_candle_max_age_seconds_1min: float = 90.0
@@ -3158,6 +3201,12 @@ class Settings(BaseSettings):
             if key in _INERT:
                 continue
             env_key = key.upper()
+            # Auto execution authority is deliberately process-local.  Persisting
+            # True lets a restarted REAL process inherit order authority before a
+            # human can review the new process's feed/broker readiness.  The runtime
+            # value remains untouched; only the next-start value is forced manual.
+            if key == "auto_mode":
+                val = False
             if env_key not in existing_values and _is_untouched_default(key, val):
                 continue
             # Handle list/dict serialization (e.g. active_indices)

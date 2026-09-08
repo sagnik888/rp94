@@ -48,6 +48,15 @@ def _sc(intel=None):
     }
     sc._premium_cache = {}
     sc._vix_percentile = lambda v, t: 41.2
+    sc._get_trade_regime = lambda candidate, default="UNKNOWN": str(
+        getattr(candidate, "market_regime", "") or default
+    )
+    sc._candidate_15m_trend_agrees = lambda candidate: bool(
+        getattr(candidate, "trend_15m_agrees", False)
+    )
+    sc._quad_union_sources = lambda candidate: list(
+        getattr(candidate, "source_engines", []) or []
+    )
     recorded = []
     sc.rtracker = SimpleNamespace(
         record_candidate=lambda cand, **kw: recorded.append((cand, kw))
@@ -68,6 +77,30 @@ def _record(sc, cand, decision="REJECTED"):
     return sc._recorded[0][0]
 
 
+def test_historical_replay_never_appends_to_the_production_rtracker():
+    sc = _sc()
+    sc.mode = "HISTORICAL"
+
+    sc._rtracker_record_candidate(
+        _cand(signal_timestamp="2026-09-04T10:00:00"),
+        decision="REJECTED",
+        reason="historical replay reject",
+        source="filtered_candidate",
+    )
+
+    assert sc._recorded == []
+
+
+def test_live_rtracker_rows_are_stamped_with_an_evidence_domain():
+    sc = _sc()
+
+    sc._rtracker_record_candidate(_cand(), decision="REJECTED", reason="x")
+
+    extra = sc._recorded[0][1]["extra"]
+    assert extra["run_mode"] == "REAL"
+    assert extra["evidence_domain"] == "LIVE_DECISION"
+
+
 # ── the rejected population now carries what the gate judged ─────────────────
 
 def test_a_rejected_signal_records_the_features_it_was_judged_on():
@@ -81,6 +114,23 @@ def test_a_rejected_signal_records_the_features_it_was_judged_on():
     assert block["adx"] == pytest.approx(18.2)
     assert block["pcr"] == pytest.approx(1.337)
     assert block["order_ratio"] == pytest.approx(0.84)
+
+
+def test_a_rejected_signal_always_records_the_versioned_quality_decision():
+    sc = _sc()
+
+    cand = _record(
+        sc,
+        _cand(
+            grade="B+", confidence=0.60, market_regime="TRENDING_UP",
+            adx_value=25.0, trend_15m_agrees=True, source_engines=["utbot", "partner"],
+        ),
+    )
+
+    quality = getattr(cand, "quality_verdict", {})
+    assert quality["policy_version"]
+    assert quality["configuration_hash"]
+    assert quality["checks"]["lane"] == "TELEMETRY"
 
 
 @pytest.mark.parametrize("decision", ["REJECTED", "STABILIZED", "ACCEPTED", "EXIT"])

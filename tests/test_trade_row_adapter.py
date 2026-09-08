@@ -43,6 +43,32 @@ def test_reconcile_legacy_trade_row_clamps_exit_and_does_not_mutate(monkeypatch)
     assert "exit_price" not in original
 
 
+def test_reconcile_repairs_broker_fill_row_from_actual_fill_pair(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "opt_cost", 80.0)
+    original = {
+        "instrument": "BANKNIFTY 57200 PE",
+        "inst_type": "OPT",
+        "direction": "SHORT",
+        "entry_price": 575.75,
+        "exit_price": 576.0,
+        "current_price": 0.0,
+        "pnl": -183.66,
+        "broker_order_id": "ENTRY-ORDER-1",
+        "exit_order_id": "EXIT-ORDER-1",
+        "lots": 1,
+        "lot_size": 30,
+        "exit_reason": "BREAKEVEN_STOP",
+    }
+
+    repaired = reconcile_legacy_trade_row(original)
+
+    assert repaired["pnl"] == -72.5
+    assert repaired["exit_price"] == 576.0
+    assert repaired["current_price"] == 0.0
+    assert original["pnl"] == -183.66
+
+
 def test_simulated_history_row_and_signal_conversion():
     timestamp = IST.localize(datetime(2026, 6, 12, 10, 30)).timestamp()
     row = {

@@ -220,7 +220,7 @@ def test_pre_candle_predictor_uses_tick_price_proxy_when_index_volume_unavailabl
     one_min = pred["evidence"]["one_min"]
     assert one_min["volume_unavailable"] is True
     assert one_min["tick_count"] == 12
-    assert "1m volume unavailable" in pred["reason"]
+    assert "live 1m cash volume unavailable" in pred["reason"]
     assert "tick activity 12/min" in pred["reason"]
     assert "1m price-action burst proxy" in pred["reason"]
     assert pred["confidence"] >= 0.50

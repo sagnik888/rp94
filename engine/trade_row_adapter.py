@@ -226,6 +226,14 @@ def is_option_dashboard_row(row: Dict[str, Any]) -> bool:
     return inst_type == "OPT" or "CE" in trading_symbol or "PE" in trading_symbol or "CE" in instrument or "PE" in instrument
 
 
+def normalized_row_inst_type(row: Dict[str, Any]) -> str:
+    """Recover product identity from legacy option contract fields when needed."""
+    inst_type = str(row.get("inst_type") or "").upper()
+    if inst_type in {"OPT", "FUT"}:
+        return inst_type
+    return "OPT" if is_option_dashboard_row(row) else "FUT"
+
+
 def trade_row_session_date(row: Dict[str, Any]):
     try:
         timestamp = row.get("entry_timestamp") or 0
@@ -279,12 +287,34 @@ def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
     row = normalize_dashboard_accounting_row(row)
     if is_quote_invalid_row(row):
         return row
-
-    inst_type = str(row.get("inst_type") or "FUT").upper()
+    inst_type = normalized_row_inst_type(row)
     direction = str(row.get("direction") or "LONG").upper()
     entry_price = float(row.get("entry_price") or row.get("price") or 0.0)
     if entry_price <= 0:
         return row
+    broker_fill_pair = bool(
+        str(row.get("broker_order_id") or "").strip()
+        and str(row.get("exit_order_id") or "").strip()
+    )
+    actual_exit = float(row.get("exit_price") or 0.0)
+    if broker_fill_pair and actual_exit > 0:
+        # Repair rows written before exact-fill accounting was fixed.  Never replace an
+        # actual exit fill with the requested stop/target, and never add simulated
+        # slippage to prices that already came from broker executions.
+        quantity = int(row.get("lots") or 1) * int(row.get("lot_size") or 1)
+        settings = get_settings()
+        configured_cost = getattr(
+            settings, "opt_cost" if inst_type == "OPT" else "fut_cost", 0.0
+        )
+        charges = max(0.0, float(configured_cost or 0.0))
+        gross = (
+            (actual_exit - entry_price) * quantity
+            if inst_type == "OPT" or direction == "LONG"
+            else (entry_price - actual_exit) * quantity
+        )
+        row["pnl"] = round(gross - charges, 2)
+        return row
+
     stop = float(row.get("current_stop") or row.get("trailing_stop") or row.get("stop") or 0.0)
     target = float(row.get("current_target") or row.get("target") or 0.0)
     exit_reason = str(row.get("exit_reason") or "").upper()
@@ -342,7 +372,7 @@ def trade_row_to_signal(row: Dict[str, Any]) -> Dict[str, Any]:
         "grade": row.get("grade", ""),
         "confidence": row.get("confidence", 0.0),
         "timeframe": row.get("timeframe", ""),
-        "inst_type": row.get("inst_type", "FUT"),
+        "inst_type": normalized_row_inst_type(row),
         "option_type": row.get("option_type", ""),
         "atm_strike": row.get("atm_strike", 0.0),
         "timestamp": entry_iso or row.get("entry_time", ""),

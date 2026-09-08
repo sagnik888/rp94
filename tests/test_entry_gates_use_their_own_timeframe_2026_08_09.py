@@ -1,39 +1,8 @@
-"""The entry gates graded every candidate on the 5-MINUTE regime.
+"""Admission/loosening cannot borrow a different timeframe's regime.
 
-`latest_regimes` is keyed by INSTRUMENT and, by its own declaration at scanner.py:273,
-always holds the 5-minute label. Four live entry gates read it directly for candidates of
-every timeframe:
-
-    _passes_candidate_grade_preference     the B-grade floor bypass
-    _market_location_entry_gate            the scalp-lock release
-    _passes_live_trade_ready_gate          the choppy veto
-    _live_signal_stabilization_requirements the stabilization window
-
-The codebase already states the rule these break. `_trade_regime_is_own_timeframe`
-(scanner.py:6953) exists for exactly this and says so:
-
-    "That borrowed label is fine for conservative tightening, but it must NOT be used to
-     grant a privilege: a 15-minute trade could otherwise enter runner mode on a 5-minute
-     regime, and sampled 5m/15m regimes disagree in 83% of same-timestamp pairs."
-
-The rule was enforced for runner mode and nowhere else. Two of these four gates GRANT:
-
-  * the B-grade bypass ADMITS a B-band signal the grade floor would refuse, and its
-    trending test was reading the 5-minute pocket;
-  * the scalp-lock release LOOSENS the tightest profit lock so a runner can run.
-
-So a 15-minute B candidate sitting in a 15-minute RANGING pocket was admitted below the
-grade floor because the 5-minute pocket happened to trend -- and then had its profit lock
-released on the same borrowed evidence.
-
-FIX: all four read `_get_trade_regime(candidate)`, which prefers the candidate's own
-timeframe and keeps the documented 5-minute fallback. The two PRIVILEGES additionally
-require `_trade_regime_is_own_timeframe(candidate)`, so a borrowed label can tighten but
-never admit or loosen.
-
-NOT changed: per_timeframe_grading_enabled stays default-off. That flag only reaches
-_grade_signal; it never reached these gates, which is why turning it on would not have
-fixed any of this.
+The instrument-only regime cache is the 5-minute label. It remains a conservative
+fallback for exit/risk management, but canonical admission treats a missing 15-minute
+label as UNKNOWN and scalp-lock release requires exact-timeframe ownership.
 """
 import ast
 import inspect
@@ -84,9 +53,8 @@ def test_a_5min_candidate_owns_the_instrument_keyed_label():
 # ── the gates read their own timeframe ───────────────────────────────────────
 
 GATES = [
-    "_passes_candidate_grade_preference",
     "_market_location_entry_gate",
-    "_passes_live_trade_ready_gate",
+    "_candidate_quality_context",
     "_live_signal_stabilization_requirements",
 ]
 
@@ -115,6 +83,12 @@ def test_the_gate_uses_the_own_timeframe_resolver(fn_name):
     assert "_get_trade_regime(" in inspect.getsource(getattr(Scanner, fn_name))
 
 
+def test_live_gate_delegates_regime_resolution_to_the_quality_context():
+    assert "_candidate_quality_context(" in inspect.getsource(
+        Scanner._passes_live_trade_ready_gate
+    )
+
+
 # ── privileges refuse a borrowed label ───────────────────────────────────────
 
 def _calls_in(node):
@@ -126,23 +100,12 @@ def _calls_in(node):
     }
 
 
-def test_the_b_grade_bypass_requires_an_own_timeframe_regime():
-    """The bypass ADMITS a B-band signal the floor would refuse.
-
-    Asserted on the AST of the `if` TEST, not on source text. The first version of this
-    test checked for the guard's NAME within 400 chars and passed against reverted code,
-    because the explanatory comment above the branch happens to name it.
-    """
-    tree = ast.parse(textwrap.dedent(
-        inspect.getsource(Scanner._passes_candidate_grade_preference)))
-    guarded = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.If) and "_b_grade_entry_allowed" in _calls_in(n.test)
-    ]
-    assert guarded, "the B-grade bypass branch was not found"
-    assert any("_trade_regime_is_own_timeframe" in _calls_in(n.test) for n in guarded), (
-        "a 15-minute B candidate can still be admitted on the 5-minute regime"
-    )
+def test_the_retired_b_grade_bypass_cannot_return():
+    """B/B+ admission belongs to the canonical evidence verdict, not this preference."""
+    source = inspect.getsource(Scanner._passes_candidate_grade_preference)
+    assert "_b_grade_entry_allowed" not in source
+    assert "live_b_grade_min_confidence" not in source
+    assert "canonical quality policy owns B+ eligibility" in source
 
 
 def test_the_scalp_lock_release_requires_an_own_timeframe_regime():

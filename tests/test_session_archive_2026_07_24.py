@@ -87,6 +87,51 @@ def test_traded_symbols_extracted_from_events():
     }
 
 
+def test_next_day_shadow_outcome_does_not_demand_prior_day_contract_candles():
+    events = [
+        {
+            "decision": "ACCEPTED",
+            "contract": {
+                "trading_symbol": "NIFTY08SEP2624000CE",
+                "symbol_token": "current-token",
+            },
+        },
+        {
+            "decision": "SHADOW_OUTCOME",
+            "shadow_outcome": {"session_date": "2026-09-03"},
+            "contract": {
+                "trading_symbol": "SENSEX03SEP2676500PE",
+                "symbol_token": "expired-token",
+            },
+        },
+    ]
+
+    assert arch.traded_symbols(events, "2026-09-04") == {"NIFTY08SEP2624000CE"}
+    assert arch.contract_tokens(events, "2026-09-04") == {
+        "NIFTY08SEP2624000CE": "current-token"
+    }
+
+
+def test_same_day_or_unowned_shadow_outcome_remains_fail_closed_contract_evidence():
+    events = [
+        {
+            "decision": "SHADOW_OUTCOME",
+            "shadow_outcome": {"session_date": "2026-09-04"},
+            "contract": {"trading_symbol": "SAME_DAY_CE"},
+        },
+        {
+            "decision": "SHADOW_OUTCOME",
+            "shadow_outcome": {},
+            "contract": {"trading_symbol": "UNKNOWN_DAY_PE"},
+        },
+    ]
+
+    assert arch.traded_symbols(events, "2026-09-04") == {
+        "SAME_DAY_CE",
+        "UNKNOWN_DAY_PE",
+    }
+
+
 def test_day_slice_filters_to_the_session(tmp_path):
     p = tmp_path / "X_1min.csv"
     pd.DataFrame([
@@ -134,6 +179,93 @@ def test_archive_writes_trades_and_manifest(monkeypatch, tmp_path):
     assert man["has_contract_identity"] is True
     assert man["contract_files_archived"] == 1
     assert (out / "candles" / "NIFTY28JUL2623600CE_1min.csv").exists()
+
+
+def test_archive_preserves_prior_day_shadow_row_without_poisoning_coverage(monkeypatch, tmp_path):
+    monkeypatch.setattr(arch, "market_hours_now", lambda: False)
+    monkeypatch.setattr(arch, "ARCHIVE", tmp_path / "session_archive")
+    monkeypatch.setattr(arch, "CANDLES", tmp_path / "candles")
+    (tmp_path / "candles").mkdir()
+    rows = [
+        {
+            "decision": "SHADOW_OUTCOME",
+            "shadow_outcome": {"session_date": "2026-09-03"},
+            "contract": {"trading_symbol": "SENSEX03SEP2676500PE"},
+        }
+    ]
+    monkeypatch.setattr(arch, "load_events", lambda day: rows)
+
+    manifest = arch.archive_day("2026-09-04", force=True, quiet=True)
+
+    saved = json.loads(
+        (tmp_path / "session_archive" / "2026-09-04" / "trades.json").read_text()
+    )
+    assert saved == rows
+    assert manifest["traded_symbols_recorded"] == []
+    assert manifest["missing_contract_symbols"] == []
+    assert manifest["cross_session_contract_events_excluded"] == 1
+    assert manifest["decisions"] == {"SHADOW_OUTCOME": 1}
+
+
+def test_ownership_migration_reuses_frozen_candles_without_live_cache(monkeypatch, tmp_path):
+    day = "2026-08-31"
+    candles = tmp_path / "live-candles"
+    events_dir = tmp_path / "events"
+    archive_dir = tmp_path / "session-archive"
+    frozen = archive_dir / day / "candles"
+    candles.mkdir()
+    events_dir.mkdir()
+    frozen.mkdir(parents=True)
+
+    rows = [
+        {
+            "decision": "ACCEPTED",
+            "contract": {"trading_symbol": "NIFTY08SEP2624000CE"},
+        },
+        {
+            "decision": "SHADOW_OUTCOME",
+            "shadow_outcome": {"session_date": "2026-08-28"},
+            "contract": {"trading_symbol": "NIFTY01SEP2624100CE"},
+        },
+    ]
+    (events_dir / f"{day}.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    frame = pd.DataFrame(
+        [
+            {
+                "timestamp": f"{day} 09:{15 + i:02d}:00",
+                "open": 100 + i,
+                "high": 102 + i,
+                "low": 99 + i,
+                "close": 101 + i,
+                "volume": 500 + i,
+            }
+            for i in range(10)
+        ]
+    )
+    frame.to_csv(frozen / "NIFTY08SEP2624000CE_1min.csv", index=False)
+    for index in arch.INDICES:
+        for timeframe in ("1min", "5min", "15min"):
+            frame.to_csv(frozen / f"{index}_{timeframe}.csv", index=False)
+
+    monkeypatch.setattr(arch, "market_hours_now", lambda: False)
+    monkeypatch.setattr(arch, "CANDLES", candles)
+    monkeypatch.setattr(arch, "EVENTS", events_dir)
+    monkeypatch.setattr(arch, "ARCHIVE", archive_dir)
+
+    manifest = arch.archive_day(day, force=True, quiet=True)
+
+    assert manifest["complete"] is True
+    assert manifest["schema_version"] == arch.ARCHIVE_SCHEMA_VERSION
+    assert manifest["contract_ownership_version"] == arch.CONTRACT_OWNERSHIP_VERSION
+    assert manifest["events"] == 2
+    assert manifest["cross_session_contract_events_excluded"] == 1
+    assert manifest["traded_symbols_recorded"] == ["NIFTY08SEP2624000CE"]
+    assert manifest["contract_symbols_archived"] == ["NIFTY08SEP2624000CE"]
+    assert manifest["contract_files_archived"] == 1
+    assert manifest["spot_files_archived"] == 12
+    assert json.loads((archive_dir / day / "trades.json").read_text()) == rows
 
 
 def test_main_py_wires_the_archiver_scheduler():

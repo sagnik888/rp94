@@ -59,8 +59,8 @@ def test_the_gamma_stop_wins_in_every_risky_regime(regime):
     )
 
 
-def test_the_choppy_floor_still_applies_off_expiry():
-    """The fix must not remove the legacy breathing room on an ordinary day."""
+def test_risky_regimes_do_not_widen_the_operator_option_cap_off_expiry():
+    """A 15% cap is retained; a lower configured cap is covered separately."""
     assert _stop_pct(False, "RANGING") == pytest.approx(15.0)
 
 

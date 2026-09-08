@@ -1,14 +1,23 @@
 from dashboard.server import _trim_chart_payload, _valid_command_payload
 
 
-def test_manual_close_rejects_non_finite_and_non_positive_prices():
-    for price in ("nan", "inf", "-1", "0"):
+def test_manual_close_rejects_non_finite_and_negative_prices():
+    for price in ("nan", "inf", "-1"):
         assert (
             _valid_command_payload(
                 {"cmd": "close_trade", "trade_id": "T0001", "price": price}
             )
             == "invalid_price"
         )
+
+
+def test_manual_close_accepts_zero_for_broker_reconciled_market_exit():
+    assert (
+        _valid_command_payload(
+            {"cmd": "close_trade", "trade_id": "T0001", "price": "0"}
+        )
+        is None
+    )
 
 
 def test_manual_close_accepts_positive_finite_price():

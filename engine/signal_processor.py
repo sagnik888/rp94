@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Optional
 from loguru import logger
 from dataclasses import dataclass, field
-from config.settings import get_settings
+from config.settings import (
+    get_settings,
+    normalize_timeframe_entry_policy,
+    timeframe_entry_timeframes,
+)
 from engine.intelligence_score import (
     LEGACY_SCORE_SCALE,
     aggregate_intelligence_score,
@@ -15,15 +19,12 @@ from engine.intelligence_score import (
 )
 from engine.option_history_store import get_option_history_store
 from engine.signal_quality_policy import (
-    b_grade_entry_allowed,
     choppy_confidence_gate,
     dynamic_rr,
-    fifteen_min_confidence_floor,
     five_min_true_impulse_allowed,
     grade_min_confidence,
     grade_rank,
     is_choppy_regime,
-    live_5min_choppy_confidence_floor,
     option_grade_allowed,
     option_index_stop_distance,
     option_premium_health_ok,
@@ -475,6 +476,9 @@ class TradeCandidate:
     geometry_schema: str = "dual_price_geometry.v1"
     expected_move_forecast: dict[str, Any] = field(default_factory=dict)
     entry_policy_verdict: dict[str, Any] = field(default_factory=dict)
+    # Versioned quality decision made before raw/override routing.  Unlike a dynamic
+    # attribute, this survives the session ledger and can be joined to rtracker exits.
+    quality_verdict: dict[str, Any] = field(default_factory=dict)
     signal_timestamp: Optional[datetime] = None
     current_price: float = 0.0
     pnl: float = 0.0
@@ -1363,11 +1367,16 @@ class SignalProcessor:
         *,
         reversion_window_open: bool = False,
     ):
-        """Keep 1min tracking rows from competing for entry unless spike or reversion window.
+        """Keep 1min rows from competing unless an exceptional route exists.
 
         - Continuous 1M SPIKE path: requires volume_spike_entry.
         - POST-WIN / distress SNAPBACK path: may admit 1min without spike while the
           reversion window is open (REV-SCLP ON, 1M-SCALP may be OFF).
+        - Confirmed shock, reversal, pullback and cascade flags may enter their own
+          downstream state-specific checks.
+
+        Selecting a 1m timeframe enables monitoring and confirmed bursts; it never
+        turns a raw UT flip into an entry path.
         """
         allow_reversion_1min = bool(reversion_window_open)
         return [
@@ -1376,6 +1385,10 @@ class SignalProcessor:
             if str(c.get("tf", "")) != "1min"
             or bool(getattr(c.get("sig"), "volume_spike_entry", False))
             or allow_reversion_1min
+            or bool(getattr(c.get("sig"), "market_ltp_shock_entry", False))
+            or bool(getattr(c.get("sig"), "market_wide_reversal_entry", False))
+            or bool(getattr(c.get("sig"), "late_session_reclaim_entry", False))
+            or bool(getattr(c.get("sig"), "one_way_cascade_entry", False))
         ]
 
     @staticmethod
@@ -1455,7 +1468,7 @@ class SignalProcessor:
         if not (0.0 <= minutes_since_exit <= max(0.5, _rev_window) and counter_trend):
             return False, meta
 
-        # Size-of-event: 0.40%+/5m OR 0.50%+/10m (stored at arm, else live).
+        # Size-of-event: 0.30%+/5m OR 0.40%+/10m (stored at arm, else live).
         qualifies = True
         move_info: dict = {"move_pct": float(stored_move)}
         if callable(getattr(scanner, "_index_event_move_qualifies", None)):
@@ -1467,11 +1480,11 @@ class SignalProcessor:
                 )
             except Exception:
                 qualifies = stored_move >= float(
-                    getattr(settings, "post_exit_reversion_fast_move_pct", 0.40) or 0.40
+                    getattr(settings, "post_exit_reversion_fast_move_pct", 0.30) or 0.30
                 )
                 move_info = {"move_pct": float(stored_move)}
         elif stored_move > 0:
-            thr = float(getattr(settings, "post_exit_reversion_fast_move_pct", 0.40) or 0.40)
+            thr = float(getattr(settings, "post_exit_reversion_fast_move_pct", 0.30) or 0.30)
             qualifies = thr <= 0 or stored_move + 1e-9 >= thr
         meta.update(
             {
@@ -1493,7 +1506,7 @@ class SignalProcessor:
                 f"🔄 [REVERSION SCALP] {base} skipped: "
                 f"5m={meta.get('move_5m_pct', 0):.2f}% / "
                 f"10m={meta.get('move_10m_pct', 0):.2f}% "
-                f"(need 0.40%/5m OR 0.50%/10m)"
+                f"(need 0.30%/5m OR 0.40%/10m)"
             )
             return False, meta
 
@@ -1929,16 +1942,6 @@ class SignalProcessor:
         return min(tight_cap, configured_cap)
 
     @staticmethod
-    def _b_grade_entry_allowed(confidence, regime, *, trend_15m_agrees, adx_value, settings) -> bool:
-        return b_grade_entry_allowed(
-            confidence,
-            regime,
-            trend_15m_agrees=trend_15m_agrees,
-            adx_value=adx_value,
-            settings=settings,
-        )
-
-    @staticmethod
     def _is_choppy_regime(regime: str) -> bool:
         return is_choppy_regime(regime)
 
@@ -1984,8 +1987,9 @@ class SignalProcessor:
             opt_sl_pct = float(getattr(scanner, "options_sl_pct", getattr(get_settings(), "options_sl_pct", 15.0)) or 15.0)
         except Exception:
             opt_sl_pct = 15.0
-        if is_choppy_regime(regime):
-            opt_sl_pct = max(opt_sl_pct, 15.0)
+        # `options_sl_pct` is an operator risk cap, not a minimum.  Choppy and
+        # unknown regimes may tighten a stop through the ATR/expiry rules below,
+        # but must never widen a configured premium loss limit.
         # RR, target and exit all flex with the intelligence score; the STOP was the one
         # of the four that ignored it entirely, moving only with regime and ATR. Strong
         # corroborating evidence earns a little more room to be right; weak evidence
@@ -2064,7 +2068,12 @@ class SignalProcessor:
         iv_percentile: Optional[float] = None,
         chain_quality: Optional[Dict] = None,
         option_premium_ok: Optional[bool] = None,
-    ) -> bool:
+        source_count: int = 1,
+        impulse_confirmed: bool = False,
+        power_move: bool = False,
+        volume_ratio: float = 0.0,
+        return_verdict: bool = False,
+    ):
         return passes_quality_gate(
             tf,
             grade,
@@ -2079,6 +2088,79 @@ class SignalProcessor:
             iv_percentile=iv_percentile,
             chain_quality=chain_quality,
             option_premium_ok=option_premium_ok,
+            source_count=source_count,
+            impulse_confirmed=impulse_confirmed,
+            power_move=power_move,
+            volume_ratio=volume_ratio,
+            return_verdict=return_verdict,
+        )
+
+    @staticmethod
+    def _explicit_signal_quality_evidence(
+        signal,
+        *,
+        structural_impulse: bool = False,
+        structural_power: bool = False,
+    ) -> Tuple[bool, bool]:
+        """Return explicit impulse/power evidence without inferring either from ADX.
+
+        ADX is already an independent input to the canonical policy.  Treating a high
+        ADX (or the absolute value of an intelligence score) as an additional impulse
+        leg double-counts the same observation and makes replay/recovery more permissive
+        than live.  Callers may provide a separately measured candle-structure result;
+        dynamically attached live flags are preserved when a signal already carries one.
+        """
+        impulse = bool(
+            structural_impulse
+            or getattr(signal, "impulse_confirmed", False)
+            or getattr(signal, "is_explosive_bypass", False)
+        )
+        power = bool(structural_power or getattr(signal, "power_move", False))
+        return impulse, power
+
+    def _quality_verdict_for_signal(
+        self,
+        signal,
+        *,
+        tf: str,
+        grade: str,
+        confidence: float,
+        regime: str,
+        inst_type: str,
+        settings,
+        trend_15m_agrees: bool,
+        source_count: int = 1,
+        structural_impulse: bool = False,
+        structural_power: bool = False,
+    ):
+        """Build the canonical call-site inputs shared by replay/recovery/EOD."""
+        impulse_confirmed, power_move = self._explicit_signal_quality_evidence(
+            signal,
+            structural_impulse=structural_impulse,
+            structural_power=structural_power,
+        )
+        try:
+            adx_value = float(getattr(signal, "adx_value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            adx_value = 0.0
+        try:
+            volume_ratio = float(getattr(signal, "volume_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            volume_ratio = 0.0
+        return self._passes_quality_gate(
+            tf,
+            grade,
+            confidence,
+            regime,
+            inst_type,
+            settings,
+            adx_value=adx_value,
+            trend_15m_agrees=bool(trend_15m_agrees),
+            source_count=max(1, int(source_count or 1)),
+            impulse_confirmed=impulse_confirmed,
+            power_move=power_move,
+            volume_ratio=volume_ratio,
+            return_verdict=True,
         )
 
     @staticmethod
@@ -2342,6 +2424,12 @@ class SignalProcessor:
         # guards are written in. 0 (the default) leaves the live-exit path inert, so
         # every existing caller keeps the pure stop/target simulation unchanged.
         qty: int = 0,
+        tf15_qty: int = 0,
+        tf15_exit_scanner=None,
+        tf15_instrument: str = "",
+        tf15_direction: str = "",
+        tf15_option_type: str = "",
+        tf15_timeframe: str = "",
     ) -> Optional[Dict]:
         if option_df is None or option_df.empty:
             return None
@@ -2375,6 +2463,7 @@ class SignalProcessor:
         exit_price = float(window.iloc[-1]["close"])
         exit_time = window.index[-1]
         exit_reason = "HISTORICAL"
+        exit_detail = ""
 
         # Optionally let the replay see the LIVE trade-management guards. Without this
         # the only reachable outcomes are SL HIT / TARGET_HIT / HISTORICAL, so a
@@ -2383,11 +2472,13 @@ class SignalProcessor:
         # drift. Imported here because scanner imports this module.
         live_guard = None
         live_qty = 0
+        fast_exit_qty = 0
         try:
             if _setting_enabled(
                 getattr(get_settings(), "backtest_live_exits_enabled", False), False
             ):
                 live_qty = max(0, int(qty or 0))
+                fast_exit_qty = max(0, int(tf15_qty or 0))
                 if live_qty > 0:
                     from scanner import Scanner as _Scanner
 
@@ -2397,6 +2488,33 @@ class SignalProcessor:
         live_self = SimpleNamespace(_setting_enabled=_setting_enabled)
         live_trade = SimpleNamespace(instrument="", inst_type="OPT")
         peak_rs = 0.0
+
+        # The dashboard's Backtest Live Exits switch is the explicit A/B boundary.
+        # Build a point-in-time view only for 15m trades and call the production rule;
+        # default/off replays remain byte-for-byte stop/target simulations.
+        tf15_probe = None
+        if (
+            fast_exit_qty > 0
+            and str(tf15_timeframe or "").lower() == "15min"
+            and tf15_exit_scanner is not None
+            and _setting_enabled(
+                getattr(get_settings(), "fifteen_min_one_min_support_exit_enabled", True),
+                True,
+            )
+        ):
+            try:
+                tf15_probe = self._historical_tf15_exit_probe(
+                    tf15_exit_scanner,
+                    instrument=tf15_instrument,
+                    direction=tf15_direction,
+                    option_type=tf15_option_type,
+                    entry_time=start,
+                    entry_price=entry_premium,
+                    stop_price=sl_price,
+                    qty=fast_exit_qty,
+                )
+            except Exception:
+                tf15_probe = None
 
         for ts, row in window.iloc[1:].iterrows():
             low = float(row.get("low", row.get("close", 0.0)) or 0.0)
@@ -2446,6 +2564,28 @@ class SignalProcessor:
                 exit_time = ts
                 exit_reason = "TARGET_HIT"
                 break
+
+            if tf15_probe is not None:
+                close_px = float(row.get("close", op) or op)
+                try:
+                    fired, _why = tf15_probe(
+                        ts,
+                        close_px,
+                        high,
+                        peak_rs,
+                    )
+                except Exception:
+                    fired = False
+                if fired:
+                    exit_price = close_px
+                    exit_time = ts
+                    exit_reason = "TF15_FAST_REVERSAL"
+                    exit_detail = str(_why or "")
+                    break
+
+            peak_qty = live_qty or fast_exit_qty
+            if peak_qty > 0:
+                peak_rs = max(peak_rs, (high - entry_premium) * peak_qty)
         return {
             "entry": entry_premium,
             "exit": max(0.05, exit_price),
@@ -2453,7 +2593,160 @@ class SignalProcessor:
             "target": target_price,
             "exit_time": exit_time,
             "reason": exit_reason,
+            "detail": exit_detail,
         }
+
+    def _historical_tf15_exit_probe(
+        self,
+        scanner,
+        *,
+        instrument: str,
+        direction: str,
+        option_type: str,
+        entry_time: datetime,
+        entry_price: float,
+        stop_price: float,
+        qty: int,
+    ):
+        """Return a no-future-leak adapter around the production 15m/1m exit."""
+        from scanner import Scanner as _Scanner
+        from intelligence.regime_detector import RegimeDetector
+
+        class _PointInTimeCandles:
+            def __init__(self, source):
+                self.source = source
+                self.as_of = None
+
+            def get_candles(self, name, timeframe):
+                if self.as_of is None:
+                    return None
+                try:
+                    base = self.source.get_candles(name, "1min")
+                except Exception:
+                    return None
+                if base is None or getattr(base, "empty", True):
+                    return None
+                frame = base.copy()
+                if not isinstance(frame.index, pd.DatetimeIndex):
+                    return None
+                cutoff = pd.Timestamp(self.as_of)
+                if cutoff.tzinfo is not None:
+                    cutoff = cutoff.tz_convert(IST).tz_localize(None)
+                if frame.index.tz is not None:
+                    frame.index = frame.index.tz_convert(IST).tz_localize(None)
+                frame = frame[frame.index <= cutoff]
+                if frame.empty or str(timeframe) == "1min":
+                    return frame
+                if str(timeframe) not in {"5min", "15min"}:
+                    return None
+                aggregations = {
+                    key: value
+                    for key, value in {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum",
+                    }.items()
+                    if key in frame.columns
+                }
+                if not all(key in aggregations for key in ("open", "high", "low", "close")):
+                    return None
+                return frame.resample(
+                    str(timeframe), label="left", closed="left"
+                ).agg(aggregations).dropna(subset=["open", "high", "low", "close"])
+
+            def get_latest_price(self, name):
+                frame = self.get_candles(name, "1min")
+                if frame is None or frame.empty:
+                    return None
+                try:
+                    return float(frame.iloc[-1]["close"])
+                except Exception:
+                    return None
+
+            @staticmethod
+            def latest_candle_receipt(_name, _timeframe):
+                return None
+
+        candle_view = _PointInTimeCandles(getattr(scanner, "candles", None))
+        probe = _Scanner.__new__(_Scanner)
+        probe.mode = "HISTORICAL"
+        probe.candles = candle_view
+        probe.active_indices = list(
+            getattr(scanner, "active_indices", None)
+            or ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+        )
+        probe.latest_regimes = {}
+        probe._timeframe_regimes = {}
+        probe._cached_results = {}
+        probe._diagnostics = {}
+        probe._timeframe_intel_cache = {}
+        regime_detector = RegimeDetector()
+
+        trade = SimpleNamespace(
+            instrument=str(instrument or "").upper(),
+            timeframe="15min",
+            direction=str(direction or "").upper(),
+            option_type=str(option_type or "").upper(),
+            inst_type="OPT",
+            entry_time=entry_time,
+            entry_price=float(entry_price),
+            current_price=float(entry_price),
+            initial_stop=float(stop_price),
+            trailing_stop=float(stop_price),
+            current_stop=float(stop_price),
+            quantity=max(1, int(qty)),
+            peak_pnl=0.0,
+        )
+
+        def evaluate(ts, close_px: float, high_px: float, peak_pnl_rs: float):
+            bar_start = pd.Timestamp(ts)
+            if bar_start.tzinfo is not None:
+                bar_start = bar_start.tz_convert(IST).tz_localize(None)
+            candle_view.as_of = bar_start
+            evaluation_time = bar_start.to_pydatetime() + timedelta(minutes=1)
+            current_spot = candle_view.get_latest_price(trade.instrument) or 0.0
+            # Rebuild the trade's rolling own-timeframe regime from only the candles
+            # visible at this replay minute. Option-chain intelligence is not invented;
+            # it remains unavailable and therefore casts no vote.
+            try:
+                regime_frame = candle_view.get_candles(trade.instrument, "15min")
+                regime_result = regime_detector.detect(
+                    regime_frame,
+                    trade.instrument,
+                    "15min",
+                )
+                regime_value = getattr(
+                    regime_result.get("regime"),
+                    "value",
+                    regime_result.get("regime", "UNKNOWN"),
+                )
+                probe._timeframe_regimes[
+                    probe._timeframe_intel_key(trade.instrument, "15min")
+                ] = str(regime_value or "UNKNOWN").upper()
+            except Exception:
+                pass
+            trade.current_price = float(close_px)
+            trade.peak_pnl = max(float(trade.peak_pnl or 0.0), float(peak_pnl_rs or 0.0))
+            verdict = probe._fifteen_min_one_min_support_exit_decision(
+                trade,
+                float(current_spot),
+                evaluation_time,
+                current_mark=float(close_px),
+                peak_pnl_rs=float(peak_pnl_rs or 0.0),
+                observed_contract_ticks=[
+                    (float(high_px), evaluation_time),
+                    (float(close_px), evaluation_time),
+                ],
+            )
+            trade.peak_pnl = max(
+                float(trade.peak_pnl or 0.0),
+                (float(high_px) - float(entry_price)) * max(1, int(qty)),
+            )
+            return verdict
+
+        return evaluate
     def _select_historical_option_candidate(
         self,
         scanner,
@@ -3096,7 +3389,13 @@ class SignalProcessor:
         # ON and this index has an open reversion window (decoupled toggles).
         scanner_engine_mode = str(getattr(settings, "scanner_engine", "utbot") or "utbot").lower()
         candidates_raw = []
-        candidate_timeframes = ["5min", "15min"]
+        tf_policy = normalize_timeframe_entry_policy(
+            getattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
+        )
+        policy_timeframes = timeframe_entry_timeframes(tf_policy)
+        candidate_timeframes = [
+            tf for tf in ("5min", "15min") if tf in policy_timeframes
+        ]
         _live = getattr(scanner, "mode", "").upper() != "HISTORICAL"
         _vol_spike_on = _setting_enabled(getattr(settings, "volume_spike_entry_enabled", True), True)
         _one_min_scalp_on = _setting_enabled(getattr(settings, "one_min_scalping_enabled", True), True)
@@ -3108,11 +3407,22 @@ class SignalProcessor:
                 _reversion_window = bool(_rw(instrument)) if callable(_rw) else False
             except Exception:
                 _reversion_window = False
+        # Explicit 1m policy enables monitoring and confirmed bursts while 1MSCALP
+        # is ON. It never admits a raw 1m UT flip. Legacy policies retain their
+        # established spike/snapback path.
         # 1M SPIKE path: volume_spike_entry + one_min_scalping both ON.
         # POST-WIN SNAPBACK path: reversion window alone is enough (decoupled —
         # must not require volume_spike_entry_enabled, or pure snapback dies).
-        if _live and (
-            (_vol_spike_on and _one_min_scalp_on) or bool(_reversion_window)
+        policy_allows_one_min_burst = (
+            "1min" in policy_timeframes and _one_min_scalp_on
+        )
+        legacy_fast_one_min = (
+            _live
+            and tf_policy in {"PRIMARY_15", "INCLUDE_5MIN"}
+            and ((_vol_spike_on and _one_min_scalp_on) or bool(_reversion_window))
+        )
+        if policy_allows_one_min_burst or legacy_fast_one_min or (
+            _live and "1min" in policy_timeframes and bool(_reversion_window)
         ):
             candidate_timeframes.insert(0, "1min")
         for tf in candidate_timeframes:
@@ -3231,7 +3541,7 @@ class SignalProcessor:
                                 sub_df = candles_df.loc[:s1.timestamp] if getattr(candles_df.index, "is_monotonic_increasing", False) else candles_df[candles_df.index <= s1.timestamp]
                             except Exception:
                                 sub_df = candles_df[candles_df.index <= s1.timestamp]
-                            hist_regime_res = scanner.intel.regime.detect(sub_df, instrument, "5min")
+                            hist_regime_res = scanner.intel.regime.detect(sub_df, instrument, tf)
                             hist_regime = hist_regime_res.get("regime", "UNKNOWN")
                         hist_confluence = scanner._compute_historical_confluence_at(
                             mtf_result,
@@ -3285,22 +3595,30 @@ class SignalProcessor:
                                 )
                         
                         logger.debug(f"🔍 [AUDIT] Signal {i} for {instrument} at {s1.timestamp}: Grade={hist_grade}, Conf={hist_conf:.2f}, Regime={hist_regime}, Type={s1.signal_type}")
-                        
-                        more_results = (
-                            _setting_enabled(getattr(settings, "ut_backtest_more_results", True), True)
-                            and scanner.mode == "HISTORICAL"
-                        )
 
-                        # grade_gate_allow_c_enabled (default OFF) lets a C continue to the
-                        # confidence/choppy/quality gates rather than being refused on
-                        # grade alone. It admits nothing by itself — see config/settings.py.
-                        allow_c_grade = _setting_enabled(
-                            getattr(settings, "grade_gate_allow_c_enabled", False), False
-                        )
-                        if hist_grade == "C" and not allow_c_grade and not (more_results and hist_conf >= self._relaxed_threshold(0.62, settings) and not self._is_choppy_regime(hist_regime)):
-                            record_reject("C grade blocked")
-                            self._historical_audit_log(f"â­ï¸ [AUDIT] Skipping C grade signal at {s1.timestamp}")
-                            continue
+                        # Replay 1m with same burst-only admission as live. Historical
+                        # L1 depth is unavailable, so never leak current depth into a
+                        # past decision.
+                        if tf == "1min":
+                            hist_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
+                            hist_volume_spike_metrics = (
+                                hist_burst_detector(
+                                    instrument,
+                                    tf,
+                                    s1.signal_type,
+                                    adx_value=float(getattr(s1, "adx_value", 0.0) or 0.0),
+                                    intel_score=float(hist_intel_score or 0.0),
+                                    as_of=s1.timestamp,
+                                    depth_context={},
+                                )
+                                if callable(hist_burst_detector)
+                                else None
+                            )
+                            setattr(s1, "volume_spike_entry", bool(hist_volume_spike_metrics))
+                            setattr(s1, "volume_spike_metrics", dict(hist_volume_spike_metrics or {}))
+                            if not hist_volume_spike_metrics:
+                                record_reject("1min requires confirmed directional burst", sim_inst)
+                                continue
 
                         direction = "LONG" if s1.signal_type == "BUY" else "SHORT"
                         trend_15m_agrees_hist = self._trend_15m_agrees_at(
@@ -3308,10 +3626,19 @@ class SignalProcessor:
                             s1.timestamp,
                             s1.signal_type,
                         )
-                        adx_val = getattr(s1, "adx_value", 0.0)
-                        momentum_override = float(adx_val or 0.0) >= float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
-                        intel_impulse = abs(normalize_intelligence_score(hist_intel_score)) >= 0.70
-                        impulse_context_hist = bool(momentum_override or intel_impulse)
+                        hist_structural_impulse = bool(
+                            tf == "5min"
+                            and self._is_5min_impulse_reversal(
+                                s1,
+                                mtf_result,
+                                hist_conf,
+                                settings,
+                            )
+                        )
+                        hist_impulse_evidence, _ = self._explicit_signal_quality_evidence(
+                            s1,
+                            structural_impulse=hist_structural_impulse,
+                        )
                         hist_reason_text = " ".join(str(r).lower() for r in (hist_reasons or []))
                         hist_extreme_exhaustion = "extreme" in hist_reason_text and "exhaustion" in hist_reason_text
                         hist_true_5min_impulse = tf == "5min" and five_min_true_impulse_allowed(
@@ -3319,8 +3646,8 @@ class SignalProcessor:
                             hist_conf,
                             settings,
                             trend_15m_agrees=trend_15m_agrees_hist,
-                            impulse_confirmed=impulse_context_hist,
-                            explosive_bypass=impulse_context_hist,
+                            impulse_confirmed=hist_impulse_evidence,
+                            explosive_bypass=bool(getattr(s1, "is_explosive_bypass", False)),
                             extreme_exhaustion=hist_extreme_exhaustion,
                         )
 
@@ -3347,24 +3674,7 @@ class SignalProcessor:
                                 "|".join([instrument, tf, str(s1.timestamp), str(s1.signal_type)]),
                             )
                         
-                        grade_hierarchy = {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4}
                         base_grade = hist_grade
-                        sig_rank = grade_hierarchy.get(base_grade, 0)
-                        
-                        grade_pref = getattr(settings, "signal_grade_preference", "auto")
-                        regime_adaptation = _setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-                        is_choppy = regime_adaptation and self._is_choppy_regime(hist_regime) and not momentum_override
-                        
-                        fifteen_min_bplus_ok = bool(
-                            tf == "15min"
-                            and sig_rank >= 1
-                            and hist_conf >= fifteen_min_confidence_floor(
-                                settings,
-                                hist_regime,
-                                adx_value=float(getattr(s1, "adx_value", 0.0) or 0.0),
-                                intel_score=hist_intel_score,
-                            )
-                        )
 
                         # Data-confirmed power move (historical parity with live): a big
                         # volume/range/close spike with momentum+alignment bypasses the grade
@@ -3441,114 +3751,10 @@ class SignalProcessor:
                             record_reject(_hc, sim_inst)
                             continue
 
-                        # 1. Block weak 5min/option noise in choppy markets, while keeping
-                        # confirmed 15min B-or-better setups on their separate confidence floor.
-                        if (
-                            is_choppy
-                            and not hist_true_5min_impulse
-                            and not fifteen_min_bplus_ok
-                            and not power_move_hist
-                            and base_grade in ["B", "B+"]
-                            and not (more_results and (base_grade == "B+" or hist_conf >= self._relaxed_threshold(0.58, settings)))
-                        ):
-                            record_reject("Choppy market blocked", sim_inst)
-                            self._historical_audit_log(f"⛔ Skipping choppy-blocked signal {s1.signal_type} {base_grade} at {s1.timestamp}")
-                            continue
-                            
-                        # 2. Dynamic Confidence Filter
-                        base_min_confidence = (0.50 if not is_choppy else 0.55) if more_results else (0.58 if not is_choppy else 0.65)
-                        min_confidence = self._relaxed_threshold(base_min_confidence, settings)
-                        if hist_conf < min_confidence and not fifteen_min_bplus_ok and not power_move_hist:
-                            record_reject(f"Confidence below {min_confidence:.0%}", sim_inst)
-                            self._historical_audit_log(f"â­ï¸ Skipping low-confidence signal {s1.signal_type} {base_grade} ({hist_conf} < {min_confidence}) at {s1.timestamp}")
-                            continue
-                            
-                        # 3. Grade Preference Filter
-                        if grade_pref == "B":
-                            # Futures allow B (1), Options require B+ (2)
-                            min_rank = 1 if sim_inst == "FUT" else 2
-                        elif grade_pref == "B+":
-                            min_rank = 2
-                        elif grade_pref == "A":
-                            min_rank = 3
-                        else: # auto
-                            min_rank = 3 if is_choppy else 2
-
-                        # A/B override (default -1 = follow signal_grade_preference above).
-                        # Read AFTER the preference ladder so it wins, and bounded to the
-                        # hierarchy so a stray value cannot open or close the gate entirely.
-                        try:
-                            rank_override = int(getattr(settings, "grade_gate_min_rank_override", -1))
-                        except (TypeError, ValueError):
-                            rank_override = -1
-                        if rank_override >= 0:
-                            min_rank = max(0, min(4, rank_override))
-
-                        if sig_rank < min_rank and not fifteen_min_bplus_ok and not power_move_hist:
-                            record_reject(f"Grade rank below required {min_rank}", sim_inst)
-                            self._historical_audit_log(f"🚫 Skipping grade-preference-blocked signal {s1.signal_type} {base_grade} (rank {sig_rank} < min {min_rank}) at {s1.timestamp}")
-                            continue
-
-                        # ── Late-trend entry ceiling ──────────────────────────
-                        # A high ADX on a WITH-trend entry means the leg is mature, not
-                        # that it is strong. Measured over 47 stored sessions:
-                        #   TRENDING_DOWN shorts   median ADX 34.4   win rate  7.1%
-                        #   BREAKOUT_DOWN  shorts  median ADX 21.4   win rate 71.4%
-                        # Same direction, same instruments — the difference is WHEN.
-                        # Independently, the whole ADX>=30 cell runs 32.4% / Rs.41 against
-                        # 45.8% / Rs.248 for ADX<20. Blocking with-trend entries above the
-                        # ceiling removes 43 of 240 historical trades worth -Rs.4,033 and
-                        # lifts the book from 40.0%/Rs.197 to 46.2%/Rs.260.
-                        # AGAINST-trend entries are untouched: they are the mean-reversion
-                        # side of the same reading and measured positive.
-                        late_ceiling = float(
-                            getattr(settings, "late_trend_entry_adx_ceiling", 30.0) or 0.0
-                        )
-                        if (
-                            late_ceiling > 0
-                            and _setting_enabled(
-                                getattr(settings, "late_trend_entry_guard_enabled", True), True
-                            )
-                            and not power_move_hist
-                            and float(adx_val or 0.0) > late_ceiling
-                            and (
-                                (str(hist_regime).upper() == "TRENDING_DOWN" and direction == "SHORT")
-                                or (str(hist_regime).upper() == "TRENDING_UP" and direction == "LONG")
-                            )
-                        ):
-                            record_reject(
-                                f"Late-trend entry: ADX {float(adx_val or 0.0):.0f} > {late_ceiling:.0f} "
-                                f"with {hist_regime}",
-                                sim_inst,
-                            )
-                            self._historical_audit_log(
-                                f"🚫 Late-trend entry blocked {s1.signal_type} {hist_regime} "
-                                f"ADX={adx_val} at {s1.timestamp}"
-                            )
-                            continue
-
-
-                        # Aligned Quality Gates (mirror _passes_live_trade_ready_gate)
-                        if not power_move_hist and not self._passes_quality_gate(
-                            tf,
-                            base_grade,
-                            hist_conf,
-                            hist_regime,
-                            sim_inst,
-                            settings,
-                            getattr(s1, "adx_value", 0.0),
-                            trend_15m_agrees=trend_15m_agrees_hist,
-                            intel_score=hist_intel_score,
-                        ):
-                            record_reject("Quality gate blocked", sim_inst)
-                            self._historical_audit_log(f"⭐ Skipping {instrument} {tf} signal due to quality gate at {s1.timestamp}")
-                            continue
-                            
-                        if hist_regime == "UNKNOWN" and not (sig_rank >= 3 and hist_conf >= 0.75) and not power_move_hist:
-                            record_reject("UNKNOWN regime requires A/A+ >=75%", sim_inst)
-                            self._historical_audit_log(f"⛔ Skipping {instrument} {tf} signal: UNKNOWN regime requires A/A+ >=75% at {s1.timestamp}")
-                            continue
-                            
+                        # One lane-independent quality verdict. Power-move is evidence,
+                        # not a bypass, and exact source multiplicity must match live.
+                        hist_source_engines = list(getattr(s1, "source_engines", []) or [])
+                        hist_source_count = max(1, len(hist_source_engines))
                         # ── No-Entry After Gate ──
                         try:
                             no_entry_after, gate_time = _entry_cutoff(settings, tf)
@@ -3560,30 +3766,6 @@ class SignalProcessor:
                                 continue
                         except Exception as e:
                             logger.exception(f"Error checking entry cutoff: {e}")
-                        # Historical concurrency is applied after all workers finish.
-                        if sim_inst == "OPT":
-                            option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
-                            option_quality_ok = self._option_grade_allowed(
-                                base_grade,
-                                hist_conf,
-                                hist_regime,
-                                adx_value=getattr(s1, "adx_value", 0.0),
-                                intel_score=hist_intel_score,
-                                signal_score=hist_conf,
-                                five_min_true_impulse=hist_true_5min_impulse,
-                                timeframe=tf,
-                            )
-                            if not option_quality_ok:
-                                if option_pref == "OPT":
-                                    record_reject("Option premium quality gate blocked", sim_inst)
-                                    self._historical_audit_log(f"Skipping option signal below premium quality gate at {s1.timestamp}")
-                                    continue
-                                self._historical_audit_log(
-                                    f"Falling back to FUT for {instrument} {tf} at {s1.timestamp}: "
-                                    f"option gate failed but AUTO/HYBRID should preserve the futures setup."
-                                )
-                                sim_inst = "FUT"
-
                         # Historical workers run concurrently. Filtering against the
                         # partially built shared trade list makes replay results depend
                         # on task completion order. TradeManager applies the configured
@@ -3758,6 +3940,12 @@ class SignalProcessor:
                                     hist_rr,
                                     natural_sl_distance=natural_sl_distance,
                                     max_sl_pct=scanner.options_sl_pct / 100.0,
+                                    tf15_qty=qty,
+                                    tf15_exit_scanner=scanner,
+                                    tf15_instrument=instrument,
+                                    tf15_direction=direction,
+                                    tf15_option_type=sim_option_type,
+                                    tf15_timeframe=tf,
                                 )
                                 if actual_option:
                                     entry_premium = actual_option["entry"]
@@ -3910,7 +4098,29 @@ class SignalProcessor:
                                 hist_target = s1.price + (index_stop_distance * hist_rr)
                             else:
                                 hist_target = s1.price - (index_stop_distance * hist_rr)
-                            
+
+                            # Evaluate once, after option-history/product fallback has
+                            # selected the product that the simulated trade will store.
+                            hist_quality_verdict = self._quality_verdict_for_signal(
+                                s1,
+                                tf=tf,
+                                grade=base_grade,
+                                confidence=hist_conf,
+                                regime=hist_regime,
+                                inst_type=sim_inst,
+                                settings=settings,
+                                trend_15m_agrees=trend_15m_agrees_hist,
+                                source_count=hist_source_count,
+                                structural_impulse=hist_structural_impulse,
+                                structural_power=power_move_hist,
+                            )
+                            if not hist_quality_verdict.allowed:
+                                record_reject("Quality gate blocked", sim_inst)
+                                self._historical_audit_log(
+                                    f"Skipping {instrument} {tf} signal due to quality gate at {s1.timestamp}"
+                                )
+                                continue
+
                             e_time = IST.localize(s1.timestamp) if (s1.timestamp and getattr(s1.timestamp, "tzinfo", None) is None) else s1.timestamp
                             ex_time = IST.localize(exit_time) if (exit_time and getattr(exit_time, "tzinfo", None) is None) else exit_time
                             t = Trade(
@@ -3931,6 +4141,7 @@ class SignalProcessor:
                                 source_engines=hist_source_engines,
                                 source_lane=hist_lane,
                                 data_provenance="BACKTEST",
+                                quality_verdict=hist_quality_verdict.to_dict(),
                             )
                             
                             live_session_day_raw = (
@@ -4125,6 +4336,31 @@ class SignalProcessor:
                                 live_intel_score = float(intel_score or 0.0)
                             except Exception:
                                 live_intel_score = 0.0
+                            # Restart recovery must not resurrect an ordinary 1m UT
+                            # flip. Stateful snapback/cascade routes are evaluated in
+                            # normal live processing; recovery permits confirmed bursts.
+                            if tf == "1min":
+                                rec_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
+                                rec_volume_spike_metrics = (
+                                    rec_burst_detector(
+                                        instrument,
+                                        tf,
+                                        last_s.signal_type,
+                                        adx_value=float(getattr(last_s, "adx_value", 0.0) or 0.0),
+                                        intel_score=live_intel_score,
+                                        as_of=last_s.timestamp,
+                                    )
+                                    if callable(rec_burst_detector)
+                                    else None
+                                )
+                                setattr(last_s, "volume_spike_entry", bool(rec_volume_spike_metrics))
+                                setattr(last_s, "volume_spike_metrics", dict(rec_volume_spike_metrics or {}))
+                                if not rec_volume_spike_metrics:
+                                    logger.info(
+                                        f"Recovery Guard: {instrument} 1min signal at {last_s.timestamp} "
+                                        "requires confirmed directional burst."
+                                    )
+                                    continue
                             try:
                                 rec_vix_key = last_s.timestamp.strftime("%Y-%m-%d %H:%M:00")
                                 rec_vix = scanner._vix_data.get(rec_vix_key)
@@ -4144,20 +4380,34 @@ class SignalProcessor:
                                 logger.warning(f"Recovery quality grading failed for {instrument} {tf}: {exc}")
                                 rec_grade, rec_conf, rec_reasons = "C", 0.0, ["Recovery grading failed"]
 
-                            if not self._passes_quality_gate(
-                                tf,
-                                rec_grade,
-                                rec_conf,
-                                live_regime,
-                                rec_inst_type,
-                                get_settings(),
-                                adx_value=float(getattr(last_s, "adx_value", 0.0) or 0.0),
-                                trend_15m_agrees=self._trend_15m_agrees_at(
+                            rec_source_engines = list(getattr(last_s, "source_engines", []) or [])
+                            rec_trend_15m_agrees = self._trend_15m_agrees_at(
+                                mtf_result,
+                                last_s.timestamp,
+                                last_s.signal_type,
+                            )
+                            rec_structural_impulse = bool(
+                                tf == "5min"
+                                and self._is_5min_impulse_reversal(
+                                    last_s,
                                     mtf_result,
-                                    last_s.timestamp,
-                                    last_s.signal_type,
-                                ),
-                            ):
+                                    rec_conf,
+                                    settings,
+                                )
+                            )
+                            rec_quality_verdict = self._quality_verdict_for_signal(
+                                last_s,
+                                tf=tf,
+                                grade=rec_grade,
+                                confidence=rec_conf,
+                                regime=live_regime,
+                                inst_type=rec_inst_type,
+                                settings=settings,
+                                trend_15m_agrees=rec_trend_15m_agrees,
+                                source_count=max(1, len(rec_source_engines)),
+                                structural_impulse=rec_structural_impulse,
+                            )
+                            if not rec_quality_verdict.allowed:
                                 logger.info(
                                     f"Recovery Guard: {instrument} {tf} {last_s.signal_type} at {last_s.timestamp} "
                                     f"rejected by live quality gate (grade={rec_grade}, conf={rec_conf:.3f}, regime={live_regime})."
@@ -4339,8 +4589,7 @@ class SignalProcessor:
                                 inst_type=rec_inst_type,
                                 entry_spot=last_s.price, 
                                 is_explosive_bypass=bool(
-                                    float(getattr(last_s, "adx_value", 0.0) or 0.0)
-                                    >= float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
+                                    getattr(last_s, "is_explosive_bypass", False)
                                 ),
                                 is_recovery=True,
                                 market_regime=str(live_regime or ""),
@@ -4353,6 +4602,7 @@ class SignalProcessor:
                                 source_lane=self._signal_source_lane(last_s, scanner_engine_mode),
                                 initial_stop=rec_stop,
                                 scalp_lock_mode=False,
+                                quality_verdict=rec_quality_verdict.to_dict(),
                             )
                             if scanner.trades.open_trades:
                                 active_tid = list(scanner.trades.open_trades.keys())[-1]
@@ -4374,21 +4624,79 @@ class SignalProcessor:
                             
                             # ── Grade Filter: Evaluate what we would trade ──
                             eod_regime = "UNKNOWN"
+                            eod_intel_score = 0.0
+                            eod_confluence = 0.0
+                            eod_vix = scanner._get_historical_vix(last_s.timestamp)
+                            eod_day_type, eod_day_conf = "", 0.0
                             try:
-                                eod_df = scanner.candles.get_candles(instrument, "5min")
-                                if eod_df is not None and not eod_df.empty:
-                                    eod_regime_res = scanner.intel.regime.detect(
-                                        eod_df[eod_df.index <= last_s.timestamp],
+                                eod_intel_score, eod_intel_regime = scanner._compute_historical_intel_at(
+                                    instrument,
+                                    last_s.timestamp,
+                                    tf,
+                                )
+                                if eod_intel_regime and eod_intel_regime != "UNKNOWN":
+                                    eod_regime = eod_intel_regime
+                                eod_confluence = scanner._compute_historical_confluence_at(
+                                    mtf_result,
+                                    last_s.timestamp,
+                                )
+                                day_at = getattr(scanner, "_historical_day_type_at", None)
+                                if callable(day_at):
+                                    eod_day_type, eod_day_conf = day_at(
                                         instrument,
-                                        "5min",
+                                        last_s.timestamp,
+                                        tf,
                                     )
-                                    eod_regime = eod_regime_res.get("regime", "UNKNOWN")
+                                eod_df = scanner.candles.get_candles(instrument, tf)
+                                if eod_df is not None and not eod_df.empty:
+                                    if eod_regime == "UNKNOWN":
+                                        eod_regime_res = scanner.intel.regime.detect(
+                                            eod_df[eod_df.index <= last_s.timestamp],
+                                            instrument,
+                                            tf,
+                                        )
+                                        eod_regime = eod_regime_res.get("regime", "UNKNOWN")
                             except Exception as exc:
                                 logger.debug(f"EOD option regime fallback for {instrument}: {exc}")
 
-                            eod_grade, eod_conf, _ = scanner.signals._grade_signal(last_s, 0.5, 0.0, regime=eod_regime)
+                            eod_grade, eod_conf, _ = scanner.signals._grade_signal(
+                                last_s,
+                                eod_confluence,
+                                eod_intel_score,
+                                regime=eod_regime,
+                                vix_value=eod_vix,
+                                day_type=eod_day_type,
+                                day_type_confidence=eod_day_conf,
+                            )
                             if eod_grade == "C":
                                 continue
+
+                            # Apply burst-only admission to the unpaired final 1m
+                            # signal too. No historical L1 snapshot exists, so depth is
+                            # deliberately unavailable rather than read from live book.
+                            if tf == "1min":
+                                eod_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
+                                eod_volume_spike_metrics = (
+                                    eod_burst_detector(
+                                        instrument,
+                                        tf,
+                                        last_s.signal_type,
+                                        adx_value=float(getattr(last_s, "adx_value", 0.0) or 0.0),
+                                        intel_score=float(eod_intel_score or 0.0),
+                                        as_of=last_s.timestamp,
+                                        depth_context={},
+                                    )
+                                    if callable(eod_burst_detector)
+                                    else None
+                                )
+                                setattr(last_s, "volume_spike_entry", bool(eod_volume_spike_metrics))
+                                setattr(last_s, "volume_spike_metrics", dict(eod_volume_spike_metrics or {}))
+                                if not eod_volume_spike_metrics:
+                                    self._historical_audit_log(
+                                        f"Skipping {instrument} 1min final signal at {last_s.timestamp}: "
+                                        "confirmed directional burst required"
+                                    )
+                                    continue
                                 
                             # Historical concurrency is applied after all workers finish.
                             # Check for existing manual exits before applying EOD close
@@ -4456,7 +4764,7 @@ class SignalProcessor:
                                         eod_conf,
                                         eod_regime,
                                         adx_value=getattr(last_s, "adx_value", 0.0),
-                                        intel_score=intel_score,
+                                        intel_score=eod_intel_score,
                                         signal_score=eod_conf,
                                         timeframe=tf,
                                     )
@@ -4490,46 +4798,6 @@ class SignalProcessor:
                                         eod_target = entry_premium - ((eod_stop - entry_premium) * eod_rr)
                                 else:
                                     eod_target = last_s.price + (abs(last_s.price - last_s.trailing_stop) * eod_rr) if direction == "LONG" else last_s.price - (abs(last_s.price - last_s.trailing_stop) * eod_rr)
-
-                                if sim_inst == "OPT":
-                                    option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
-                                    _, no_entry_after = _entry_cutoff(settings, tf)
-                                    eod_option_quality_ok = (
-                                        self._option_grade_allowed(
-                                            eod_grade,
-                                            eod_conf,
-                                            eod_regime,
-                                            adx_value=getattr(last_s, "adx_value", 0.0),
-                                            intel_score=intel_score,
-                                            signal_score=eod_conf,
-                                            timeframe=tf,
-                                        )
-                                        and last_s.timestamp.time() <= no_entry_after
-                                    )
-                                    if not eod_option_quality_ok:
-                                        if option_pref == "OPT":
-                                            logger.info(f"Skipping EOD option below premium quality gate at {last_s.timestamp}")
-                                            continue
-                                        logger.info(
-                                            f"Falling back to FUT for EOD {instrument} {tf} at {last_s.timestamp}: "
-                                            f"option gate failed but AUTO/HYBRID should preserve the futures setup."
-                                        )
-                                        sim_inst = "FUT"
-                                        sim_option_type = ""
-                                        sim_multiplier = 1.0
-                                        entry_premium = last_s.price
-                                        exit_premium = eod_price
-                                        eod_fut_sl_pct = futures_stop_tolerance_pct(
-                                            scanner.futures_sl_pct,
-                                            eod_regime,
-                                        )
-                                        max_fut_sl_dist = entry_premium * (eod_fut_sl_pct / 100.0)
-                                        if direction == "LONG":
-                                            eod_stop = max(last_s.trailing_stop, entry_premium - max_fut_sl_dist)
-                                            eod_target = entry_premium + ((entry_premium - eod_stop) * eod_rr)
-                                        else:
-                                            eod_stop = min(last_s.trailing_stop, entry_premium + max_fut_sl_dist)
-                                            eod_target = entry_premium - ((eod_stop - entry_premium) * eod_rr)
 
                                 if sim_inst == "OPT":
                                     sim_atm_strike = self._historical_option_strike(instrument, direction, last_s.price, cfg)
@@ -4575,6 +4843,13 @@ class SignalProcessor:
                                         max_sl_dist = est_entry * (scanner.options_sl_pct / 100.0)
                                         effective_sl_dist = max(0.05, min(natural_sl_premium_dist, max_sl_dist))
                                         opt_sl_price = max(0.05, est_entry - effective_sl_dist)
+                                        eod_probe_qty = max(
+                                            1,
+                                            int(
+                                                getattr(scanner, "user_lots", {}).get(instrument, 1)
+                                                or 1
+                                            ) * int(lot_size or 1),
+                                        )
                                         actual_eod = self._simulate_actual_option_exit(
                                             option_df,
                                             last_s.timestamp,
@@ -4583,6 +4858,12 @@ class SignalProcessor:
                                             eod_rr,
                                             natural_sl_distance=natural_sl_premium_dist,
                                             max_sl_pct=scanner.options_sl_pct / 100.0,
+                                            tf15_qty=eod_probe_qty,
+                                            tf15_exit_scanner=scanner,
+                                            tf15_instrument=instrument,
+                                            tf15_direction=direction,
+                                            tf15_option_type=sim_option_type,
+                                            tf15_timeframe=tf,
                                         )
                                         if actual_eod:
                                             entry_premium = actual_eod["entry"]
@@ -4599,20 +4880,34 @@ class SignalProcessor:
                                         fallback_risk = max(0.5, entry_premium - opt_sl_price)
                                         eod_target = entry_premium + (fallback_risk * eod_rr)
 
-                                # Check quality gate
-                                if not self._passes_quality_gate(
-                                    tf,
-                                    eod_grade,
-                                    eod_conf,
-                                    eod_regime,
-                                    sim_inst,
-                                    settings,
-                                    trend_15m_agrees=self._trend_15m_agrees_at(
+                                # Check the same structured quality policy as live/recovery.
+                                eod_trend_15m_agrees = self._trend_15m_agrees_at(
+                                    mtf_result,
+                                    last_s.timestamp,
+                                    last_s.signal_type,
+                                )
+                                eod_structural_impulse = bool(
+                                    tf == "5min"
+                                    and self._is_5min_impulse_reversal(
+                                        last_s,
                                         mtf_result,
-                                        last_s.timestamp,
-                                        last_s.signal_type,
-                                    ),
-                                ):
+                                        eod_conf,
+                                        settings,
+                                    )
+                                )
+                                eod_quality_verdict = self._quality_verdict_for_signal(
+                                    last_s,
+                                    tf=tf,
+                                    grade=eod_grade,
+                                    confidence=eod_conf,
+                                    regime=eod_regime,
+                                    inst_type=sim_inst,
+                                    settings=settings,
+                                    trend_15m_agrees=eod_trend_15m_agrees,
+                                    source_count=max(1, len(eod_source_engines)),
+                                    structural_impulse=eod_structural_impulse,
+                                )
+                                if not eod_quality_verdict.allowed:
                                     logger.info(f"⭐️ Skipping EOD {instrument} {tf} signal due to quality gate at {last_s.timestamp}")
                                     continue
 
@@ -4658,6 +4953,7 @@ class SignalProcessor:
                                     source_engine=eod_source_engine,
                                     source_engines=eod_source_engines,
                                     source_lane=eod_lane,
+                                    quality_verdict=eod_quality_verdict.to_dict(),
                                     data_provenance="BACKTEST",
                                 )
                                 live_session_day_raw = (
@@ -4793,7 +5089,7 @@ class SignalProcessor:
                     if callable(signal_mode_getter)
                     else bool(getattr(settings, "live_intrabar_signal_entries", True))
                 )
-                recheck_due = is_live and intrabar_signals_enabled and self._live_signal_recheck_due(
+                recheck_due = is_live and (intrabar_signals_enabled or recheck_eligible) and self._live_signal_recheck_due(
                     s_ts,
                     tf,
                     now_naive,
@@ -4946,6 +5242,19 @@ class SignalProcessor:
                             )
                         except Exception:
                             pass
+                        # This is a temporary data hold, not a processed/rejected
+                        # signal. Keep its identity eligible until its own candle
+                        # closes so a refreshed intelligence bundle can grade it.
+                        deadline_fn = getattr(scanner, "_live_signal_processing_deadline", None)
+                        retry_deadline = (
+                            deadline_fn(s_ts, tf)
+                            if callable(deadline_fn)
+                            else s_ts + timedelta(minutes=tf_minutes, seconds=90)
+                        )
+                        if is_live and (retry_deadline is None or now_naive <= retry_deadline):
+                            if not hasattr(scanner, "_live_signal_recheck_eligible"):
+                                scanner._live_signal_recheck_eligible = {}
+                            scanner._live_signal_recheck_eligible[dedup_key] = signal_identity
                         self._remember_live_signal_identity(
                             scanner, dedup_key, s_ts, signal_identity
                         )
@@ -5180,6 +5489,16 @@ class SignalProcessor:
                             str(getattr(_flip_sig, "signal_type", "") or ""),
                             getattr(_flip_sig, "timestamp", None),
                             timeframe=_flip_tf,
+                            setup_confidence=float(
+                                getattr(_flip_sig, "graded_confidence", 0.0) or 0.0
+                            ),
+                            setup_adx=float(getattr(_flip_sig, "adx_value", 0.0) or 0.0),
+                            setup_intel_score=float(
+                                getattr(_flip_sig, "graded_intel_score", 0.0) or 0.0
+                            ),
+                            trend_15m_agrees=bool(
+                                getattr(_flip_sig, "trend_15m_agrees", False)
+                            ),
                         )
                         if _shock_ctx:
                             setattr(_flip_sig, "market_ltp_shock_entry", True)
@@ -5221,25 +5540,38 @@ class SignalProcessor:
         )
         if not entry_candidates_raw:
             return []
-        if getattr(scanner, "mode", "") != "HISTORICAL":
-            tf_policy = str(getattr(settings, "ut_timeframe_entry_policy", "PRIMARY_15") or "PRIMARY_15").upper()
-            # PRIMARY_15 (non-quad_prime): 5min is timing/exit-only; 15min enters.
-            # 1min SPIKE / POST-WIN SNAPBACK are independent fast paths — NEVER
-            # blocked by engine choice or TF policy. Only their own settings
-            # (one_min_scalping / volume_spike / post_exit_reversion + window/tape)
-            # govern them; they already passed _entry_admissible_raw_candidates.
-            if tf_policy == "PRIMARY_15" and scanner_engine_mode != "quad_prime":
-                entry_candidates_raw = [
-                    c
-                    for c in entry_candidates_raw
-                    if str(c.get("tf") or "") in {"15min", "1min"}
-                ]
-                if not entry_candidates_raw:
-                    scanner.log_event(
-                        f"Entry blocked: {instrument} 5min signal is exit/timing-only while 15M MAIN policy is active",
-                        "trade",
+        # All explicit policies apply to every engine and historical replay. Legacy
+        # 15M retains Quad Prime's established raw multi-source exception; old 15M /
+        # 5M+15M modes also preserve established fast 1m spike/snapback routes.
+        legacy_fast_one_min_policy = tf_policy in {"PRIMARY_15", "INCLUDE_5MIN"}
+        legacy_quad_prime_bypass = (
+            tf_policy == "PRIMARY_15" and scanner_engine_mode == "quad_prime"
+        )
+        if not legacy_quad_prime_bypass:
+            entry_candidates_raw = [
+                c
+                for c in entry_candidates_raw
+                if str(c.get("tf") or "") in policy_timeframes
+                or (
+                    legacy_fast_one_min_policy
+                    and str(c.get("tf") or "") == "1min"
+                    and (
+                        bool(getattr(c.get("sig"), "volume_spike_entry", False))
+                        or bool(_reversion_window)
                     )
-                    return _build_rejected_from_raw(candidates_raw[-1], "5min signal is exit/timing-only while 15M MAIN policy is active", "REJECTED - 15M MAIN Policy Blocked")
+                )
+            ]
+        if not entry_candidates_raw:
+            selected = "+".join(sorted(policy_timeframes))
+            scanner.log_event(
+                f"Entry blocked: {instrument} has no candidate inside {tf_policy} ({selected})",
+                "trade",
+            )
+            return _build_rejected_from_raw(
+                candidates_raw[-1],
+                f"No signal inside selected timeframe policy {tf_policy}",
+                "REJECTED - Timeframe Policy Blocked",
+            )
 
         scored = []
         for c in entry_candidates_raw:
@@ -5570,6 +5902,10 @@ class SignalProcessor:
                         str(best_sig.signal_type),
                         best_sig.timestamp,
                         timeframe=best_tf,
+                        setup_confidence=float(graded.confidence or 0.0),
+                        setup_adx=float(adx_value or 0.0),
+                        setup_intel_score=float(normalize_intelligence_score(intel_score)),
+                        trend_15m_agrees=bool(trend_15m_agrees),
                     )
                     if _shock_ctx:
                         market_ltp_shock_entry = True
@@ -5606,15 +5942,6 @@ class SignalProcessor:
             pass
         momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
         intel_norm = normalize_intelligence_score(intel_score)
-        # When a smoothed trend engine (consensus/ema/auto) is active, the signal is
-        # ALREADY a confirmed trend flip — not UTBot's noisy single-bar flip. The
-        # impulse-context / choppy-confirmation gates exist to filter UT1 noise, so a
-        # 15m-aligned signal from a trend engine satisfies them on its own (confidence
-        # floor still applies). "auto" emits consensus/ema flips, so it counts too.
-        trend_engine_signal = (
-            scanner_engine_mode in {"consensus", "ema", "auto", "utbot_ema", "utbot_consensus", "quad_union", "quad_prime", "adaptive_hybrid", "adaptive_dual", "quality_hybrid"}
-            and _setting_enabled(getattr(settings, "trend_engine_relaxed_gate", True), True)
-        )
         # Data-confirmed late-session power move (volume + range + close + momentum/align).
         # When confirmed it may bypass the grade floor and (after 15:00) the no-entry
         # cutoff, entering in tight scalp-lock mode.
@@ -5734,139 +6061,11 @@ class SignalProcessor:
             )
         except Exception:
             quality_hybrid_entry = False
-        if (not graded or not graded.is_actionable) and not (
-            volume_spike_entry
-            or market_ltp_shock_entry
-            or quad_union_entry
-            or quality_hybrid_entry
-            or late_session_reclaim_entry
-            or one_way_cascade_entry
-        ):
-            grade_txt = str(getattr(graded, "grade", "?")) if graded else "?"
-            conf_txt = f"{float(getattr(graded, 'confidence', 0.0) or 0.0):.0%}" if graded else "0%"
-            msg = (
-                f"Not actionable after filters "
-                f"[{grade_txt} @ {conf_txt}, regime={regime}, adx={adx_value:.0f}, "
-                f"15m_agrees={trend_15m_agrees}]"
-            )
-            return _build_rejected_candidate(msg, "REJECTED - Quality Gate")
-
-        if best_tf == "5min":
-            try:
-                sig_time = best_sig.timestamp.astimezone(IST).time() if getattr(best_sig.timestamp, "tzinfo", None) is not None else best_sig.timestamp.time()
-            except Exception:
-                sig_time = datetime.now(IST).time()
-
-            early_cutoff_str = str(getattr(settings, "ut_early_session_cutoff", "09:30") or "09:30")
-            pre_close_cutoff_str = str(getattr(settings, "ut_no_entry_after", "15:00") or "15:00")
-            early_cutoff = datetime.strptime(early_cutoff_str, "%H:%M").time()
-            pre_close_cutoff = datetime.strptime(pre_close_cutoff_str, "%H:%M").time()
-
-            min_conf_5m = self._relaxed_threshold(
-                float(getattr(settings, "ut_5min_option_min_confidence", 0.60) or 0.60),
-                settings,
-            )
-
-            gate_name = "5min quality gate"
-
-            if sig_time < early_cutoff:
-                early_conf = self._relaxed_threshold(
-                    float(getattr(settings, "live_5min_early_min_confidence", 0.70) or 0.70),
-                    settings,
-                )
-                min_conf_5m = max(min_conf_5m, early_conf)
-                gate_name = "5min early morning gate"
-            elif sig_time >= pre_close_cutoff:
-                pre_close_conf = self._relaxed_threshold(
-                    float(getattr(settings, "live_5min_pre_close_min_confidence", 0.70) or 0.70),
-                    settings,
-                )
-                min_conf_5m = max(min_conf_5m, pre_close_conf)
-                gate_name = "5min pre-close gate"
-
-            if self._is_choppy_regime(regime):
-                # Aligned VOLATILE tapes relax toward 0.65; RANGING/UNKNOWN keep 0.70.
-                choppy_min_conf_5m = live_5min_choppy_confidence_floor(
-                    settings, regime, trend_15m_agrees
-                )
-                min_conf_5m = max(min_conf_5m, choppy_min_conf_5m)
-            grade_conf_ok = self._grade_rank(graded.grade) >= 2 and graded.confidence >= min_conf_5m
-            if not (
-                quad_union_entry
-                or
-                quality_hybrid_entry
-                or
-                volume_spike_entry
-                or late_session_reclaim_entry
-                or one_way_cascade_entry
-                or power_move
-                or true_5min_impulse
-                or (grade_conf_ok and trend_15m_agrees and impulse_context_confirmed)
-                # Trend engine: a 15m-aligned, confidence-qualified consensus/ema flip is
-                # itself the trend confirmation — no separate impulse reversal required.
-                or (trend_engine_signal and grade_conf_ok and trend_15m_agrees)
-            ):
-                msg = (
-                    f"{gate_name} needs B+/A/A+ with >= {min_conf_5m:.0%}, "
-                    f"or special B+/A/A+ >=60% with 15min agreement, ADX>=30/very strong intel, "
-                    f"known regime, healthy option premium, and no exhaustion "
-                    f"[got {graded.grade} @ {graded.confidence:.0%}, regime={regime}, "
-                    f"adx={adx_value:.0f}, 15m_agrees={trend_15m_agrees}]"
-                )
-                # Cap words for the REJECTED status msg (e.g. "REJECTED - 5Min Early Morning Gate")
-                return _build_rejected_candidate(msg, f"REJECTED - {gate_name.title()}")
-            
-        min_confidence = 0.55
-        if getattr(settings, "ut_dynamic_confidence", False):
-            regime_adaptation = _setting_enabled(getattr(settings, "ut_regime_adaptation", True), True)
-            if best_tf == "15min":
-                min_confidence = max(
-                    min_confidence,
-                    fifteen_min_confidence_floor(
-                        settings,
-                        regime,
-                        adx_value=adx_value,
-                        intel_score=intel_score,
-                    ),
-                )
-            elif regime_adaptation and self._is_choppy_regime(regime):
-                min_confidence = max(
-                    min_confidence,
-                    self._relaxed_threshold(
-                        self._choppy_confidence_gate(settings),
-                        settings,
-                    ),
-                )
-                
-        if graded.confidence < min_confidence and not (
-            quad_union_entry
-            or quality_hybrid_entry
-            or
-            fast_thrust_override
-            or late_session_reclaim_entry
-            or one_way_cascade_entry
-            or (best_tf == "5min" and (trend_15m_agrees or is_explosive_bypass))
-        ):
-            msg = (
-                f"{graded.grade} {graded.confidence:.3%} below "
-                f"{min_confidence:.3%} confidence gate"
-            )
-            return _build_rejected_candidate(msg, "REJECTED - Low Confidence")
-
-        if best_tf == "5min" and self._is_choppy_regime(regime):
-            # A trend-engine flip aligned with the 15m trend already cleared the
-            # confidence floor above; the engine itself is the trend confirmation.
-            if not (
-                quad_union_entry
-                or quality_hybrid_entry
-                or true_5min_impulse
-                or volume_spike_entry
-                or late_session_reclaim_entry
-                or one_way_cascade_entry
-                or (trend_engine_signal and trend_15m_agrees)
-            ):
-                msg = "5min choppy gate needs true impulse: B+/A/A+ >=70%, or special B+/A/A+ >=60% with 15min agreement, ADX>=30/very strong intel, known regime, healthy option premium, no exhaustion"
-                return _build_rejected_candidate(msg, "REJECTED - 5min Choppy Confirmation")
+        # Grade, confidence, regime, ADX and contemporaneous confirmations are
+        # intentionally not admitted/rejected here.  The scanner's canonical verdict
+        # evaluates the fully built candidate once, after this processor has attached all
+        # evidence.  Keeping a second 5m/chop/dynamic-confidence ladder here caused valid
+        # B+ setups to disappear before the authoritative gate could inspect them.
 
         # --- REVERSION / SNAPBACK eligibility (before Weak-1min gate) ---
         # Must run early: pure SNAPBACK has no volume_spike_entry and would die
@@ -5901,8 +6100,8 @@ class SignalProcessor:
                         settings, instrument
                     )
                     return _build_rejected_candidate(
-                        f"1min entry requires confirmed directional burst: {spike_requirement}; "
-                        "or an open POST-WIN SNAPBACK window with bare-min tape confirm",
+                        f"1min entry requires directional burst: {spike_requirement}; "
+                        "POST-WIN SNAPBACK; or confirmed one-way cascade",
                         "REJECTED - Weak 1min",
                     )
             else:
@@ -5920,7 +6119,6 @@ class SignalProcessor:
 
         iv_percentile_for_routing = float(iv_percentile if iv_percentile is not None else 50.0)
         is_high_iv = iv_percentile_for_routing > 80.0
-        is_choppy = self._is_choppy_regime(regime)
         strong_momentum = abs(intel_norm) > 0.60 or best_score > 0.4
         
         trade_date = best_sig.timestamp.date()
@@ -6210,58 +6408,11 @@ class SignalProcessor:
                     )
                     return _build_rejected_candidate(msg, "REJECTED - Price Action")
 
-        if inst_type == "OPT":
-            option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
-            if best_tf == "5min" and is_choppy and not (
-                volume_spike_entry
-                or quad_union_entry
-                or quality_hybrid_entry
-                or late_session_reclaim_entry
-            ):
-                min_conf_5m = max(
-                    self._relaxed_threshold(
-                        float(getattr(settings, "ut_5min_option_min_confidence", 0.60) or 0.60),
-                        settings,
-                    ),
-                    self._relaxed_threshold(
-                        float(getattr(settings, "live_5min_choppy_min_confidence", 0.70) or 0.70),
-                        settings,
-                    ),
-                )
-                if not true_5min_impulse:
-                    msg = (
-                        f"5min choppy option needs >= {min_conf_5m:.0%} confidence plus true impulse, "
-                        "or special B+/A/A+ >=60% with strong ADX/intel and healthy option premium"
-                    )
-                    logger.info(f"Skipping option signal for {instrument}: {msg}")
-                    return _build_rejected_candidate(msg, "REJECTED - 5min Choppy Opt")
-                if extreme_exhaustion and not is_explosive_bypass:
-                    msg = "Extreme ADX exhaustion in choppy regime needs 15min agreement plus follow-through"
-                    logger.info(f"Skipping option signal for {instrument}: {msg}")
-                    return _build_rejected_candidate(msg, "REJECTED - Exhaustion Risk")
-            option_quality_ok = self._option_grade_allowed(
-                graded.grade,
-                graded.confidence,
-                regime,
-                adx_value=getattr(best_sig, "adx_value", 0.0),
-                intel_score=intel_score,
-                signal_score=best_score,
-                five_min_true_impulse=true_5min_impulse,
-                timeframe=best_tf,
-            )
-            if not option_quality_ok and not (
-                volume_spike_entry
-                or quad_union_entry
-                or quality_hybrid_entry
-                or late_session_reclaim_entry
-            ):
-                if option_pref == "OPT":
-                    msg = "Below premium quality gate"
-                    logger.info(f"Skipping option signal below premium quality gate for {instrument} at {best_sig.timestamp}")
-                    return _build_rejected_candidate(msg, "REJECTED - Opt Gate")
-                inst_type = "FUT"
+        # Product eligibility below is limited to contract/quote/liquidity integrity.
+        # The removed option grade/chop ladder duplicated the canonical quality verdict
+        # and could silently flip an otherwise valid OPT setup into FUT.
 
-                # ═══ Cross-Timeframe Monopoly Guard ═══
+        # ═══ Cross-Timeframe Monopoly Guard ═══
         existing_index_trades = [
             t
             for t in scanner.trades.open_trades.values()

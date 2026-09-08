@@ -432,29 +432,25 @@ function renderTradeControlCell(row = {}, flags = {}) {
     } = flags;
     if (isOpenTrade) {
         const label = executionRetryable ? 'RETRY' : 'EXIT';
-        // Guard the price the way the manual-signal EXIT below already does.
-        //
-        // This button had NO disabled state and sent `Number(row.current_price) || 0`.
-        // The server refuses price <= 0 with "invalid_price", so whenever the trade had
-        // no live price -- a stalled or degraded feed, which this system has had -- the
-        // operator got a clickable EXIT on an open position that could only ever fail,
-        // and a toast reading "Exit blocked: invalid_price". The two exit paths now
-        // behave the same: no price, no button, and the tooltip says why.
+        // A close is a MARKET order: price is only a local accounting mark until the
+        // broker confirms the fill.  Keep the emergency exit usable during a quote/feed
+        // outage instead of presenting a button that can only say "invalid_price".
         const exitPrice = Number(row.current_price) || 0;
-        const canExit = exitPrice > 0;
-        const title = canExit
+        const title = exitPrice > 0
             ? (label === 'RETRY' ? 'Retry pending exit' : 'Submit manual exit')
-            : 'Exit unavailable: no live price for this trade yet';
-        return `<div class="trade-control-stack"><button class="trade-control-btn exit" data-action="close-trade" data-trade-id="${escHtml(row.id)}" data-trade-price="${exitPrice}" ${canExit ? '' : 'disabled'} title="${escHtml(title)}">${label}</button></div>`;
+            : 'Submit MARKET exit; quote unavailable, broker fill will reconcile';
+        return `<div class="trade-control-stack"><button class="trade-control-btn exit" data-action="close-trade" data-trade-id="${escHtml(row.id)}" data-trade-price="${exitPrice}" title="${escHtml(title)}">${label}</button></div>`;
     }
     if (isSignalRow) {
         const manualExitTradeId = row.manual_exit_trade_id || '';
         if (manualExitTradeId) {
             const manualExitPrice = Number(row.manual_exit_price || row.current_price || row.exit_price || row.entry_price || 0);
-            const canExit = row.manual_exit_enabled !== false && manualExitPrice > 0;
+            const canExit = row.manual_exit_enabled !== false;
             const statusText = String(row.manual_exit_execution_status || row.manual_exit_status || '').replace(/_/g, ' ').toLowerCase();
             const title = canExit
-                ? 'Submit dashboard exit for this manual signal'
+                ? (manualExitPrice > 0
+                    ? 'Submit dashboard exit for this manual signal'
+                    : 'Submit MARKET exit; quote unavailable, broker fill will reconcile')
                 : `Exit unavailable${statusText ? `: ${statusText}` : ''}`;
             return `<div class="trade-control-stack"><button class="trade-control-btn exit" data-action="close-trade" data-trade-id="${escHtml(manualExitTradeId)}" data-trade-price="${manualExitPrice}" ${canExit ? '' : 'disabled'} title="${escHtml(title)}">EXIT</button></div>`;
         }
@@ -476,6 +472,7 @@ function updateTradesPanel(trades, simId) {
     if (!tbody) return;
     const panelTotals = tradeHistoryTotals(trades || {});
     const pageInfo = getTradePageInfo(trades || {});
+    const backendSummary = trades.summary || {};
     const modeBadge = document.getElementById('tradeDataMode');
     if (modeBadge) {
         const meta = trades.meta || {};
@@ -489,7 +486,10 @@ function updateTradesPanel(trades, simId) {
             : '';
         let modeText = `TRADE MANAGER (${managerRows})`;
         let modeClass = 'trade-data-mode live';
-        if (source === 'historical_session_plus_simulation') {
+        if (backendSummary.is_signal_tracker === true) {
+            modeText = `SESSION SIGNAL TRACKER (${restored || panelTotals.total}${visibleLabel})`;
+            modeClass = 'trade-data-mode restored';
+        } else if (source === 'historical_session_plus_simulation') {
             modeText = `BACKTEST (${expectedRows}${visibleLabel})`;
             modeClass = 'trade-data-mode restored';
         } else if (source === 'restored_session_signals') {
@@ -700,20 +700,25 @@ function updateTradesPanel(trades, simId) {
     // for a session whose live result was -Rs 1,106.50. The lane is decided server-side
     // in TradeManager.get_dashboard_payload; this only renders it.
     const isReplay = summary.is_replay === true;
+    const isSignalTracker = summary.is_signal_tracker === true;
+    const isNonMoney = isReplay || isSignalTracker || summary.pnl_is_money === false;
+    const nonMoneyTitle = isSignalTracker
+        ? 'SIGNAL TRACKER - hypothetical signal marks; no broker fill is implied'
+        : isReplay
+            ? 'BACKTEST REPLAY - simulated, not live money'
+            : '';
     const pnlEl = document.getElementById('dailyPnl');
     if (pnlEl) {
         const dp = summary.daily_pnl || 0;
         pnlEl.textContent = '₹' + dp.toLocaleString();
         pnlEl.className = 'h-summary-value '
-            + (isReplay ? 'replay-value' : (dp >= 0 ? 'green' : 'red'));
-        pnlEl.title = isReplay
-            ? 'BACKTEST REPLAY - simulated, not live money'
-            : '';
+            + (isNonMoney ? 'replay-value nonmoney-value' : (dp >= 0 ? 'green' : 'red'));
+        pnlEl.title = nonMoneyTitle;
     }
     const pnlLabelEl = document.getElementById('dailyPnlLabel');
     if (pnlLabelEl) {
         pnlLabelEl.textContent = (summary.pnl_label || 'DAILY P&L') + ':';
-        pnlLabelEl.className = 'h-summary-label' + (isReplay ? ' replay-label' : '');
+        pnlLabelEl.className = 'h-summary-label' + (isNonMoney ? ' replay-label nonmoney-label' : '');
         pnlLabelEl.title = pnlEl ? pnlEl.title : '';
     }
     
@@ -721,14 +726,16 @@ function updateTradesPanel(trades, simId) {
     if (futPnlEl) {
         const fp = summary.fut_pnl || 0;
         futPnlEl.textContent = '₹' + fp.toLocaleString();
-        futPnlEl.className = 'h-summary-value ' + (fp >= 0 ? 'green' : 'red');
+        futPnlEl.className = 'h-summary-value ' + (isNonMoney ? 'nonmoney-value' : (fp >= 0 ? 'green' : 'red'));
+        futPnlEl.title = nonMoneyTitle;
     }
     
     const optPnlEl = document.getElementById('optPnl');
     if (optPnlEl) {
         const op = summary.opt_pnl || 0;
         optPnlEl.textContent = '₹' + op.toLocaleString();
-        optPnlEl.className = 'h-summary-value ' + (op >= 0 ? 'green' : 'red');
+        optPnlEl.className = 'h-summary-value ' + (isNonMoney ? 'nonmoney-value' : (op >= 0 ? 'green' : 'red'));
+        optPnlEl.title = nonMoneyTitle;
     }
     setText('totalTrades', summary.total_trades || 0);
     setText('winLoss', `${summary.wins || 0}/${summary.losses || 0}`);

@@ -49,18 +49,32 @@ async def test_websocket_broadcast_fans_out_concurrently(monkeypatch):
     import dashboard.server as server
 
     class Socket:
+        def __init__(self):
+            self.send_count = 0
+
         async def send_text(self, message):
             await asyncio.sleep(0.15)
+            self.send_count += 1
 
     clients = {Socket(), Socket(), Socket()}
     monkeypatch.setattr(server, "active_connections", clients)
     server.dashboard_state.last_sent_states.clear()
-    started = time.perf_counter()
-    await server.broadcast({"scan_count": 1})
-    elapsed = time.perf_counter() - started
-    assert elapsed < 0.35
-    assert len(server.active_connections) == 3
-    server.dashboard_state.last_sent_states.clear()
+    try:
+        started = time.perf_counter()
+        assert await server.broadcast({"scan_count": 1}) is True
+        await server._wait_for_broadcast_idle()
+        elapsed = time.perf_counter() - started
+
+        # Three serial 150 ms sends take at least 450 ms.  The worker must fan
+        # them out concurrently, while broadcast() itself remains enqueue-only.
+        assert elapsed < 0.35
+        assert all(client.send_count == 1 for client in clients)
+        assert len(server.active_connections) == 3
+    finally:
+        # pytest-asyncio gives each test its own loop.  Do not strand the
+        # module-global worker on this test's loop after the test returns.
+        await server._stop_broadcast_worker()
+        server.dashboard_state.last_sent_states.clear()
 
 
 @pytest.mark.asyncio

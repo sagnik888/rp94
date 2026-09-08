@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict
 from config.settings import get_settings
 from engine.trade_row_adapter import (
     accounting_pnl,
+    is_engine_replay_row,
     is_option_dashboard_row,
     is_simulated_history_row,
     normalize_dashboard_accounting_row,
@@ -40,6 +41,7 @@ class HistoricalTradeResultBuilder:
         reconcile_display_row = self.reconcile_display_row
         row_event_seconds = self.row_event_seconds
         session_rows = []
+        excluded_session_rows = []
         for instrument in (getattr(scanner, "_session_trade_candidates", {}) or {}).keys():
             for candidate in scanner._get_session_trade_candidates(instrument):
                 if inst_pref_match(candidate):
@@ -57,11 +59,27 @@ class HistoricalTradeResultBuilder:
                         and hasattr(scanner, "_normalize_loaded_exit_candidate")
                     ):
                         scanner._normalize_loaded_exit_candidate(candidate)
-                    session_rows.append(
-                        normalize_dashboard_accounting_row(
-                            scanner._serialize_trade_candidate(candidate)
-                        )
+                    row = normalize_dashboard_accounting_row(
+                        scanner._serialize_trade_candidate(candidate)
                     )
+                    # Historical mode also restores the live/manual session ledger.
+                    # Those candidates are useful audit facts, but are not output of
+                    # the current engine replay and must not replace same-date replay
+                    # rows or enter BACKTEST P&L.
+                    provenance = str(row.get("data_provenance") or "").strip()
+                    if provenance and not is_engine_replay_row(row):
+                        excluded_session_rows.append(row)
+                        continue
+                    session_rows.append(row)
+
+        if excluded_session_rows:
+            payload["meta"] = {
+                **payload.get("meta", {}),
+                "excluded_session_candidate_rows": len(excluded_session_rows),
+                "excluded_session_candidate_pnl": round(
+                    sum(accounting_pnl(row) for row in excluded_session_rows), 2
+                ),
+            }
 
         filtered_rows = []
         for rows in (getattr(scanner, "_latest_filtered_candidates", {}) or {}).values():

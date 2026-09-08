@@ -204,6 +204,23 @@ def test_cache_only_snapshot_prefers_kite_and_exposes_both_clock_ages():
     assert snapshot["exchange_timestamp_epoch"] == NOW - 1.5
 
 
+def test_fresh_kite_rest_beats_fresh_fyers_websocket_for_entry_authority():
+    provider = _provider()
+    provider._ltp_cache["NIFTY"] = _quote(
+        24_094.15, "kite_rest", NOW - 0.01, NOW - 0.02
+    )
+    provider._ws_cache[FYERS_INDEX_SYMBOLS["NIFTY"]] = _quote(
+        24_080.0, "fyers_ws", NOW - 0.001, NOW - 0.002
+    )
+
+    snapshot = provider.get_cached_index_quote_snapshot("NIFTY", now_ts=NOW)
+
+    assert snapshot["ltp"] == pytest.approx(24_094.15)
+    assert snapshot["selected_price_source"] == "kite_rest"
+    assert snapshot["source_role"] == "primary"
+    assert snapshot["is_fresh"] is True
+
+
 def test_snapshot_rejects_replayed_kite_packet_and_uses_fresh_fyers():
     provider = _provider()
     provider._ws_cache[KITE_TOKEN] = _quote(

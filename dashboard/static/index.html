@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <script src="/static/vendor/lightweight-charts-5.2.0/lightweight-charts.standalone.production.js?v=5.2.0-only"></script>
-    <link rel="stylesheet" href="/static/css/style.css?v=30-forensics-matched">
+    <link rel="stylesheet" href="/static/css/style.css?v=32-angelone-badge">
 </head>
 <body>
     <!-- ═══ TOP NAV BAR ═══ -->
@@ -43,7 +43,7 @@
             <div class="switch-group">
                 <span class="switch-label">AUTO</span>
                 <label class="modern-toggle" title="Toggle Auto Execution">
-                    <input type="checkbox" id="autoModeSwitch" aria-label="Automatic order execution" checked>
+                    <input type="checkbox" id="autoModeSwitch" aria-label="Automatic order execution">
                     <span class="modern-slider"></span>
                 </label>
             </div>
@@ -84,8 +84,11 @@
             <div class="tf-policy-wrapper">
                 <span class="switch-label">TF</span>
                 <select id="topTimeframePolicy" class="tf-policy-select modern-select" aria-label="Signal timeframe policy">
+                    <option value="PRIMARY_5">5M</option>
                     <option value="PRIMARY_15">15M</option>
                     <option value="INCLUDE_5MIN">5M+15M</option>
+                    <option value="INCLUDE_1MIN_5MIN">1M+5M</option>
+                    <option value="INCLUDE_1MIN_5MIN_15MIN">1M+5M+15M</option>
                 </select>
             </div>
             <div class="capsule-divider"></div>
@@ -107,6 +110,13 @@
                 <span class="switch-label">1MSCALP</span>
                 <label class="modern-toggle pill-style" title="1mscalp: continuous 1-minute high-burst/spike entries. OFF keeps tracking/trailing; does not block p-win snap when that toggle is ON.">
                     <input type="checkbox" id="oneMinScalpSwitch" aria-label="One-minute scalp entries" checked>
+                    <span class="modern-slider" data-on="ON" data-off="OFF"></span>
+                </label>
+            </div>
+            <div class="switch-group">
+                <span class="switch-label">1M EXIT</span>
+                <label class="modern-toggle pill-style" title="Huge 1-minute reversal emergency exit for open 15-minute trades. OFF ignores the 1m-only emergency exit; broker stop/target and normal 15m management remain active.">
+                    <input type="checkbox" id="fifteenMinOneMinSupportExitSwitch" aria-label="One-minute emergency exit for 15-minute trades" checked>
                     <span class="modern-slider" data-on="ON" data-off="OFF"></span>
                 </label>
             </div>
@@ -229,8 +239,8 @@
                     <div class="gateway-badge" id="gw_fyers" title="Fyers Data Status">
                         <span class="gw-dot"></span> FYERS
                     </div>
-                    <div class="gateway-badge" id="gw_yahoo" title="Yahoo Finance Fallback Status">
-                        <span class="gw-dot"></span> YAHOO
+                    <div class="gateway-badge" id="gw_angelone" title="AngelOne price-only index fallback status">
+                        <span class="gw-dot"></span> ANGEL
                     </div>
                 </div>
             </div>
@@ -503,6 +513,7 @@
 
                 </div>
                 <div id="pnlContentView" class="intel-view-pane" style="display: none;">
+                    <div id="pnlBasisLabel" class="pnl-basis-label">Waiting for accounting basis...</div>
                     <div class="pnl-grid">
                         <div class="pnl-card glass-card">
                             <span>WIN RATE</span>
@@ -827,16 +838,16 @@
     <div class="toast-container" id="toastContainer"></div>
 
     <script src="/static/js/trade-pagination.js?v=2-fut-opt"></script>
-    <script src="/static/js/trade-table.js?v=8-normalized-trade-times"></script>
+    <script src="/static/js/trade-table.js?v=9-signal-pnl-basis"></script>
     <script src="/static/js/dashboard-charts.js?v=5.2.0-only"></script>
     <!-- Bump this ?v= whenever dashboard-settings.js changes, or the browser serves the
          cached copy and the new controls simply never appear. That is exactly what
          happened on 2026-08-18: the breakeven-stop, give-back-cap and backtest-live-exit
          controls were present in the file and mounted in the DOM, but invisible in the
          running dashboard because the version string still said v=24. -->
-    <script src="/static/js/dashboard-settings.js?v=31-stop-reentry-net"></script>
+    <script src="/static/js/dashboard-settings.js?v=32-single-auto-authority"></script>
     <script src="/static/js/signal-forensics.js?v=3-integration-fixed"></script>
-    <script src="/static/js/app.js?v=aug2026-v43-independent-quotes"></script>
+    <script src="/static/js/app.js?v=sep2026-v46-angelone-refresh"></script>
 </body>
 
 

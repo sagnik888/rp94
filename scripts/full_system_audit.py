@@ -1,6 +1,8 @@
 
 import sys
 import os
+import argparse
+import json
 import math
 from pathlib import Path
 import pandas as pd
@@ -126,6 +128,7 @@ def run_end_to_end_audit(days=7):
     external_blockers = []
     software_failures = []
     chain_status = {}
+    quote_status = {}
     certification_limitations = []
 
     # 1. TEST CONNECTIVITY (read-only: authentication + market-data streams only)
@@ -187,12 +190,18 @@ def run_end_to_end_audit(days=7):
 
         # A. Historical data integrity through the unified fetcher. For index
         # candles this prefers cache/Fyers and avoids competing with the live
-        # scanner for AngelOne history quota.
+        # scanner for AngelOne history quota. The audit must not merge the result
+        # into the production candle store merely by observing it.
         unified_history = run_with_timeout(
             executor,
             f"Unified {symbol} history",
             lambda token=token, symbol=symbol: provider.get_historical_candles(
-                token, exchange, "5min", days_back=days, instrument_name=symbol
+                token,
+                exchange,
+                "5min",
+                days_back=days,
+                instrument_name=symbol,
+                persist_cache=False,
             ),
             timeout=25,
             default=pd.DataFrame(),
@@ -283,6 +292,16 @@ def run_end_to_end_audit(days=7):
             and quote_session in {"LIVE", "OPEN"}
             and snapshot.get("entry_eligible")
         )
+        quote_status[symbol] = {
+            "price": price,
+            "source": source,
+            "freshest_source": freshest_label,
+            "freshest_age_seconds": age,
+            "quote_session": quote_session,
+            "market_open": market_open,
+            "entry_eligible": bool(snapshot.get("entry_eligible")),
+            "entry_ok": entry_ok,
+        }
         entry_label = "entry-ok" if entry_ok else f"context-only ({quote_session})"
         logger.info(
             f"  - {symbol}: ₹{price} (Quote: {source}; Freshest: "
@@ -291,6 +310,11 @@ def run_end_to_end_audit(days=7):
         if price <= 0:
             logger.error(f"  - {symbol}: 🔴 CRITICAL PRICE ERROR")
             failures.append(f"{symbol} index quote")
+        elif market_open and not entry_ok:
+            logger.error(
+                f"  - {symbol}: 🔴 live entry quote is not primary/fresh/eligible"
+            )
+            failures.append(f"{symbol} executable quote")
 
     # 4. TEST OPTION CHAIN & PCR
     logger.info("Step 4: Option Intelligence Audit...")
@@ -396,6 +420,8 @@ def run_end_to_end_audit(days=7):
         "live_ready": bool(
             not failures
             and observed_open_session
+            and quote_status
+            and all(item.get("entry_ok") for item in quote_status.values())
             and chain_status
             and all(item.get("auto_certified") for item in chain_status.values())
         ),
@@ -403,6 +429,7 @@ def run_end_to_end_audit(days=7):
             "kite": _public_status(kite_status),
             "fyers": _public_status(fyers_status),
         },
+        "quotes": quote_status,
         "option_chains": chain_status,
         "external_blockers": external_blockers,
         "software_failures": sorted(set(software_failures)),
@@ -437,10 +464,33 @@ def run_end_to_end_audit(days=7):
             logger.warning(f"Audit stream shutdown skipped: {exc}")
     return result
 
-if __name__ == "__main__":
-    result = run_end_to_end_audit(days=7)
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Run read-only UT1 connectivity, market-data, and option-chain checks."
+    )
+    parser.add_argument("--days", type=int, default=7, help="history lookback in days")
+    parser.add_argument(
+        "--require-live-ready",
+        action="store_true",
+        help="return exit code 2 when checks pass but the session is not live-ready",
+    )
+    parser.add_argument("--json", action="store_true", help="print the structured result")
+    args = parser.parse_args(argv)
+    result = run_end_to_end_audit(days=max(1, int(args.days)))
+    if args.json:
+        print(json.dumps(result, default=str, sort_keys=True))
     try:
         logger.complete()
     except Exception:
         pass
-    raise SystemExit(0 if result.get("ok") else 1)
+    if not result.get("ok"):
+        return 1
+    if args.require_live_ready and not result.get("live_ready"):
+        logger.error("Audit checks passed, but live-session readiness was not certified.")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

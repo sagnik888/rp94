@@ -63,7 +63,8 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "expected_move_data_as_of", "expected_move_model_version", "expected_move_source",
     "entry_policy_allowed", "entry_policy_phase", "entry_policy_checked_at",
     "entry_policy_reason", "entry_policy_actual_rr",
-    "entry_policy_underlying_stop_pct", "entry_policy_version", "is_recovery",
+    "entry_policy_underlying_stop_pct", "entry_policy_version", "quality_verdict",
+    "is_recovery",
     # Exchange-side protection + recovery state: read by from_dict(), so it has to
     # be written or every restart silently resets it.
     "protective_order_id", "protective_trigger", "protective_quantity",
@@ -119,6 +120,45 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "runner_stop_basis",
     "stop_provenance",
 })
+
+
+_TRADE_JSON_COLUMNS = frozenset({"quality_verdict"})
+
+
+def _encode_trade_value(column: str, value: Any) -> Any:
+    """Convert non-native trade values into stable SQLite representations."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value == "--" and column in ("entry_time", "exit_time"):
+        return None
+    if column in _TRADE_JSON_COLUMNS:
+        # Loaded rows may be handed back to a writer, so accept both the decoded
+        # mapping and its already-encoded representation without double encoding.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+        if not isinstance(value, dict):
+            value = {}
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return value
+
+
+def _decode_trade_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """Decode structured trade columns while failing closed on legacy corruption."""
+    item = dict(row)
+    for column in _TRADE_JSON_COLUMNS:
+        raw = item.get(column)
+        if isinstance(raw, dict):
+            item[column] = dict(raw)
+            continue
+        try:
+            decoded = json.loads(raw) if raw else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = {}
+        item[column] = decoded if isinstance(decoded, dict) else {}
+    return item
 
 
 def _running_under_pytest() -> bool:
@@ -428,6 +468,7 @@ class DatabaseManager:
                     volume_spike_entry INTEGER,
                     power_move INTEGER,
                     source_lane TEXT,
+                    quality_verdict TEXT,
                     lifecycle_id TEXT,
                     runner_mode INTEGER,
                     runner_activation_timestamp TEXT,
@@ -493,6 +534,7 @@ class DatabaseManager:
                     "entry_policy_actual_rr": "REAL",
                     "entry_policy_underlying_stop_pct": "REAL",
                     "entry_policy_version": "TEXT",
+                    "quality_verdict": "TEXT",
                     "is_recovery": "INTEGER",
                     # Exchange-side protection state. Trade.from_dict() has always read
                     # these back, but nothing ever wrote them, so a restart forgot that a
@@ -781,16 +823,12 @@ class DatabaseManager:
             columns = ', '.join(filtered_dict.keys())
             placeholders = ', '.join(['?'] * len(filtered_dict))
             
-            # Handle datetime serialization if they are passed as raw datetime objects
-            # However, trade.to_dict() mostly formats them. Let's make sure.
-            values = []
-            for k, v in filtered_dict.items():
-                if isinstance(v, datetime):
-                    values.append(v.isoformat())
-                elif v == "--" and k in ('entry_time', 'exit_time'):
-                    values.append(None)
-                else:
-                    values.append(v)
+            # Handle datetime and structured-column serialization even when callers
+            # provide a raw dataclass mapping instead of Trade.to_dict().
+            values = [
+                _encode_trade_value(column, value)
+                for column, value in filtered_dict.items()
+            ]
 
             sql = f'''
                 INSERT OR REPLACE INTO trades ({columns}) 
@@ -817,14 +855,10 @@ class DatabaseManager:
             if not filtered:
                 continue
             columns = tuple(filtered)
-            values = []
-            for key in columns:
-                value = filtered[key]
-                if isinstance(value, datetime):
-                    value = value.isoformat()
-                elif value == "--" and key in ("entry_time", "exit_time"):
-                    value = None
-                values.append(value)
+            values = [
+                _encode_trade_value(key, filtered[key])
+                for key in columns
+            ]
             grouped.setdefault(columns, []).append(tuple(values))
 
         if not grouped:
@@ -890,7 +924,7 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             cursor.execute("SELECT * FROM trades")
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [_decode_trade_row(row) for row in rows]
 
     _TRADABLE_SYMBOLS: Optional[frozenset] = None
 
@@ -947,7 +981,7 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             cursor.execute("SELECT * FROM trades WHERE status = 'OPEN'")
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [_decode_trade_row(row) for row in rows]
 
     def load_closed_trades(self) -> List[Dict]:
         """Load only closed trades from the database."""
@@ -955,7 +989,7 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             cursor.execute("SELECT * FROM trades WHERE status = 'CLOSED'")
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [_decode_trade_row(row) for row in rows]
 
     def save_session_signals(self, date_str: str, signals: List[Dict]):
         """Replace the saved session candidates for one trading date."""
@@ -1146,6 +1180,10 @@ class DatabaseManager:
             str(event.get("decision") or ""),
             str(event.get("reason_code") or ""),
             str(event.get("reason_text") or ""),
+            # AUTO and MANUAL are separate operator/execution facts.  Without this a
+            # mode transition with identical price geometry collapsed as a duplicate and
+            # left the forensic flight recorder saying the wrong mode.
+            str(event.get("execution_mode") or "").upper(),
             f"{float(event.get('current_stop') or 0.0):.2f}",
             f"{float(event.get('current_target') or 0.0):.2f}",
             f"{float(event.get('pnl') or 0.0):.2f}",

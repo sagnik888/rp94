@@ -56,6 +56,13 @@ class FakeProvider:
 
 def test_full_system_audit_reports_quote_and_freshest_source(monkeypatch):
     messages = []
+    history_calls = []
+
+    class RecordingProvider(FakeProvider):
+        def get_historical_candles(self, *args, **kwargs):
+            history_calls.append(dict(kwargs))
+            return super().get_historical_candles(*args, **kwargs)
+
     monkeypatch.setattr(
         audit,
         "get_settings",
@@ -67,7 +74,7 @@ def test_full_system_audit_reports_quote_and_freshest_source(monkeypatch):
             active_indices=["NIFTY"],
         ),
     )
-    monkeypatch.setattr(audit, "MarketDataProvider", FakeProvider)
+    monkeypatch.setattr(audit, "MarketDataProvider", RecordingProvider)
     monkeypatch.setattr(audit.logger, "info", lambda msg: messages.append(str(msg)))
     monkeypatch.setattr(audit.logger, "warning", lambda msg: messages.append(str(msg)))
     monkeypatch.setattr(audit.logger, "error", lambda msg: messages.append(str(msg)))
@@ -82,6 +89,8 @@ def test_full_system_audit_reports_quote_and_freshest_source(monkeypatch):
     assert "Source: unknown" not in joined
     assert "AngelOne" not in joined
     assert result["read_only"] is True
+    assert history_calls
+    assert all(call.get("persist_cache") is False for call in history_calls)
 
 
 def test_closed_session_replay_tick_is_never_reported_entry_eligible(monkeypatch):
@@ -107,11 +116,54 @@ def test_closed_session_replay_tick_is_never_reported_entry_eligible(monkeypatch
     monkeypatch.setattr(audit.logger, "error", lambda msg: messages.append(str(msg)))
     monkeypatch.setattr(audit.time, "sleep", lambda _seconds: None)
 
-    audit.run_end_to_end_audit(days=1)
+    result = audit.run_end_to_end_audit(days=1)
 
     joined = "\n".join(messages)
     assert "context-only (CLOSED)" in joined
     assert "entry-ok" not in joined
+    assert result["quotes"]["NIFTY"]["entry_ok"] is False
+    assert result["live_ready"] is False
+
+
+def test_open_session_non_primary_quote_fails_the_audit(monkeypatch):
+    class SecondaryOnlyProvider(FakeProvider):
+        def get_index_quote(self, symbol):
+            return {"ltp": 23950.0, "source": "fyers_ws", "quote_label": "LIVE"}
+
+        def get_market_source_snapshot(self, symbol):
+            return {
+                "freshest": {"source": "fyers_ws", "age_seconds": 0.1},
+                "entry_eligible": False,
+            }
+
+    monkeypatch.setattr(
+        audit,
+        "get_settings",
+        lambda: SimpleNamespace(
+            angelone_api_key="", angelone_client_id="", angelone_password="",
+            angelone_totp_secret="", active_indices=["NIFTY"],
+        ),
+    )
+    monkeypatch.setattr(audit, "MarketDataProvider", SecondaryOnlyProvider)
+    monkeypatch.setattr(audit.time, "sleep", lambda _seconds: None)
+
+    result = audit.run_end_to_end_audit(days=1)
+
+    assert result["ok"] is False
+    assert result["quotes"]["NIFTY"]["entry_ok"] is False
+    assert "NIFTY executable quote" in result["failures"]
+
+
+def test_cli_live_ready_requirement_has_a_distinct_exit_code(monkeypatch):
+    monkeypatch.setattr(
+        audit,
+        "run_end_to_end_audit",
+        lambda days: {"ok": True, "live_ready": False, "days": days},
+    )
+    monkeypatch.setattr(audit.logger, "complete", lambda: None)
+
+    assert audit.main(["--days", "3"]) == 0
+    assert audit.main(["--days", "3", "--require-live-ready"]) == 2
 
 
 def _run_fyers_history_audit(monkeypatch, history_result=None, history_error=None):

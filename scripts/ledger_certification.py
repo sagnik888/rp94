@@ -15,15 +15,23 @@ writes nothing, and never changes a setting.
     python -m scripts.ledger_certification            # live positions
     python -m scripts.ledger_certification --offline  # ledger only, no broker call
 
-Exit code 0 means agreement (or nothing to check), 1 means a discrepancy that must be
-understood before stacking is re-enabled.
+Exit code 0 means agreement (or an explicitly requested offline inspection), 1 means a
+discrepancy, and 2 means the requested live broker comparison could not be performed.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Tuple
+
+
+# ``python -m scripts.ledger_certification`` already places the repository on
+# sys.path.  Operators and audit runners also invoke this file directly; in that
+# form Python exposes only ``scripts/`` and the lazy ``data`` import below fails.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _ledger_holdings() -> Dict[str, Dict[str, int]]:
@@ -48,7 +56,7 @@ def _broker_positions() -> Tuple[Dict[str, int], str]:
     """{tradingsymbol: netqty} from the live broker, plus a note on how it went."""
     try:
         from config.settings import get_settings
-        from trading.kite_auth import get_kite_auth
+        from data.kite_auth import get_kite_auth
         from trading.kite_broker import KiteBroker
     except Exception as exc:
         return {}, f"broker unavailable ({exc})"
@@ -173,8 +181,10 @@ def main() -> int:
         positions, note = _broker_positions()
         if note != "ok":
             print(f"! {note}")
-            print("Falling back to an offline report.\n")
-            args.offline = True
+            print("Live broker comparison was requested but could not be performed.\n")
+            _report(ledger, {}, offline=True)
+            print("\nNOT CERTIFIED: broker state is unavailable.")
+            return 2
 
     return _report(ledger, positions, args.offline)
 

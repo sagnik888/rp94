@@ -20,6 +20,8 @@ Default OFF: turning it on changes the numbers, so a run with it on is not compa
 a run with it off.
 """
 import inspect
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -57,7 +59,13 @@ def test_the_simulator_alone_can_only_produce_stop_target_or_session_end():
         for line in src.splitlines()
         if 'exit_reason = "' in line
     }
-    assert produced <= {"HISTORICAL", "SL HIT", "TARGET_HIT", "PEAK_GIVEBACK_CAP"}
+    assert produced <= {
+        "HISTORICAL",
+        "SL HIT",
+        "TARGET_HIT",
+        "PEAK_GIVEBACK_CAP",
+        "TF15_FAST_REVERSAL",
+    }
     # Nothing from the live trade-management stack is reachable without the toggle.
     for live_only in ("SMART_PROFIT_LOCK", "PEAK_THREAT_EXIT", "LOSS_THREAT_EXIT",
                       "EARLY_LOSS_CUT", "PROFIT_GIVEBACK_GUARD"):
@@ -146,6 +154,105 @@ def test_existing_callers_are_unaffected():
     """qty defaults to 0, so every current call site keeps the pure stop/target sim."""
     sig = inspect.signature(SignalProcessor._simulate_actual_option_exit)
     assert sig.parameters["qty"].default == 0
+
+
+def test_opt_in_replay_calls_production_tf15_exit(monkeypatch):
+    import scanner as scanner_module
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "backtest_live_exits_enabled", True)
+    monkeypatch.setattr(settings, "fifteen_min_one_min_support_exit_enabled", True)
+    monkeypatch.setattr(
+        scanner_module.Scanner,
+        "_peak_giveback_cap_exit",
+        lambda *args, **kwargs: (False, ""),
+    )
+    processor = SignalProcessor.__new__(SignalProcessor)
+    seen = []
+    processor._historical_tf15_exit_probe = lambda *args, **kwargs: (
+        lambda ts, close, high, peak: (seen.append((ts, close, high, peak)) or True, "fast")
+    )
+    df = _bars([100.0, 99.0, 98.0])
+
+    out = processor._simulate_actual_option_exit(
+        df,
+        df.index[0],
+        df.index[-1],
+        sl_price=50.0,
+        rr=99.0,
+        max_sl_pct=0.60,
+        tf15_qty=75,
+        tf15_exit_scanner=SimpleNamespace(),
+        tf15_instrument="NIFTY",
+        tf15_direction="LONG",
+        tf15_option_type="CE",
+        tf15_timeframe="15min",
+    )
+
+    assert out["reason"] == "TF15_FAST_REVERSAL"
+    assert seen
+
+
+def test_tf15_replay_candle_view_never_exposes_future_rows(monkeypatch):
+    import scanner as scanner_module
+    from intelligence.regime_detector import RegimeDetector
+
+    idx = pd.date_range("2026-08-17 09:15", periods=16, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "open": range(100, 116),
+            "high": range(101, 117),
+            "low": range(99, 115),
+            "close": range(100, 116),
+            "volume": [100] * 16,
+        },
+        index=idx,
+    )
+
+    class Source:
+        @staticmethod
+        def get_candles(_instrument, timeframe):
+            return frame.copy() if timeframe == "1min" else None
+
+    captured = {}
+
+    def decision(scanner, trade, spot, latest_time, **kwargs):
+        one = scanner.candles.get_candles("NIFTY", "1min")
+        fifteen = scanner.candles.get_candles("NIFTY", "15min")
+        captured["one_last"] = one.index[-1]
+        captured["fifteen_close"] = float(fifteen.iloc[-1]["close"])
+        captured["evaluation"] = latest_time
+        captured["regime"] = scanner._get_trade_regime(trade)
+        return False, ""
+
+    monkeypatch.setattr(
+        scanner_module.Scanner,
+        "_fifteen_min_one_min_support_exit_decision",
+        decision,
+    )
+    monkeypatch.setattr(
+        RegimeDetector,
+        "detect",
+        lambda *args, **kwargs: {"regime": "TRENDING_DOWN"},
+    )
+    processor = SignalProcessor.__new__(SignalProcessor)
+    probe = processor._historical_tf15_exit_probe(
+        SimpleNamespace(candles=Source(), active_indices=["NIFTY"]),
+        instrument="NIFTY",
+        direction="LONG",
+        option_type="CE",
+        entry_time=idx[0].to_pydatetime(),
+        entry_price=100.0,
+        stop_price=90.0,
+        qty=75,
+    )
+
+    probe(idx[2], 102.0, 103.0, 150.0)
+
+    assert captured["one_last"] == idx[2]
+    assert captured["fifteen_close"] == 102.0
+    assert captured["evaluation"] == idx[2].to_pydatetime() + timedelta(minutes=1)
+    assert captured["regime"] == "TRENDING_DOWN"
 
 
 # ── the dashboard controls ───────────────────────────────────────────────────

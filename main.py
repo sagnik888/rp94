@@ -562,12 +562,27 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 except Exception:
                     health = {}
                 if health.get("kite_stream_stalled"):
-                    if not state.get("kite_stream_resubscribed"):
-                        state["kite_stream_resubscribed"] = True
+                    # A successful socket write does not prove that ticks resumed. Keep
+                    # retrying at a bounded cadence until the health signal itself clears;
+                    # otherwise a one-time write into a wedged websocket silently ends
+                    # recovery forever.
+                    retry_every = max(15.0, float(check_every))
+                    now_monotonic = time.monotonic()
+                    last_attempt = float(state.get("kite_stream_resubscribe_attempt_at", 0.0) or 0.0)
+                    if now_monotonic - last_attempt >= retry_every:
+                        state["kite_stream_resubscribe_attempt_at"] = now_monotonic
                         try:
-                            scanner.data.resubscribe_kite_tokens()
+                            # A failed resubscribe is not a recovery.  Latching before
+                            # checking the result left a connected-but-silent socket
+                            # permanently stalled after one transient broker failure.
+                            # The watchdog cadence is already bounded, so a false result
+                            # is safe to retry on the next health pass.
+                            state["kite_stream_resubscribed"] = bool(
+                                scanner.data.resubscribe_kite_tokens()
+                            )
                         except Exception as exc:
                             logger.debug(f"Kite resubscribe attempt failed: {exc}")
+                            state["kite_stream_resubscribed"] = False
                     age = health.get("kite_tick_age_seconds")
                     _alert(
                         "kite_stream",
@@ -582,6 +597,7 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 else:
                     state.pop("kite_stream", None)
                     state.pop("kite_stream_resubscribed", None)
+                    state.pop("kite_stream_resubscribe_attempt_at", None)
 
                 # 3. Fyers auth — expires daily and cannot auto-refresh.
                 try:
@@ -634,6 +650,21 @@ def _contract_token_for(data_provider, symbol: str) -> str:
                     return token
             except Exception:
                 continue
+    # MarketDataProvider deliberately exposes Kite as a composed source rather than
+    # proxying every contract-master method.  The live archive provider has already
+    # loaded that source, so use its exact tradingsymbol lookup before falling back to
+    # legacy provider shapes.  This is especially useful when an older event omitted
+    # its token but the contract is still present in today's broker master.
+    kite_source = getattr(data_provider, "kite", None)
+    instrument_token = getattr(kite_source, "instrument_token", None)
+    if callable(instrument_token):
+        exchange = "BFO" if str(symbol or "").upper().startswith("SENSEX") else "NFO"
+        try:
+            token = str(instrument_token(symbol, exchange) or "").strip()
+            if token:
+                return token
+        except Exception:
+            pass
     lookup = getattr(data_provider, "contract_master", None)
     if isinstance(lookup, dict):
         row = lookup.get(symbol) or {}
@@ -653,10 +684,43 @@ def _archive_missing_contract_count(value) -> int:
         return 1
 
 
+_SESSION_ARCHIVE_SCHEMA_VERSION = 3
+_SESSION_ARCHIVE_CONTRACT_OWNERSHIP_VERSION = "shadow-outcome-session-date.v1"
+
+
+def _session_archive_event_identity(root: Path, day: str) -> dict:
+    """Identity of the exact event-ledger revision an archive claims to cover."""
+    try:
+        stat = (
+            root / "data_store" / "rtracker" / "events" / f"{day}.jsonl"
+        ).stat()
+        return {"exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    except OSError:
+        return {"exists": False, "size": 0, "mtime_ns": 0}
+
+
 def _session_archive_manifest_complete(root: Path, day: str) -> bool:
     path = root / "data_store" / "session_archive" / day / "manifest.json"
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
+        # Schema v3 is the first version that assigns delayed SHADOW_OUTCOME rows to
+        # their embedded session date and binds completion to a specific ledger
+        # revision. Older "complete" manifests must be rerun once against their
+        # already-frozen candles; otherwise foreign contracts and late outcomes remain
+        # silently accepted forever.
+        if (
+            _safe_nonnegative_int(manifest.get("schema_version"))
+            < _SESSION_ARCHIVE_SCHEMA_VERSION
+            or str(manifest.get("contract_ownership_version") or "")
+            != _SESSION_ARCHIVE_CONTRACT_OWNERSHIP_VERSION
+            or manifest.get("source_event_identity")
+            != _session_archive_event_identity(root, day)
+        ):
+            return False
+        if manifest.get("complete") is not True or bool(
+            manifest.get("coverage_errors")
+        ):
+            return False
         symbols = {
             str(symbol or "").strip()
             for symbol in (manifest.get("traded_symbols_recorded") or [])
@@ -699,6 +763,288 @@ def _session_archive_manifest_complete(root: Path, day: str) -> bool:
         return False
 
 
+def _read_session_archive_manifest(root: Path, day: str) -> dict:
+    """Best-effort manifest reader shared by completion and repair handling."""
+    try:
+        value = json.loads(
+            (root / "data_store" / "session_archive" / day / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return dict(value) if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _safe_nonnegative_int(value, default: int = 0) -> int:
+    """Normalize persisted counters without letting a damaged manifest kill a worker."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, int(default))
+
+
+def _session_archive_source_identity(root: Path, day: str, manifest: dict | None = None) -> dict:
+    """Identity of the ledger and missing-contract files behind a terminal decision.
+
+    A terminal classification is only valid for the evidence it inspected. Appending
+    events, restoring a cache file, or manually repairing an archived candle therefore
+    re-queues the day automatically instead of leaving a stale permanent tombstone.
+    """
+    manifest = manifest if isinstance(manifest, dict) else _read_session_archive_manifest(root, day)
+
+    def _file_identity(path: Path) -> dict:
+        try:
+            stat = path.stat()
+            return {"exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        except OSError:
+            return {"exists": False, "size": 0, "mtime_ns": 0}
+
+    ledger = root / "data_store" / "rtracker" / "events" / f"{day}.jsonl"
+    symbols_value = manifest.get("missing_contract_symbols") or []
+    symbols = sorted(
+        {
+            str(symbol or "").strip()
+            for symbol in symbols_value
+            if str(symbol or "").strip()
+        }
+    ) if isinstance(symbols_value, (list, tuple, set)) else []
+    files: dict[str, dict] = {}
+    for symbol in symbols:
+        files[symbol] = {
+            "cache": _file_identity(root / "data_store" / "candles" / f"{symbol}_1min.csv"),
+            "archive": _file_identity(
+                root / "data_store" / "session_archive" / day / "candles" / f"{symbol}_1min.csv"
+            ),
+        }
+    return {"ledger": _file_identity(ledger), "missing_contract_files": files}
+
+
+def _session_archive_manifest_terminal(root: Path, day: str) -> bool:
+    """Whether an incomplete archive is terminal for its *current* source evidence."""
+    manifest = _read_session_archive_manifest(root, day)
+    status = manifest.get("repair_status") or {}
+    if not isinstance(status, dict) or str(status.get("state") or "").lower() != "terminal_unfillable":
+        return False
+    recorded = status.get("source_identity")
+    return isinstance(recorded, dict) and recorded == _session_archive_source_identity(
+        root, day, manifest
+    )
+
+
+def _session_archive_repair_due(root: Path, day: str, now: datetime) -> bool:
+    """Apply persisted transient backoff without confusing it with terminal coverage."""
+    status = _read_session_archive_manifest(root, day).get("repair_status") or {}
+    if not isinstance(status, dict):
+        return True
+    raw = str(status.get("next_retry_at") or "").strip()
+    # Compatibility for manifests written before archive-level backoff was persisted.
+    # Their contract rows may all be terminal (or absent for a legacy ledger) while
+    # spot coverage still fails, leaving a high archive_failures count but no retry
+    # timestamp. Derive the same bounded delay from the last recorded attempt instead
+    # of immediately starting another five-minute backlog sweep after every restart.
+    if (
+        not raw
+        and _safe_nonnegative_int(status.get("archive_failures"))
+        >= _session_archive_repair_attempt_limit()
+    ):
+        last_attempt = str(status.get("last_attempt_at") or "").strip()
+        if last_attempt:
+            try:
+                retry_at = datetime.fromisoformat(last_attempt) + timedelta(
+                    minutes=_session_archive_retry_backoff_minutes()
+                )
+                raw = retry_at.isoformat()
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if not raw:
+        return True
+    try:
+        retry_at = datetime.fromisoformat(raw)
+        now_ist = IST.localize(now) if now.tzinfo is None else now.astimezone(IST)
+        retry_at = IST.localize(retry_at) if retry_at.tzinfo is None else retry_at.astimezone(IST)
+        return now_ist >= retry_at
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
+def _session_archive_repair_attempt_limit() -> int:
+    """Bound automatic repair retries; a missing expired contract cannot heal by spam."""
+    try:
+        return max(
+            1,
+            min(20, int(os.getenv("SESSION_ARCHIVE_REPAIR_MAX_ATTEMPTS", "3") or 3)),
+        )
+    except (TypeError, ValueError):
+        return 3
+
+
+def _session_archive_retry_backoff_minutes() -> int:
+    """Bounded delay shared by persisted and legacy-derived archive backoff."""
+    try:
+        return max(
+            5,
+            min(
+                24 * 60,
+                int(os.getenv("SESSION_ARCHIVE_RETRY_BACKOFF_MINUTES", "360") or 360),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 360
+
+
+def _record_session_archive_repair(
+    root: Path,
+    day: str,
+    *,
+    backfill_outcomes: dict | None = None,
+    default_reason: str = "archive incomplete",
+) -> dict:
+    """Persist exact repair evidence without turning transient outages into data loss.
+
+    Retry limits trigger a durable backoff, not a terminal classification. Only an
+    outcome explicitly marked both ``terminal_unfillable`` and ``permanent`` may stop
+    automatic retries, and that decision is bound to the current ledger/cache identity.
+    """
+    path = root / "data_store" / "session_archive" / day / "manifest.json"
+    manifest = _read_session_archive_manifest(root, day)
+    if not manifest:
+        manifest = {
+            "schema_version": _SESSION_ARCHIVE_SCHEMA_VERSION,
+            "contract_ownership_version": _SESSION_ARCHIVE_CONTRACT_OWNERSHIP_VERSION,
+            "source_event_identity": _session_archive_event_identity(root, day),
+            "date": day,
+            "events": 0,
+            "complete": False,
+            "coverage_errors": [default_reason],
+            "missing_contract_symbols": [],
+        }
+
+    old = manifest.get("repair_status") or {}
+    old = dict(old) if isinstance(old, dict) else {}
+    old_attempts = _safe_nonnegative_int(old.get("attempts"))
+    archive_failures = _safe_nonnegative_int(old.get("archive_failures")) + 1
+    limit = _session_archive_repair_attempt_limit()
+    missing_symbols = sorted(
+        {
+            str(symbol or "").strip()
+            for symbol in (manifest.get("missing_contract_symbols") or [])
+            if str(symbol or "").strip()
+        }
+    )
+    prior_rows = old.get("missing_contracts") or {}
+    prior_rows = prior_rows if isinstance(prior_rows, dict) else {}
+    outcomes = backfill_outcomes if isinstance(backfill_outcomes, dict) else {}
+    rows: dict[str, dict] = {}
+    made_authenticated_attempt = False
+    for symbol in missing_symbols:
+        prior_row = prior_rows.get(symbol)
+        row = dict(prior_row) if isinstance(prior_row, dict) else {}
+        outcome = outcomes.get(symbol)
+        if isinstance(outcome, dict):
+            row.update({key: value for key, value in outcome.items() if value not in (None, "")})
+        attempted_symbol = bool(isinstance(outcome, dict) and outcome.get("attempted", True))
+        symbol_attempts = _safe_nonnegative_int(row.get("attempts"))
+        if attempted_symbol:
+            symbol_attempts += 1
+            made_authenticated_attempt = True
+        if not row:
+            row = {"state": "retryable", "reason": default_reason}
+        row.setdefault("state", "retryable")
+        row.setdefault("reason", default_reason)
+        row["attempts"] = symbol_attempts
+        permanent = bool(row.get("permanent"))
+        if row["state"] == "terminal_unfillable" and not permanent:
+            row["state"] = "retryable"
+            row["reason"] = f"unconfirmed permanent failure: {row['reason']}"
+        if row["state"] == "filled":
+            # A successful fetch that did not leave usable day bars is not proof of
+            # coverage.  Keep it visible and retryable rather than calling it fixed.
+            row["state"] = "retryable"
+            row["reason"] = "backfill returned but no usable 1-minute day bars were archived"
+        if row["state"] == "retryable" and symbol_attempts >= limit:
+            row["state"] = "retry_backoff"
+            evidence = str(row.get("reason") or default_reason or "transient gap").strip()
+            row["reason"] = (
+                f"{evidence} (retry backoff after {symbol_attempts} repair attempts)"
+            )[:500]
+        rows[symbol] = row
+
+    attempts = old_attempts + (1 if made_authenticated_attempt else 0)
+
+    coverage_errors = list(manifest.get("coverage_errors") or [])
+    contract_only_errors = all(
+        "contract symbol coverage" in str(item).lower()
+        or "contract file" in str(item).lower()
+        for item in coverage_errors
+    ) if coverage_errors else False
+    all_missing_terminal = bool(rows) and all(
+        str(row.get("state") or "") == "terminal_unfillable" and bool(row.get("permanent"))
+        for row in rows.values()
+    )
+    # Only exact contract-history gaps can be classified terminal automatically.
+    # Missing spot files, a failed child process, or a transient filesystem error may
+    # recover on the next run and must remain retryable rather than being abandoned
+    # after an arbitrary count.
+    terminal = all_missing_terminal and (not coverage_errors or contract_only_errors)
+    contract_backoff = any(
+        str(row.get("state") or "") == "retry_backoff" for row in rows.values()
+    )
+    # The archive can remain incomplete even when there is no retryable contract row:
+    # legacy ledgers may have no contract identity, and sessions whose contracts are
+    # all permanently unavailable can still be missing spot/timeframe files.  Those
+    # failures previously stayed ``retryable`` forever with no ``next_retry_at``, so
+    # the daemon respawned the same doomed child every five minutes after each backlog
+    # rotation.  Bound the *archive* retry cadence as well as the per-contract cadence.
+    coverage_backoff = not terminal and archive_failures >= limit
+    in_backoff = contract_backoff or coverage_backoff
+    state = "terminal_unfillable" if terminal else ("retry_backoff" if in_backoff else "retryable")
+    now_ist = datetime.now(IST)
+    backoff_minutes = _session_archive_retry_backoff_minutes()
+    manifest["schema_version"] = max(
+        _SESSION_ARCHIVE_SCHEMA_VERSION,
+        _safe_nonnegative_int(manifest.get("schema_version")),
+    )
+    manifest["contract_ownership_version"] = (
+        _SESSION_ARCHIVE_CONTRACT_OWNERSHIP_VERSION
+    )
+    manifest["source_event_identity"] = _session_archive_event_identity(root, day)
+    manifest["complete"] = False
+    manifest["repair_status"] = {
+        "state": state,
+        "classification": state,
+        "attempts": attempts,
+        "archive_failures": archive_failures,
+        "max_attempts": limit,
+        "last_attempt_at": now_ist.isoformat(),
+        "last_error": str(default_reason or "archive incomplete")[:1000],
+        "missing_contracts": rows,
+        "source_identity": _session_archive_source_identity(root, day, manifest),
+        "next_retry_at": (
+            (now_ist + timedelta(minutes=backoff_minutes)).isoformat()
+            if in_backoff and not terminal
+            else None
+        ),
+        "next_action": (
+            "manual data recovery required; automatic retries stopped"
+            if terminal
+            else (
+                f"retry incomplete session archive after {backoff_minutes} minute backoff"
+                if in_backoff
+                else "retry authenticated exact-contract backfill before the next archive run"
+            )
+        ),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.warning(f"Could not persist archive repair status for {day}: {exc}")
+    return dict(manifest["repair_status"])
+
+
 def _next_due_session_archive_day(
     root: Path,
     now: datetime,
@@ -723,7 +1069,11 @@ def _next_due_session_archive_day(
             except ValueError:
                 continue
             if parsed < now_ist.date() or (parsed == now_ist.date() and due_today):
-                if not _session_archive_manifest_complete(root, day):
+                if (
+                    not _session_archive_manifest_complete(root, day)
+                    and not _session_archive_manifest_terminal(root, day)
+                    and _session_archive_repair_due(root, day, now_ist)
+                ):
                     due.append(day)
     except OSError as exc:
         logger.warning(f"Unable to inspect session ledgers for archive catch-up: {exc}")
@@ -745,6 +1095,7 @@ def _fetch_contract_history_for_session(
     session_day: str,
     symbol: str,
     token: str,
+    call_outcome: dict | None = None,
 ) -> bool:
     """Fetch one option contract with the requested session as the API end date."""
     try:
@@ -760,8 +1111,104 @@ def _fetch_contract_history_for_session(
         instrument_name=symbol,
         force_refresh=True,
         to_date=target_end,
+        kite_call_outcome=call_outcome,
+        record_kite_history_health=False,
     )
     return df is not None and len(df) > 0
+
+
+def _contract_history_backfill_outcome(
+    data_provider,
+    filled: bool,
+    call_outcome: dict | None = None,
+) -> dict:
+    """Translate the exact authenticated history result into durable repair evidence.
+
+    Kite returns an empty frame for both an ordinary transient failure and a permanently
+    invalid *instrument* token.  Collapsing those outcomes to ``False`` made the archive
+    scheduler retry expired contracts forever even though Kite had given a conclusive
+    answer.  Keep the permanent match intentionally exact: access-token/session errors,
+    throttles, timeouts and successful-but-empty responses remain retryable.
+    """
+    if filled:
+        return {
+            "state": "filled",
+            "reason": "historical fetch returned usable rows",
+            "attempted": True,
+        }
+
+    # Prefer evidence carried by this exact call. The provider-wide status remains a
+    # compatibility fallback for lightweight providers/tests, but is racy when archive
+    # repair and the live scanner fetch history concurrently.
+    exact = dict(call_outcome or {})
+    if exact:
+        last_call_ok = exact.get("ok")
+        failure = str(exact.get("reason") or "").strip()
+    else:
+        status: dict = {}
+        source = getattr(data_provider, "kite", None)
+        status_fn = getattr(source, "historical_rest_status", None)
+        if callable(status_fn):
+            try:
+                value = status_fn() or {}
+                status = dict(value) if isinstance(value, dict) else {}
+            except Exception:
+                status = {}
+        last_call_ok = status.get("kite_historical_rest_last_call_ok")
+        failure = str(
+            status.get("kite_historical_rest_failure")
+            or status.get("kite_historical_rest_last_error")
+            or ""
+        ).strip()
+    normalized = re.sub(r"\s+", " ", failure).strip().lower().rstrip(".")
+    normalized = normalized.removeprefix("kiteconnect.exceptions.")
+    if last_call_ok is False and normalized == "inputexception: invalid token":
+        return {
+            "state": "terminal_unfillable",
+            "reason": "broker permanently rejected the exact instrument token as invalid",
+            "permanent": True,
+            "attempted": True,
+        }
+    if last_call_ok is True:
+        return {
+            "state": "retryable",
+            "reason": "authenticated broker returned zero rows for the closed-session window",
+            "attempted": True,
+        }
+    if failure:
+        return {
+            "state": "retryable",
+            "reason": f"historical broker request failed: {failure}"[:500],
+            "attempted": True,
+        }
+    return {
+        "state": "retryable",
+        "reason": "historical fetch returned no usable rows without conclusive broker evidence",
+        "attempted": True,
+    }
+
+
+def _session_archive_terminal_contracts(root: Path, day: str) -> dict[str, dict]:
+    """Terminal per-contract rows whose ledger/cache evidence has not changed."""
+    manifest = _read_session_archive_manifest(root, day)
+    status = manifest.get("repair_status") or {}
+    if not isinstance(status, dict):
+        return {}
+    recorded = status.get("source_identity")
+    if not isinstance(recorded, dict) or recorded != _session_archive_source_identity(
+        root, day, manifest
+    ):
+        return {}
+    rows = status.get("missing_contracts") or {}
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        str(symbol): dict(row)
+        for symbol, row in rows.items()
+        if isinstance(row, dict)
+        and str(row.get("state") or "") == "terminal_unfillable"
+        and bool(row.get("permanent"))
+    }
 
 
 def _resolve_session_archive_provider(data_provider):
@@ -889,10 +1336,14 @@ def start_session_archiver_scheduler(data_provider=None):
             # Mark only after deferred startup dependencies are ready. A real
             # provider/back-fill/child failure should yield to the rest of the backlog.
             attempted.add(session_day)
+            backfill_outcomes: dict[str, dict] = {}
             if provider is not None:
                 try:
                     from scripts.archive_session_data import (
-                        backfill_contract_history, contract_tokens, load_events,
+                        backfill_contract_history,
+                        contract_tokens,
+                        load_events,
+                        missing_contract_symbols,
                     )
 
                     # The token comes from the session's OWN event stream. Asking the
@@ -903,14 +1354,35 @@ def start_session_archiver_scheduler(data_provider=None):
                     # token was always "", _fetch always returned False, and this
                     # back-fill filled nothing on any session. It stays as a fallback.
                     session_events = load_events(session_day)
-                    session_tokens = contract_tokens(session_events)
+                    session_tokens = contract_tokens(session_events, session_day)
+                    wanted_symbols = missing_contract_symbols(session_day, session_events)
+                    terminal_contracts = _session_archive_terminal_contracts(
+                        root, session_day
+                    )
 
                     def _fetch(symbol: str) -> bool:
+                        terminal_row = terminal_contracts.get(symbol)
+                        if terminal_row is not None:
+                            # A different ledger or cache/archive file identity empties
+                            # terminal_contracts above and automatically re-enables the
+                            # request.  While the evidence is unchanged, do not hammer an
+                            # expired instrument token just because another symbol on the
+                            # same day is still retryable.
+                            backfill_outcomes[symbol] = {
+                                **terminal_row,
+                                "attempted": False,
+                            }
+                            return False
                         token = (
                             session_tokens.get(symbol)
                             or _contract_token_for(provider, symbol)
                         )
                         if not token:
+                            backfill_outcomes[symbol] = {
+                                "state": "retryable",
+                                "reason": "exact contract token absent from session evidence and provider",
+                                "attempted": False,
+                            }
                             return False
                         # force_refresh, because the whole point of this call is to GO
                         # AND GET the day. Otherwise get_historical_candles returns the
@@ -919,16 +1391,36 @@ def start_session_archiver_scheduler(data_provider=None):
                         # whose cache stops at an earlier session answers instantly with
                         # a non-empty frame, this counts a success, and nothing new is
                         # ever written for the archiver to copy.
-                        return _fetch_contract_history_for_session(
-                            provider,
-                            session_day,
-                            symbol,
-                            token,
+                        try:
+                            call_outcome: dict = {}
+                            filled = _fetch_contract_history_for_session(
+                                provider,
+                                session_day,
+                                symbol,
+                                token,
+                                call_outcome=call_outcome,
+                            )
+                        except Exception as exc:
+                            backfill_outcomes[symbol] = {
+                                "state": "retryable",
+                                "reason": f"historical fetch failed: {exc}"[:500],
+                                "attempted": True,
+                            }
+                            return False
+                        backfill_outcomes[symbol] = _contract_history_backfill_outcome(
+                            provider, filled, call_outcome=call_outcome
                         )
+                        return filled
 
                     filled = backfill_contract_history(
                         session_day, _fetch, events=session_events, quiet=True
                     )
+                    for symbol in wanted_symbols:
+                        backfill_outcomes.setdefault(symbol, {
+                            "state": "retryable",
+                            "reason": "backfill produced no classified outcome",
+                            "attempted": False,
+                        })
                     if filled:
                         logger.info(
                             f"Back-filled {len(filled)} contract histories before "
@@ -959,10 +1451,41 @@ def start_session_archiver_scheduler(data_provider=None):
                 detail = ""
                 if isinstance(exc, subprocess.CalledProcessError):
                     detail = str((exc.stderr or exc.stdout or "").strip())[-500:]
-                logger.warning(
-                    f"Session archive failed for {session_day}: {exc}"
-                    + (f"; child output: {detail}" if detail else "")
-                )
+                manifest = _read_session_archive_manifest(root, session_day)
+                coverage = manifest.get("coverage_errors") or []
+                coverage_reason = "; ".join(
+                    str(item).strip() for item in coverage if str(item).strip()
+                ) if isinstance(coverage, list) else ""
+                reason = coverage_reason[:1000] or detail or str(exc)
+                try:
+                    repair = _record_session_archive_repair(
+                        root,
+                        session_day,
+                        backfill_outcomes=backfill_outcomes,
+                        default_reason=reason,
+                    )
+                except Exception as repair_exc:
+                    # The exception path must never terminate the daemon because a
+                    # prior manifest is malformed or temporarily unwritable.
+                    logger.exception(
+                        f"Could not record session archive repair state for {session_day}: "
+                        f"{repair_exc}"
+                    )
+                    repair = {"state": "retryable", "attempts": 0, "max_attempts": 0}
+                if repair.get("state") == "terminal_unfillable":
+                    logger.error(
+                        f"Session archive for {session_day} is terminal-unfillable after "
+                        f"{repair.get('attempts')} repair attempt(s); automatic retries stopped. "
+                        f"See data_store/session_archive/{session_day}/manifest.json."
+                    )
+                else:
+                    logger.warning(
+                        f"Session archive incomplete for {session_day} "
+                        f"(archive failures {repair.get('archive_failures')}/"
+                        f"{repair.get('max_attempts')}; authenticated contract repair "
+                        f"cycles {repair.get('attempts')}): {exc}"
+                        + (f"; child output: {detail}" if detail else "")
+                    )
                 # Retry the missed ledger instead of marking it complete, but do not
                 # spin a failing child process continuously.
                 time.sleep(300.0)
@@ -994,7 +1517,7 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
 
     This intentionally never enables Auto Mode. It only changes the feed/broker
     operating mode so live data, broker health, warmup, and manual supervision
-    are ready before the 09:18 trading gate.
+    are ready before the 09:15 trading gate.
     """
     if not _setting_enabled(getattr(settings, "auto_real_mode_premarket_enabled", True), True):
         return False, "disabled"
@@ -1024,15 +1547,29 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
     current_mode = str(getattr(scanner, "mode", "") or "").upper()
     if current_mode == "REAL":
         if bool(getattr(scanner, "auto_mode", False)):
-            scanner.configure(auto_mode=False, persist_settings=False)
-            logger.warning("Premarket REAL worker forced Auto Mode OFF while already in REAL mode.")
+            auto_disabled = scanner.configure(auto_mode=False, persist_settings=False)
+            if not auto_disabled or bool(getattr(scanner, "auto_mode", False)):
+                reason = str(
+                    getattr(scanner, "_last_configure_block_reason", "")
+                    or "auto_mode_disable_blocked"
+                )
+                logger.warning(f"Premarket REAL/manual arm blocked: {reason}")
+                return False, reason
         return True, "already_real_manual"
     if current_mode != "HISTORICAL":
         return False, f"unsupported_mode:{current_mode or 'unknown'}"
 
-    if bool(getattr(scanner, "auto_mode", False)):
-        scanner.configure(auto_mode=False, persist_settings=False)
-        logger.info("Premarket REAL worker disabled Auto Mode before arming REAL/manual mode.")
+    # The premarket worker may start while historical Auto Mode is still enabled
+    # from a replay.  Disarm it before changing the broker/feed mode so there is no
+    # instant in which the REAL singleton can inherit unattended execution.
+    auto_disabled = scanner.configure(auto_mode=False, persist_settings=False)
+    if not auto_disabled or bool(getattr(scanner, "auto_mode", False)):
+        reason = str(
+            getattr(scanner, "_last_configure_block_reason", "")
+            or "auto_mode_disable_blocked"
+        )
+        logger.warning(f"Premarket REAL/manual arm blocked: {reason}")
+        return False, reason
 
     configured = scanner.configure(
         mode="REAL",
@@ -1042,9 +1579,7 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
         persist_settings=False,
     )
     if configured and str(getattr(scanner, "mode", "") or "").upper() == "REAL":
-        if bool(getattr(scanner, "auto_mode", False)):
-            scanner.configure(auto_mode=False, persist_settings=False)
-        message = "Auto premarket arm: switched to REAL manual mode; Auto Mode remains OFF."
+        message = "Auto premarket arm: switched to REAL mode."
         logger.warning(message)
         try:
             scanner.log_event(message, "system")
@@ -1168,10 +1703,8 @@ def create_system():
     logger.info("🚀 UT1 Index Trading System v2.0")
     logger.info("═" * 60)
 
-    # 1. Data Provider (Yahoo Finance + AngelOne)
-    # No credentials passed: Kite authenticates through the browser login, and the
-    # provider binds to the shared KiteAuth session in connect(). Feeding it the old
-    # AngelOne credentials implied they still mattered — they do not.
+    # 1. Kite primary, Fyers secondary, AngelOne index-price fallback. Credentials are
+    # loaded inside the provider so secrets never travel through startup logs/arguments.
     data_provider = MarketDataProvider()
     data_provider.connect()
     if settings.trading_mode == "REAL":

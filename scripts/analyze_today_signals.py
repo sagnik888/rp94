@@ -58,7 +58,7 @@ def main() -> None:
                 if sig.timestamp.date() != today:
                     continue
                 candle_close = sig.timestamp + pd.Timedelta(minutes=5 if tf == "5min" else 15)
-                if candle_close.time() < pd.Timestamp("09:18").time():
+                if candle_close.time() < pd.Timestamp("09:15").time():
                     continue
                 rows.append(
                     {

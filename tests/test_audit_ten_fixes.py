@@ -791,10 +791,11 @@ def test_r4_severity_cap_limits_stacking():
     assert lab2 == "pullback_hold"
 
 
-def test_r8_quarantine_count_locked():
-    from tests.conftest import _QUARANTINED
+def test_r8_has_no_collection_time_baseline_quarantine():
+    import tests.conftest as conftest
 
-    assert len(_QUARANTINED) == 12
+    assert not hasattr(conftest, "_QUARANTINED")
+    assert not hasattr(conftest, "pytest_collection_modifyitems")
 
 
 def test_r2_tm_uses_published_cut_r_override():

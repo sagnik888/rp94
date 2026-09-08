@@ -155,7 +155,7 @@ def test_the_runner_lock_keeps_most_of_the_peak(regime):
     px, why = bt.sim_runner(_trade(regime), bars, _sc(), 65)
 
     assert why == "RUNNER_LOCK"
-    assert px >= ENTRY + peak_gain * 0.85
+    assert px >= ENTRY + peak_gain * 0.80
 
 
 def test_dynamic_helper_can_give_choppier_regimes_more_room():

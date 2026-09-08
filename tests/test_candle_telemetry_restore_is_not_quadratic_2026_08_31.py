@@ -125,13 +125,7 @@ def _frame(index, *, history, duplicate, integral, rng):
 
 
 def _outcome(function, combined, existing):
-    """The frame, or the exception type if the call raises.
-
-    Duplicate index labels are NOT supported by this function and never were: a
-    single-label lookup then returns a Series, and `str(series or "")` raises
-    ValueError: The truth value of a Series is ambiguous. That is pre-existing
-    behaviour, so the rewrite has to reproduce the raise, not paper over it.
-    """
+    """The frame, or the exception type if an unexpected call raises."""
     try:
         return function(combined, existing)
     except Exception as exc:  # noqa: BLE001 - the exception IS the observation
@@ -158,12 +152,11 @@ def _difference(left, right):
     return None
 
 
-def test_the_rewrite_matches_the_old_implementation_exactly():
-    """Values and dtypes, over overlapping, disjoint and duplicate-label frames."""
+def test_the_rewrite_matches_the_old_implementation_for_unique_timestamps():
+    """Values and dtypes match the old implementation where its input was valid."""
     rng = random.Random(20260831)
     differences = []
     duplicates = 0
-    raised = 0
     for trial in range(200):
         rows = rng.randint(1, 40)
         shift = rng.randint(0, 10)
@@ -181,19 +174,36 @@ def test_the_rewrite_matches_the_old_implementation_exactly():
             integral=integral,
             rng=rng,
         )
-        expected = _outcome(reference_restore, incoming.copy(), existing.copy())
         actual = _outcome(
             CandleBuilder._restore_candle_telemetry, incoming.copy(), existing.copy()
         )
-        if isinstance(expected, str):
-            raised += 1
+        if duplicate:
+            # The old function raised for this input; the fixed path must instead
+            # canonicalise to a unique, sorted last-write-wins index.
+            assert not isinstance(actual, str), f"duplicate timestamps still raise: {actual}"
+            assert actual.index.is_unique
+            continue
+        expected = _outcome(reference_restore, incoming.copy(), existing.copy())
         difference = _difference(expected, actual)
         if difference:
             differences.append(f"trial {trial}: {difference}")
 
     assert duplicates > 0, "the duplicate-label path was never exercised"
-    assert raised > 0, "the pre-existing duplicate-label raise was never reached"
     assert not differences, "the rewrite changed behaviour: " + "; ".join(differences[:5])
+
+
+def test_duplicate_timestamps_are_repaired_not_left_to_raise():
+    """A provider retry cannot poison the next telemetry restoration."""
+    index = pd.to_datetime(["2026-08-31 09:15", "2026-08-31 09:15", "2026-08-31 09:16"])
+    existing = pd.DataFrame(
+        {"tick_count": [2, 7, 9], "source": ["kite", "kite", "kite"]}, index=index
+    )
+    incoming = pd.DataFrame(
+        {"tick_count": [0, 0, 0], "source": ["history", "history", "history"]}, index=index
+    )
+    restored = CandleBuilder._restore_candle_telemetry(incoming, existing)
+    assert restored.index.is_unique
+    assert restored.loc[pd.Timestamp("2026-08-31 09:15"), "tick_count"] == 7
 
 
 def test_a_nan_restored_into_an_int_column_still_upcasts():

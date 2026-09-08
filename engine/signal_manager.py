@@ -315,9 +315,6 @@ class SignalManager:
             logger.debug(f"Confidence calibration unavailable: {exc}")
             _settings = None
 
-        # Exhaustion honesty cap: an ADX>40 entry carries its own "Risk of
-        # exhaustion" flag, yet could still grade A+ 0.95 (both 10:25 losers on
-        # 2026-07-03). An exhaustion-flagged setup must not wear the top label.
         try:
             if _settings is None:
                 from config.settings import get_settings as _gs_cap

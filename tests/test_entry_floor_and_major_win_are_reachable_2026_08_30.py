@@ -150,6 +150,23 @@ def test_an_unpriceable_position_falls_back_to_the_flat_rung():
     assert sc._major_win_guard_arm_rs(None) == pytest.approx(flat)
 
 
+def test_futures_major_win_uses_a_risk_multiple_not_option_cost_percentages():
+    sc = Scanner.__new__(Scanner)
+    future = SimpleNamespace(
+        instrument="NIFTY", inst_type="FUT", entry_price=25_000.0,
+        lots=1, lot_size=25, quantity=25, frozen_initial_risk_rs=2_500.0,
+    )
+
+    arm = sc._major_win_guard_arm_rs(future)
+
+    expected = max(
+        get_settings().major_win_guard_flat_fallback_rs,
+        future.frozen_initial_risk_rs * get_settings().major_win_guard_futures_r_multiple,
+    )
+    assert arm == pytest.approx(expected)
+    assert arm > future.frozen_initial_risk_rs, "a sub-1R peak must not arm a major-win exit"
+
+
 def test_both_ladders_read_the_same_rung():
     """The session and live ladders priced the same exit differently once already."""
     import inspect

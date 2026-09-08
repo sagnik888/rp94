@@ -163,6 +163,173 @@ def test_health_flags_the_futures_fallback_as_degraded():
     assert row["futures_oi"] == 1_200_000.0, "OI is part of the decided fallback payload"
 
 
+def test_fresh_fyers_cash_candles_are_the_threshold_source_even_with_futures_confirmation():
+    """The health verdict must describe the bars the ratio gates actually consume."""
+    scanner = _scanner("kite_index_futures")
+    end = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=1)
+    index = pd.date_range(end=end, periods=10, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "open": range(10),
+            "high": range(1, 11),
+            "low": range(10),
+            "close": range(1, 11),
+            "volume": [1000 + i for i in range(10)],
+            "volume_basis": ["fyers_index"] * 10,
+            "source": ["fyers_history"] * 10,
+        },
+        index=index,
+    )
+    scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
+
+    health = scanner.volume_source_health()
+    row = health["instruments"]["NIFTY"]
+
+    assert health["healthy"] is True
+    assert row["source"] == "fyers_history"
+    assert row["volume_comparable"] is True
+    assert row["fyers_history_volume_fresh"] is True
+    assert row["futures_available"] is True
+
+    context = scanner._prediction_volume_context("NIFTY", frame)
+    assert context["volume_source"] == "fyers_history"
+    assert context["volume_basis"] == "fyers_index"
+    assert context["volume_comparable"] is True
+    assert context["threshold_volume_available"] is True
+    assert context["intrabar_volume_available"] is False
+    assert context["volume_available"] is False
+    assert context["futures_volume_available"] is False
+
+
+def test_forming_price_only_bar_keeps_completed_cash_thresholds_without_inventing_intrabar_volume():
+    """A blank forming bar is not a cash-volume outage and is not live volume either."""
+    scanner = _scanner("kite_index_futures")
+    current_minute = datetime.now().replace(second=0, microsecond=0)
+    index = pd.date_range(end=current_minute, periods=10, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "open": range(10),
+            "high": range(1, 11),
+            "low": range(10),
+            "close": range(1, 11),
+            "volume": [1000 + i for i in range(9)] + [0],
+            "volume_basis": ["fyers_index"] * 9 + [""],
+            "source": ["fyers_history"] * 9 + ["live_tick"],
+        },
+        index=index,
+    )
+    scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
+    # The provider can legitimately retain a recent positive cumulative total even
+    # though the newest price-only tick supplied no volume for the forming candle.
+    scanner.data.get_index_tick_volume_diagnostics = lambda: {
+        "NIFTY": {
+            "volume_available": True,
+            "volume_reliable": True,
+            "volume_comparable": True,
+            "volume_source": "fyers_index",
+        }
+    }
+
+    health = scanner.volume_source_health()
+    row = health["instruments"]["NIFTY"]
+
+    assert health["healthy"] is True
+    assert row["source"] == "fyers_history"
+    assert row["threshold_volume_available"] is True
+    assert row["completed_cash_volume_fresh"] is True
+    assert row["intrabar_volume_available"] is False
+    assert row["latest_candle_source"] == "live_tick"
+    assert row["latest_candle_volume"] == 0.0
+    assert row["futures_available"] is True
+
+    context = scanner._prediction_volume_context("NIFTY", frame)
+    assert context["volume_source"] == "fyers_history"
+    assert context["volume_comparable"] is True
+    assert context["threshold_volume_available"] is True
+    assert context["completed_cash_volume_fresh"] is True
+    assert context["intrabar_volume_available"] is False
+    assert context["volume_available"] is False
+    assert context["volume_reliable"] is False
+    assert context["latest_1min_volume"] == 0.0
+    assert context["latest_1min_volume_source"] == "live_tick"
+
+
+def test_zero_latest_completed_cash_bar_cannot_be_skipped_for_older_positive_evidence():
+    scanner = _scanner("kite_index_futures")
+    current_minute = datetime.now().replace(second=0, microsecond=0)
+    index = pd.date_range(end=current_minute, periods=10, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "volume": [1000 + i for i in range(8)] + [0, 0],
+            "volume_basis": ["fyers_index"] * 9 + [""],
+            "source": ["fyers_history"] * 9 + ["live_tick"],
+        },
+        index=index,
+    )
+    scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
+
+    health = scanner.volume_source_health()
+    row = health["instruments"]["NIFTY"]
+
+    assert health["healthy"] is False
+    assert row["source"] == "kite_index_futures"
+    assert row["threshold_volume_available"] is False
+    assert row["completed_cash_volume_fresh"] is False
+    assert row["intrabar_volume_available"] is False
+
+
+def test_prior_minute_live_cash_bar_is_completed_not_intrabar():
+    scanner = _scanner("kite_index_futures")
+    end = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=1)
+    index = pd.date_range(end=end, periods=10, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "volume": [1000 + i for i in range(10)],
+            "volume_basis": ["fyers_index"] * 10,
+            "source": ["live_tick"] * 10,
+        },
+        index=index,
+    )
+    scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
+
+    row = scanner.volume_source_health()["instruments"]["NIFTY"]
+    assert row["threshold_volume_available"] is True
+    assert row["completed_cash_volume_fresh"] is True
+    assert row["intrabar_volume_available"] is False
+    context = scanner._prediction_volume_context("NIFTY", frame)
+    assert context["intrabar_volume_available"] is False
+    assert context["volume_available"] is False
+    assert context["volume_reliable"] is False
+
+
+@pytest.mark.parametrize("failure", ["stale", "mixed"])
+def test_stale_or_mixed_cash_candles_cannot_hide_the_futures_fallback(failure):
+    scanner = _scanner("kite_index_futures")
+    end = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=1)
+    if failure == "stale":
+        end -= timedelta(minutes=10)
+    index = pd.date_range(end=end, periods=10, freq="1min")
+    bases = ["fyers_index"] * 10
+    if failure == "mixed":
+        bases[-1] = "MIXED"
+    frame = pd.DataFrame(
+        {
+            "volume": [1000 + i for i in range(10)],
+            "volume_basis": bases,
+            "source": ["fyers_history"] * 10,
+        },
+        index=index,
+    )
+    scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
+
+    health = scanner.volume_source_health()
+    row = health["instruments"]["NIFTY"]
+
+    assert health["healthy"] is False
+    assert row["source"] == "kite_index_futures"
+    assert row["volume_comparable"] is False
+
+
 def test_health_flags_a_total_outage():
     health = _scanner("none").volume_source_health()
     assert health["degraded"] == ["NIFTY"] and "none" in health["summary"].lower()
@@ -409,6 +576,8 @@ def test_a_short_warmup_series_is_not_called_dry():
     health = s.volume_source_health()
     assert health["instruments"]["NIFTY"]["candle_volume_dry"] is False
     assert health["healthy"] is True
+    assert health["instruments"]["NIFTY"]["threshold_volume_available"] is False
+    assert "warming" in health["summary"].lower()
 
 
 def test_dry_candles_raise_the_alert_even_when_the_source_looks_primary():

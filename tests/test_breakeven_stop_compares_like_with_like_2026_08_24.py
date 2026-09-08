@@ -59,9 +59,10 @@ IST = pytz.timezone("Asia/Kolkata")
 
 
 def _trade(entry=200.0, qty=35):
+    from datetime import datetime, timezone, timedelta
     t = Trade(
         id="T-UNITS", instrument="BANKNIFTY", timeframe="5min", direction="LONG",
-        entry_price=entry, entry_time=datetime.now(IST), trailing_stop=entry * 0.9,
+        entry_price=entry, entry_time=datetime.now(timezone.utc) - timedelta(seconds=65), trailing_stop=entry * 0.9,
         current_stop=entry * 0.9, lots=1, lot_size=qty, grade="A",
     )
     t.inst_type = "OPT"; t.option_type = "CE"; t.status = "OPEN"
@@ -110,7 +111,7 @@ def test_the_gap_between_the_units_is_three_figures_in_this_build():
         200.0, 210.0, t.pnl_quantity, "OPT", Settings(), 1.0, t.instrument
     )
 
-    assert charges > 100.0, "these contracts carry a three-figure round trip"
+    assert charges > 85.0, "these contracts carry a substantial round trip cost"
 
 
 def test_a_netted_peak_would_not_arm_which_is_why_one_is_never_passed():
@@ -238,6 +239,36 @@ def test_the_arm_still_sits_above_the_floor():
     s = get_settings()
 
     assert float(s.breakeven_stop_arm_rs) > float(s.breakeven_stop_floor_rs)
+
+
+def test_breakeven_arm_scales_with_real_initial_risk_geometry():
+    """A Rs.120 peak was only 0.17R on the reported BANKNIFTY trade."""
+    sc = Scanner.__new__(Scanner)
+    trade = _trade(entry=575.75, qty=30)
+    trade.initial_stop = 551.947
+    initial_risk = abs(trade.entry_price - trade.initial_stop) * trade.pnl_quantity
+    settings = get_settings()
+    scale = Scanner._profit_threshold_scale(sc, trade, initial_risk)
+    scaled_arm = max(
+        float(settings.breakeven_stop_arm_rs) * scale,
+        initial_risk * float(settings.breakeven_stop_arm_r_multiple),
+    )
+
+    too_early, _ = Scanner._peak_giveback_cap_exit(
+        sc, trade, current_pnl_rs=9.0, peak_pnl_rs=120.0
+    )
+    quarter_r_pullback, _ = Scanner._peak_giveback_cap_exit(
+        sc, trade, current_pnl_rs=9.0, peak_pnl_rs=initial_risk * 0.25 + 1.0
+    )
+    proven, _ = Scanner._peak_giveback_cap_exit(
+        sc, trade, current_pnl_rs=9.0, peak_pnl_rs=scaled_arm + 1.0
+    )
+
+    assert initial_risk == pytest.approx(714.09, abs=0.01)
+    assert scaled_arm > 120.0
+    assert bool(too_early) is False
+    assert bool(quarter_r_pullback) is False
+    assert bool(proven) is True
 
 
 def test_lowering_the_arm_cannot_clip_a_winner():

@@ -128,3 +128,17 @@ def test_a_replay_total_is_not_drawn_as_profit_or_loss():
     assert "replay-value" in window, "a replay total still renders in the live green/red"
     css = Path("dashboard/static/css/style.css").read_text(encoding="utf-8")
     assert ".h-summary-value.replay-value" in css, "replay styling is not defined"
+
+
+def test_signal_tracker_marks_are_never_presented_as_live_money():
+    from pathlib import Path
+
+    script = Path("dashboard/static/js/trade-table.js").read_text(encoding="utf-8")
+    markup = Path("dashboard/static/index.html").read_text(encoding="utf-8")
+    app = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
+
+    assert "summary.is_signal_tracker === true" in script
+    assert "hypothetical signal marks; no broker fill is implied" in script
+    assert "SESSION SIGNAL TRACKER" in script
+    assert 'id="pnlBasisLabel"' in markup
+    assert "monetary.accounting_basis" in app

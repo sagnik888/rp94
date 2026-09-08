@@ -54,7 +54,7 @@
   "signal_timeframes": ["5min", "15min"],
   "tracking_timeframe": "1min",
   "session": {
-    "start": "09:20",
+    "start": "09:15",
     "end": "15:29",
     "market_open": "09:15",
     "market_close": "15:30"

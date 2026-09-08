@@ -953,11 +953,8 @@ class KiteBroker(Broker):
             params["market_protection"] = -1
         if order_type == "LIMIT":
             params["price"] = self._tick_price(limit_price)
-            # Backstop only — see kite_entry_limit_ttl_minutes. The cancel/replace
-            # path handles staleness in ~12s; this exists so a limit left resting by a
-            # dead process expires server-side instead of filling hours later.
             ttl = self._entry_limit_ttl_minutes()
-            if ttl > 0:
+            if ttl > 0 and str(exchange or "").upper() != "BFO":
                 params["validity"] = "TTL"
                 params["validity_ttl"] = ttl
         # An explicit tag names the LEG and attempt; trade_id alone can only ever
@@ -1875,6 +1872,49 @@ class KiteBroker(Broker):
             return None
         return total
 
+    @staticmethod
+    def _entry_margin_refusal_cache_key(
+        symbol: str, qty: int, side: str, product_type: str, price: float
+    ) -> tuple:
+        return (
+            str(symbol or "").upper(), int(qty or 0), str(side or "BUY").upper(),
+            str(product_type or "").upper(), round(float(price or 0.0), 2),
+        )
+
+    def _cache_entry_margin_refusal(self, key: tuple, verdict: Dict[str, Any]) -> None:
+        """Remember only a definitive shortfall for the scanner's non-blocking gate."""
+        if not isinstance(verdict, dict) or verdict.get("ok", True):
+            return
+        cache = getattr(self, "_entry_margin_refusal_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._entry_margin_refusal_cache = cache
+        cache[key] = {"at": time.monotonic(), "verdict": dict(verdict)}
+
+    def cached_entry_margin_refusal(self, **kwargs) -> Optional[Dict[str, Any]]:
+        """Return a very recent exact funds refusal without performing I/O.
+
+        This is deliberately one-sided.  A cached approval is not authority to spend,
+        because account funds and in-flight reservations can change immediately.  A
+        cached refusal only avoids repeating a known doomed entry while the background
+        preflight retains the authoritative check and reservation.
+        """
+        try:
+            key = self._entry_margin_refusal_cache_key(
+                str(kwargs.get("symbol") or ""),
+                int(kwargs.get("qty") or kwargs.get("quantity") or 0),
+                str(kwargs.get("side") or "BUY"),
+                str(kwargs.get("product_type") or "CARRYFORWARD"),
+                float(kwargs.get("price") or 0.0),
+            )
+        except (TypeError, ValueError):
+            return None
+        record = getattr(self, "_entry_margin_refusal_cache", {}).get(key)
+        if not isinstance(record, dict) or time.monotonic() - float(record.get("at", 0.0) or 0.0) > 2.0:
+            return None
+        verdict = record.get("verdict")
+        return dict(verdict) if isinstance(verdict, dict) and not verdict.get("ok", True) else None
+
     def preflight_entry_margin(self, **kwargs) -> Dict[str, Any]:
         """Compare the exact required margin against free cash, where both are known.
 
@@ -1900,6 +1940,10 @@ class KiteBroker(Broker):
             price = float(kwargs.get("price") or 0.0)
         except (TypeError, ValueError):
             price = 0.0
+        reserve = bool(kwargs.get("reserve", True))
+        cache_key = self._entry_margin_refusal_cache_key(
+            symbol, qty, side, product_type, price
+        )
 
         required = (
             self.required_entry_margin(symbol, qty, side, product_type, price=price)
@@ -1969,7 +2013,7 @@ class KiteBroker(Broker):
             outstanding = sum(r["amount"] for r in self._margin_reservations.values())
             spendable = available - outstanding
             if spendable < committed:
-                return {
+                verdict = {
                     "ok": False, "reservation_id": "", "basis": "KITE_ORDER_MARGIN",
                     "available": available, "required": required,
                     "reserved": outstanding,
@@ -1980,10 +2024,14 @@ class KiteBroker(Broker):
                            if outstanding else "")
                     ),
                 }
-            reservation_id = f"{symbol}:{time.time():.6f}"
-            self._margin_reservations[reservation_id] = {
-                "amount": committed, "at": time.time(), "symbol": symbol,
-            }
+                self._cache_entry_margin_refusal(cache_key, verdict)
+                return verdict
+            reservation_id = ""
+            if reserve:
+                reservation_id = f"{symbol}:{time.time():.6f}"
+                self._margin_reservations[reservation_id] = {
+                    "amount": committed, "at": time.time(), "symbol": symbol,
+                }
         return {
             "ok": True,
             "reservation_id": reservation_id,

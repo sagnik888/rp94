@@ -775,7 +775,7 @@ def test_scanner_bool_parser_treats_false_string_as_disabled():
     assert Scanner._setting_enabled("true", False) is True
 
 
-def test_signal_processor_false_string_disables_regime_gate(monkeypatch):
+def test_signal_processor_false_string_cannot_disable_canonical_regime_floor(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "ut_regime_adaptation", "False")
     monkeypatch.setattr(settings, "ut_backtest_more_results", True)
@@ -787,12 +787,15 @@ def test_signal_processor_false_string_disables_regime_gate(monkeypatch):
     processor = SignalProcessor.__new__(SignalProcessor)
     processor.scanner = DummyScanner()
 
-    assert processor._passes_quality_gate(
+    verdict = processor._passes_quality_gate(
         "15min",
-        "B",
+        "B+",
         0.55,
         "CHOPPY",
         "OPT",
         settings,
         adx_value=0.0,
+        return_verdict=True,
     )
+    assert verdict.allowed is False
+    assert verdict.reason_code == "BPLUS_RISKY_SETUP_INSUFFICIENT"

@@ -975,6 +975,7 @@ html, body {
 }
 .gateway-badge.online { color: var(--green); border-color: var(--green-dim); background: var(--green-dim); }
 .gateway-badge.offline { color: var(--red); border-color: var(--red-dim); background: var(--red-dim); }
+.gateway-badge.standby { color: var(--blue); border-color: rgba(59, 130, 246, 0.35); background: rgba(59, 130, 246, 0.12); }
 .gateway-badge.auth-required { color: var(--orange); border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.14); cursor: pointer; }
 .gw-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .quote-session-label.pre { color: var(--orange) !important; }
@@ -4562,15 +4563,30 @@ input:checked + .slider-mini:before { transform: translateX(16px); }
 }
 
 
-/* Backtest-replay headline P&L.
-   A replay total shown in the same green as live money is how a -Rs 1,106 session read
-   as +Rs 6,065 on 2026-08-31. Amber, not green/red: it is not a result, it is a rehearsal. */
-.h-summary-value.replay-value {
+/* Non-money P&L (backtest replay or accepted-signal tracker).
+   A hypothetical total shown in the same green as broker P&L invites a false claim.
+   Amber, not green/red: it is evidence for review, not realised money. */
+.h-summary-value.replay-value,
+.h-summary-value.nonmoney-value {
     color: #f0a020;
     font-style: italic;
 }
-.h-summary-label.replay-label {
+.h-summary-label.replay-label,
+.h-summary-label.nonmoney-label {
     color: #f0a020;
     font-weight: 700;
     letter-spacing: 0.02em;
+}
+.pnl-basis-label {
+    margin: 0 0 10px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+}
+.pnl-basis-label.nonmoney {
+    border-color: rgba(240, 160, 32, 0.45);
+    color: #f0a020;
 }

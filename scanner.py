@@ -24,7 +24,11 @@ from typing import Dict, Optional, Callable, List, Tuple, Any
 from loguru import logger
 from data.sqlite_db import db
 
-from config.settings import get_settings
+from config.settings import (
+    get_settings,
+    normalize_timeframe_entry_policy,
+    timeframe_entry_timeframes,
+)
 from data.market_data import FYERS_INDEX_SYMBOLS, MarketDataProvider
 from data.candle_builder import CandleBuilder
 from data.warm_memory import WarmMemoryStore, dataframe_to_records, records_to_dataframe
@@ -319,6 +323,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._engine_lab_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="EngineLabRefresh"
         )
+        self._scanner_live_executor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="ScannerLive"
+        )
         self.recalculation_queue = RecalculationQueue(
             self._perform_full_recalculation_impl,
             debounce_seconds=float(getattr(settings, "settings_recalculation_debounce_seconds", 8.0) or 8.0),
@@ -348,7 +355,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._last_data_fetch: Dict[str, float] = {}
         self._api_semaphore = asyncio.Semaphore(1) # Background history semaphore (serialized to prevent rate limits)
         self._ltp_semaphore = asyncio.Semaphore(5) # High-priority price semaphore (LTP)
-        self._ltp_rate_limiter = TokenBucket(capacity=3, fill_rate=2.0)
+        # Four index fallback polls form one 2-second batch.  Capacity four prevents one
+        # symbol being arbitrarily delayed inside that safe 2 requests/second average.
+        self._ltp_rate_limiter = TokenBucket(capacity=4, fill_rate=2.0)
         self._state_lock = asyncio.Lock()
         self._initial_setup_task = None
         self._initial_setup_completed = False
@@ -665,6 +674,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._morning_refresh_summary: Dict[str, Any] = {}
         self._morning_refresh_attempts: Dict[str, int] = {}
         self._morning_refresh_catchup_done_date: Optional[str] = None
+        self._configured_startup_auto_armed_date: Optional[str] = None
+        self._configured_startup_auto_last_attempt_at: float = 0.0
         self._pending_live_signals = {}
 
         # â• â• â•  CACHED PROCESS RESULTS (avoid double-processing) â• â• â•
@@ -2499,10 +2510,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         as_of: Optional[datetime] = None,
         stored: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, Dict[str, float]]:
-        """SNAPBACK size-of-event: 0.40%+/5m OR 0.50%+/10m (OR logic)."""
+        """SNAPBACK size-of-event: 0.30%+/5m OR 0.40%+/10m (OR logic)."""
         settings = get_settings()
-        thr5 = float(getattr(settings, "post_exit_reversion_fast_move_pct", 0.40) or 0.40)
-        thr10 = float(getattr(settings, "post_exit_reversion_slow_move_pct", 0.50) or 0.50)
+        thr5 = float(getattr(settings, "post_exit_reversion_fast_move_pct", 0.30) or 0.30)
+        thr10 = float(getattr(settings, "post_exit_reversion_slow_move_pct", 0.40) or 0.40)
         lb5 = float(getattr(settings, "post_exit_reversion_fast_lookback_minutes", 5.0) or 5.0)
         lb10 = float(getattr(settings, "post_exit_reversion_slow_lookback_minutes", 10.0) or 10.0)
         m5 = 0.0
@@ -2568,7 +2579,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Open / refresh the post-exit or open-distress reversion window for an index.
 
         Returns True if the window was armed. When require_big_move is True (default),
-        arms only if short-span move qualifies: 0.40%+/5m OR 0.50%+/10m.
+        arms only if short-span move qualifies: 0.30%+/5m OR 0.40%+/10m.
         Prefer calling only for 5min/15min source trades (see source_tf filter at
         exit/distress call sites).
         """
@@ -2589,9 +2600,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.info(
                 f"🔄 [REVERSION SCALP] Window NOT opened for {base} ({source}): "
                 f"5m={move_info.get('move_5m_pct', 0):.2f}% "
-                f"(need>={move_info.get('thr_5m', 0.40):.2f}%) / "
+                f"(need>={move_info.get('thr_5m', 0.30):.2f}%) / "
                 f"10m={move_info.get('move_10m_pct', 0):.2f}% "
-                f"(need>={move_info.get('thr_10m', 0.50):.2f}%) "
+                f"(need>={move_info.get('thr_10m', 0.40):.2f}%) "
                 f"({reason or 'event'})"
             )
             return False
@@ -3196,6 +3207,54 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "power_move_spike_range_atr_mult": getattr(get_settings(), "power_move_spike_range_atr_mult", 2.5),
             "volume_spike_entry_enabled": getattr(get_settings(), "volume_spike_entry_enabled", True),
             "one_min_scalping_enabled": getattr(get_settings(), "one_min_scalping_enabled", True),
+            "fifteen_min_one_min_support_exit_enabled": getattr(
+                get_settings(), "fifteen_min_one_min_support_exit_enabled", True
+            ),
+            "fifteen_min_one_min_support_min_hold_seconds": getattr(
+                get_settings(), "fifteen_min_one_min_support_min_hold_seconds", 15.0
+            ),
+            "fifteen_min_one_min_support_fresh_trade_seconds": getattr(
+                get_settings(), "fifteen_min_one_min_support_fresh_trade_seconds", 60.0
+            ),
+            "fifteen_min_one_min_support_loss_min_r": getattr(
+                get_settings(), "fifteen_min_one_min_support_loss_min_r", 0.35
+            ),
+            "fifteen_min_one_min_support_stop_near_r": getattr(
+                get_settings(), "fifteen_min_one_min_support_stop_near_r", 0.35
+            ),
+            "fifteen_min_one_min_support_win_giveback_pct": getattr(
+                get_settings(), "fifteen_min_one_min_support_win_giveback_pct", 0.25
+            ),
+            "fifteen_min_one_min_support_lock_buffer_r": getattr(
+                get_settings(), "fifteen_min_one_min_support_lock_buffer_r", 0.15
+            ),
+            "fifteen_min_one_min_support_premium_adverse_min_r": getattr(
+                get_settings(), "fifteen_min_one_min_support_premium_adverse_min_r", 0.10
+            ),
+            "fifteen_min_one_min_support_min_confirmations": getattr(
+                get_settings(), "fifteen_min_one_min_support_min_confirmations", 2
+            ),
+            "fifteen_min_fast_intelligence_enabled": getattr(
+                get_settings(), "fifteen_min_fast_intelligence_enabled", True
+            ),
+            "fifteen_min_fast_intelligence_min_sources": getattr(
+                get_settings(), "fifteen_min_fast_intelligence_min_sources", 3
+            ),
+            "fifteen_min_fast_chain_min_votes": getattr(
+                get_settings(), "fifteen_min_fast_chain_min_votes", 2
+            ),
+            "fifteen_min_fast_depth_max_age_seconds": getattr(
+                get_settings(), "fifteen_min_fast_depth_max_age_seconds", 2.0
+            ),
+            "fifteen_min_fast_order_flow_bullish_ratio": getattr(
+                get_settings(), "fifteen_min_fast_order_flow_bullish_ratio", 1.08
+            ),
+            "fifteen_min_fast_order_flow_bearish_ratio": getattr(
+                get_settings(), "fifteen_min_fast_order_flow_bearish_ratio", 0.92
+            ),
+            "fifteen_min_live_expected_move_enabled": getattr(
+                get_settings(), "fifteen_min_live_expected_move_enabled", True
+            ),
             "one_min_scalping_high_burst_only": getattr(get_settings(), "one_min_scalping_high_burst_only", True),
             "post_exit_reversion_enabled": getattr(get_settings(), "post_exit_reversion_enabled", False),
             "post_exit_reversion_window_minutes": getattr(get_settings(), "post_exit_reversion_window_minutes", 3.0),
@@ -3205,11 +3264,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "post_exit_reversion_open_distress_enabled": getattr(get_settings(), "post_exit_reversion_open_distress_enabled", True),
             "post_exit_reversion_loss_band_soft_rs": getattr(get_settings(), "post_exit_reversion_loss_band_soft_rs", 1000.0),
             "post_exit_reversion_loss_band_deep_rs": getattr(get_settings(), "post_exit_reversion_loss_band_deep_rs", 2000.0),
-            "post_exit_reversion_min_move_pct": getattr(get_settings(), "post_exit_reversion_min_move_pct", 0.40),
+            "post_exit_reversion_min_move_pct": getattr(get_settings(), "post_exit_reversion_min_move_pct", 0.30),
             "post_exit_reversion_move_lookback_minutes": getattr(get_settings(), "post_exit_reversion_move_lookback_minutes", 5.0),
-            "post_exit_reversion_fast_move_pct": getattr(get_settings(), "post_exit_reversion_fast_move_pct", 0.40),
+            "post_exit_reversion_fast_move_pct": getattr(get_settings(), "post_exit_reversion_fast_move_pct", 0.30),
             "post_exit_reversion_fast_lookback_minutes": getattr(get_settings(), "post_exit_reversion_fast_lookback_minutes", 5.0),
-            "post_exit_reversion_slow_move_pct": getattr(get_settings(), "post_exit_reversion_slow_move_pct", 0.50),
+            "post_exit_reversion_slow_move_pct": getattr(get_settings(), "post_exit_reversion_slow_move_pct", 0.40),
             "post_exit_reversion_slow_lookback_minutes": getattr(get_settings(), "post_exit_reversion_slow_lookback_minutes", 10.0),
             "rare_dual_tf_entry_enabled": getattr(get_settings(), "rare_dual_tf_entry_enabled", True),
             "rare_dual_tf_min_grade": getattr(get_settings(), "rare_dual_tf_min_grade", "A"),
@@ -4738,9 +4797,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 logger.info(f"UT Bot Preset updated: {preset}")
 
         if timeframe_entry_policy is not None:
-            policy = str(timeframe_entry_policy or "PRIMARY_15").upper()
-            if policy not in {"PRIMARY_15", "INCLUDE_5MIN"}:
-                policy = "PRIMARY_15"
+            policy = normalize_timeframe_entry_policy(timeframe_entry_policy)
             if getattr(settings, "ut_timeframe_entry_policy", "PRIMARY_15") != policy:
                 settings.ut_timeframe_entry_policy = policy
                 needs_full_refresh = True
@@ -5751,6 +5808,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """
         session_day = now_ist.date().isoformat()
         if self._morning_refresh_is_complete_for_day(session_day):
+            self._maybe_arm_configured_startup_auto(session_day, now_ist)
             # An "accepted incomplete" day is NOT a warmed day. The attempt cap sets
             # _morning_refresh_last_date purely to stop blocking scans forever, but
             # completeness is also what this early return tests, so the 09:15 catch-up
@@ -5874,6 +5932,62 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return True
 
         return False
+
+    def _maybe_arm_configured_startup_auto(
+        self,
+        session_day: str,
+        now_ist: datetime,
+    ) -> None:
+        """Arm explicit REAL-startup Auto intent only after full daily readiness.
+
+        ``AUTO_MODE`` remains process-local and always starts false.  This separate
+        opt-in exists for an operator who wants an unattended REAL startup without
+        allowing a stale process to inherit broker authority before its live feeds,
+        chains, and daily warmup have proved ready.
+        """
+        settings = get_settings()
+        if not self._setting_enabled(
+            getattr(settings, "auto_real_mode_startup_enabled", False),
+            False,
+        ):
+            return
+        if str(getattr(self, "mode", "") or "").upper() != "REAL":
+            return
+        if bool(getattr(self, "auto_mode", False)):
+            self._configured_startup_auto_armed_date = session_day
+            return
+        if getattr(self, "_configured_startup_auto_armed_date", None) == session_day:
+            return
+        live_start = self._clock_setting("real_mode_live_start", "09:15:00")
+        live_end = self._clock_setting("real_mode_live_end", "15:30:00")
+        if not (live_start <= now_ist.time() <= live_end):
+            return
+        summary = self._morning_refresh_summary_for_day(session_day)
+        if not bool(summary.get("complete")):
+            return
+        now_epoch = time.time()
+        if now_epoch - float(
+            getattr(self, "_configured_startup_auto_last_attempt_at", 0.0) or 0.0
+        ) < 30.0:
+            return
+        self._configured_startup_auto_last_attempt_at = now_epoch
+        configured = self.configure(
+            auto_mode=True,
+            confirm_real_mode=True,
+            real_mode_verification="YES",
+            persist_settings=False,
+        )
+        if configured and bool(getattr(self, "auto_mode", False)):
+            self._configured_startup_auto_armed_date = session_day
+            message = "Configured REAL startup Auto Mode armed after full daily readiness."
+            logger.warning(message)
+            self.log_event(message, "success")
+            return
+        reason = str(
+            getattr(self, "_last_configure_block_reason", "")
+            or "readiness revalidation failed"
+        )
+        logger.warning(f"Configured REAL startup Auto Mode waiting: {reason}")
 
     async def _morning_market_refresh(
         self,
@@ -6451,8 +6565,28 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 logger.debug(f"Entry shadow worker skipped: {exc}")
                 await asyncio.sleep(5)
 
+    def _index_ltp_poll_due(self, name: str, min_rest_refresh_seconds: float = 2.0) -> bool:
+        """Whether a price fallback poll is needed; cache reads only, never broker I/O."""
+        getter = getattr(self.data, "get_cached_index_quote_snapshot", None)
+        if not callable(getter):
+            return True
+        try:
+            quote = getter(name)
+            ltp = float((quote or {}).get("ltp") or 0.0)
+            source = str((quote or {}).get("quote_source") or (quote or {}).get("source") or "").lower()
+            age = float((quote or {}).get("receipt_age_seconds"))
+        except (TypeError, ValueError, AttributeError):
+            return True
+        if ltp <= 0.0:
+            return True
+        # Fresh websocket ticks are already lower latency than any REST poll.
+        if source.endswith("_ws") and bool(quote.get("quote_fresh")):
+            return False
+        # REST/fallback sources need a bounded 2-second refresh, including AngelOne.
+        return age >= max(0.5, float(min_rest_refresh_seconds or 2.0))
+
     async def _background_ltp_worker(self):
-        """Constant high-priority LTP polling utilizing 85% of SmartAPI throughput"""
+        """Keep missing/stale index marks fresh without polling healthy websocket quotes."""
         while self.is_running:
             try:
                 if not self.data.is_market_open() and not self.trades.open_trades:
@@ -6462,13 +6596,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 tasks = []
                 for name, cfg in indices.items():
                     token = cfg.get("token")
-                    if token:
+                    if token and self._index_ltp_poll_due(name):
                         tasks.append(self._fetch_ltp_raw(name, token, cfg.get("exchange", "NSE")))
 
                 if tasks:
                     await asyncio.gather(*tasks)
 
-                # Stagger to utilize ~15 pings/sec (Safe under 20/sec limit)
+                # Cache checks run five times a second; external fallback calls run only
+                # when needed and remain bounded by the token bucket above.
                 await asyncio.sleep(0.2)
             except Exception as e:
                 logger.debug(f"LTP Worker error: {e}")
@@ -6587,10 +6722,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     continue
                 if self.mode == "REAL":
                     await self._fetch_all_data(indices, timeframes=["1min"])
-                    last_full = getattr(self, "_last_full_history_refresh", 0.0)
-                    if time.time() - last_full >= 300.0:
-                        await self._fetch_all_data(indices, timeframes=["5min", "15min"])
-                        self._last_full_history_refresh = time.time()
+                    # Startup hydrates 5m/15m; CandleBuilder resamples every accepted
+                    # 1m update. Eight redundant higher-TF REST calls serialized behind
+                    # this lane and pushed the next cash-volume refresh out 70-80s.
+                    # Align close to the next minute boundary instead.
+                    now_ts = time.time()
+                    next_minute = ((int(now_ts) // 60) + 1) * 60 + 3.0
+                    await asyncio.sleep(max(1.0, next_minute - now_ts))
+                    continue
                 else:
                     await self._fetch_all_data(indices)
                 await asyncio.sleep(self._data_fetch_interval)
@@ -7648,7 +7787,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     spot = self.candles.get_latest_price(name)
                     if spot <= 0:
                         spot = await asyncio.get_event_loop().run_in_executor(
-                            None,
+                            self._scanner_live_executor,
                             lambda: self.data.get_ltp(cfg.get("exchange", "NSE"), name, cfg.get("token", "")),
                         )
                         if spot and spot > 0:
@@ -7656,7 +7795,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
                     loop = asyncio.get_event_loop()
                     try:
-                        processing_future = loop.run_in_executor(None, lambda: self._process_instrument(name, cfg))
+                        processing_future = loop.run_in_executor(self._scanner_live_executor, lambda: self._process_instrument(name, cfg))
                         if self.mode != "HISTORICAL" and not cycle_is_warmup:
                             self._live_processing_futures[name] = processing_future
                             self._live_processing_started[name] = time.time()
@@ -8248,10 +8387,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         fetched_at = float(meta.get("fetched_at", time.time()))
         age = max(0.0, time.time() - fetched_at)
         fallback = bool(meta.get("fallback", strike_count <= 1))
-        if strike_count >= 10 and not fallback:
+        auto_certified = bool(meta.get("auto_certified", False))
+        trusted_source = bool(not fallback or auto_certified)
+        if strike_count >= 10 and trusted_source:
             score = 95
-        elif strike_count >= 5 and not fallback:
+        elif strike_count >= 5 and trusted_source:
             score = 75
+        elif strike_count >= 3 and trusted_source:
+            score = 60
         elif strike_count == 1:
             score = 35
         else:
@@ -8259,6 +8402,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         expiry_aligned = bool(meta.get("expiry_aligned", meta.get("source") != "fyers"))
         if meta.get("source") == "fyers" and not expiry_aligned:
             score = min(score, 50)
+        try:
+            intelligence_max_age = float(
+                getattr(get_settings(), "option_chain_intelligence_max_age_seconds", 300.0)
+                or 300.0
+            )
+        except (TypeError, ValueError):
+            intelligence_max_age = 300.0
+        # `stale` remains the management/intelligence lifetime contract. New OPT
+        # entries apply the stricter 120s/90s clock in the final entry gate.
+        stale = bool(age > max(10.0, intelligence_max_age))
+        intelligence_usable = bool(
+            strike_count >= 3
+            and trusted_source
+            and expiry_aligned
+            and not stale
+        )
         return {
             "instrument": name,
             "source": meta.get("source", "unknown" if strike_count else "none"),
@@ -8266,7 +8425,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "age_seconds": round(age, 1),
             "score": score,
             "fallback": fallback,
-            "stale": False,
+            "auto_certified": auto_certified,
+            "stale": stale,
+            "intelligence_usable": intelligence_usable,
             "active_expiry": meta.get("active_expiry", ""),
             "expiry_aligned": expiry_aligned,
         }
@@ -8320,9 +8481,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # "stale" chain, which it then dropped: PCR/OI showed 0/unavailable all
                 # session even though the chain was being fetched successfully.
                 max_age = float(
-                    getattr(settings, "option_chain_intelligence_max_age_seconds", 300.0) or 300.0
+                    getattr(settings, "option_chain_intelligence_max_age_seconds", 300.0)
+                    or 300.0
                 )
                 quality["stale"] = age > max_age
+                quality["intelligence_usable"] = bool(
+                    not quality["stale"]
+                    and int(quality.get("strike_count", 0) or 0) >= 3
+                    and bool(quality.get("expiry_aligned", False))
+                    and (
+                        not bool(quality.get("fallback", True))
+                        or bool(quality.get("auto_certified", False))
+                    )
+                )
                 return cached, quality
             empty = pd.DataFrame()
             quality = self._assess_chain_quality(
@@ -9145,6 +9316,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 "futures_oi": float(futures.get("oi") or 0.0),
                 "futures_symbol": str(futures.get("tradingsymbol") or ""),
             }
+            futures_minute_getter = getattr(
+                data, "get_index_futures_minute_volume_context", None
+            )
+            futures_minute = (
+                futures_minute_getter(name)
+                if callable(futures_minute_getter)
+                else {}
+            ) or {}
+            row.update({
+                "futures_minute_available": bool(futures_minute.get("available")),
+                "futures_minute_reliable": bool(futures_minute.get("reliable")),
+                "futures_minute_ratio": float(
+                    futures_minute.get("projected_ratio") or 0.0
+                ),
+                "futures_minute_baseline": float(
+                    futures_minute.get("baseline_volume") or 0.0
+                ),
+                "futures_minute_samples": int(
+                    futures_minute.get("completed_samples") or 0
+                ),
+                "futures_minute_unit": str(
+                    futures_minute.get("unit") or "contracts"
+                ),
+            })
             # What a feed COULD supply is not what reached the candles, and the gates
             # read the candles. During the 2026-07-27 outage the Fyers quote cache was
             # fine while the candle series was all zeros — a health check built on the
@@ -9307,6 +9502,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 candle_source = ""
 
         candle_evidence = self._recent_cash_volume_evidence(name, candle_1min)
+        intrabar_cash: Dict[str, Any] = {}
+        try:
+            getter = getattr(data, "get_index_intrabar_cash_volume", None)
+            if callable(getter):
+                intrabar_cash = dict(getter(name) or {})
+        except Exception:
+            intrabar_cash = {}
 
         # In-memory ONLY. This runs per instrument on the 1s scan interval, so calling
         # get_index_activity here meant a Fyers REST probe plus a Kite quote per index
@@ -9320,10 +9522,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         fallback = dict((getattr(data, "_index_futures_fallback", {}) or {}).get(name) or {})
         fallback_at = float(fallback.get("at") or 0.0)
         on_futures = fallback_at > 0 and (time.time() - fallback_at) <= 120.0
+        futures_minute: Dict[str, Any] = {}
+        try:
+            getter = getattr(data, "get_index_futures_minute_volume_context", None)
+            if callable(getter):
+                futures_minute = dict(getter(name) or {})
+        except Exception:
+            futures_minute = {}
 
         diag_tick_count = int(float((diag or {}).get("tick_count_current_minute") or 0))
         intrabar_volume_available = bool(
             candle_evidence["intrabar_volume_available"]
+            or (
+                intrabar_cash.get("available")
+                and float(intrabar_cash.get("volume") or 0.0) > 0.0
+                and candle_evidence["cash_comparable"]
+                and str(intrabar_cash.get("basis") or "").lower() == "fyers_index"
+            )
         )
         # A provider's cumulative total can remain fresh after a price-only tick creates
         # the forming candle.  It proves feed provenance, not that this bar has a volume
@@ -9389,6 +9604,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "volume_key": str((diag or {}).get("volume_key") or ""),
             "volume_fields": dict((diag or {}).get("volume_fields") or {}),
             "latest_1min_volume": round(latest_volume, 4),
+            "intrabar_cash_volume": float(intrabar_cash.get("volume") or 0.0),
+            "intrabar_cash_progress": float(intrabar_cash.get("progress") or 0.0),
+            "intrabar_cash_age_seconds": intrabar_cash.get("age_seconds"),
             "latest_1min_volume_source": str(candle_evidence["latest_source"] or ""),
             "latest_1min_volume_basis": str(candle_evidence["latest_basis"] or ""),
             "tick_count_current_minute": max(diag_tick_count, candle_tick_count),
@@ -9398,6 +9616,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # once the fallback existed. Report what the provider actually resolved.
             "futures_volume_available": on_futures,
             "futures_volume": float(fallback.get("volume") or 0.0) if on_futures else 0.0,
+            "futures_minute_volume": futures_minute,
+            "futures_minute_volume_available": bool(futures_minute.get("available")),
+            "futures_minute_volume_reliable": bool(futures_minute.get("reliable")),
+            "futures_minute_volume_ratio": float(
+                futures_minute.get("projected_ratio") or 0.0
+            ),
             # Distinct from "volume_source" above, which reports the per-tick diagnostic
             # ("kite_ws"/"fyers_ws"). This is which FEED supplied the cumulative total,
             # and therefore which unit the numbers are in.
@@ -12905,22 +13129,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         timeframe: str,
         df: Optional[pd.DataFrame],
     ) -> Optional[pd.DataFrame]:
-        """Fail closed while today's 5-minute signal engine is under-warmed.
+        """Start each live timeframe from clean state on its first 09:15 bar.
 
-        Prior-session candles may warm indicators, but they must not preserve yesterday's
-        arrow/state as a live signal. Until the active session has the configured number
-        of completed 5-minute bars, invalidate every result/data/state cache for this key.
+        Prior-session candles remain available for indicator warmup, but no cached
+        arrow, result, or engine state may cross the session boundary. Five-minute
+        entries no longer wait through a first-hour blackout; one current-session
+        forming bar is sufficient, matching 1min/15min availability from market open.
         """
         window = self._live_analysis_window(df, timeframe)
         if (
             str(getattr(self, "mode", "") or "").upper() != "REAL"
-            or str(timeframe or "").lower() != "5min"
             or window is None
             or getattr(window, "empty", True)
         ):
             return window
 
-        key = f"{instrument}_{timeframe}"
+        tf = str(timeframe or "").lower()
+        key = f"{instrument}_{tf}"
         try:
             session_day = pd.Timestamp(self._get_current_session_day()).date()
             index = window.index
@@ -12929,41 +13154,55 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if index.tz is not None:
                 index = index.tz_convert(IST).tz_localize(None)
             today_count = int(sum(value == session_day for value in index.date))
-            required = max(
-                1,
-                int(getattr(get_settings(), "live_signal_5min_warmup_bars", 12) or 12),
+            required = (
+                max(
+                    1,
+                    int(getattr(get_settings(), "live_signal_5min_warmup_bars", 1) or 1),
+                )
+                if tf == "5min"
+                else 1
             )
         except Exception as exc:
             logger.debug(f"Live signal warmup check failed for {key}: {exc}")
-            today_count, required = 0, 12
+            session_day, today_count, required = None, 0, 1
 
         ready = today_count >= required
         if not hasattr(self, "_live_signal_warmup_ready"):
             self._live_signal_warmup_ready = {}
         self._live_signal_warmup_ready[key] = ready
+
+        if not hasattr(self, "_live_signal_state_session"):
+            self._live_signal_state_session = {}
+        session_marker = session_day.isoformat() if session_day is not None else ""
+        new_session = self._live_signal_state_session.get(key) != session_marker
+        self._live_signal_state_session[key] = session_marker
+
+        if new_session or not ready:
+            for attr in ("_cached_results", "_cached_result_metadata", "_last_signal_time", "_last_signal_identity"):
+                store = getattr(self, attr, None)
+                if isinstance(store, dict):
+                    store.pop(key, None)
+            candidate_cache = getattr(self, "_candidate_process_cache", None)
+            if isinstance(candidate_cache, dict):
+                candidate_cache.pop(instrument, None)
+            mtf = getattr(self, "mtf", None)
+            for attr in ("_result_cache", "_data_hash", "_data_cache"):
+                store = getattr(mtf, attr, None)
+                if isinstance(store, dict):
+                    store.pop(key, None)
+            engine = getattr(getattr(mtf, "engines", {}), "get", lambda *_: None)(key)
+            states = getattr(engine, "_states", None)
+            if isinstance(states, dict):
+                states.pop(key, None)
+
         if ready:
             return window
 
-        for attr in ("_cached_results", "_cached_result_metadata", "_last_signal_time", "_last_signal_identity"):
-            store = getattr(self, attr, None)
-            if isinstance(store, dict):
-                store.pop(key, None)
-        candidate_cache = getattr(self, "_candidate_process_cache", None)
-        if isinstance(candidate_cache, dict):
-            candidate_cache.pop(instrument, None)
-        mtf = getattr(self, "mtf", None)
-        for attr in ("_result_cache", "_data_hash", "_data_cache"):
-            store = getattr(mtf, attr, None)
-            if isinstance(store, dict):
-                store.pop(key, None)
-        engine = getattr(getattr(mtf, "engines", {}), "get", lambda *_: None)(key)
-        states = getattr(engine, "_states", None)
-        if isinstance(states, dict):
-            states.pop(key, None)
         try:
             self.log_signal_decision_once(
                 f"{key}|live-warmup|{today_count}/{required}",
-                f"Live {key} signal engine waiting for warmup ({today_count}/{required} bars); stale state cleared.",
+                f"Live {key} waiting for first current-session bar "
+                f"({today_count}/{required}); stale state cleared.",
                 "info",
             )
         except Exception:
@@ -13652,19 +13891,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         strike_interval = cfg.get("strike_interval", 50)
         combined_cap = self.capital_fut + self.capital_opt
 
-        # 1. Use background-cached LTP to prevent API rate limits and speed up processing
+        # 1. Scan hot path is cache-only. Calling get_index_quote() here can enter Kite,
+        # Fyers and Yahoo REST. During the minute history refresh, all four scanner
+        # workers then wait behind Fyers' global single-flight for 3-10 seconds. The
+        # websocket/background-LTP lanes already populate this coherent snapshot.
         market_quote = {}
-        if hasattr(self.data, "get_index_quote"):
+        cached_quote = getattr(self.data, "get_cached_index_quote_snapshot", None)
+        if callable(cached_quote):
             try:
-                market_quote = self.data.get_index_quote(name) or {}
+                market_quote = cached_quote(name) or {}
             except Exception as exc:
-                logger.debug(f"Index quote fetch failed for {name}: {exc}")
+                logger.debug(f"Cached index quote read failed for {name}: {exc}")
+        elif hasattr(self.data, "get_index_quote"):
+            # Compatibility for lightweight/test providers. Production always exposes
+            # the cache-only reader above.
+            market_quote = self.data.get_index_quote(name) or {}
 
         quote_spot = float(market_quote.get("ltp", 0.0) or 0.0)
-        if quote_spot > 0:
+        quote_fresh = bool(
+            market_quote.get(
+                "quote_fresh", market_quote.get("is_fresh", quote_spot > 0)
+            )
+        )
+        if quote_spot > 0 and quote_fresh:
             self.candles.update_latest_price(name, quote_spot)
 
-        spot = quote_spot if quote_spot > 0 else self.candles.get_latest_price(name)
+        candle_spot = self.candles.get_latest_price(name)
+        spot = quote_spot if quote_spot > 0 and quote_fresh else candle_spot
+        if spot <= 0 and quote_spot > 0:
+            # Last-known reference is safer than an artificial zero, but stays stale in
+            # market_quote so entry freshness gates cannot treat it as a live tick.
+            spot = quote_spot
         if spot <= 0:
             logger.warning(f"âš ï¸  Spot price for {name} is {spot}. Skipping scan.")
             return {"error": f"Invalid spot price: {spot}"}, []
@@ -13695,7 +13952,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             prev_close = quote_prev_close or self._prev_close_cache.get(name, 0)
             if prev_close <= 0:
-                prev_close = self.data.get_previous_close(name)
+                cached_previous_close = getattr(
+                    self.data, "get_cached_previous_close", None
+                )
+                prev_close = (
+                    cached_previous_close(name)
+                    if callable(cached_previous_close)
+                    else 0.0
+                )
                 self._prev_close_cache[name] = prev_close
 
             change_points = (spot - prev_close) if prev_close > 0 else 0
@@ -15220,6 +15484,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         signal_type: str,
         signal_timestamp=None,
         timeframe: str = "5min",
+        *,
+        setup_confidence: float = 0.0,
+        setup_adx: float = 0.0,
+        setup_intel_score: float = 0.0,
+        trend_15m_agrees: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Detect multi-index LTP shock (dump or rally) over a short lookback.
 
@@ -15277,11 +15546,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not in_window and outside_mode != "strong":
             return None
 
+        direction = -1.0 if sig_type == "SELL" else 1.0
+        try:
+            confidence = float(setup_confidence or 0.0)
+            adx = float(setup_adx or 0.0)
+            directional_intel = float(setup_intel_score or 0.0) * direction
+        except (TypeError, ValueError):
+            confidence = adx = directional_intel = 0.0
+        strong_setup_floor = max(
+            0.70,
+            float(
+                getattr(settings, "quality_policy_market_shift_min_confidence", 0.60)
+                or 0.60
+            ),
+        )
+        outside_quality_relax = bool(
+            not in_window
+            and confidence >= strong_setup_floor
+            and (bool(trend_15m_agrees) or adx >= 28.0 or directional_intel >= 0.55)
+        )
+
         min_move = max(
             0.05,
             float(getattr(settings, "market_ltp_shock_min_move_pct", 0.20) or 0.20),
         )
-        if not in_window:
+        if not in_window and not outside_quality_relax:
             # Strong-tier only outside the window: raise the per-index floor so a
             # routine 0.20% opening drive can never hijack entries into scalps.
             min_move = max(
@@ -15320,7 +15609,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             else ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
         )
         candidate_base = str(instrument or "").split()[0].upper()
-        direction = -1.0 if sig_type == "SELL" else 1.0
 
         try:
             as_of = signal_timestamp
@@ -15388,8 +15676,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 avg_shock = float(vol.mean()) if len(vol) else 0.0
                 avg_prior = float(prior_vol.mean()) if len(prior_vol) else 0.0
                 vol_ratio = (avg_shock / avg_prior) if avg_prior > 0 else (1.0 if avg_shock > 0 else 0.0)
-                # Allow pure price shock when volume is unavailable; require ratio when present.
-                if avg_prior > 0 and vol_ratio < min_vol and best_move < strong_move:
+                # Lower-than-strong outside-window route is exceptional: high-quality
+                # setup plus measured volume confirmation. Ordinary >=strong_move shocks
+                # retain price-only fallback when volume history is unavailable.
+                if outside_quality_relax and best_move < strong_move:
+                    if avg_prior <= 0 or vol_ratio < min_vol:
+                        continue
+                elif avg_prior > 0 and vol_ratio < min_vol and best_move < strong_move:
                     continue
 
                 votes[inst] = {
@@ -15422,6 +15715,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "signal_type": sig_type,
             "side": side_label,
             "in_window": bool(in_window),
+            "outside_quality_relax": bool(outside_quality_relax),
             "strong": bool(strong),
             "avg_abs_move_pct": round(avg_abs, 4),
             "min_move_pct": min_move,
@@ -15437,6 +15731,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 f"market LTP {side_label}: core {len(core_votes)}/3, "
                 f"total {len(total_votes)}, avg |move|={avg_abs:.2f}% "
                 f"in ≤{lookback_max}m (≥{min_move:.2f}%)"
+                + ("; strong setup outside-window relief" if outside_quality_relax else "")
             ),
         }
 
@@ -16019,7 +16314,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         # statistically significant (p=0.21), which is why dropping this branch is opt-in
         # rather than the default.
         if not self._setting_enabled(
-            getattr(settings, "stabilization_override_drop_regime_flip", False), False
+            getattr(settings, "stabilization_override_drop_regime_flip", True), True
         ):
             reg = str(regime or getattr(self, "latest_regimes", {}).get(instrument, "") or "").upper()
             if reg and is_trending_regime(reg) and regime_aligns(reg, sig):
@@ -16915,8 +17210,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     ) -> Tuple[bool, str]:
         """Exit once a trade has handed back more than a fixed rupee amount from its peak.
 
-        Deliberately the simplest rule in the exit stack, and deliberately ABSOLUTE
-        rather than a fraction of peak — see the settings block for the measurements.
+        Deliberately the simplest rule in the exit stack.  The give-back cap remains
+        absolute; the breakeven sub-rule uses an absolute floor plus a small R-scaled
+        arm when trustworthy entry/stop geometry exists.
         Every other profit guard arms above the median peak of Rs.454 (lock Rs.250,
         giveback Rs.500, peak-threat Rs.750), so 77% of trades reached profit and the
         book still captured only 27% of the peak it touched.
@@ -16941,15 +17237,37 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             getattr(settings, "breakeven_stop_enabled", True), True
         ):
             try:
-                be_arm = float(getattr(settings, "breakeven_stop_arm_rs", 150.0) or 0.0)
-                be_floor = float(getattr(settings, "breakeven_stop_floor_rs", 80.0) or 0.0)
+                be_arm = float(getattr(settings, "breakeven_stop_arm_rs", 250.0) or 0.0)
+                be_floor = float(getattr(settings, "breakeven_stop_floor_rs", 120.0) or 0.0)
                 be_peak = float(peak_pnl_rs or 0.0)
                 be_now = float(current_pnl_rs or 0.0)
+                be_r_multiple = float(
+                    getattr(settings, "breakeven_stop_arm_r_multiple", 0.40) or 0.0
+                )
+                try:
+                    initial_risk = Scanner._trade_like_initial_risk_rs(self, trade_like)
+                except Exception:
+                    # Minimal replay/session projections intentionally carry no entry-stop
+                    # geometry.  Preserve their measured absolute-arm behavior rather
+                    # than disabling the whole guard because risk cannot be derived.
+                    initial_risk = 0.0
+
+                # Dynamically scale the arm and floor based on regime and volatility (ATR/risk)
+                try:
+                    scale = Scanner._profit_threshold_scale(self, trade_like, initial_risk)
+                except Exception:
+                    scale = 1.0
+
+                be_arm = be_arm * scale
+                be_level = be_floor * scale
+                be_rule = "BREAKEVEN_STOP"
+
+                if initial_risk > 0.0 and be_r_multiple > 0.0:
+                    be_arm = max(be_arm, initial_risk * be_r_multiple)
 
                 # Optional peak trail, gated to peaks large enough for a percentage to
                 # mean more than the spread. Off by default — an UNGATED percentage
                 # trail is the give-back cap again and clips winners the same way.
-                be_level, be_rule = be_floor, "BREAKEVEN_STOP"
                 if self._setting_enabled(
                     getattr(settings, "peak_trail_enabled", False), False
                 ):
@@ -16960,7 +17278,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         if trailed > be_level:
                             be_level, be_rule = trailed, "PEAK_TRAIL"
 
-                if be_arm > 0.0 and be_peak >= be_arm and be_now <= be_level:
+                min_age_seconds = max(0.0, float(getattr(settings, "breakeven_stop_min_age_seconds", 60.0) or 60.0))
+                age_seconds = min_age_seconds # default to pass if we can't find age
+                try:
+                    entry_time = getattr(trade_like, "signal_timestamp", getattr(trade_like, "entry_time", None))
+                    if entry_time is not None:
+                        ref = entry_time.astimezone(IST).replace(tzinfo=None) if getattr(entry_time, "tzinfo", None) is not None else entry_time
+                        last_update = getattr(trade_like, "last_update", datetime.now())
+                        lu = last_update.astimezone(IST).replace(tzinfo=None) if getattr(last_update, "tzinfo", None) is not None else last_update
+                        age_seconds = max(0.0, (lu - ref).total_seconds())
+                except Exception:
+                    pass
+
+                if be_arm > 0.0 and be_peak >= be_arm and be_now <= be_level and age_seconds >= min_age_seconds:
                     if be_rule == "PEAK_TRAIL":
                         return ExitVerdict(True, (
                             f"peaked Rs.{be_peak:,.0f} and has come back to "
@@ -16969,7 +17299,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         ), "PEAK_TRAIL")
                     return ExitVerdict(True, (
                         f"peaked Rs.{be_peak:,.0f} and has come back to "
-                        f"Rs.{be_now:,.0f} — a proven trade may not close negative"
+                        f"Rs.{be_now:,.0f} after {age_seconds:.0f}s — a proven trade may not close negative"
                     ), "BREAKEVEN_STOP")
             except (TypeError, ValueError):
                 pass
@@ -17781,10 +18111,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """
         if latest_time is None:
             return None
+        # Prefer the broker fill / accepted-candidate clock over the source-signal
+        # candle.  A signal can wait through stabilization or broker submission before
+        # it becomes exposure; measuring from the older candle makes every minimum-hold
+        # guard partly or wholly expire before the trade exists.
         entered = (
-            getattr(trade_like, "entry_time", None)
+            getattr(trade_like, "entry_filled_at", None)
             or getattr(trade_like, "entry_timestamp", None)
+            or getattr(trade_like, "entry_time", None)
             or getattr(trade_like, "signal_time", None)
+            or getattr(trade_like, "signal_timestamp", None)
         )
         if entered is None:
             return None
@@ -18343,7 +18679,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return base
         reg = str(regime or "").upper()
         if reg in {"VOLATILE", "BREAKOUT_UP", "BREAKOUT_DOWN"}:
-            loose = float(getattr(settings, "trend_runner_lock_pct_high_vol", 0.85) or 0.85)
+            loose = float(getattr(settings, "trend_runner_lock_pct_high_vol", 0.80) or 0.80)
             return min(0.98, max(0.25, min(base, loose)))
         return base
 
@@ -19825,6 +20161,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         latest_time: Optional[datetime],
         *_args,
         timeframe: Optional[str] = None,
+        closed_only: bool = False,
         **_kwargs,
     ) -> Dict[str, Any]:
         """Read recent own-timeframe price action to distinguish pullback from fast reversal."""
@@ -19867,6 +20204,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if latest_ts.tzinfo is not None:
                 latest_ts = latest_ts.tz_convert(IST).tz_localize(None)
             work = work[work.index <= latest_ts]
+            if closed_only:
+                tf_minutes = {"1min": 1, "5min": 5, "15min": 15}[tf]
+                # CandleBuilder labels bars by their opening timestamp. Normal reversal
+                # exits must therefore ignore the forming bar; catastrophic tick/shock
+                # handling deliberately keeps using the unfiltered context above.
+                work = work[
+                    work.index <= latest_ts - pd.Timedelta(minutes=tf_minutes)
+                ]
         if len(work) < 4:
             return context
 
@@ -20074,6 +20419,20 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # Dividing it by an option premium instead is off by roughly 100x.
                 "reference_price": float(closes.iloc[-1]),
                 "candle_freshness": freshness,
+                "candle_closed": bool(closed_only),
+                "evaluated_bar_at": work.index[-1],
+            }
+        )
+        # Preserve the owning frame before the existing 1m emergency promotion below.
+        # Without these raw fields a large 1m candle rewrites the 15m verdict and callers
+        # can no longer tell a supporting alert from an actual higher-timeframe break.
+        context.update(
+            {
+                "own_fast_reversal": bool(context["fast_reversal"]),
+                "own_trend_supportive": bool(context["trend_supportive"]),
+                "own_trend_votes": int(context["trend_votes"]),
+                "own_pullback_class": str(context["pullback_class"]),
+                "own_reason": str(context["reason"]),
             }
         )
         if tf != "1min":
@@ -20133,13 +20492,622 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     )
         return context
 
+    @staticmethod
+    def _reversal_breaks_own_frame(context: Optional[Dict[str, Any]]) -> bool:
+        """Read the unpromoted verdict of a reversal context."""
+        if not isinstance(context, dict) or not context.get("has_context"):
+            return False
+        supportive = bool(
+            context.get("own_trend_supportive", context.get("trend_supportive"))
+        )
+        fast = bool(context.get("own_fast_reversal", context.get("fast_reversal")))
+        pullback = str(
+            context.get("own_pullback_class", context.get("pullback_class", "")) or ""
+        )
+        votes = int(context.get("own_trend_votes", context.get("trend_votes", 0)) or 0)
+        return bool(
+            not supportive
+            and pullback in {"reversal", "big_reversal", "structure_break"}
+            and (fast or pullback == "structure_break" or votes == 0)
+        )
+
+    def _fifteen_min_exit_trade_state(
+        self,
+        trade,
+        *,
+        current_mark: Optional[float],
+        current_pnl_rs: Optional[float],
+        initial_risk_rs: Optional[float],
+        peak_pnl_rs: Optional[float],
+        observed_contract_ticks: Optional[List[Tuple[float, Optional[datetime]]]] = None,
+    ) -> Dict[str, Any]:
+        """Normalize loss, stop-distance, giveback and option-premium evidence in R."""
+        settings = get_settings()
+
+        def number(value, default=0.0):
+            try:
+                parsed = float(value)
+                return parsed if math.isfinite(parsed) else float(default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        entry = number(self._trade_like_entry_price(trade))
+        mark = number(current_mark)
+        if mark <= 0:
+            mark = number(getattr(trade, "current_price", 0.0))
+        try:
+            qty = int(
+                getattr(trade, "pnl_quantity", None)
+                or self._trade_like_quantity(trade)
+                or 1
+            )
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+        inst_type = str(getattr(trade, "inst_type", "") or "").upper()
+        premium_long = inst_type == "OPT"
+        price_direction = "LONG" if premium_long else str(
+            getattr(trade, "direction", "LONG") or "LONG"
+        ).upper()
+        multiplier = 1.0 if premium_long else max(
+            0.0, number(getattr(trade, "instrument_multiplier", 1.0), 1.0)
+        )
+        if multiplier <= 0:
+            multiplier = 1.0
+
+        supplied_pnl = number(current_pnl_rs)
+        if entry > 0 and mark > 0:
+            if price_direction == "SHORT":
+                pnl = (entry - mark) * qty * multiplier
+            else:
+                pnl = (mark - entry) * qty * multiplier
+        else:
+            pnl = supplied_pnl
+
+        risk = number(initial_risk_rs)
+        if risk <= 0:
+            try:
+                risk = number(self._trade_like_initial_risk_rs(trade))
+            except Exception:
+                risk = 0.0
+
+        peak = max(0.0, number(peak_pnl_rs), number(getattr(trade, "peak_pnl", 0.0)), pnl)
+        tick_prices = []
+        for item in observed_contract_ticks or []:
+            try:
+                tick = float(item[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if math.isfinite(tick) and tick > 0:
+                tick_prices.append(tick)
+        if entry > 0 and tick_prices:
+            favorable = min(tick_prices) if price_direction == "SHORT" else max(tick_prices)
+            tick_peak = (
+                (entry - favorable) if price_direction == "SHORT" else (favorable - entry)
+            ) * qty * multiplier
+            peak = max(peak, tick_peak)
+
+        loss_r = max(0.0, -pnl / risk) if risk > 0 else 0.0
+        giveback_pct = max(0.0, (peak - pnl) / peak) if peak > 0 else 0.0
+
+        stop = number(
+            getattr(trade, "current_stop", 0.0)
+            or getattr(trade, "stop", 0.0)
+            or getattr(trade, "trailing_stop", 0.0)
+        )
+        remaining_stop_r = float("inf")
+        locked_floor_pnl = 0.0
+        if risk > 0 and mark > 0 and stop > 0:
+            if price_direction == "SHORT":
+                remaining_points = max(0.0, stop - mark)
+                locked_floor_pnl = (entry - stop) * qty * multiplier
+            else:
+                remaining_points = max(0.0, mark - stop)
+                locked_floor_pnl = (stop - entry) * qty * multiplier
+            remaining_stop_r = remaining_points * qty * multiplier / risk
+
+        loss_min_r = max(
+            0.0,
+            number(getattr(settings, "fifteen_min_one_min_support_loss_min_r", 0.35), 0.35),
+        )
+        stop_near_r = max(
+            0.0,
+            number(getattr(settings, "fifteen_min_one_min_support_stop_near_r", 0.35), 0.35),
+        )
+        giveback_floor = min(
+            1.0,
+            max(
+                0.0,
+                number(
+                    getattr(settings, "fifteen_min_one_min_support_win_giveback_pct", 0.25),
+                    0.25,
+                ),
+            ),
+        )
+        lock_buffer_r = max(
+            0.0,
+            number(getattr(settings, "fifteen_min_one_min_support_lock_buffer_r", 0.15), 0.15),
+        )
+        premium_adverse_min_r = max(
+            0.0,
+            number(
+                getattr(settings, "fifteen_min_one_min_support_premium_adverse_min_r", 0.10),
+                0.10,
+            ),
+        )
+
+        lock_threat = bool(
+            pnl > 0
+            and locked_floor_pnl > 0
+            and risk > 0
+            and 0.0 <= remaining_stop_r <= lock_buffer_r
+        )
+        loss_ready = bool(
+            pnl < 0
+            and risk > 0
+            and (loss_r >= loss_min_r or remaining_stop_r <= stop_near_r)
+        )
+        win_ready = bool(
+            peak > 0
+            and pnl >= 0
+            and (giveback_pct >= giveback_floor or lock_threat)
+        )
+        if pnl < 0:
+            state = "LOSING"
+        elif peak > 0:
+            state = "WINNING"
+        else:
+            state = "FLAT"
+
+        premium_adverse_r = 0.0
+        premium_quote_valid = bool(mark > 0 and entry > 0)
+        if premium_long and premium_quote_valid and risk > 0:
+            # For bought CE and PE, premium itself always profits upward. The high-water
+            # P&L includes exact ticks from the current 100ms batch, so an intracycle
+            # spike-and-reversal cannot disappear between scanner passes.
+            premium_adverse_r = max(0.0, (peak - pnl) / risk)
+        premium_confirmed = bool(
+            not premium_long
+            or (
+                premium_quote_valid
+                and risk > 0
+                and premium_adverse_r >= premium_adverse_min_r
+            )
+        )
+        return {
+            "state": state,
+            "pnl_rs": pnl,
+            "peak_pnl_rs": peak,
+            "initial_risk_rs": risk,
+            "loss_r": loss_r,
+            "remaining_stop_r": remaining_stop_r,
+            "giveback_pct": giveback_pct,
+            "locked_floor_pnl_rs": locked_floor_pnl,
+            "lock_threat": lock_threat,
+            "loss_ready": loss_ready,
+            "win_ready": win_ready,
+            "normal_state_ready": bool(loss_ready or win_ready),
+            "premium_quote_valid": premium_quote_valid,
+            "premium_adverse_r": premium_adverse_r,
+            "premium_confirmed": premium_confirmed,
+        }
+
+    @staticmethod
+    def _fifteen_min_chain_votes(intel: Optional[Dict[str, Any]]) -> Tuple[int, int]:
+        """Return bearish/bullish votes from OI and PCR only.
+
+        Fast L1 order flow is sampled independently. Keeping it out of this count
+        prevents one cached order-flow value from masquerading as a newly fetched
+        option-chain shift.
+        """
+        if not isinstance(intel, dict):
+            return 0, 0
+        pcr = intel.get("pcr", {}) if isinstance(intel.get("pcr"), dict) else {}
+        oi = intel.get("oi", {}) if isinstance(intel.get("oi"), dict) else {}
+        pcr_signal = str(
+            pcr.get("contrarian_signal") or pcr.get("signal") or "NEUTRAL"
+        ).upper()
+        oi_signal = str(oi.get("signal") or "NEUTRAL").upper()
+        bearish = int(pcr_signal in {"BEARISH", "STRONG_BEARISH"}) + int(
+            oi_signal in {"BEARISH", "STRONG_BEARISH"}
+        )
+        bullish = int(pcr_signal in {"BULLISH", "STRONG_BULLISH"}) + int(
+            oi_signal in {"BULLISH", "STRONG_BULLISH"}
+        )
+        return bearish, bullish
+
+    def _fifteen_min_chain_is_post_entry(
+        self,
+        trade,
+        intel: Optional[Dict[str, Any]],
+        latest_time: Optional[datetime],
+    ) -> bool:
+        """Prove the option-chain observation itself occurred after the fill."""
+        if not isinstance(intel, dict) or latest_time is None:
+            return False
+        quality = intel.get("data_quality", {})
+        if not isinstance(quality, dict) or not bool(
+            quality.get("intelligence_usable", False)
+        ):
+            return False
+        try:
+            chain_age_at_analysis = float(quality.get("age_seconds"))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(chain_age_at_analysis) or chain_age_at_analysis < 0:
+            return False
+        base = str(getattr(trade, "instrument", "") or "").split()[0].upper()
+        intel_age = self._intel_age_seconds(intel, base, latest_time)
+        if intel_age is None or not math.isfinite(float(intel_age)) or intel_age < 0:
+            return False
+        entered = (
+            getattr(trade, "entry_filled_at", None)
+            or getattr(trade, "entry_timestamp", None)
+            or getattr(trade, "entry_time", None)
+            or getattr(trade, "signal_timestamp", None)
+        )
+        entry_ts = self._parse_trade_timestamp(entered)
+        now_ts = self._parse_trade_timestamp(latest_time)
+        if entry_ts is None or now_ts is None:
+            return False
+        captured = now_ts - timedelta(
+            seconds=chain_age_at_analysis + float(intel_age)
+        )
+        return captured > entry_ts
+
+    def _refresh_fifteen_min_live_expected_move(
+        self,
+        trade,
+        *,
+        current_spot: float,
+        latest_time: Optional[datetime],
+        state: Dict[str, Any],
+        directional: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Refresh live remaining-move outlook without inventing a probability.
+
+        Entry MFE forecast remains immutable calibration evidence. This view subtracts
+        realized directional movement and appends current evidence/state every monitor
+        pass; its probability field is explicitly the entry baseline, not a live model.
+        """
+        if not self._setting_enabled(
+            getattr(get_settings(), "fifteen_min_live_expected_move_enabled", True),
+            True,
+        ):
+            return {}
+
+        def finite(value, default=0.0):
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            return result if math.isfinite(result) else float(default)
+
+        view = self._trade_direction_view(trade)
+        entry_spot = finite(
+            getattr(trade, "underlying_entry", 0.0)
+            or getattr(trade, "entry_spot", 0.0)
+        )
+        spot = finite(current_spot)
+        realized = 0.0
+        if entry_spot > 0 and spot > 0 and view in {"LONG", "SHORT"}:
+            raw = (spot - entry_spot) / entry_spot * 100.0
+            realized = raw if view == "LONG" else -raw
+
+        expected = max(0.0, finite(getattr(trade, "expected_move_pct", 0.0)))
+        baseline_probability = min(
+            1.0,
+            max(0.0, finite(getattr(trade, "expected_move_probability", 0.0))),
+        )
+        remaining = max(0.0, expected - max(0.0, realized))
+        horizon_minutes = max(
+            0, int(finite(getattr(trade, "expected_move_horizon_minutes", 0), 0))
+        )
+        age_seconds = self._trade_like_age_seconds(trade, latest_time)
+        remaining_seconds = (
+            max(0.0, horizon_minutes * 60.0 - age_seconds)
+            if age_seconds is not None and horizon_minutes > 0
+            else None
+        )
+        live = dict(directional or {})
+        status = str(live.get("status") or "NEUTRAL").upper()
+        if status == "NEUTRAL" and bool(state.get("loss_ready")):
+            status = "PREMIUM_ADVERSE"
+        outlook = {
+            "version": "entry_mfe_remaining_plus_live_evidence.v1",
+            "status": status,
+            "updated_at": (
+                latest_time.isoformat()
+                if isinstance(latest_time, datetime)
+                else ""
+            ),
+            "entry_expected_favorable_move_pct": round(expected, 4),
+            "entry_probability_baseline": round(baseline_probability, 4),
+            "probability_recalibrated": False,
+            "realized_directional_move_pct": round(realized, 4),
+            "remaining_entry_expectation_pct": round(remaining, 4),
+            "horizon_remaining_seconds": (
+                round(remaining_seconds, 1) if remaining_seconds is not None else None
+            ),
+            "premium_pnl_r": round(
+                finite(state.get("pnl_rs"))
+                / max(1e-9, finite(state.get("initial_risk_rs"), 0.0)),
+                4,
+            )
+            if finite(state.get("initial_risk_rs"), 0.0) > 0
+            else 0.0,
+            "premium_giveback_pct": round(finite(state.get("giveback_pct")), 4),
+            "adverse_sources": list(live.get("adverse_sources") or []),
+            "supportive_sources": list(live.get("supportive_sources") or []),
+            "chain_post_entry": bool(live.get("chain_post_entry", False)),
+            "depth_age_seconds": live.get("depth_age_seconds"),
+        }
+        try:
+            setattr(trade, "live_expected_move_forecast", outlook)
+        except Exception:
+            pass
+        return outlook
+
+    def _fifteen_min_fast_directional_intelligence(
+        self,
+        trade,
+        *,
+        current_spot: float,
+        latest_time: datetime,
+        state: Dict[str, Any],
+        live_context: Dict[str, Any],
+        adverse_shock: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Current sub-60s evidence, split into independent source categories."""
+        settings = get_settings()
+        result: Dict[str, Any] = {
+            "enabled": self._setting_enabled(
+                getattr(settings, "fifteen_min_fast_intelligence_enabled", True), True
+            ),
+            "status": "NEUTRAL",
+            "adverse_sources": [],
+            "supportive_sources": [],
+            "adverse_ready": False,
+            "supportive_ready": False,
+            "chain_post_entry": False,
+            "depth_age_seconds": None,
+        }
+        if not result["enabled"]:
+            return result
+        view = self._trade_direction_view(trade)
+        if view not in {"LONG", "SHORT"}:
+            return result
+        adverse_signal = "SELL" if view == "LONG" else "BUY"
+        supportive_signal = "BUY" if view == "LONG" else "SELL"
+        base = str(getattr(trade, "instrument", "") or "").split()[0].upper()
+        if not base:
+            return result
+
+        intel = None
+        try:
+            intel = self._fresh_exact_trade_intel(
+                trade,
+                evaluation_time=latest_time,
+                allow_blocking=False,
+            )
+        except Exception:
+            intel = None
+        chain_post_entry = self._fifteen_min_chain_is_post_entry(
+            trade, intel, latest_time
+        )
+        result["chain_post_entry"] = bool(chain_post_entry)
+        bearish_chain, bullish_chain = self._fifteen_min_chain_votes(intel)
+        chain_floor = max(
+            1,
+            int(getattr(settings, "fifteen_min_fast_chain_min_votes", 2) or 2),
+        )
+        adverse_chain_votes = bearish_chain if view == "LONG" else bullish_chain
+        supportive_chain_votes = bullish_chain if view == "LONG" else bearish_chain
+        chain_changed = False
+        if chain_post_entry and adverse_chain_votes >= chain_floor:
+            try:
+                chain_changed = bool(
+                    self._intel_reversal_is_new_evidence(trade, view, intel)[0]
+                )
+            except Exception:
+                chain_changed = False
+
+        depth = {}
+        try:
+            # For an option trade, contract L1 is the executable book. Prefer it over
+            # index depth; fall back to underlying depth when broker contract depth is
+            # unavailable.
+            depth_reader = getattr(getattr(self, "data", None), "get_order_book_snapshot", None)
+            trading_symbol = str(getattr(trade, "trading_symbol", "") or "")
+            symbol_token = str(getattr(trade, "symbol_token", "") or "")
+            if callable(depth_reader) and trading_symbol and symbol_token:
+                exchange = "BFO" if base in {"SENSEX", "BANKEX"} else "NFO"
+                depth = depth_reader(exchange, trading_symbol, symbol_token) or {}
+            if not isinstance(depth, dict) or not depth.get("usable"):
+                cfg = (getattr(self, "config", {}) or {}).get("indices", {}).get(base, {})
+                depth = self._get_depth_context(base, cfg or {})
+        except Exception:
+            depth = {}
+        try:
+            depth_age = float(depth.get("age_seconds"))
+        except (TypeError, ValueError, AttributeError):
+            depth_age = float("inf")
+        depth_max_age = max(
+            0.05,
+            float(
+                getattr(settings, "fifteen_min_fast_depth_max_age_seconds", 2.0)
+                or 2.0
+            ),
+        )
+        depth_fresh = bool(
+            isinstance(depth, dict)
+            and depth.get("usable")
+            and math.isfinite(depth_age)
+            and 0.0 <= depth_age <= depth_max_age
+        )
+        result["depth_age_seconds"] = round(depth_age, 3) if depth_fresh else None
+        try:
+            ofr = float(depth.get("ofr") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            ofr = 0.0
+        bullish_ofr = max(
+            1.0,
+            float(
+                getattr(settings, "fifteen_min_fast_order_flow_bullish_ratio", 1.08)
+                or 1.08
+            ),
+        )
+        bearish_ofr = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(settings, "fifteen_min_fast_order_flow_bearish_ratio", 0.92)
+                    or 0.92
+                ),
+            ),
+        )
+        adverse_depth = depth_fresh and (
+            (view == "LONG" and ofr <= bearish_ofr)
+            or (view == "SHORT" and ofr >= bullish_ofr)
+        )
+        supportive_depth = depth_fresh and (
+            (view == "LONG" and ofr >= bullish_ofr)
+            or (view == "SHORT" and ofr <= bearish_ofr)
+        )
+
+        def directional_thrust(signal: str) -> Tuple[bool, Dict[str, Any]]:
+            try:
+                metrics = self._candle_thrust_metrics(
+                    base, "1min", signal, as_of=latest_time
+                ) or {}
+            except Exception:
+                metrics = {}
+            try:
+                volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
+                range_ratio = float(metrics.get("range_atr_ratio", 0.0) or 0.0)
+                close_location = float(metrics.get("close_location", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return False, metrics
+            volume_floor = max(
+                0.0,
+                float(getattr(settings, "market_ltp_shock_min_volume_ratio", 1.10) or 1.10),
+            )
+            range_floor = max(
+                0.0,
+                float(getattr(settings, "quality_hybrid_thrust_range_atr", 1.05) or 1.05),
+            )
+            close_floor = max(
+                0.50,
+                float(getattr(settings, "market_wide_reversal_min_close_location", 0.65) or 0.65),
+            )
+            return bool(
+                volume_ratio >= volume_floor
+                and range_ratio >= range_floor
+                and close_location >= close_floor
+            ), metrics
+
+        adverse_volume, adverse_metrics = directional_thrust(adverse_signal)
+        supportive_volume, supportive_metrics = directional_thrust(supportive_signal)
+
+        regime = self._get_trade_regime(trade)
+        try:
+            rolling = self._live_direction_context(trade, view, regime)
+        except Exception:
+            rolling = {}
+        adverse_market = bool(adverse_shock or rolling.get("cross_adverse"))
+
+        supportive_shock = None
+        # Broad census costs pandas work across four indices. Run it only after the
+        # local tape has qualified as directional volume, never on ordinary ticks.
+        if supportive_volume:
+            try:
+                supportive_shock = self._evaluate_market_ltp_shock(
+                    base,
+                    supportive_signal,
+                    latest_time,
+                    timeframe="1min",
+                )
+            except Exception:
+                supportive_shock = None
+        supportive_market = bool(supportive_shock)
+
+        adverse_sources = []
+        supportive_sources = []
+        if adverse_market:
+            adverse_sources.append("market-wide")
+        if adverse_volume:
+            adverse_sources.append("volume")
+        if adverse_depth:
+            adverse_sources.append("order-flow")
+        if chain_changed:
+            adverse_sources.append("new-OI/PCR")
+        if supportive_market:
+            supportive_sources.append("market-wide")
+        if supportive_volume:
+            supportive_sources.append("volume")
+        if supportive_depth:
+            supportive_sources.append("order-flow")
+        if chain_post_entry and supportive_chain_votes >= chain_floor:
+            supportive_sources.append("new-OI/PCR")
+
+        minimum_sources = max(
+            3,
+            int(getattr(settings, "fifteen_min_fast_intelligence_min_sources", 3) or 3),
+        )
+        flow_or_chain_adverse = bool(adverse_depth or chain_changed)
+        flow_or_chain_supportive = bool(
+            supportive_depth
+            or (chain_post_entry and supportive_chain_votes >= chain_floor)
+        )
+        adverse_ready = bool(
+            live_context.get("one_min_emergency")
+            and adverse_market
+            and adverse_volume
+            and flow_or_chain_adverse
+            and len(adverse_sources) >= minimum_sources
+            and state.get("normal_state_ready")
+            and state.get("premium_confirmed")
+        )
+        supportive_ready = bool(
+            supportive_market
+            and supportive_volume
+            and flow_or_chain_supportive
+            and len(supportive_sources) >= minimum_sources
+            and float(state.get("pnl_rs", 0.0) or 0.0) >= 0.0
+        )
+        status = "ADVERSE" if adverse_ready else (
+            "SUPPORTIVE" if supportive_ready else "NEUTRAL"
+        )
+        result.update(
+            {
+                "status": status,
+                "adverse_sources": adverse_sources,
+                "supportive_sources": supportive_sources,
+                "adverse_ready": adverse_ready,
+                "supportive_ready": supportive_ready,
+                "adverse_metrics": adverse_metrics,
+                "supportive_metrics": supportive_metrics,
+                "adverse_chain_votes": adverse_chain_votes,
+                "supportive_chain_votes": supportive_chain_votes,
+                "order_flow_ratio": ofr if depth_fresh else None,
+            }
+        )
+        return result
+
     def _fifteen_min_one_min_support_exit_decision(
         self,
         trade,
         current_spot: float,
         latest_time: Optional[datetime],
+        *,
+        current_mark: Optional[float] = None,
+        current_pnl_rs: Optional[float] = None,
+        initial_risk_rs: Optional[float] = None,
+        peak_pnl_rs: Optional[float] = None,
+        observed_contract_ticks: Optional[List[Tuple[float, Optional[datetime]]]] = None,
     ) -> Tuple[bool, str]:
-        """Let 1m detect emergencies while the 15m chart remains the owning frame."""
+        """State-aware 1m emergency monitor for a 15m-owned trade."""
         settings = get_settings()
         if not self._setting_enabled(
             getattr(settings, "fifteen_min_one_min_support_exit_enabled", True), True
@@ -20147,11 +21115,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return False, ""
         if str(getattr(trade, "timeframe", "") or "").lower() != "15min":
             return False, ""
-        entry_time = getattr(trade, "entry_time", None) or getattr(
-            trade, "signal_timestamp", None
+        entry_time = (
+            getattr(trade, "entry_filled_at", None)
+            or getattr(trade, "entry_timestamp", None)
+            or getattr(trade, "entry_time", None)
+            or getattr(trade, "signal_timestamp", None)
         )
         if not isinstance(entry_time, datetime) or not isinstance(latest_time, datetime):
             return False, "entry/evaluation clock unavailable"
+        held = 0.0
         if isinstance(entry_time, datetime) and isinstance(latest_time, datetime):
             entry_cmp = (
                 entry_time.astimezone(IST).replace(tzinfo=None)
@@ -20174,37 +21146,303 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 )
             except (TypeError, ValueError):
                 min_hold = 15.0
-            if held < min_hold:
-                return False, f"held {held:.1f}s<{min_hold:.1f}s"
 
-        context = self._profit_guard_reversal_context(
+        state = self._fifteen_min_exit_trade_state(
+            trade,
+            current_mark=current_mark,
+            current_pnl_rs=current_pnl_rs,
+            initial_risk_rs=initial_risk_rs,
+            peak_pnl_rs=peak_pnl_rs,
+            observed_contract_ticks=observed_contract_ticks,
+        )
+        # Premium/underlying progress updates from the first monitor pass. Exit still
+        # respects the 15-second fill debounce below.
+        self._refresh_fifteen_min_live_expected_move(
+            trade,
+            current_spot=float(current_spot or 0.0),
+            latest_time=latest_time,
+            state=state,
+        )
+        if held < min_hold:
+            return False, f"held {held:.1f}s<{min_hold:.1f}s"
+
+        live_context = self._profit_guard_reversal_context(
             trade,
             float(current_spot or 0.0),
             latest_time,
             timeframe="15min",
         )
-        one_min = context.get("one_min_context", {}) if isinstance(context, dict) else {}
-        if not context.get("has_context") or not isinstance(one_min, dict) or not one_min.get("has_context"):
+        live_one_min = (
+            live_context.get("one_min_context", {})
+            if isinstance(live_context, dict)
+            else {}
+        )
+        if (
+            not live_context.get("has_context")
+            or not isinstance(live_one_min, dict)
+            or not live_one_min.get("has_context")
+        ):
             return False, "missing own 15m or supporting 1m chart context"
-        # The established classifier promotes only a large 1m body/close move, a severe
-        # rejection wick, a multi-bar adverse grind, or a simultaneous 1m+15m trend
-        # break. Ordinary 1m noise explicitly leaves one_min_emergency false.
-        emergency = bool(context.get("one_min_emergency"))
-        reversal_shape = bool(
-            context.get("fast_reversal")
-            or context.get("pullback_class") == "structure_break"
+
+        view = self._trade_direction_view(trade)
+        opposite_signal = "SELL" if view == "LONG" else ("BUY" if view == "SHORT" else "")
+        instrument_parts = str(getattr(trade, "instrument", "") or "").split()
+        base = instrument_parts[0].upper() if instrument_parts else ""
+        shock = None
+        # The broad shock census is the expensive part of this 100ms monitor. It cannot
+        # qualify without an emergency 1m shape, so do not scan four index frames on
+        # ordinary ticks.
+        if (
+            live_context.get("one_min_emergency")
+            and opposite_signal in {"BUY", "SELL"}
+            and base
+        ):
+            try:
+                shock = self._evaluate_market_ltp_shock(
+                    base,
+                    opposite_signal,
+                    latest_time,
+                    timeframe="1min",
+                )
+            except Exception:
+                shock = None
+        catastrophic = bool(
+            live_context.get("one_min_emergency")
+            and isinstance(shock, dict)
+            and shock.get("strong")
         )
-        confirmed = bool(
-            emergency
-            and reversal_shape
-            and not context.get("trend_supportive")
-            and context.get("pullback_class") in {"reversal", "big_reversal", "structure_break"}
+        fresh_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    "fifteen_min_one_min_support_fresh_trade_seconds",
+                    60.0,
+                )
+                or 0.0
+            ),
         )
-        if not confirmed:
-            return False, str(context.get("reason") or "1m support did not confirm a 15m reversal")
+        fast_directional = {}
+        if held < fresh_seconds:
+            fast_directional = self._fifteen_min_fast_directional_intelligence(
+                trade,
+                current_spot=float(current_spot or 0.0),
+                latest_time=latest_time,
+                state=state,
+                live_context=live_context,
+                adverse_shock=shock,
+            )
+            self._refresh_fifteen_min_live_expected_move(
+                trade,
+                current_spot=float(current_spot or 0.0),
+                latest_time=latest_time,
+                state=state,
+                directional=fast_directional,
+            )
+        if catastrophic:
+            if not state.get("premium_confirmed"):
+                return False, (
+                    "catastrophic underlying shock held: option premium has not confirmed "
+                    f"adverse movement ({state.get('premium_adverse_r', 0.0):.2f}R)"
+                )
+            return True, (
+                "catastrophic multi-index/tick reversal; "
+                f"{shock.get('reason', '')}; state={state.get('state')} "
+                f"loss={state.get('loss_r', 0.0):.2f}R "
+                f"giveback={state.get('giveback_pct', 0.0):.0%} "
+                f"premium_adverse={state.get('premium_adverse_r', 0.0):.2f}R"
+            )
+
+        if held < fresh_seconds:
+            if fast_directional.get("adverse_ready"):
+                sources = ", ".join(fast_directional.get("adverse_sources") or [])
+                return True, (
+                    "fresh multi-source reversal; "
+                    f"{sources}; state={state.get('state')} "
+                    f"loss={state.get('loss_r', 0.0):.2f}R "
+                    f"giveback={state.get('giveback_pct', 0.0):.0%} "
+                    f"premium_adverse={state.get('premium_adverse_r', 0.0):.2f}R"
+                )
+            return False, (
+                f"fresh trade {held:.1f}s<{fresh_seconds:.1f}s; "
+                "normal reversal waits for completed 1m confirmation; "
+                f"fast evidence={','.join(fast_directional.get('adverse_sources') or []) or 'none'}"
+            )
+
+        closed_one_min = self._profit_guard_reversal_context(
+            trade,
+            float(current_spot or 0.0),
+            latest_time,
+            timeframe="1min",
+            closed_only=True,
+        )
+        if not self._reversal_breaks_own_frame(closed_one_min):
+            return False, str(
+                closed_one_min.get("reason")
+                or "completed 1m candle did not confirm reversal"
+            )
+
+        five_min = self._profit_guard_reversal_context(
+            trade,
+            float(current_spot or 0.0),
+            latest_time,
+            timeframe="5min",
+        )
+        fifteen_break = self._reversal_breaks_own_frame(live_context)
+        five_break = self._reversal_breaks_own_frame(five_min)
+
+        market_wide = None
+        if opposite_signal in {"BUY", "SELL"} and base:
+            for confirm_tf in ("5min", "15min"):
+                try:
+                    market_wide = self._market_wide_reversal_context(
+                        base, confirm_tf, opposite_signal, latest_time
+                    )
+                except Exception:
+                    market_wide = None
+                if market_wide:
+                    break
+
+        regime = self._get_trade_regime(trade)
+        try:
+            rolling = self._live_direction_context(trade, view, regime)
+        except Exception:
+            rolling = {}
+        rolling_adverse = bool(rolling.get("adverse"))
+        market_confirmed = bool(
+            market_wide
+            or rolling.get("cross_adverse")
+        )
+        if not (fifteen_break or five_break or market_confirmed):
+            return False, (
+                "completed 1m reversal held: neither 5m/15m structure nor "
+                "market-wide rolling direction confirmed"
+            )
+
+        intel = None
+        try:
+            intel = self._fresh_exact_trade_intel(
+                trade,
+                evaluation_time=latest_time,
+                allow_blocking=False,
+            )
+        except Exception:
+            intel = None
+        intel_votes = (
+            self._intel_adverse_votes(view, intel)
+            if self._intel_evidence_is_usable(intel)
+            else 0
+        )
+        intel_floor = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "loss_guard_oi_pcr_votes_losing"
+                    if state.get("state") == "LOSING"
+                    else "loss_guard_oi_pcr_votes_winning",
+                    2 if state.get("state") == "LOSING" else 3,
+                )
+                or (2 if state.get("state") == "LOSING" else 3)
+            ),
+        )
+        greeks = intel.get("greeks", {}) if isinstance(intel, dict) else {}
+        greeks_available = bool(
+            isinstance(greeks, dict)
+            and any(
+                isinstance(value, dict) and any(value.get(k) is not None for k in ("delta", "gamma", "iv", "vega"))
+                for value in greeks.values()
+            )
+        )
+
+        thrust = None
+        if base and opposite_signal in {"BUY", "SELL"}:
+            try:
+                thrust = self._candle_thrust_metrics(
+                    base,
+                    "1min",
+                    opposite_signal,
+                    as_of=closed_one_min.get("evaluated_bar_at"),
+                )
+            except Exception:
+                thrust = None
+        volume_ratio = float((thrust or {}).get("volume_ratio", 0.0) or 0.0)
+        volume_floor = max(
+            0.0,
+            float(getattr(settings, "market_ltp_shock_min_volume_ratio", 1.10) or 1.10),
+        )
+
+        confirmations = []
+        if five_break:
+            confirmations.append("5m-structure")
+        if fifteen_break:
+            confirmations.append("15m-structure")
+        if market_confirmed:
+            confirmations.append("market-wide/rolling-regime")
+        elif rolling_adverse:
+            confirmations.append("rolling-regime")
+        if intel_votes >= intel_floor:
+            confirmations.append(f"intel-{intel_votes}v")
+        if volume_ratio >= volume_floor:
+            confirmations.append(f"volume-{volume_ratio:.2f}x")
+        min_confirmations = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "fifteen_min_one_min_support_min_confirmations",
+                    2,
+                )
+                or 2
+            ),
+        )
+        # A synchronized multi-index reversal already contains multiple independent
+        # instruments, so it satisfies the breadth side of the confirmation count.
+        confirmation_count = max(
+            len(confirmations),
+            min_confirmations if market_confirmed else 0,
+        )
+        if confirmation_count < min_confirmations:
+            return False, (
+                f"reversal corroboration {confirmation_count}/{min_confirmations}: "
+                f"{', '.join(confirmations) or 'none'}"
+            )
+        durable_confirmation = bool(
+            market_confirmed
+            or (
+                rolling_adverse
+                and intel_votes >= intel_floor
+                and volume_ratio >= volume_floor
+            )
+        )
+        if not durable_confirmation:
+            return False, (
+                "local reversal held: normal regime transition needs adverse rolling "
+                "regime + fresh OI/PCR/order-flow + abnormal volume, or genuine "
+                "market-wide confirmation"
+            )
+        if not state.get("normal_state_ready"):
+            return False, (
+                f"{state.get('state')} trade not at state exit band: "
+                f"loss={state.get('loss_r', 0.0):.2f}R, "
+                f"stop_remaining={state.get('remaining_stop_r', float('inf')):.2f}R, "
+                f"giveback={state.get('giveback_pct', 0.0):.0%}, "
+                f"lock_threat={bool(state.get('lock_threat'))}"
+            )
+        if not state.get("premium_confirmed"):
+            return False, (
+                "underlying reversal held: verified option premium did not deteriorate "
+                f"by required R band ({state.get('premium_adverse_r', 0.0):.2f}R)"
+            )
+
         return True, (
-            "15m structure under emergency 1m opposing move; "
-            f"15m={context.get('reason', '')}; 1m={one_min.get('reason', '')}"
+            "state-confirmed 15m reversal; completed 1m + "
+            f"{', '.join(confirmations)}; state={state.get('state')} "
+            f"loss={state.get('loss_r', 0.0):.2f}R "
+            f"stop_remaining={state.get('remaining_stop_r', float('inf')):.2f}R "
+            f"giveback={state.get('giveback_pct', 0.0):.0%} "
+            f"premium_adverse={state.get('premium_adverse_r', 0.0):.2f}R "
+            f"greeks={'available' if greeks_available else 'unknown'}"
         )
 
     def _intel_age_seconds(
@@ -23674,7 +24912,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 geometry_observed_at=now.isoformat(),
                 geometry_source="missed_reentry.futures",
                 geometry_verified=True,
-                signal_timestamp=now,
+                signal_timestamp=source_ts if source_ts is not None else now,
                 current_price=fut_price,
                 status="MISSED RE-ENTRY SIGNAL",
                 action="ENTRY",
@@ -23753,7 +24991,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 geometry_observed_at=now.isoformat(),
                 geometry_source="missed_reentry.option_delta",
                 geometry_verified=True,
-                signal_timestamp=now,
+                signal_timestamp=source_ts if source_ts is not None else now,
                 current_price=premium,
                 status="MISSED RE-ENTRY SIGNAL",
                 action="ENTRY",
@@ -25049,6 +26287,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 sig_type,
                 getattr(signal, "timestamp", None),
                 timeframe=str(timeframe or ""),
+                setup_confidence=float(getattr(signal, "confidence", 0.0) or 0.0),
+                setup_adx=float(getattr(signal, "adx_value", 0.0) or 0.0),
+                setup_intel_score=float(
+                    getattr(signal, "intelligence_score", 0.0)
+                    or getattr(signal, "graded_intel_score", 0.0)
+                    or 0.0
+                ),
+                trend_15m_agrees=bool(getattr(signal, "trend_15m_agrees", False)),
             )
         except Exception:
             ctx = None
@@ -25243,36 +26489,36 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         return handled
 
     def _passes_timeframe_entry_policy(self, candidate: TradeCandidate) -> bool:
-        """Return whether a candidate may become a fresh live/manual entry.
+        """Return whether fresh entry frame obeys selected operator policy.
 
-        PRIMARY_15 only restricts plain 5min structure entries. 1min SPIKE /
-        SNAPBACK (and other fast 1m chassis flags) are never blocked here —
-        those paths are governed solely by their own settings toggles.
+        Legacy 15M / 5M+15M modes retain confirmed 1m special entries.
+        Quad Prime raw multi-source entry keeps its established 15M-only exception.
+        Explicit 5M and 1m-inclusive policies are exact frame selections.
         """
-        if getattr(self, "mode", "") == "HISTORICAL":
-            return True
-
-        if self._is_quad_prime_raw_candidate(candidate):
-            return True
-
         timeframe = str(getattr(candidate, "timeframe", "") or "")
-        # Fast 1m paths: independent of TF policy / engine.
-        if timeframe == "1min" and (
+        policy = normalize_timeframe_entry_policy(
+            getattr(get_settings(), "ut_timeframe_entry_policy", "INCLUDE_5MIN")
+        )
+        if policy == "PRIMARY_15" and self._is_quad_prime_raw_candidate(candidate):
+            return True
+        if timeframe in timeframe_entry_timeframes(policy):
+            return True
+        legacy_fast_one_min = policy in {"PRIMARY_15", "INCLUDE_5MIN"} and timeframe == "1min" and (
             bool(getattr(candidate, "volume_spike_entry", False))
             or bool(getattr(candidate, "is_reversion_scalp", False))
             or bool(getattr(candidate, "market_ltp_shock_entry", False))
             or bool(getattr(candidate, "market_wide_reversal_entry", False))
-        ):
+            or bool(getattr(candidate, "late_session_reclaim_entry", False))
+            or bool(getattr(candidate, "one_way_cascade_entry", False))
+        )
+        if legacy_fast_one_min:
             return True
-
-        policy = str(getattr(get_settings(), "ut_timeframe_entry_policy", "PRIMARY_15") or "PRIMARY_15").upper()
-        if policy == "PRIMARY_15" and timeframe == "5min":
-            return self._gate_block(
-                candidate,
-                f"Live Gate: blocked {candidate.instrument} {timeframe} {candidate.direction}; "
-                "15M MAIN policy treats 5min as timing/exit-only.",
-            )
-        return True
+        return self._gate_block(
+            candidate,
+            f"Entry policy {policy} blocks {candidate.instrument} {timeframe} "
+            f"{candidate.direction}; selected frames are "
+            f"{'+'.join(sorted(timeframe_entry_timeframes(policy)))}.",
+        )
 
     def _market_location_entry_gate(self, candidate: TradeCandidate) -> Tuple[bool, str]:
         """Classify live entries that are badly located inside the intraday structure."""
@@ -25896,6 +27142,56 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             )
         return True, "", ""
 
+    def _option_chain_entry_freshness_blocker(
+        self,
+        candidate: TradeCandidate,
+        regime: str,
+    ) -> str:
+        """Reject option entries whose attached chain evidence aged past its lane."""
+        if str(getattr(candidate, "inst_type", "") or "").upper() != "OPT":
+            return ""
+        quality = getattr(candidate, "chain_quality", None)
+        if not isinstance(quality, dict) or "age_seconds" not in quality:
+            # Every production signal stamps LIVE provenance and its grading chain.
+            # Fail closed if that evidence is lost between grading and submission;
+            # untagged lightweight/replay facades retain compatibility below.
+            if str(getattr(candidate, "data_provenance", "") or "").upper() == "LIVE":
+                return "option-chain freshness evidence is missing"
+            return ""
+        try:
+            age = float(quality.get("age_seconds"))
+        except (TypeError, ValueError):
+            return "option-chain age is invalid"
+        if not math.isfinite(age) or age < 0:
+            return "option-chain age is invalid"
+        settings = get_settings()
+        try:
+            iv_percentile = float(getattr(candidate, "iv_percentile", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            iv_percentile = 0.0
+        high_vol = bool(
+            str(regime or "").upper() in {"VOLATILE", "HIGH_VOLATILITY"}
+            or iv_percentile
+            >= float(getattr(settings, "option_chain_high_vol_percentile", 70.0) or 70.0)
+        )
+        setting_name = (
+            "option_chain_high_vol_entry_max_age_seconds"
+            if high_vol
+            else "option_chain_entry_max_age_seconds"
+        )
+        default_limit = 90.0 if high_vol else 120.0
+        try:
+            limit = max(
+                10.0,
+                float(getattr(settings, setting_name, default_limit) or default_limit),
+            )
+        except (TypeError, ValueError):
+            limit = default_limit
+        if bool(quality.get("stale", False)) or age > limit:
+            lane = "high-volatility" if high_vol else "normal"
+            return f"option chain age {age:.1f}s exceeds {lane} entry limit {limit:.1f}s"
+        return ""
+
     def _passes_live_trade_ready_gate(self, candidate: TradeCandidate) -> bool:
         """Final live/manual gate before a signal is allowed into the session ledger."""
         if getattr(self, "mode", "") == "HISTORICAL":
@@ -25989,6 +27285,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             logger.info(f"🚀 [OVERRIDE] Live Choppy regime bypassed due to strong ADX ({adx_val:.1f} >= {momentum_threshold})")
         timeframe = str(getattr(candidate, "timeframe", "") or "")
         inst_type = str(getattr(candidate, "inst_type", "") or "").upper()
+
+        chain_age_blocker = Scanner._option_chain_entry_freshness_blocker(
+            self, candidate, regime
+        )
+        if chain_age_blocker:
+            return self._gate_block(
+                candidate,
+                f"Live Gate: blocked {candidate.instrument} {timeframe} "
+                f"{candidate.direction}; {chain_age_blocker}.",
+            )
 
         # This guard refreshes the 15-minute intelligence/ADX reading on the candidate.
         # Do that before quality is evaluated so the verdict can neither pass stale-high
@@ -26473,6 +27779,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 previous,
                 float(current_price or 0.0),
                 latest_time,
+                current_mark=float(current_price or 0.0),
+                current_pnl_rs=session_pnl,
+                initial_risk_rs=initial_risk_sess,
+                peak_pnl_rs=max(
+                    float(getattr(previous, "peak_pnl", 0.0) or 0.0),
+                    session_pnl,
+                ),
             )
             if fast_exit:
                 create_exit(
@@ -29280,10 +30593,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             ts_key = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
         except Exception:
             ts_key = str(ts)
+        tf_key = str(tf or "5min").lower()
+        if tf_key not in {"1min", "5min", "15min"}:
+            tf_key = "5min"
         cache_key = (
             int(getattr(self, "simulation_id", 0) or 0),
             str(instrument or "").upper(),
-            str(tf or "5min"),
+            tf_key,
             ts_key,
         )
         cache = getattr(self, "_historical_intel_at_cache", None)
@@ -29304,21 +30620,29 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         try:
             df_5m = self.candles.get_candles(instrument, "5min")
             df_1m = self.candles.get_candles(instrument, "1min")
-            if df_5m is None or df_5m.empty:
+            df_tf = (
+                df_1m
+                if tf_key == "1min"
+                else df_5m
+                if tf_key == "5min"
+                else self.candles.get_candles(instrument, "15min")
+            )
+            if df_5m is None or df_5m.empty or df_tf is None or df_tf.empty:
                 cache[cache_key] = (0.0, "UNKNOWN")
                 return 0.0, "UNKNOWN"
             sub_5m = _slice_to(df_5m, ts)
+            sub_tf = _slice_to(df_tf, ts)
             sub_1m = None
             if df_1m is not None and not df_1m.empty:
                 sub_1m = _slice_to(df_1m, ts)
                 if sub_1m.empty:
                     sub_1m = None
-            if sub_5m.empty:
+            if sub_5m.empty or sub_tf.empty:
                 cache[cache_key] = (0.0, "UNKNOWN")
                 return 0.0, "UNKNOWN"
-            spot = float(sub_5m["close"].iloc[-1])
+            spot = float(sub_tf["close"].iloc[-1])
             try:
-                o = float(sub_5m["open"].iloc[-1])
+                o = float(sub_tf["open"].iloc[-1])
                 pct = ((spot - o) / o) * 100.0 if o > 0 else 0.0
             except Exception:
                 pct = 0.0
@@ -29350,8 +30674,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 day_cache.clear()
             intel_res = self.intel.analyze(
                 instrument=instrument,
-                timeframe=tf,
-                candle_df=sub_5m,
+                timeframe=tf_key,
+                candle_df=sub_tf,
                 candle_1min_df=sub_1m,
                 options_chain=None,
                 spot_price=spot,
@@ -31592,6 +32916,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     signal_type,
                     signal_time_for_reversal,
                     timeframe=str(getattr(sig, "timeframe", "") or ""),
+                    setup_confidence=float(getattr(sig, "confidence", 0.0) or 0.0),
+                    setup_adx=float(getattr(sig, "adx_value", 0.0) or 0.0),
+                    setup_intel_score=float(getattr(sig, "intelligence_score", 0.0) or 0.0),
+                    trend_15m_agrees=bool(getattr(sig, "trend_15m_agrees", False)),
                 )
                 if market_ltp_shock:
                     setattr(sig, "market_ltp_shock_entry", True)
@@ -32310,7 +33638,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         elif now_ist.weekday() >= 5:
             reason = "Market closed (weekend)"
         elif self._is_real_mode_premarket_arm_window(now_ist):
-            reason = "Pre-open arming window (REAL allowed; trading starts 09:18 IST)"
+            reason = "Pre-open arming window (REAL allowed; trading starts 09:15 IST)"
         elif now_ist.time() < dtime(9, 15):
             reason = "Pre-open (REAL arming starts 09:00:00 IST; market opens 09:15 IST)"
         elif now_ist.time() > dtime(15, 30):
@@ -33311,6 +34639,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 trade,
                 float(price or 0.0),
                 latest_time,
+                current_mark=float(opt_val or 0.0),
+                current_pnl_rs=live_unreal,
+                peak_pnl_rs=float(getattr(trade, "peak_pnl", 0.0) or 0.0),
+                observed_contract_ticks=observed_contract_ticks,
             )
             if fast_exit:
                 self.log_event(

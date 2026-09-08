@@ -79,7 +79,7 @@ INTEL_SCORE_GATES = (
 )
 
 
-def cheapest_one_lot_cost(settings) -> tuple[float, str]:
+def cheapest_one_lot_cost(settings, active_indices: list[str] | None = None) -> tuple[float, str]:
     """Rupees needed for ONE lot of the cheapest active index option, and how it was got.
 
     This used to be a flat Rs.50,000 constant described as "the floor for one index lot".
@@ -117,7 +117,9 @@ def cheapest_one_lot_cost(settings) -> tuple[float, str]:
     except Exception:
         return 0.0, ""
 
-    configured_active = getattr(settings, "active_indices", None)
+    configured_active = (
+        active_indices if active_indices is not None else getattr(settings, "active_indices", None)
+    )
     active = [
         str(x).upper()
         for x in (configured_active if configured_active is not None else indices)
@@ -180,24 +182,11 @@ def inert_guard_warnings(settings) -> list[tuple[str, str]]:
         except (TypeError, ValueError):
             return default
 
-    # engine/signal_processor.py:1842 — `if is_choppy_regime(...): opt_sl_pct =
-    # max(opt_sl_pct, 15.0)`. The literal is the same 15.0 that options_sl_pct already
-    # ships, so the chop branch cannot widen anything. On 1min/5min it could not anyway:
-    # the band ceiling is min(option_stop_5min_max_pct, opt_sl_pct) = 10.0.
-    options_sl_pct = _f("options_sl_pct", 15.0)
-    if options_sl_pct >= 15.0:
-        found.append((
-            "chop stop widening",
-            f"options_sl_pct is already {options_sl_pct:.1f}%, and the choppy branch only "
-            f"does max(opt_sl_pct, 15.0), so a choppy regime widens the option stop by "
-            f"nothing. The 5min band ceiling of 10% binds first in any case.",
-        ))
-
     # Scanner._dynamic_runner_lock_pct returns min(base, loose). A LOWER lock_pct leaves
     # more of the gain unlocked, i.e. more room, so `loose` must be strictly below the
     # base for the volatile-tape branch to mean anything.
     base_lock = _f("dynamic_rr_runner_lock_pct", 0.85)
-    loose_lock = _f("trend_runner_lock_pct_high_vol", 0.85)
+    loose_lock = _f("trend_runner_lock_pct_high_vol", 0.80)
     if loose_lock >= base_lock:
         found.append((
             "trend_runner_lock_pct_high_vol",
@@ -208,7 +197,7 @@ def inert_guard_warnings(settings) -> list[tuple[str, str]]:
         ))
 
     # dynamic_rr_max caps a sum that cannot reach it.
-    max_rr = _f("dynamic_rr_max", 12.0)
+    max_rr = _f("dynamic_rr_max", 5.0)
     if max_rr > DYNAMIC_RR_LADDER_CEILING:
         five_min_max = _f("dynamic_rr_5min_max", 2.5)
         found.append((
@@ -259,14 +248,69 @@ def calendar_coverage_status(data_provider, now) -> dict:
     }
 
 
+def option_chain_readiness_max_age_seconds(settings: Any) -> float:
+    """Age through which a verified chain remains safe for Auto startup."""
+    try:
+        network_ttl = float(
+            getattr(settings, "intelligence_cache_ttl_seconds", 90.0) or 90.0
+        )
+    except (TypeError, ValueError):
+        network_ttl = 90.0
+    try:
+        startup_age = float(
+            getattr(settings, "option_chain_startup_max_age_seconds", 150.0)
+            or 150.0
+        )
+    except (TypeError, ValueError):
+        startup_age = 150.0
+    # Never make startup freshness shorter than the normal broker refresh TTL.
+    return max(10.0, network_ttl, startup_age)
+
+
+def option_chain_auto_readiness_reasons(
+    meta: Any,
+    *,
+    strike_count: int,
+    age_seconds: float,
+    min_strikes: int,
+    max_age_seconds: float,
+) -> List[str]:
+    """Explain why a primary or independently certified fallback chain cannot arm Auto."""
+    reasons: List[str] = []
+    payload = meta if isinstance(meta, dict) else {}
+    if int(strike_count or 0) < int(min_strikes or 0):
+        reasons.append(f"{int(strike_count or 0)} strikes (need {int(min_strikes or 0)})")
+    if (
+        not isinstance(meta, dict)
+        or (
+            bool(payload.get("fallback", True))
+            and not bool(payload.get("auto_certified", False))
+        )
+    ):
+        reasons.append("fallback chain")
+    if not bool(payload.get("expiry_aligned", False)):
+        reasons.append("active expiry not verified")
+    if not str(payload.get("active_expiry") or "").strip():
+        reasons.append("active expiry missing")
+    if not (0.0 <= float(age_seconds) <= float(max_age_seconds)):
+        reasons.append("chain stale or missing")
+    return reasons
+
+
 def validate_real_mode_readiness(
     settings: Any,
     data_provider: Any = None,
     now: datetime | None = None,
     *,
     require_option_chains: bool = False,
+    active_indices: list[str] | None = None,
 ) -> Dict[str, Any]:
-    """Return a structured readiness decision before REAL mode is allowed."""
+    """Return a structured readiness decision before REAL mode is allowed.
+
+    ``active_indices`` is an optional proposed execution universe.  Configure calls
+    this before mutating live settings, so the option-chain and funding checks cannot
+    accidentally certify the previous same-sized universe.
+    """
     now = now or datetime.now(IST)
     if now.tzinfo is None:
         now = IST.localize(now)
@@ -422,7 +466,7 @@ def validate_real_mode_readiness(
 
         _probe = _KB(kite=_auth_for_funds(settings).kite)
         _cash = _probe.available_funds()
-        _floor, _detail = cheapest_one_lot_cost(settings)
+        _floor, _detail = cheapest_one_lot_cost(settings, active_indices=active_indices)
         if _cash is not None and _floor > 0 and _cash < _floor:
             warnings.append(
                 f"broker free cash is {_cash:,.2f}, below the {_floor:,.0f} needed for "
@@ -464,26 +508,29 @@ def validate_real_mode_readiness(
         if data_provider is None:
             blockers.append("option-chain readiness unavailable")
         else:
-            active_indices = [
+            readiness_indices = [
                 str(item or "").strip().upper()
-                for item in (getattr(settings, "active_indices", []) or [])
+                for item in (
+                    active_indices
+                    if active_indices is not None
+                    else (getattr(settings, "active_indices", []) or [])
+                )
                 if str(item or "").strip()
             ]
+            readiness_indices = list(dict.fromkeys(readiness_indices))
             min_strikes = max(
                 3,
                 int(getattr(settings, "auto_option_chain_min_strikes", 3) or 3),
             )
-            max_age = max(
-                10.0,
-                float(
-                    getattr(settings, "intelligence_cache_ttl_seconds", 90.0)
-                    or 90.0
-                ),
-            )
+            # The network refresh TTL controls how often a broker is called; it is
+            # not the expiry of already-valid intelligence. A full four-index morning
+            # warmup can itself exceed 90s, which made its first chains "stale" before
+            # the warmup completed and permanently prevented configured Auto startup.
+            max_age = option_chain_readiness_max_age_seconds(settings)
             meta_by_index = getattr(data_provider, "_option_chain_meta", {}) or {}
             cache_by_index = getattr(data_provider, "_opt_chain_cache", {}) or {}
             now_epoch = now.timestamp()
-            for instrument in active_indices:
+            for instrument in readiness_indices:
                 meta = meta_by_index.get(instrument, {})
                 chain = cache_by_index.get(f"opt_chain_{instrument}")
                 try:
@@ -492,17 +539,13 @@ def validate_real_mode_readiness(
                     count = 0
                 fetched_at = float(meta.get("fetched_at") or 0.0) if isinstance(meta, dict) else 0.0
                 age = now_epoch - fetched_at if fetched_at > 0 else float("inf")
-                reasons = []
-                if count < min_strikes:
-                    reasons.append(f"{count} strikes (need {min_strikes})")
-                if not isinstance(meta, dict) or bool(meta.get("fallback", True)):
-                    reasons.append("fallback chain")
-                if not bool((meta or {}).get("expiry_aligned", False)):
-                    reasons.append("active expiry not verified")
-                if not str((meta or {}).get("active_expiry") or "").strip():
-                    reasons.append("active expiry missing")
-                if not (0.0 <= age <= max_age):
-                    reasons.append("chain stale or missing")
+                reasons = option_chain_auto_readiness_reasons(
+                    meta,
+                    strike_count=count,
+                    age_seconds=age,
+                    min_strikes=min_strikes,
+                    max_age_seconds=max_age,
+                )
                 if reasons:
                     blockers.append(
                         f"{instrument} option chain not Auto-ready: "

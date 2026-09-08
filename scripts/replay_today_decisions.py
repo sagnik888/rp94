@@ -4,15 +4,19 @@ from datetime import date, datetime
 import json
 from pathlib import Path
 import sys
-from types import SimpleNamespace
-
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import get_settings
+from engine.quality_verdict import (
+    POLICY_VERSION,
+    QualityInputs,
+    evaluate_quality,
+    policy_configuration,
+    policy_configuration_hash,
+)
 from engine.signal_manager import SignalManager
-from engine.signal_processor import SignalProcessor
 from engine.ut_bot_core import UTBotEngine
 from intelligence.regime_detector import RegimeDetector
 
@@ -34,9 +38,9 @@ class Decision:
     regime: str
     confluence: float
     direction_15m: int
-    current: str
-    strict: str
-    max_relaxed: str
+    decision: str
+    route: str
+    reason_code: str
     reason: str
 
 
@@ -95,10 +99,6 @@ def confluence_at(results: dict, candles: dict, instrument: str, ts: pd.Timestam
     return score, label, pos15
 
 
-def grade_rank(grade: str) -> int:
-    return {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4}.get(str(grade or "C").split()[0], 0)
-
-
 def is_choppy(regime: str) -> bool:
     return str(regime or "UNKNOWN").upper() in {
         "CHOPPY",
@@ -111,11 +111,8 @@ def is_choppy(regime: str) -> bool:
     }
 
 
-def relaxed(value: float, pct: float) -> float:
-    return float(value) * (1.0 - min(max(float(pct), 0.0), 0.20))
-
-
-def impulse_reversal(sig, df_5m: pd.DataFrame, confidence: float, pct: float, choppy_gate: float) -> bool:
+def setup_evidence(sig, frame: pd.DataFrame) -> tuple[bool, float]:
+    """Return structural impulse and measured volume ratio without ADX double-counting."""
     candle = getattr(sig, "raw_candle", {}) or {}
     atr = max(float(getattr(sig, "atr_value", 0.0) or 0.0), 1e-9)
     open_px = float(candle.get("open") or 0.0)
@@ -129,52 +126,20 @@ def impulse_reversal(sig, df_5m: pd.DataFrame, confidence: float, pct: float, ch
         if sig.signal_type == "BUY"
         else close_px <= low_px + (0.25 * atr)
     )
-    strong_adx = float(sig.adx_value or 0.0) >= 28.0 and confidence >= relaxed(choppy_gate, pct)
     impulse_body = body_atr >= 0.80 and range_atr >= 1.05 and close_near_extreme
-    extreme_range = range_atr >= 1.45 and close_near_extreme and confidence >= relaxed(0.78, pct)
+    extreme_range = range_atr >= 1.45 and close_near_extreme
 
-    volume_confirmed = False
+    volume_ratio = 0.0
     idx = int(getattr(sig, "bar_index", -1) or -1)
-    if 0 <= idx < len(df_5m):
-        current_vol = float(df_5m.iloc[idx].get("volume", 0.0) or 0.0)
-        lookback = df_5m.iloc[max(0, idx - 12):idx]
+    if 0 <= idx < len(frame):
+        current_vol = float(frame.iloc[idx].get("volume", 0.0) or 0.0)
+        lookback = frame.iloc[max(0, idx - 12):idx]
         vols = [float(v) for v in lookback.get("volume", pd.Series(dtype=float)).tolist() if float(v or 0) > 0]
         avg_vol = sum(vols) / len(vols) if vols else 0.0
-        volume_confirmed = avg_vol > 0 and current_vol >= (1.35 * avg_vol)
+        volume_ratio = current_vol / avg_vol if avg_vol > 0 else 0.0
 
-    return strong_adx or ((impulse_body or extreme_range) and (volume_confirmed or confidence >= relaxed(0.82, pct)))
-
-
-def decide(sig, tf: str, grade: str, conf: float, regime: str, pos15: int, df_5m: pd.DataFrame, pct: float) -> tuple[str, str]:
-    settings = get_settings()
-    rank = grade_rank(grade)
-    choppy_gate = float(getattr(settings, "live_choppy_gate_confidence", 0.84) or 0.84)
-
-    if rank <= 0:
-        return "REJECT", "C grade blocked"
-    if conf < 0.55:
-        return "REJECT", "below 55% confidence gate"
-
-    if tf == "5min" and is_choppy(regime):
-        direction_pos = 1 if sig.signal_type == "BUY" else -1
-        if pos15 != direction_pos and not impulse_reversal(sig, df_5m, conf, pct, choppy_gate):
-            return "REJECT", "5m choppy gate lacks 15m agreement or impulse"
-
-    policy = str(getattr(settings, "ut_timeframe_entry_policy", "PRIMARY_15")).upper()
-    if policy == "PRIMARY_15" and tf == "5min":
-        return "REJECT", "5m blocked by timeframe policy"
-
-    if tf == "5min":
-        min_conf = relaxed(float(getattr(settings, "ut_5min_option_min_confidence", 0.90) or 0.90), pct)
-        if rank < 3 and conf < min_conf:
-            return "REJECT", f"5m needs A grade or {min_conf:.0%} confidence"
-        if is_choppy(regime) and not ((rank >= 3 and conf >= relaxed(0.72, pct)) or conf >= min_conf):
-            return "REJECT", "5m choppy quality gate"
-
-    if is_choppy(regime) and rank < 3 and conf < relaxed(choppy_gate, pct):
-        return "REJECT", f"choppy gate below {relaxed(choppy_gate, pct):.0%}"
-
-    return "ACCEPT", "passed replay gates"
+    volume_confirmed = volume_ratio >= 1.35
+    return bool((impulse_body or extreme_range) and volume_confirmed), volume_ratio
 
 
 def main() -> None:
@@ -206,14 +171,34 @@ def main() -> None:
             raw_counts[instrument][tf] = len(today_sigs)
             for sig in today_sigs:
                 sig_ts = pd.Timestamp(sig.timestamp)
-                df5_cut = candles["5min"][candles["5min"].index <= sig_ts]
-                regime = regime_detector.detect(df5_cut, instrument, "5min").get("regime", "UNKNOWN")
+                own_frame = candles[tf]
+                own_cut = own_frame[own_frame.index <= sig_ts]
+                regime = regime_detector.detect(own_cut, instrument, tf).get("regime", "UNKNOWN")
                 confluence, _, pos15 = confluence_at(results, candles, instrument, sig_ts)
                 grade, conf, _ = signal_manager._grade_signal(sig, confluence, 0.0, regime)
-                current_pct = float(getattr(settings, "live_filter_leniency_pct", 0.0) or 0.0)
-                current, reason = decide(sig, tf, grade, conf, regime, pos15, candles["5min"], current_pct)
-                strict, _ = decide(sig, tf, grade, conf, regime, pos15, candles["5min"], 0.0)
-                max_relaxed, _ = decide(sig, tf, grade, conf, regime, pos15, candles["5min"], 0.20)
+                direction_pos = 1 if sig.signal_type == "BUY" else -1
+                trend_15m_agrees = pos15 == direction_pos
+                impulse_confirmed, volume_ratio = setup_evidence(sig, own_frame)
+                risky = is_choppy(regime)
+                verdict = evaluate_quality(
+                    QualityInputs(
+                        timeframe=tf,
+                        inst_type=str(getattr(settings, "inst_pref", "AUTO") or "AUTO"),
+                        confidence=conf,
+                        regime=regime,
+                        adx_value=float(getattr(sig, "adx_value", 0.0) or 0.0),
+                        trend_15m_agrees=trend_15m_agrees,
+                        impulse_confirmed=impulse_confirmed,
+                        risky_regime=risky,
+                        is_choppy=risky and not impulse_confirmed,
+                        grade=grade,
+                        source_count=1,
+                        volume_ratio=volume_ratio,
+                        lane="REPLAY_TODAY",
+                        direction="LONG" if sig.signal_type == "BUY" else "SHORT",
+                    ),
+                    settings,
+                )
                 decisions.append(
                     Decision(
                         instrument=instrument,
@@ -227,48 +212,34 @@ def main() -> None:
                         regime=regime,
                         confluence=confluence,
                         direction_15m=pos15,
-                        current=current,
-                        strict=strict,
-                        max_relaxed=max_relaxed,
-                        reason=reason,
+                        decision="ACCEPT" if verdict.allowed else "REJECT",
+                        route=verdict.route,
+                        reason_code=verdict.reason_code,
+                        reason=verdict.reason,
                     )
                 )
 
-    current_counts = Counter(d.current for d in decisions)
-    strict_counts = Counter(d.strict for d in decisions)
-    max_relaxed_counts = Counter(d.max_relaxed for d in decisions)
-    reject_reasons = Counter(d.reason for d in decisions if d.current == "REJECT")
+    decision_counts = Counter(d.decision for d in decisions)
+    reject_reasons = Counter(d.reason_code for d in decisions if d.decision == "REJECT")
 
-    accepted = [d.__dict__ for d in decisions if d.current == "ACCEPT"]
-    marginal = [
-        d.__dict__
-        for d in decisions
-        if d.current == "REJECT" and d.max_relaxed == "ACCEPT"
-    ]
+    accepted = [d.__dict__ for d in decisions if d.decision == "ACCEPT"]
     nearest = sorted(
-        [d for d in decisions if d.current == "REJECT"],
-        key=lambda d: (grade_rank(d.grade), d.confidence, d.adx),
+        [d for d in decisions if d.decision == "REJECT"],
+        key=lambda d: (d.confidence, d.adx),
         reverse=True,
     )[:12]
 
     out = {
         "date": str(today),
-        "settings": {
-            "live_filter_leniency_pct": settings.live_filter_leniency_pct,
-            "live_choppy_gate_confidence": settings.live_choppy_gate_confidence,
-            "ut_5min_option_min_confidence": settings.ut_5min_option_min_confidence,
-            "ut_timeframe_entry_policy": settings.ut_timeframe_entry_policy,
-            "signal_grade_preference": settings.signal_grade_preference,
+        "quality_policy": {
+            "version": POLICY_VERSION,
+            "configuration_hash": policy_configuration_hash(settings),
+            "configuration": policy_configuration(settings),
         },
         "raw_signal_counts": raw_counts,
-        "decision_counts": {
-            "strict_0pct": strict_counts,
-            f"current_{int(round(float(getattr(settings, 'live_filter_leniency_pct', 0.0) or 0.0) * 100))}pct": current_counts,
-            "max_20pct": max_relaxed_counts,
-        },
+        "decision_counts": decision_counts,
         "reject_reasons_current": reject_reasons,
         "accepted_current": accepted,
-        "would_pass_only_at_20pct": marginal,
         "nearest_rejected_current": [d.__dict__ for d in nearest],
     }
     open('output.json', 'w').write(json.dumps(out, indent=2, default=dict))

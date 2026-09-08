@@ -157,6 +157,15 @@ def _one_min_metrics(
             "volume_source": str(volume_context.get("volume_source") or volume_context.get("source") or ""),
             "volume_key": str(volume_context.get("volume_key") or ""),
             "tick_count": int(tick_count),
+            "completed_cash_volume_fresh": bool(
+                volume_context.get("completed_cash_volume_fresh")
+            ),
+            "futures_volume_reliable": bool(
+                volume_context.get("futures_minute_volume_reliable")
+            ),
+            "futures_volume_ratio": _safe_float(
+                volume_context.get("futures_minute_volume_ratio")
+            ),
         }
     recent = candle_1min.tail(21)
     last = recent.iloc[-1]
@@ -165,6 +174,11 @@ def _one_min_metrics(
     prior_nonzero = prior_vol[prior_vol > 0]
     avg_vol = _safe_float(prior_nonzero.mean() if len(prior_nonzero) else prior_vol.mean())
     current_vol = _safe_float(last.get("volume"))
+    frame_measured = bool(avg_vol > 0 and current_vol > 0)
+    context_intrabar = _safe_float(volume_context.get("intrabar_cash_volume"))
+    used_context_intrabar = bool(current_vol <= 0.0 and context_intrabar > 0.0)
+    if used_context_intrabar:
+        current_vol = context_intrabar
     high = _safe_float(last.get("high"))
     low = _safe_float(last.get("low"))
     rng = max(0.0, high - low)
@@ -177,10 +191,30 @@ def _one_min_metrics(
     if tick_count <= 0:
         tick_count = _safe_float(volume_context.get("tick_count_current_minute"))
     provider_available = bool(volume_context.get("volume_available"))
-    volume_available = bool(avg_vol > 0 and current_vol > 0) or provider_available
-    volume_reliable = bool(avg_vol > 0 and current_vol > 0) or bool(volume_context.get("volume_reliable"))
+    volume_available = bool(
+        frame_measured
+        or (used_context_intrabar and avg_vol > 0 and provider_available)
+    )
+    volume_reliable = bool(
+        frame_measured
+        or (
+            used_context_intrabar
+            and volume_available
+            and volume_context.get("volume_reliable")
+        )
+    )
+    volume_ratio = (current_vol / avg_vol) if avg_vol > 0 else 0.0
+    if used_context_intrabar and volume_ratio > 0.0:
+        progress = max(
+            0.2,
+            min(
+                1.0,
+                _safe_float(volume_context.get("intrabar_cash_progress")) or 0.2,
+            ),
+        )
+        volume_ratio /= progress
     return {
-        "volume_ratio": round((current_vol / avg_vol) if avg_vol > 0 else 0.0, 4),
+        "volume_ratio": round(volume_ratio, 4),
         "range_atr_ratio": round((rng / atr) if atr > 0 else 0.0, 4),
         "close_location": round(_close_location(last, direction), 4),
         "volume_available": volume_available,
@@ -189,6 +223,15 @@ def _one_min_metrics(
         "volume_source": str(volume_context.get("volume_source") or volume_context.get("source") or ""),
         "volume_key": str(volume_context.get("volume_key") or ""),
         "tick_count": int(tick_count),
+        "completed_cash_volume_fresh": bool(
+            volume_context.get("completed_cash_volume_fresh")
+        ),
+        "futures_volume_reliable": bool(
+            volume_context.get("futures_minute_volume_reliable")
+        ),
+        "futures_volume_ratio": _safe_float(
+            volume_context.get("futures_minute_volume_ratio")
+        ),
     }
 
 
@@ -323,8 +366,18 @@ def build_pre_candle_prediction(
         score += 0.08
         reasons.append(f"1m volume {one_metrics['volume_ratio']:.1f}x")
     elif one_metrics["volume_unavailable"]:
-        reasons.append("1m volume unavailable")
-        if one_metrics["tick_count"] >= 8:
+        cash_note = "live 1m cash volume unavailable"
+        if one_metrics["completed_cash_volume_fresh"]:
+            cash_note += "; completed cash bars available"
+        reasons.append(cash_note)
+        futures_ratio = one_metrics["futures_volume_ratio"]
+        if one_metrics["futures_volume_reliable"] and futures_ratio >= 2.0:
+            score += 0.12
+            reasons.append(f"futures 1m volume {futures_ratio:.1f}x own baseline")
+        elif one_metrics["futures_volume_reliable"] and futures_ratio >= 1.5:
+            score += 0.06
+            reasons.append(f"futures 1m volume {futures_ratio:.1f}x own baseline")
+        elif one_metrics["tick_count"] >= 8:
             score += 0.08
             reasons.append(f"tick activity {one_metrics['tick_count']}/min")
         elif one_metrics["tick_count"] >= 4:

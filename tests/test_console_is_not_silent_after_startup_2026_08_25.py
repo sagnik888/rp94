@@ -29,6 +29,14 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 
 
+def test_stderr_log_timestamp_does_not_depend_on_removed_wmic():
+    launcher = (REPO / "Start_UT1.bat").read_text(encoding="utf-8")
+
+    assert "wmic os get localdatetime" not in launcher.lower()
+    assert "Get-Date -Format yyyyMMdd_HHmmss" in launcher
+    assert "if not defined _STAMP" in launcher
+
+
 def test_a_log_line_reaches_stdout_not_the_stderr_redirect():
     """Import main the way startup does, then log; the console must see it."""
     probe = (

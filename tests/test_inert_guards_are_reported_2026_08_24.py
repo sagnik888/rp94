@@ -6,21 +6,15 @@ engine/safe_mode.py already reports two neighbouring classes: a setting nothing 
 shipped values make the operation a no-op, so the protection an operator believes is
 active does nothing.
 
-Three found on 2026-08-24, all verified against the live config:
+Two found on 2026-08-24, all verified against the live config:
 
-  1. The chop stop-widening line, engine/signal_processor.py:1842:
-         if is_choppy_regime(regime): opt_sl_pct = max(opt_sl_pct, 15.0)
-     options_sl_pct ships 15.0 (config/settings.py:294), so max(15.0, 15.0) widens
-     nothing. On 5min it could not widen anything regardless, because the band ceiling
-     is min(10.0, opt_sl_pct) = 10.0.
-
-  2. Scanner._dynamic_runner_lock_pct, whose own docstring promises runners "MORE room
+  1. Scanner._dynamic_runner_lock_pct, whose own docstring promises runners "MORE room
      in fast/volatile tape ... so noise does not shake the runner out". It returns
      min(base, loose) with base = dynamic_rr_runner_lock_pct = 0.85 (settings.py:1649)
      and loose = trend_runner_lock_pct_high_vol = 0.85 (settings.py:1252), i.e. the base
      unchanged in every regime. settings.py:1250 still describes the base as 0.90.
 
-  3. dynamic_rr_max = 12.0 (settings.py:1647). The RR ladder is
+  2. dynamic_rr_max = 12.0 (settings.py:1647). The RR ladder is
      min_rr + confidence_runway + grade_bonus + intel_adjustment, bounded above by
      1.6 + 1.44 + 1.15 + 0.833 = 5.02, because normalize_intelligence_score clamps to
      [-1, 1] and the code divides by 1.20. 12.0 can never bind; what binds on every
@@ -44,10 +38,20 @@ def _names(settings):
     return {name for name, _why in inert_guard_warnings(settings)}
 
 
-def test_the_live_config_reports_all_three():
+def test_shipped_runner_and_rr_settings_are_not_inert():
     found = _names(_s())
 
-    assert "chop stop widening" in found
+    assert "trend_runner_lock_pct_high_vol" not in found
+    assert "dynamic_rr_max" not in found
+
+
+def test_equal_runner_locks_and_unreachable_rr_still_warn():
+    found = _names(_s(
+        trend_runner_lock_pct_high_vol=0.85,
+        dynamic_rr_runner_lock_pct=0.85,
+        dynamic_rr_max=12.0,
+    ))
+
     assert "trend_runner_lock_pct_high_vol" in found
     assert "dynamic_rr_max" in found
 
@@ -56,15 +60,6 @@ def test_each_warning_explains_what_governs_instead():
     for _name, why in inert_guard_warnings(_s()):
         assert len(why) > 40, why
 
-
-def test_a_chop_stop_that_can_actually_widen_is_not_reported():
-    """The branch is `max(opt_sl_pct, 15.0)`, so it only widens when the stop is BELOW 15.
-
-    Raising options_sl_pct does not un-inert it — at 20% the branch is just as empty as
-    at 15%. Only a stop under the literal leaves the max() anything to do.
-    """
-    assert "chop stop widening" not in _names(_s(options_sl_pct=12.0))
-    assert "chop stop widening" in _names(_s(options_sl_pct=20.0))
 
 
 def test_a_genuinely_looser_high_vol_lock_is_not_reported():

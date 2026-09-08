@@ -113,20 +113,18 @@ class AsyncExecutionQueue:
 
         # Never block the scanner indefinitely. Recheck shutdown state between
         # short bounded waits so shutdown cannot strand a producer behind put().
-        logger.critical(f"⚠️ AsyncExecutionQueue full; bounded wait for broker task: {task_name}")
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            with self._state_lock:
-                if not self._accepting:
-                    logger.error(f"AsyncExecutionQueue shutdown rejected broker task: {task_name}")
-                    return False
-                try:
-                    self.task_queue.put(task, timeout=0.1)
-                    return True
-                except queue.Full:
-                    continue
-        logger.critical(f"AsyncExecutionQueue saturated; broker task was not enqueued: {task_name}")
-        return False
+        logger.critical(f"⚠️ AsyncExecutionQueue full; attempting fast enqueue for broker task: {task_name}")
+        with self._state_lock:
+            if not self._accepting:
+                logger.error(f"AsyncExecutionQueue shutdown rejected broker task: {task_name}")
+                return False
+            try:
+                # Use a very short timeout so we don't stall the scanner heartbeat
+                self.task_queue.put(task, timeout=0.05)
+                return True
+            except queue.Full:
+                logger.critical(f"AsyncExecutionQueue saturated; broker task was not enqueued: {task_name}")
+                return False
 
     def shutdown(self, *, drain: bool = True, timeout_seconds: float = 10.0) -> bool:
         """Stop workers predictably, optionally allowing already queued work to finish."""

@@ -418,6 +418,11 @@ class RegimeTracker:
             "status": status,
             "reason": str(rejection_reason or ""),
             "source": source,
+            # New rows are explicitly attributable. Legacy rows remain readable, but
+            # downstream audits can now reject any future non-live domain instead of
+            # guessing from overlapping source labels.
+            "run_mode": str((extra or {}).get("run_mode") or ""),
+            "evidence_domain": str((extra or {}).get("evidence_domain") or ""),
             "source_lane": str(_candidate_value(candidate, "source_lane", "") or ""),
             "grade": str(_candidate_value(candidate, "grade", "") or ""),
             "confidence": _safe_float(_candidate_value(candidate, "confidence", 0.0)),
@@ -590,6 +595,14 @@ class RegimeTracker:
                     "underlying_stop_pct": _measured_candidate_float(candidate, "entry_policy_underlying_stop_pct"),
                     "policy_version": str(_candidate_value(candidate, "entry_policy_version", "") or ""),
                 }
+            ),
+            # The versioned signal-quality decision is separate from final execution
+            # policy.  It is carried on ACCEPTED, REJECTED and EXIT rows so later
+            # outcomes can be joined to the exact admission route/configuration.
+            "quality": (
+                dict(_candidate_value(candidate, "quality_verdict", {}) or {})
+                if isinstance(_candidate_value(candidate, "quality_verdict", {}), dict)
+                else {}
             ),
             "regime": {
                 "raw_regime": str(regime_ctx.get("raw_regime") or ""),

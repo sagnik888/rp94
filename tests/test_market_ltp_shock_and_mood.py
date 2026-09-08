@@ -268,9 +268,9 @@ def test_settings_declare_shock_and_mood_knobs():
     assert fields["market_ltp_shock_strong_move_pct"].default == 0.35
     # Full-sensitivity window per operator spec 2026-07-10: 14:00–15:10 IST,
     # strong tier (0.35%) required outside the window.
-    assert fields["market_ltp_shock_session_start"].default == "14:00"
-    assert fields["market_ltp_shock_session_end"].default == "15:10"
-    assert fields["market_ltp_shock_session_override_start"].default == "14:00"
+    assert fields["market_ltp_shock_session_start"].default == "13:00"
+    assert fields["market_ltp_shock_session_end"].default == "15:15"
+    assert fields["market_ltp_shock_session_override_start"].default == "13:00"
     assert fields["market_ltp_shock_outside_window_mode"].default == "strong"
     assert fields["market_ltp_shock_outside_strong_move_pct"].default == 0.35
     assert fields["market_ltp_shock_stabilization_seconds"].default == 8.0

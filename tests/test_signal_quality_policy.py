@@ -95,25 +95,27 @@ def test_adx_alone_does_not_bypass_risky_five_minute_gate(monkeypatch):
     )
 
 
-def test_explosive_override_requires_alignment_and_intelligence(monkeypatch):
+def test_adx_alignment_and_intelligence_do_not_invent_impulse_evidence(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
     monkeypatch.setattr(settings, "ut_regime_adaptation", True)
     monkeypatch.setattr(settings, "ut_backtest_more_results", False)
     monkeypatch.setattr(settings, "live_filter_leniency_pct", 0.0)
 
-    assert passes_quality_gate(
-        "5min",
-        "B+",
-        0.70,
-        "VOLATILE",
-        "OPT",
-        settings,
+    common = dict(
+        tf="5min",
+        grade="A",
+        confidence=0.70,
+        regime="VOLATILE",
+        inst_type="OPT",
+        settings=settings,
         mode="REAL",
         adx_value=40.0,
         trend_15m_agrees=True,
         intel_score=0.8,
     )
+    assert not passes_quality_gate(**common)
+    assert passes_quality_gate(**common, impulse_confirmed=True)
 
 
 def test_five_min_true_impulse_math_is_exact(monkeypatch):
@@ -122,7 +124,7 @@ def test_five_min_true_impulse_math_is_exact(monkeypatch):
     monkeypatch.setattr(settings, "live_5min_bplus_min_confidence", 0.70)
 
     assert five_min_true_impulse_allowed(
-        "B+",
+        "A",
         0.70,
         settings,
         trend_15m_agrees=True,
@@ -151,7 +153,7 @@ def test_five_min_true_impulse_math_is_exact(monkeypatch):
     )
 
 
-def test_five_min_special_bplus_a_aplus_sixty_exception_requires_all_guards(monkeypatch):
+def test_five_min_special_bplus_sixty_exception_requires_all_guards(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "live_filter_leniency_pct", 0.0)
     monkeypatch.setattr(settings, "live_5min_special_min_confidence", 0.60)
@@ -160,20 +162,19 @@ def test_five_min_special_bplus_a_aplus_sixty_exception_requires_all_guards(monk
     monkeypatch.setattr(settings, "live_5min_special_max_iv_percentile", 70.0)
     monkeypatch.setattr(settings, "live_5min_special_min_chain_score", 50.0)
 
-    for grade in ("B+", "A", "A+"):
-        assert five_min_true_impulse_allowed(
-            grade,
-            0.60,
-            settings,
-            trend_15m_agrees=True,
-            impulse_confirmed=False,
-            explosive_bypass=False,
-            regime="VOLATILE",
-            adx_value=30.0,
-            intel_score=0.30,
-            iv_percentile=65.0,
-            chain_quality={"score": 60, "stale": False},
-        )
+    assert five_min_true_impulse_allowed(
+        "B+",
+        0.60,
+        settings,
+        trend_15m_agrees=True,
+        impulse_confirmed=False,
+        explosive_bypass=False,
+        regime="VOLATILE",
+        adx_value=30.0,
+        intel_score=0.30,
+        iv_percentile=65.0,
+        chain_quality={"score": 60, "stale": False},
+    )
     assert not five_min_true_impulse_allowed(
         "B+",
         0.60,
@@ -196,7 +197,7 @@ def test_five_min_special_bplus_a_aplus_sixty_exception_requires_all_guards(monk
     )
 
 
-def test_quality_gate_uses_separate_15min_confidence_floor(monkeypatch):
+def test_quality_gate_uses_canonical_bplus_floor_and_setup_evidence(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "ut_regime_adaptation", True)
     monkeypatch.setattr(settings, "ut_backtest_more_results", False)
@@ -205,21 +206,27 @@ def test_quality_gate_uses_separate_15min_confidence_floor(monkeypatch):
 
     assert passes_quality_gate(
         "15min",
-        "B",
-        0.62,
+        "B+",
+        0.55,
         "RANGING",
         "OPT",
         settings,
         mode="REAL",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        volume_ratio=1.30,
     )
     assert not passes_quality_gate(
         "15min",
         "B",
-        0.61,
+        0.54,
         "RANGING",
         "OPT",
         settings,
         mode="REAL",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        volume_ratio=1.30,
     )
     assert not passes_quality_gate(
         "15min",
@@ -238,21 +245,21 @@ def test_option_grade_allows_15min_b_choppy_floor(monkeypatch):
     monkeypatch.setattr(settings, "live_15min_min_confidence", 0.62)
 
     assert option_grade_allowed(
-        "B",
+        "B+",
         0.62,
         "VOLATILE",
         mode="REAL",
         timeframe="15min",
     )
     assert option_grade_allowed(
-        "B",
+        "B+",
         0.62,
         "TRENDING_UP",
         mode="REAL",
         timeframe="15min",
     )
     assert not option_grade_allowed(
-        "B",
+        "B+",
         0.61,
         "VOLATILE",
         mode="REAL",
@@ -270,7 +277,7 @@ def test_option_grade_allows_15min_b_choppy_floor(monkeypatch):
     )
 
 
-def test_15min_trending_momentum_uses_lower_direction_neutral_floor(monkeypatch):
+def test_15min_uses_the_same_bplus_evidence_policy_as_live(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "ut_regime_adaptation", True)
     monkeypatch.setattr(settings, "ut_backtest_more_results", False)
@@ -282,36 +289,43 @@ def test_15min_trending_momentum_uses_lower_direction_neutral_floor(monkeypatch)
 
     assert passes_quality_gate(
         "15min",
-        "B",
+        "B+",
         0.58,
         "TRENDING_DOWN",
         "OPT",
         settings,
         mode="REAL",
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        intel_score=0.70,
+        impulse_confirmed=True,
     )
     assert passes_quality_gate(
         "15min",
-        "B",
+        "B+",
         0.58,
         "RANGING",
         "OPT",
         settings,
         mode="REAL",
-        adx_value=24.0,
+        adx_value=25.0,
+        trend_15m_agrees=True,
+        volume_ratio=1.3,
     )
-    assert passes_quality_gate(
+    assert not passes_quality_gate(
         "15min",
-        "B",
+        "B+",
         0.58,
         "RANGING",
         "OPT",
         settings,
         mode="REAL",
+        adx_value=25.0,
         intel_score=-0.60,
     )
     assert not passes_quality_gate(
         "15min",
-        "B",
+        "B+",
         0.58,
         "RANGING",
         "OPT",
@@ -322,21 +336,21 @@ def test_15min_trending_momentum_uses_lower_direction_neutral_floor(monkeypatch)
     )
 
 
-def test_option_grade_allows_15min_b_trending_momentum_floor(monkeypatch):
+def test_option_grade_allows_15min_bplus_trending_momentum_floor(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "live_filter_leniency_pct", 0.0)
     monkeypatch.setattr(settings, "live_15min_min_confidence", 0.62)
     monkeypatch.setattr(settings, "live_15min_trending_momentum_min_confidence", 0.58)
 
     assert option_grade_allowed(
-        "B",
+        "B+",
         0.58,
         "BREAKOUT_UP",
         mode="REAL",
         timeframe="15min",
     )
     assert not option_grade_allowed(
-        "B",
+        "B+",
         0.57,
         "BREAKOUT_UP",
         mode="REAL",
@@ -344,7 +358,7 @@ def test_option_grade_allows_15min_b_trending_momentum_floor(monkeypatch):
     )
 
 
-def test_15min_low_grade_momentum_override_admits_c_and_b(monkeypatch):
+def test_common_quality_floor_cannot_be_bypassed_by_low_grade_momentum(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "live_filter_leniency_pct", 0.0)
     monkeypatch.setattr(settings, "live_15min_momentum_override_enabled", True)
@@ -363,7 +377,7 @@ def test_15min_low_grade_momentum_override_admits_c_and_b(monkeypatch):
         close_location=0.82,
     )
 
-    assert passes_quality_gate(
+    assert not passes_quality_gate(
         "15min",
         "C",
         0.22,
@@ -372,7 +386,7 @@ def test_15min_low_grade_momentum_override_admits_c_and_b(monkeypatch):
         settings,
         **base,
     )
-    assert option_grade_allowed(
+    assert not option_grade_allowed(
         "B",
         0.44,
         "RANGING",
@@ -465,7 +479,7 @@ def test_choppy_option_grade_gate_honors_true_five_min_impulse(monkeypatch):
     # Use a self-consistent B+ confidence (0.62). 0.70 is A-grade confidence, so
     # "B+ @ 0.70" is contradictory under the single-source model (grade == bucket(conf)).
     assert not option_grade_allowed(
-        "B+",
+        "A",
         0.62,
         "VOLATILE",
         mode="REAL",
@@ -489,7 +503,7 @@ def test_quality_gate_blocks_bplus_five_min_without_full_impulse(monkeypatch):
 
     assert not passes_quality_gate(
         "5min",
-        "B+",
+        "A",
         0.70,
         "VOLATILE",
         "OPT",
@@ -499,7 +513,7 @@ def test_quality_gate_blocks_bplus_five_min_without_full_impulse(monkeypatch):
         trend_15m_agrees=False,
         intel_score=0.8,
     )
-    assert not passes_quality_gate(
+    assert passes_quality_gate(
         "5min",
         "B+",
         0.69,
@@ -510,10 +524,11 @@ def test_quality_gate_blocks_bplus_five_min_without_full_impulse(monkeypatch):
         adx_value=40.0,
         trend_15m_agrees=True,
         intel_score=0.8,
+        impulse_confirmed=True,
     )
 
 
-def test_quality_gate_allows_special_bplus_sixty_only_with_option_health(monkeypatch):
+def test_quality_gate_allows_bplus_sixty_with_trend_and_volume_confirmation(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
     monkeypatch.setattr(settings, "ut_regime_adaptation", True)
@@ -533,18 +548,5 @@ def test_quality_gate_allows_special_bplus_sixty_only_with_option_health(monkeyp
         intel_score=0.2,
         iv_percentile=65.0,
         chain_quality={"score": 60, "stale": False},
-    )
-    assert not passes_quality_gate(
-        "5min",
-        "B+",
-        0.60,
-        "VOLATILE",
-        "OPT",
-        settings,
-        mode="REAL",
-        adx_value=30.0,
-        trend_15m_agrees=True,
-        intel_score=0.2,
-        iv_percentile=75.0,
-        chain_quality={"score": 60, "stale": False},
+        volume_ratio=1.3,
     )

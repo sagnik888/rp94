@@ -465,6 +465,22 @@ async function connectWebSocket() {
         });
     }
 
+    // ═══ 1M EMERGENCY EXIT FOR 15M TRADES ═══
+    const fifteenMinOneMinSupportExitSwitch = document.getElementById('fifteenMinOneMinSupportExitSwitch');
+    if (fifteenMinOneMinSupportExitSwitch) {
+        fifteenMinOneMinSupportExitSwitch.addEventListener('change', () => {
+            const isChecked = fifteenMinOneMinSupportExitSwitch.checked;
+            window.sendCommand({
+                cmd: 'configure',
+                fifteen_min_one_min_support_exit_enabled: isChecked
+            });
+            if (state.latestData && state.latestData.config) {
+                state.latestData.config.fifteen_min_one_min_support_exit_enabled = isChecked;
+            }
+            showToast(`1M Emergency Exit: ${isChecked ? 'ON' : 'OFF'}`, isChecked ? 'info' : 'warning');
+        });
+    }
+
     // ═══ P-WIN SNAP (post-win 3m snapback; decoupled from 1mscalp) ═══
     const reversionScalpSwitch = document.getElementById('reversionScalpSwitch');
     if (reversionScalpSwitch) {
@@ -747,6 +763,23 @@ function updateDashboard(data) {
         const serverSaysOn = data.config.one_min_scalping_enabled !== false;
         if (oneMinScalpSwitch.checked !== serverSaysOn) {
             oneMinScalpSwitch.checked = serverSaysOn;
+        }
+    }
+
+    // ══ SYNC 1M EMERGENCY EXIT FOR 15M TRADES ══
+    const fifteenMinOneMinSupportExitSwitch = document.getElementById('fifteenMinOneMinSupportExitSwitch');
+    if (fifteenMinOneMinSupportExitSwitch && data.config && data.config.fifteen_min_one_min_support_exit_enabled !== undefined) {
+        const serverSaysOn = data.config.fifteen_min_one_min_support_exit_enabled !== false;
+        if (fifteenMinOneMinSupportExitSwitch.checked !== serverSaysOn) {
+            fifteenMinOneMinSupportExitSwitch.checked = serverSaysOn;
+        }
+    }
+
+    const topTimeframePolicy = document.getElementById('topTimeframePolicy');
+    if (topTimeframePolicy && data.config && data.config.ut_timeframe_entry_policy) {
+        const serverPolicy = data.config.ut_timeframe_entry_policy;
+        if ([...topTimeframePolicy.options].some(option => option.value === serverPolicy)) {
+            topTimeframePolicy.value = serverPolicy;
         }
     }
 
@@ -2109,6 +2142,7 @@ function setupEventListeners() {
     if (autoSwitch) {
         autoSwitch.addEventListener('change', () => {
             const isChecked = autoSwitch.checked;
+            const previouslyConfirmed = Boolean(state.latestData?.config?.auto_mode);
             let realModeVerification = '';
             let confirmRealMode = false;
             if (isChecked && state.latestData?.mode === 'REAL') {
@@ -2121,16 +2155,29 @@ function setupEventListeners() {
                 realModeVerification = 'YES';
                 confirmRealMode = true;
             }
-            window.sendCommand({ 
+            // Do not claim AUTO is on before the scanner acknowledges all readiness
+            // checks.  The previous optimistic update showed ENABLED even when the
+            // backend refused the request for missing chains/warmup.
+            autoSwitch.disabled = true;
+            window.sendCommand({
                 cmd: 'configure', 
                 auto_mode: isChecked,
                 confirm_real_mode: confirmRealMode,
                 real_mode_verification: realModeVerification
+            }).then((msg) => {
+                const accepted = msg?.type === 'config_ack' && msg?.data?.status === 'ok';
+                if (accepted) {
+                    if (state.latestData && state.latestData.config) {
+                        state.latestData.config.auto_mode = isChecked;
+                    }
+                } else {
+                    autoSwitch.checked = previouslyConfirmed;
+                }
+                autoSwitch.disabled = false;
+            }).catch(() => {
+                autoSwitch.checked = previouslyConfirmed;
+                autoSwitch.disabled = false;
             });
-            if (state.latestData && state.latestData.config) {
-                state.latestData.config.auto_mode = isChecked;
-            }
-            showToast(`Auto Mode: ${isChecked ? 'ENABLED' : 'DISABLED'}`, 'info');
         });
     }
 
@@ -2146,7 +2193,14 @@ function setupEventListeners() {
             if (state.latestData && state.latestData.config) {
                 state.latestData.config.ut_timeframe_entry_policy = policy;
             }
-            showToast(`TF Policy: ${policy === 'INCLUDE_5MIN' ? '5M+15M' : '15M MAIN'}`, 'info');
+            const labels = {
+                PRIMARY_5: '5M',
+                PRIMARY_15: '15M',
+                INCLUDE_5MIN: '5M+15M',
+                INCLUDE_1MIN_5MIN: '1M+5M',
+                INCLUDE_1MIN_5MIN_15MIN: '1M+5M+15M'
+            };
+            showToast(`TF Policy: ${labels[policy] || policy}`, 'info');
         });
     }
 
@@ -2247,6 +2301,14 @@ function updatePnlPanel(trades = {}) {
     const capital = monetary.capital || {};
     const period = monetary.period_pnl || {};
     const summary = trades.summary || {};
+    const basis = monetary.accounting_basis || {};
+    const basisLabel = document.getElementById('pnlBasisLabel');
+    if (basisLabel) {
+        const lane = String(basis.lane || summary.lane || 'UNKNOWN').toUpperCase();
+        const description = String(basis.description || 'Accounting basis unavailable');
+        basisLabel.textContent = `${lane}: ${description}`;
+        basisLabel.className = 'pnl-basis-label ' + (basis.is_live_money === true ? 'live' : 'nonmoney');
+    }
 
     setText('pnlWinRate', formatPercent(headline.win_rate || 0));
     setText('pnlWinMeta', `${summary.wins || 0}W / ${summary.losses || 0}L`);
@@ -2449,19 +2511,26 @@ async function submitFyersCode(authCode) {
 }
 
 function updateGatewayStatus(status) {
+    status = status || {};
     const kiteSessionKnown = Object.prototype.hasOwnProperty.call(status || {}, 'kite_session_live');
     const kiteOnline = kiteSessionKnown
         ? status.kite_session_live === true && status.kite_data_fresh !== false
         : status.kite === true;
+    const angel = status.angelone_index_quotes || {};
+    const angelAge = Number(angel.last_success_age_seconds);
+    const angelOnline = angel.connected === true
+        && (!Number.isFinite(angelAge) || angelAge <= 15);
+    const angelStandby = angel.configured === true && !angelOnline;
     const gateways = {
         'gw_kite': kiteOnline,
         'gw_fyers': status.fyers,
-        'gw_yahoo': status.yahoo
+        'gw_angelone': angelOnline,
     };
     
     for (const [id, isOnline] of Object.entries(gateways)) {
         const el = document.getElementById(id);
         if (el) {
+            el.classList.remove('standby');
             if (isOnline) {
                 el.classList.add('online');
                 el.classList.remove('offline');
@@ -2470,6 +2539,20 @@ function updateGatewayStatus(status) {
                 el.classList.remove('online');
             }
         }
+    }
+    const angelEl = document.getElementById('gw_angelone');
+    if (angelEl) {
+        angelEl.classList.toggle('standby', angelStandby);
+        angelEl.classList.toggle('offline', !angelOnline && !angelStandby);
+        angelEl.classList.toggle('online', angelOnline);
+        const ageText = Number.isFinite(angelAge)
+            ? `${formatQuoteAge(angelAge)} since last AngelOne quote`
+            : 'no AngelOne quote used this session';
+        angelEl.title = angelOnline
+            ? `AngelOne price-only index fallback active; ${ageText}. Spot-index volume is unavailable by design.`
+            : (angelStandby
+                ? 'AngelOne price-only index fallback configured and standing by. It authenticates only when Kite and Fyers price sources need fallback.'
+                : `AngelOne index fallback unavailable: ${angel.last_error || 'credentials not configured'}.`);
     }
     const kiteEl = document.getElementById('gw_kite');
     if (kiteEl) {

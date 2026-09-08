@@ -53,6 +53,22 @@ def test_a_single_affordable_entry_is_approved_and_reserves_its_margin():
     )
 
 
+def test_an_early_affordability_probe_does_not_reserve_margin():
+    broker = _broker(available=51_284.0, required=13_240.0)
+
+    verdict = broker.preflight_entry_margin(
+        symbol="NIFTY2680524500CE",
+        qty=65,
+        side="BUY",
+        product_type="CARRYFORWARD",
+        reserve=False,
+    )
+
+    assert verdict["ok"] is True
+    assert verdict["reservation_id"] == ""
+    assert broker._margin_reservations == {}
+
+
 def test_concurrent_entries_cannot_all_spend_the_same_cash():
     """The actual bug: free cash is read per worker and does not move between reads."""
     broker = _broker(available=51_284.0, required=13_240.0)
@@ -144,6 +160,16 @@ def test_a_definite_shortfall_still_blocks():
     verdict = _preflight(_broker(available=5_000.0, required=13_240.0))
     assert verdict["ok"] is False
     assert "insufficient funds" in verdict["limitation"]
+
+
+def test_a_recent_exact_shortfall_can_be_read_without_another_broker_request():
+    broker = _broker(available=5_000.0, required=13_240.0)
+    assert _preflight(broker)["ok"] is False
+
+    cached = broker.cached_entry_margin_refusal(
+        symbol="NIFTY2680524500CE", qty=65, side="BUY", product_type="CARRYFORWARD",
+    )
+    assert cached and cached["ok"] is False
 
 
 def test_reservations_are_thread_safe():

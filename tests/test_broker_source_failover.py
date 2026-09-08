@@ -388,13 +388,17 @@ def test_preopen_index_quote_uses_fresh_ws_after_settlement(monkeypatch):
     assert quote["preopen_settlement"] is False
 
 
-def test_price_bridge_uses_yahoo_only_after_both_brokers_fail(monkeypatch):
+def test_delayed_yahoo_price_requires_explicit_opt_in(monkeypatch):
     provider = _provider(monkeypatch)
 
     class FakeTicker:
         fast_info = SimpleNamespace(last_price=23111.5)
 
     monkeypatch.setattr("data.market_data.yf.Ticker", lambda ticker: FakeTicker())
+    monkeypatch.setattr(
+        "config.settings.get_settings",
+        lambda: SimpleNamespace(yahoo_live_price_fallback_enabled=True),
+    )
 
     price = provider.get_latest_price_by_token("99926000", "NIFTY", "NSE")
 

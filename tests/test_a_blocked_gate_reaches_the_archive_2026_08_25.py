@@ -58,7 +58,9 @@ class _Candidate:
 def scanner():
     s = Scanner.__new__(Scanner)
     s.rtracker = _FakeTracker()
-    s.mode = "SIGNAL"
+    # The production evidence ledger is intentionally REAL-only; historical/paper
+    # scans are kept out so restarts cannot inflate rejected-signal counts.
+    s.mode = "REAL"
     s.log_event = lambda *a, **k: None
     return s
 

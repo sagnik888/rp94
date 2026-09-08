@@ -1,4 +1,4 @@
-"""Five changes from the 2026-08-11 end-to-end audit.
+"""Four retained changes from the 2026-08-11 end-to-end audit.
 
 The session that prompted them: NIFTY, BANKNIFTY and SENSEX opened at their high and
 92-94% of the daily move was over by 10:00 (post-10:00 Kaufman ER 0.016-0.019, i.e.
@@ -11,7 +11,10 @@ killed them, including a MIDCPNIFTY 15min SHORT carrying a one-way downside casc
     2  thrust scaling         — a thrusting bar does not wait a flat 30s
     3  stabilization logging  — the surviving side is recorded, so a rate exists
     4  first-rung retention   — fast regimes get room matching measured heat
-    5  late-trend ceiling     — high ADX on a with-trend entry means LATE, not strong
+
+The former late-trend ADX ceiling was retired. It duplicated the canonical quality
+verdict, used mixed observational evidence, and could reject otherwise valid setups
+after the single admission decision had passed.
 """
 from types import SimpleNamespace
 
@@ -28,8 +31,7 @@ def _pinned():
     keys = ("stabilization_cascade_latch_enabled", "stabilization_thrust_scaling_enabled",
             "stabilization_thrust_min_seconds", "stabilization_thrust_range_atr",
             "stabilization_thrust_volume_ratio", "first_rung_regime_retention_enabled",
-            "first_rung_fast_regime_retention", "late_trend_entry_guard_enabled",
-            "late_trend_entry_adx_ceiling", "profit_lock_min_ratio")
+            "first_rung_fast_regime_retention", "profit_lock_min_ratio")
     saved = {k: getattr(s, k, None) for k in keys}
     for k in keys:
         if k in Settings.model_fields:
@@ -228,56 +230,16 @@ def test_an_unknown_position_is_left_alone():
 
 # ── 5. the late-trend ceiling ────────────────────────────────────────────────
 
-def test_the_ceiling_is_wired_into_the_gate():
+def test_the_duplicate_late_trend_gate_stays_retired():
+    """Admission has one owner; a second post-verdict ADX ceiling must not return."""
     import inspect
 
-    from engine.signal_processor import SignalProcessor
-
-    src = inspect.getsource(SignalProcessor)
-    assert "late_trend_entry_adx_ceiling" in src
-    idx = src.index("late_trend_entry_adx_ceiling")
-    window = src[idx:idx + 1400]
-    assert "TRENDING_DOWN" in window and "TRENDING_UP" in window
-    assert "SHORT" in window and "LONG" in window
-    assert "Late-trend entry" in window
-
-
-def test_only_with_trend_entries_are_gated():
-    """AGAINST-trend entries are the mean-reversion side of the same reading and measured
-    POSITIVE (TRENDING_DOWN against: 40.0% and +Rs.147). Gating them would cost money."""
-    import inspect
-
-    from engine.signal_processor import SignalProcessor
-
-    src = inspect.getsource(SignalProcessor)
-    idx = src.index("late_trend_entry_adx_ceiling")
-    window = src[idx:idx + 1400]
-    assert 'direction == "SHORT"' in window and 'direction == "LONG"' in window
-
-
-def test_a_power_move_is_exempt():
-    import inspect
-
-    from engine.signal_processor import SignalProcessor
-
-    src = inspect.getsource(SignalProcessor)
-    idx = src.index("late_trend_entry_adx_ceiling")
-    assert "not power_move_hist" in src[idx:idx + 1400]
-
-
-def test_the_ceiling_defaults_match_the_measurement():
     from config.settings import Settings
-
-    assert Settings.model_fields["late_trend_entry_adx_ceiling"].default == 30.0
-    assert Settings.model_fields["late_trend_entry_guard_enabled"].default is True
-
-
-def test_a_zero_ceiling_disables_the_gate():
-    """0 must mean off rather than 'block everything above zero ADX'."""
-    import inspect
-
     from engine.signal_processor import SignalProcessor
 
     src = inspect.getsource(SignalProcessor)
-    idx = src.index("late_trend_entry_adx_ceiling")
-    assert "late_ceiling > 0" in src[idx:idx + 1400]
+    assert "late_trend_entry_adx_ceiling" not in src
+    assert "late_trend_entry_guard_enabled" not in src
+    assert "Late-trend entry" not in src
+    assert "late_trend_entry_adx_ceiling" not in Settings.model_fields
+    assert "late_trend_entry_guard_enabled" not in Settings.model_fields

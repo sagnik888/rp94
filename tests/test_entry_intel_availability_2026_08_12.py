@@ -20,9 +20,8 @@ build's own primitives rather than chain-porting its cache readers.
 
 Separately: the guard fast-tracks market-wide reversals through an 8-second
 stabilization buffer and then vetoes them as isolated chop scalps. Those entries
-already clear B+ grade, 60% confidence and an independently confirmed peer
-(_market_wide_candidate_quality), which is strictly more evidence than a single
-instrument's intel alignment.
+already clear the canonical B+ evidence-first quality verdict, which is stronger
+evidence than a single instrument's intel alignment.
 """
 import time
 from types import SimpleNamespace

@@ -190,15 +190,6 @@ function setupSettingsExperience() {
         `;
         body.appendChild(presetGroup);
     }
-    if (!document.getElementById('settAutoMode')) {
-        const autoCard = document.createElement('label');
-        autoCard.className = 'settings-switch-card';
-        autoCard.innerHTML = `
-            <span><strong>Auto Mode</strong><small>Allow system execution when enabled</small></span>
-            <input type="checkbox" id="settAutoMode">
-        `;
-        body.appendChild(autoCard);
-    }
     if (!document.getElementById('settFuturesShadow')) {
         const shadowCard = document.createElement('label');
         shadowCard.className = 'settings-switch-card';
@@ -467,9 +458,9 @@ function setupSettingsExperience() {
         findGroup('settScannerEngine'),
         findGroup('settUtPreset'),
         document.getElementById('settIntrabarSignals')?.closest('.settings-switch-card'),
-        document.getElementById('settAutoMode')?.closest('.settings-switch-card'),
-        // Keep the hedge A/B next to Auto Mode: both govern execution behaviour, and
-        // further down the list it fell below the visible fold of the settings panel.
+        // Execution Auto Mode deliberately has one authority: the guarded top-bar
+        // switch in app.js.  A second copy in this modal retained stale state while
+        // open and could re-enable REAL execution when saving an unrelated setting.
         document.getElementById('settStopOutReentry')?.closest('.settings-switch-card'),
         document.getElementById('settPerTfGrading')?.closest('.settings-switch-card'),
         document.getElementById('settPullbackHedge')?.closest('.settings-switch-card'),
@@ -784,6 +775,11 @@ function setupSettingsExperience() {
 
 function syncSettingsFromConfig(data) {
     const modal = document.getElementById('settingsModal');
+    // The dedicated execution control must always mirror backend truth.  General
+    // settings stay frozen while their modal is open so the operator's edits are not
+    // overwritten, but Auto is not a modal setting and must never retain stale state.
+    const autoSwitch = document.getElementById('autoModeSwitch');
+    if (autoSwitch && data.config) autoSwitch.checked = data.config.auto_mode === true;
     if (data.config && (!modal || modal.style.display !== 'flex')) {
         const cfg = data.config;
         const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
@@ -813,10 +809,6 @@ function syncSettingsFromConfig(data) {
             setVal('settLotsFutSensex', cfg.lots_fut.SENSEX || 1);
             setVal('settLotsFutMidcap', cfg.lots_fut.MIDCPNIFTY || 1);
         }
-        const autoEl = document.getElementById('settAutoMode');
-        if (autoEl) autoEl.checked = cfg.auto_mode;
-        const autoSwitch = document.getElementById('autoModeSwitch');
-        if (autoSwitch) autoSwitch.checked = cfg.auto_mode;
         const shadowEl = document.getElementById('settFuturesShadow');
         if (shadowEl) shadowEl.checked = cfg.futures_shadow_enabled === true;
         const hedgeEl = document.getElementById('settPullbackHedge');
@@ -1110,19 +1102,6 @@ function saveSettings() {
         return;
     }
 
-    const wantsAuto = document.getElementById('settAutoMode')?.checked ?? document.getElementById('autoModeSwitch')?.checked;
-    let realModeVerification = '';
-    let confirmRealMode = false;
-    if (wantsAuto && state.latestData?.mode === 'REAL') {
-        const confirmed = confirm('REAL AUTO MODE will allow live broker orders. Save this setting?');
-        if (!confirmed) {
-            showToast('Settings not saved: REAL Auto Mode requires confirmation.', 'warning');
-            return;
-        }
-        realModeVerification = 'YES';
-        confirmRealMode = true;
-    }
-
     const config = {
         cmd: 'configure',
         capital_total: parseFloat(document.getElementById('settCapitalTotal')?.value) || 500000,
@@ -1135,9 +1114,6 @@ function saveSettings() {
         fut_cost: parseFloat(document.getElementById('settFutCost')?.value) || 200,
         opt_cost: parseFloat(document.getElementById('settOptCost')?.value) || 80,
         backtest_days: parseInt(document.getElementById('settBacktestDays')?.value) || 1,
-        auto_mode: wantsAuto,
-        confirm_real_mode: confirmRealMode,
-        real_mode_verification: realModeVerification,
         inst_pref: document.getElementById('settInstPref')?.value || 'AUTO',
         strike_selection: document.getElementById('settStrikeSelection')?.value || 'BOTH',
         grade_preference: document.getElementById('settGradePreference')?.value || 'auto',
