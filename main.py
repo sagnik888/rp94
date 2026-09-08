@@ -22,6 +22,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
+# NumPy and SciPy each may reserve a full native worker pool at import time. UT1
+# operates on short intraday frames and already parallelizes across instruments;
+# large BLAS pools add thread stacks and contention without helping this workload.
+# Keep an explicit environment override for research jobs needing wider matrices.
+try:
+    _numeric_threads = max(1, min(8, int(os.getenv("UT1_NUMERIC_THREADS", "1"))))
+except (TypeError, ValueError):
+    _numeric_threads = 1
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, str(_numeric_threads))
+
 import uvicorn
 from loguru import logger
 
