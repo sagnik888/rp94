@@ -17207,6 +17207,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     def _peak_giveback_cap_exit(
         self, trade_like, *, current_pnl_rs: float, peak_pnl_rs: float,
+        evaluated_at: Optional[datetime] = None,
     ) -> Tuple[bool, str]:
         """Exit once a trade has handed back more than a fixed rupee amount from its peak.
 
@@ -17230,9 +17231,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         # Breakeven stop first: a trade that has proven itself may not close negative.
         # Checked before the give-back cap because it is the stricter statement of the
-        # same idea and, unlike the cap, it can never fire on a trade that is still in
-        # profit — so it cannot clip a winner. Measured: helped 10, HURT 0 across 49
-        # replayed positions, at every arm tested.
+        # same idea. It can still clip a later recovery after gross P&L crosses its
+        # configured floor, so recorded-path calibration remains part of its contract.
         if self._setting_enabled(
             getattr(settings, "breakeven_stop_enabled", True), True
         ):
@@ -17281,10 +17281,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 min_age_seconds = max(0.0, float(getattr(settings, "breakeven_stop_min_age_seconds", 60.0) or 60.0))
                 age_seconds = min_age_seconds # default to pass if we can't find age
                 try:
-                    entry_time = getattr(trade_like, "signal_timestamp", getattr(trade_like, "entry_time", None))
+                    # Hold starts at accepted/fill time, never source-candle time.
+                    # Historical candidates expose entry_timestamp; broker trades
+                    # expose entry_time. Signal time is only a legacy fallback.
+                    entry_time = (
+                        getattr(trade_like, "entry_time", None)
+                        or getattr(trade_like, "entry_timestamp", None)
+                        or getattr(trade_like, "signal_timestamp", None)
+                    )
                     if entry_time is not None:
+                        if isinstance(entry_time, str):
+                            entry_time = datetime.fromisoformat(
+                                entry_time.replace("Z", "+00:00")
+                            )
+                        elif isinstance(entry_time, (int, float)):
+                            entry_time = datetime.fromtimestamp(entry_time, IST)
                         ref = entry_time.astimezone(IST).replace(tzinfo=None) if getattr(entry_time, "tzinfo", None) is not None else entry_time
-                        last_update = getattr(trade_like, "last_update", datetime.now())
+                        # Historical candidates do not carry a mutable last_update.
+                        # Wall time makes a fresh replay trade look arbitrarily old and
+                        # defeats the configured hold. Callers therefore supply the
+                        # market-clock value used for this evaluation.
+                        last_update = (
+                            evaluated_at
+                            if evaluated_at is not None
+                            else getattr(trade_like, "last_update", datetime.now())
+                        )
                         lu = last_update.astimezone(IST).replace(tzinfo=None) if getattr(last_update, "tzinfo", None) is not None else last_update
                         age_seconds = max(0.0, (lu - ref).total_seconds())
                 except Exception:
@@ -28161,6 +28182,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     previous,
                     current_pnl_rs=current_pnl_rs,
                     peak_pnl_rs=previous_peak,
+                    evaluated_at=latest_time,
                 )
                 cap_exit, cap_reason = cap_verdict
                 # The method hosts two rules; log the one that actually fired.
@@ -35285,15 +35307,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # never arm again for that position. main.py restarts several times a
                 # session, so that was not a corner case.
                 #
-                # Rs.150 / Rs.80 were fitted by replaying pnl_path, which is the gross
+                # The arm/floor were fitted by replaying pnl_path, which is the gross
                 # series peak_pnl tracks. Feeding the rule anything lower feeds it a
-                # series the calibration never saw. Arming more often is safe here: the
-                # rule cannot fire while a trade is in profit above the floor, so it
-                # cannot clip a winner (measured helped 10, hurt 0 over 49 positions).
+                # series the calibration never saw. A floor crossing may still precede
+                # a later recovery, so lowering the arm is not assumed risk-free.
                 cap_verdict = self._peak_giveback_cap_exit(
                     trade,
                     current_pnl_rs=current_pnl_rs,
                     peak_pnl_rs=float(getattr(trade, "peak_pnl", 0.0) or 0.0),
+                    evaluated_at=latest_time,
                 )
                 cap_exit, cap_reason = cap_verdict
                 # The method hosts two rules; log the one that actually fired.
