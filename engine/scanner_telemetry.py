@@ -40,6 +40,48 @@ _EMPTY_SYSTEM_METRICS: Dict[str, Any] = {
 }
 
 
+def _windows_process_working_set_mb() -> float:
+    """Return this process's Windows working set without an optional dependency."""
+    if os.name != "nt":
+        return 0.0
+    try:
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        handle = kernel32.GetCurrentProcess()
+        ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        if not ok or counters.WorkingSetSize <= 0:
+            return 0.0
+        return round(float(counters.WorkingSetSize) / (1024 * 1024), 1)
+    except Exception:
+        return 0.0
+
+
 def _fresh_system_memory_probe() -> Dict[str, Any]:
     """Return a fresh, validity-stamped RAM/commit sample.
 
@@ -352,6 +394,9 @@ class ScannerTelemetryMixin:
             except Exception:
                 pass
             if os.name == "nt":
+                working_set_mb = _windows_process_working_set_mb()
+                if working_set_mb > 0:
+                    return working_set_mb
                 try:
                     proc = subprocess.run(
                         ["tasklist", "/FI", f"PID eq {os.getpid()}", "/FO", "CSV", "/NH"],
@@ -369,30 +414,7 @@ class ScannerTelemetryMixin:
                             return round(mem_kb / 1024.0, 1)
                 except Exception:
                     pass
-            if os.name != "nt":
-                return 0.0
-            try:
-                class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                    _fields_ = [
-                        ("cb", ctypes.c_ulong),
-                        ("PageFaultCount", ctypes.c_ulong),
-                        ("PeakWorkingSetSize", ctypes.c_size_t),
-                        ("WorkingSetSize", ctypes.c_size_t),
-                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                        ("PagefileUsage", ctypes.c_size_t),
-                        ("PeakPagefileUsage", ctypes.c_size_t),
-                    ]
-
-                counters = PROCESS_MEMORY_COUNTERS()
-                counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-                handle = ctypes.windll.kernel32.GetCurrentProcess()
-                ok = ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
-                return round(float(counters.WorkingSetSize) / (1024 * 1024), 1) if ok else 0.0
-            except Exception:
-                return 0.0
+            return 0.0
 
         def system_memory() -> Dict[str, Dict[str, float]]:
             sample = _fresh_system_memory_probe()

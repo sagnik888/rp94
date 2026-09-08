@@ -1,14 +1,23 @@
+import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pandas as pd
 
 from engine.scanner_telemetry import ScannerTelemetryMixin
+from engine.scanner_telemetry import _windows_process_working_set_mb
 from trading.trade_manager import IST
 
 
 class DummyTelemetry(ScannerTelemetryMixin):
     pass
+
+
+def test_windows_process_ram_probe_reports_current_working_set():
+    if os.name != "nt":
+        return
+
+    assert _windows_process_working_set_mb() > 0.0
 
 
 def test_live_diagnostics_use_live_source_age_not_five_minute_candle_age():
