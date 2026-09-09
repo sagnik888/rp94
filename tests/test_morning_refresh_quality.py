@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -238,6 +239,20 @@ def test_complete_refresh_sets_last_date(monkeypatch):
     assert sc._morning_refresh_summary.get("complete") is True
     assert sc._morning_refresh_summary.get("missing_keys") == []
     assert sc._morning_refresh_inflight is False
+    sc._fetch_all_data.assert_awaited_once()
+    assert sc._fetch_all_data.await_args.kwargs["timeframes"] == ["1min"]
+
+
+def test_readiness_wait_path_publishes_scanner_heartbeat():
+    source = inspect.getsource(Scanner._scan_cycle)
+    readiness_branch = source.split(
+        'if self.mode == "REAL" and not cycle_is_warmup and self._ensure_market_session_refresh',
+        1,
+    )[1].split("# ══ DAILY DATA MAINTENANCE", 1)[0]
+
+    assert "self.last_scan_time = datetime.now(IST)" in readiness_branch
+    assert '"market_status": "READINESS"' in readiness_branch
+    assert "self._update_dashboard_cache(results)" in readiness_branch
 
 
 # ─── 2) Store summary + partial re-warm missing keys only ───────────────────

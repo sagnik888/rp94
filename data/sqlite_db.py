@@ -64,6 +64,7 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "entry_policy_allowed", "entry_policy_phase", "entry_policy_checked_at",
     "entry_policy_reason", "entry_policy_actual_rr",
     "entry_policy_underlying_stop_pct", "entry_policy_version", "quality_verdict",
+    "entry_intel", "decision_intel", "calibration_outcome_recorded",
     "is_recovery",
     # Exchange-side protection + recovery state: read by from_dict(), so it has to
     # be written or every restart silently resets it.
@@ -122,7 +123,7 @@ TRADE_PERSISTED_COLUMNS = frozenset({
 })
 
 
-_TRADE_JSON_COLUMNS = frozenset({"quality_verdict"})
+_TRADE_JSON_COLUMNS = frozenset({"quality_verdict", "entry_intel", "decision_intel"})
 
 
 def _encode_trade_value(column: str, value: Any) -> Any:
@@ -469,6 +470,9 @@ class DatabaseManager:
                     power_move INTEGER,
                     source_lane TEXT,
                     quality_verdict TEXT,
+                    entry_intel TEXT,
+                    decision_intel TEXT,
+                    calibration_outcome_recorded INTEGER,
                     lifecycle_id TEXT,
                     runner_mode INTEGER,
                     runner_activation_timestamp TEXT,
@@ -535,6 +539,9 @@ class DatabaseManager:
                     "entry_policy_underlying_stop_pct": "REAL",
                     "entry_policy_version": "TEXT",
                     "quality_verdict": "TEXT",
+                    "entry_intel": "TEXT",
+                    "decision_intel": "TEXT",
+                    "calibration_outcome_recorded": "INTEGER",
                     "is_recovery": "INTEGER",
                     # Exchange-side protection state. Trade.from_dict() has always read
                     # these back, but nothing ever wrote them, so a restart forgot that a

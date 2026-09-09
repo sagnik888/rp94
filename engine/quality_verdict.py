@@ -21,7 +21,7 @@ from typing import Any, Dict
 from engine.signal_quality_policy import confidence_to_grade, grade_min_confidence, grade_rank
 
 
-POLICY_VERSION = "quality_verdict.v5-confirmed-market-shift"
+POLICY_VERSION = "quality_verdict.v6-full-core-market-shift"
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -69,6 +69,12 @@ def policy_configuration(settings) -> Dict[str, Any]:
         "unknown_confidence": grade_min_confidence("A"),
         "market_shift_min_confidence": _number(
             getattr(settings, "quality_policy_market_shift_min_confidence", 0.60), 0.60
+        ),
+        "full_core_market_shift_min_confidence": _number(
+            getattr(settings, "quality_policy_full_core_market_shift_min_confidence", 0.35), 0.35
+        ),
+        "full_core_market_shift_min_adx": _number(
+            getattr(settings, "quality_policy_full_core_market_shift_min_adx", 18.0), 18.0
         ),
     }
 
@@ -126,6 +132,8 @@ class QualityInputs:
     volume_ratio: float = 0.0
     power_move: bool = False
     market_shift_confirmed: bool = False
+    market_shift_core_votes: int = 0
+    market_shift_total_votes: int = 0
     lane: str = "LIVE"
     direction: str = ""
 
@@ -176,6 +184,8 @@ def evaluate_quality(inputs: QualityInputs, settings) -> QualityVerdict:
     impulse = bool(inputs.impulse_confirmed)
     power = bool(inputs.power_move)
     market_shift = bool(inputs.market_shift_confirmed)
+    market_shift_core_votes = max(0, int(_number(inputs.market_shift_core_votes)))
+    market_shift_total_votes = max(0, int(_number(inputs.market_shift_total_votes)))
     risky = _is_risky(regime, inputs)
     # QualityInputs permits an omitted grade because confidence is canonical.
     # Avoid indexing an empty token list for direct/recovery callers that rely on
@@ -210,6 +220,8 @@ def evaluate_quality(inputs: QualityInputs, settings) -> QualityVerdict:
         "source_count": source_count,
         "power_move": power,
         "market_shift_confirmed": market_shift,
+        "market_shift_core_votes": market_shift_core_votes,
+        "market_shift_total_votes": market_shift_total_votes,
         "confirmation_legs": confirmation_legs,
         "confirmation_count": confirmation_count,
     }
@@ -224,8 +236,34 @@ def evaluate_quality(inputs: QualityInputs, settings) -> QualityVerdict:
             settings, expected_grade=canonical_grade, **base_checks,
         )
 
-    # Every route starts at canonical B+. No raw/context/power/high-confidence flag can
-    # admit a B or C, and no retrospective tracker label participates in this decision.
+    # A 5m reversal independently confirmed by all three core indices is the sole
+    # exception to canonical B+.  The detector already requires synchronized
+    # directional candles, range expansion and close location for every vote; this
+    # route additionally needs measured ADX and a 35% confidence floor.  It fixes
+    # the prior contradiction where strict 3/3 market evidence was recorded but
+    # discarded before it could influence admission.  No 1m/15m, partial-core, or
+    # generic market-shift row can use this exception.
+    full_core_market_shift = bool(
+        market_shift
+        and timeframe == "5min"
+        and market_shift_core_votes >= 3
+        and market_shift_total_votes >= 3
+        and confidence >= cfg["full_core_market_shift_min_confidence"]
+        and adx >= cfg["full_core_market_shift_min_adx"]
+    )
+    if full_core_market_shift:
+        return _verdict(
+            True, "full_core_market_shift", "FULL_CORE_MARKET_SHIFT",
+            "5min full-core market shift confirmed by synchronized candles, breadth and ADX",
+            settings,
+            required=cfg["full_core_market_shift_min_confidence"],
+            required_adx=cfg["full_core_market_shift_min_adx"],
+            required_core_votes=3,
+            **base_checks,
+        )
+
+    # Every remaining route starts at canonical B+. No raw/context/power/high-confidence
+    # flag can admit a B or C, and no retrospective tracker label participates here.
     if confidence < cfg["bplus_min_confidence"] or grade_rank(canonical_grade) < grade_rank("B+"):
         return _verdict(
             False, "minimum_confidence", "BELOW_BPLUS_ELIGIBILITY",

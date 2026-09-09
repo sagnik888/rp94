@@ -353,6 +353,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._live_signal_recheck_at: Dict[str, datetime] = {}
         self._post_repaint_recheck: Dict[str, Dict[str, Any]] = {}
         self._last_data_fetch: Dict[str, float] = {}
+        self._background_history_inflight = False
+        self._background_intel_inflight = False
         self._api_semaphore = asyncio.Semaphore(1) # Background history semaphore (serialized to prevent rate limits)
         self._ltp_semaphore = asyncio.Semaphore(5) # High-priority price semaphore (LTP)
         # Four index fallback polls form one 2-second batch.  Capacity four prevents one
@@ -1474,6 +1476,26 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             reason=str(getattr(trade, "exit_reason", "") or ""),
             source="trade_manager_terminal_fill",
         )
+        # Outcome calibration had a store but no producer, so its sample count stayed
+        # at zero forever. Record only genuine REAL, fresh-exposure terminal fills and
+        # freeze the accepted entry context carried on the Trade. This is evidence
+        # collection only; it does not alter any signal or size decision.
+        if (
+            str(getattr(self, "mode", "") or "").upper() == "REAL"
+            and not bool(getattr(trade, "is_ghost", False))
+            and not bool(getattr(trade, "is_recovery", False))
+            and not bool(getattr(trade, "calibration_outcome_recorded", False))
+        ):
+            try:
+                intel = dict(getattr(trade, "entry_intel", None) or {})
+                row = self.outcome_calibration.build_row(trade, intel)
+                if self.outcome_calibration.append_rows([row]) == 1:
+                    setattr(trade, "calibration_outcome_recorded", True)
+                    marker = getattr(getattr(self, "trades", None), "_mark_dirty", None)
+                    if callable(marker):
+                        marker()
+            except Exception as exc:
+                logger.warning(f"Outcome calibration write failed for {getattr(trade, 'id', '')}: {exc}")
 
     def _record_delayed_entry_result(self, trade, accepted: bool) -> None:
         """Rejoin a post-ACK entry rejection to its original signal lifecycle."""
@@ -3800,7 +3822,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             2.0, float(getattr(get_settings(), "engine_lab_refresh_seconds", 10.0) or 10.0)
         )
         last_refresh = float(getattr(self, "_engine_lab_live_refreshed_at", 0.0) or 0.0)
-        if (now - last_refresh) >= refresh_seconds and not getattr(self, "_engine_lab_refresh_inflight", False):
+        scanner_under_pressure = bool(
+            getattr(self, "_background_history_inflight", False)
+            or getattr(self, "_background_intel_inflight", False)
+            or float(getattr(self, "_last_cycle_ms", 0.0) or 0.0) >= 5000.0
+            or (
+                hasattr(self, "_initial_setup_completed")
+                and (
+                    not getattr(self, "_initial_setup_completed", False)
+                    or int(getattr(self, "scan_count", 0) or 0) < 10
+                )
+            )
+        )
+        if (
+            (now - last_refresh) >= refresh_seconds
+            and not getattr(self, "_engine_lab_refresh_inflight", False)
+            and not scanner_under_pressure
+        ):
             self._engine_lab_refresh_inflight = True
             frames = self._engine_lab_collect_frames(copy=True)
 
@@ -5310,7 +5348,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # User-selected 2-30 day windows are applied by the serialized
             # recalculation queue after this fast one-day hydration.
             startup_days = 1
-            if active_cfg:
+            if active_cfg and self.mode != "REAL":
                 await self._fetch_all_data(
                     {active_inst: active_cfg},
                     force=True,
@@ -5320,9 +5358,11 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if run_live_startup_refresh:
                 await self._run_startup_market_refresh(indices, startup_now)
             else:
+                startup_timeframes = ["1min"] if self.mode == "REAL" else None
                 await self._fetch_all_data(
                     indices,
                     force=False,
+                    timeframes=startup_timeframes,
                     days_back_override=startup_days,
                 )
 
@@ -5380,6 +5420,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         finally:
             self._initial_setup_completed = True
+            # The lab is diagnostics only. Delay its first expensive sweep after the
+            # startup hydration instead of immediately colliding with the first live
+            # scans and the first periodic data refresh.
+            self._engine_lab_live_refreshed_at = time.time()
             # Initial setup runs exactly once at startup; after it completes the
             # system is live and must NOT stay in warmup. Restoring ``was_warmup``
             # here was buggy: scan_count==1 pre-sets is_warmup=True before this
@@ -6107,8 +6151,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             if need_history:
                 try:
+                    # One authoritative 1m series is sufficient in REAL mode:
+                    # CandleBuilder deterministically rebuilds 5m/15m from every 1m
+                    # merge. Fetching all three separately spent ~35s under the
+                    # broker-safe 0.35 req/s limiter and competed with startup scans.
+                    # Historical mode keeps direct higher-TF hydration for its wider
+                    # replay windows.
+                    history_timeframes = (
+                        ["1min"]
+                        if self.mode == "REAL"
+                        else ["1min", "5min", "15min"]
+                    )
                     await self._fetch_all_data(
-                        active_indices, force=True, timeframes=["1min", "5min", "15min"]
+                        active_indices, force=True, timeframes=history_timeframes
                     )
                     self._last_full_history_refresh = time.time()
                     summary["history"] = True
@@ -6510,7 +6565,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Persist a rolling crash-recovery checkpoint independent of scan completion."""
         while self.is_running:
             try:
-                saved = self._save_warm_memory()
+                # Candle copies plus ~400KB JSON serialization must not block the
+                # ScannerEventLoop, its 100ms manager, or dashboard callbacks.
+                saved = await asyncio.to_thread(self._save_warm_memory)
                 if saved:
                     self._persist_session_trade_candidates()
                     save_state = getattr(getattr(self, "trades", None), "save_state", None)
@@ -6629,6 +6686,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         """Background Options Intel Fetcher (PCR, OI, Greeks) — Non-Blocking"""
         while self.is_running:
             try:
+                if self.mode == "REAL" and not self._initial_setup_completed:
+                    await asyncio.sleep(1.0)
+                    continue
+                self._background_intel_inflight = True
                 indices = {k: v for k, v in self.config.get("indices", {}).items() if k in self.active_indices}
                 for name, cfg in indices.items():
                     spot = self.candles.get_latest_price(name)
@@ -6705,8 +6766,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                 self._record_bar_aligned_intelligence(name, options_chain, intel_res, chain_quality, depth_context)
                     except Exception as e: logger.debug(f"Ignored exception: {e}")
                     await asyncio.sleep(5) # Stagger between instruments
+                self._background_intel_inflight = False
                 await asyncio.sleep(25) # Main interval
             except Exception as e:
+                self._background_intel_inflight = False
                 await asyncio.sleep(5)
 
     async def _background_history_worker(self):
@@ -6721,7 +6784,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     await asyncio.sleep(max(300, self._data_fetch_interval))
                     continue
                 if self.mode == "REAL":
-                    await self._fetch_all_data(indices, timeframes=["1min"])
+                    if not self._initial_setup_completed:
+                        await asyncio.sleep(1.0)
+                        continue
+                    self._background_history_inflight = True
+                    try:
+                        # This worker is itself aligned to one pass per minute and the
+                        # history limiter still serializes/rate-limits broker calls.
+                        # Force bypasses the generic 60s cache comparison: a pass that
+                        # starts a few milliseconds before the prior timestamp's exact
+                        # anniversary must not silently skip a whole minute of cash
+                        # volume authority.
+                        await self._fetch_all_data(
+                            indices, force=True, timeframes=["1min"]
+                        )
+                    finally:
+                        self._background_history_inflight = False
                     # Startup hydrates 5m/15m; CandleBuilder resamples every accepted
                     # 1m update. Eight redundant higher-TF REST calls serialized behind
                     # this lane and pushed the next cash-volume refresh out 70-80s.
@@ -7588,7 +7666,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._daily_reset_done = False # Reset readiness flag for next session
 
         if self.mode == "REAL" and not cycle_is_warmup and self._ensure_market_session_refresh(indices, now_ist):
+            # Readiness work is intentionally entry-blocking, but it is not a dead
+            # scanner. Publish a lightweight heartbeat so the dashboard/watchdog does
+            # not call an actively warming process stale while broker refresh runs.
+            previous = self.latest_results if isinstance(self.latest_results, dict) else {}
+            results.update({
+                "instruments": dict(previous.get("instruments") or {}),
+                "system_power": self.system_power,
+                "is_calculating": False,
+                "market_status": "READINESS",
+                "mode": self.mode,
+                "gateway_status": self.data.get_source_health(),
+                "config": self.get_broadcast_config(),
+                "engine_lab": dict(previous.get("engine_lab") or {}),
+                "trades": dict(previous.get("trades") or {}),
+                "scan_count": self.scan_count,
+                "latency": round((time.time() - t0) * 1000),
+                "timestamp": datetime.now(IST).isoformat(),
+                "simulation_id": self.simulation_id,
+            })
+            self.latest_results = results
+            self._update_dashboard_cache(results)
+            self.last_scan_time = datetime.now(IST)
             self.is_calculating = False
+            if self.on_update and time.time() - getattr(self, "_last_broadcast_time", 0) >= 1.0:
+                self._last_broadcast_time = time.time()
+                try:
+                    await self.on_update(results)
+                except Exception as exc:
+                    logger.error("Readiness heartbeat broadcast failed: %s", exc)
             return
 
         # ══ DAILY DATA MAINTENANCE (At 15:45 PM IST) ══
@@ -7651,7 +7757,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             })
             self.latest_results = results
             self._update_dashboard_cache(results)
-            self._save_warm_memory()
+            # Periodic recovery persistence is owned by the background checkpoint
+            # worker, where candle copies and disk I/O run off this event loop.
             if self.on_update:
                 try: await self.on_update(results)
                 except Exception as e:
@@ -8130,7 +8237,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self.latest_results = results
             self._update_dashboard_cache(results)
             self._last_sent_sim_id = self.simulation_id
-            self._save_warm_memory()
+            # Periodic recovery persistence is owned by the background checkpoint
+            # worker; forced signal-state checkpoints remain synchronous below.
 
             # â• â•  DASHBOARD THROTTLE â• â•
             # Force broadcast if data updated OR at least every 1s
@@ -8282,7 +8390,22 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # observation.  Keep the candle receipt clock untouched so a healthy
                 # quote lane or a just-finished download cannot make stale OHLC look
                 # eligible for a fresh entry/exit decision.
-                self.candles.update_candles(name, df, tf, mark_receipt=False)
+                update_df = df
+                if (
+                    getattr(self, "mode", "HISTORICAL") == "REAL"
+                    and tf == "1min"
+                    and self.candles.get_candle_count(name, tf) >= 500
+                ):
+                    latest = self.candles.latest_candle_time(name, tf)
+                    if latest is not None:
+                        # Existing deep history is already present. Merge only the
+                        # correction seam and genuinely newer bars. Recovery after a
+                        # gap still includes every row newer than `latest`.
+                        cutoff = pd.Timestamp(latest) - pd.Timedelta(minutes=2)
+                        incremental = df[df.index >= cutoff]
+                        if incremental is not None and not incremental.empty:
+                            update_df = incremental
+                self.candles.update_candles(name, update_df, tf, mark_receipt=False)
         except Exception as e:
             logger.error(f"Fetch failed for {name} {tf}: {e}")
 
@@ -23671,6 +23794,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     volume_confirmed=bool(checks.get("volume_confirmed", False)),
                     volume_ratio=float(checks.get("volume_ratio", 0.0) or 0.0),
                     power_move=bool(checks.get("power_move", False)),
+                    market_shift_confirmed=bool(checks.get("market_shift_confirmed", False)),
+                    market_shift_core_votes=int(checks.get("market_shift_core_votes", 0) or 0),
+                    market_shift_total_votes=int(checks.get("market_shift_total_votes", 0) or 0),
                     lane="RESTORE",
                     direction=str(getattr(candidate, "direction", "") or ""),
                 ),
@@ -27055,6 +27181,12 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         impulse = bool(getattr(candidate, "impulse_confirmed", False)) or bool(
             getattr(candidate, "is_explosive_bypass", False)
         )
+        market_wide_context = getattr(candidate, "market_wide_reversal_context", None)
+        market_wide_confirmed = bool(
+            getattr(candidate, "market_wide_reversal_entry", False)
+            and isinstance(market_wide_context, dict)
+            and market_wide_context.get("enabled") is True
+        )
         verdict = evaluate_quality(
             QualityInputs(
                 timeframe=str(getattr(candidate, "timeframe", "") or ""),
@@ -27074,16 +27206,23 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # Entry flags alone are not quality evidence: legacy/tests may carry
                 # them without having run a detector. Each production detector stamps
                 # enabled=True only after its breadth/range/timing rules pass.
-                market_shift_confirmed=any(
+                market_shift_confirmed=market_wide_confirmed or any(
                     bool(getattr(candidate, flag, False))
                     and isinstance(getattr(candidate, context, None), dict)
                     and getattr(candidate, context, {}).get("enabled") is True
                     for flag, context in (
-                        ("market_wide_reversal_entry", "market_wide_reversal_context"),
                         ("market_ltp_shock_entry", "market_ltp_shock_context"),
                         ("one_way_cascade_entry", "one_way_cascade_context"),
                         ("late_session_reclaim_entry", "late_session_reclaim_context"),
                     )
+                ),
+                market_shift_core_votes=(
+                    int(market_wide_context.get("core_votes", 0) or 0)
+                    if market_wide_confirmed else 0
+                ),
+                market_shift_total_votes=(
+                    int(market_wide_context.get("total_votes", 0) or 0)
+                    if market_wide_confirmed else 0
                 ),
                 lane=str(lane or "LIVE"),
                 direction=str(getattr(candidate, "direction", "") or ""),
@@ -33244,6 +33383,13 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         self._close_superseded_session_entries([sig])
                         self._latest_trade_candidates[sig.instrument] = [sig]
                         setattr(sig, "accepted_by_gate", True)
+                        # This lane intentionally does not submit an order.  Preserve
+                        # the distinction so a later tracked/repaint exit can never be
+                        # mistaken for a broker-filled trade by a consumer of the
+                        # session-candidate ledger.
+                        setattr(sig, "execution_status", "SIGNAL_ONLY")
+                        setattr(sig, "execution_state", "NOT_PLACED")
+                        setattr(sig, "broker_fill_confirmed", False)
                         self._mark_candidate_accepted_time(sig, datetime.now(IST))
                         accepted_candidates.append(sig)
                         self._record_accepted_entry(sig)

@@ -1562,6 +1562,16 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
 
     current_mode = str(getattr(scanner, "mode", "") or "").upper()
     if current_mode == "REAL":
+        # This worker owns only the 09:00 premarket transition.  Once live
+        # trading has started, Auto Mode may have been explicitly authorized by
+        # the operator or by the readiness-gated startup arm.  A late worker pass
+        # must never revoke that authority between signals.
+        live_start = _parse_hhmmss(
+            getattr(settings, "real_mode_live_start", "09:15:00"),
+            dt_time(9, 15),
+        )
+        if now_ist.time() >= live_start:
+            return True, "already_real"
         if bool(getattr(scanner, "auto_mode", False)):
             auto_disabled = scanner.configure(auto_mode=False, persist_settings=False)
             if not auto_disabled or bool(getattr(scanner, "auto_mode", False)):
@@ -1609,7 +1619,7 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
 
 
 def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
-    """Arm REAL/manual mode at 09:00 on trading days when the app is already running."""
+    """Arm REAL/manual mode at 09:00 without revoking live Auto authority."""
     if not _setting_enabled(getattr(settings, "auto_real_mode_premarket_enabled", True), True):
         logger.info("Premarket REAL/manual worker disabled by settings.")
         return
@@ -1827,7 +1837,10 @@ def create_system():
     logger.info(f"✅ Active Broker: {'REAL' if active_broker == real_broker else 'SIGNAL SIMULATION (Real Data)'}")
 
     # 2. Candle Builder
-    candle_builder = CandleBuilder(max_candles=2000)
+    candle_builder = CandleBuilder(
+        max_candles=2000,
+        partial_publish_min_interval_seconds=0.1,
+    )
     logger.info("✅ Candle Builder")
 
     # Connect tick streams

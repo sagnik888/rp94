@@ -75,6 +75,26 @@ class OutcomeCalibrationStore:
         )
         anchor = intel.get("anchor_regime", {}) if isinstance(intel.get("anchor_regime"), dict) else {}
         breadth = intel.get("breadth_context", {}) if isinstance(intel.get("breadth_context"), dict) else {}
+        # Accepted-trade snapshots are intentionally compact/flat; full intelligence
+        # snapshots are nested. Support both without inventing absent evidence.
+        flat = intel
+        regime_value = regime.get("regime", "") or flat.get("regime_label", "") or getattr(trade, "market_regime", "")
+        aggregate_value = aggregate.get("score", "")
+        if aggregate_value == "":
+            aggregate_value = flat.get("aggregate_score", "")
+        volume_ratio_value = volume.get("volume_ratio", "")
+        if volume_ratio_value == "":
+            volume_ratio_value = flat.get("volume_ratio", "")
+        pcr_value = pcr.get("primary_pcr", pcr.get("pcr_oi", pcr.get("pcr", "")))
+        if pcr_value == "":
+            pcr_value = flat.get("pcr", "")
+        oi_value = oi.get("signal", "") or flat.get("oi_signal", "")
+        ofr_value = flow.get("ratio", flow.get("buy_sell_ratio", ""))
+        if ofr_value == "":
+            ofr_value = flat.get("order_ratio", "")
+        iv_value = greeks.get("iv_percentile", "")
+        if iv_value == "":
+            iv_value = flat.get("iv_percentile", "")
         return {
             "trade_id": getattr(trade, "id", ""),
             "instrument": getattr(trade, "instrument", ""),
@@ -89,14 +109,14 @@ class OutcomeCalibrationStore:
             "mfe": float(getattr(trade, "peak_pnl", 0.0) or 0.0),
             "mae": float(getattr(trade, "max_drawdown", 0.0) or 0.0),
             "exit_reason": getattr(trade, "exit_reason", ""),
-            "regime": regime.get("regime", ""),
-            "aggregate_score": aggregate.get("score", ""),
+            "regime": regime_value,
+            "aggregate_score": aggregate_value,
             "volume_signal": volume.get("signal", ""),
-            "volume_ratio": volume.get("volume_ratio", ""),
-            "pcr": pcr.get("primary_pcr", pcr.get("pcr_oi", pcr.get("pcr", ""))),
-            "oi_signal": oi.get("signal", ""),
-            "ofr": flow.get("ratio", flow.get("buy_sell_ratio", "")),
-            "iv_percentile": greeks.get("iv_percentile", ""),
+            "volume_ratio": volume_ratio_value,
+            "pcr": pcr_value,
+            "oi_signal": oi_value,
+            "ofr": ofr_value,
+            "iv_percentile": iv_value,
             "day_type": session_context.get("day_type", ""),
             "session_bias": session_context.get("bias", ""),
             "hourly_anchor": anchor.get("regime", ""),

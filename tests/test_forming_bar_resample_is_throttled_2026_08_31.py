@@ -45,6 +45,42 @@ from loguru import logger
 from data.candle_builder import CandleBuilder
 
 
+def test_forming_row_can_coalesce_to_management_cadence_without_losing_ticks(monkeypatch):
+    clock = {"now": 1.0}
+    monkeypatch.setattr("data.candle_builder.time.monotonic", lambda: clock["now"])
+    builder = CandleBuilder(
+        max_candles=100,
+        partial_publish_min_interval_seconds=0.1,
+    )
+    start = pd.Timestamp("2026-09-09 14:20:00").to_pydatetime()
+
+    builder.update_from_tick("NIFTY", 100.0, 1000.0, start, "fyers_index")
+    clock["now"] = 1.05
+    builder.update_from_tick("NIFTY", 102.0, 1100.0, start, "fyers_index")
+    assert float(builder.get_candles("NIFTY", "1min").iloc[-1]["close"]) == 100.0
+
+    clock["now"] = 1.11
+    builder.update_from_tick("NIFTY", 101.0, 1200.0, start, "fyers_index")
+    forming = builder.get_candles("NIFTY", "1min").iloc[-1]
+    assert float(forming["high"]) == 102.0
+    assert float(forming["close"]) == 101.0
+    assert int(forming["tick_count"]) == 3
+
+    # A minute transition bypasses the coalescing window: the closed bar and the new
+    # forming bar are both immediately visible.
+    clock["now"] = 1.12
+    builder.update_from_tick(
+        "NIFTY", 103.0, 1300.0, start + dt.timedelta(minutes=1), "fyers_index"
+    )
+    frame = builder.get_candles("NIFTY", "1min")
+    assert list(frame.index[-2:]) == [
+        pd.Timestamp("2026-09-09 14:20:00"),
+        pd.Timestamp("2026-09-09 14:21:00"),
+    ]
+    assert float(frame.iloc[-2]["close"]) == 101.0
+    assert float(frame.iloc[-1]["close"]) == 103.0
+
+
 @pytest.fixture(autouse=True)
 def _quiet():
     """update_from_tick logs a line per volume-source rebase; 10k ticks is unreadable."""

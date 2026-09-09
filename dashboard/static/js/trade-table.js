@@ -189,7 +189,15 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
             const isExit = sig.is_exit || sig.action === 'EXIT' || sig.status === 'EXIT SIGNAL';
             const isNoEntry = sig.action === 'NO_ENTRY' || String(sig.status || '').includes('NO ENTRY');
             const exitReason = sig.exit_reason || sig.status || '';
-            const rowPnl = accountingTradePnl({ ...sig, exit_reason: exitReason });
+            // A terminal session signal is an internal tracking/audit event, not a
+            // broker trade.  Do not resurrect it from instrument snapshots after the
+            // API has correctly excluded it, otherwise a REPAINT_ABORT can appear as
+            // a second closed position with fictional P&L.
+            if (isExit) return;
+
+            // An actionable manual signal has not been placed yet; it carries no
+            // realised or mark-to-market broker P&L.
+            const rowPnl = 0;
             
             // Fix: Filter out ghost 'NO_ENTRY' signals so they do not flash on the dashboard
             if (isNoEntry) return;

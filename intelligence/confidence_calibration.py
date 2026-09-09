@@ -65,7 +65,7 @@ class ConfidenceCalibrator:
         return max(0.0, min(1.0, out))
 
 
-_CACHE: dict = {"calibrator": None, "at": 0.0, "ok": False}
+_CACHE: dict = {}
 _CACHE_TTL = 300.0
 
 
@@ -73,6 +73,9 @@ def load_calibrator(
     path: str = "data_store/outcome_calibration.csv",
     *,
     min_samples: int = 200,
+    instrument: str = "",
+    timeframe: str = "",
+    regime: str = "",
 ) -> Optional[ConfidenceCalibrator]:
     """Fit (and cache) a calibrator, or return None if the data is not ready.
 
@@ -80,10 +83,15 @@ def load_calibrator(
     classes present. A degenerate dataset returns None (calibration is a no-op).
     """
     now = time.monotonic()
-    if _CACHE["calibrator"] is not None and (now - _CACHE["at"]) < _CACHE_TTL:
-        return _CACHE["calibrator"]
-    if _CACHE["ok"] and (now - _CACHE["at"]) < _CACHE_TTL:
-        return None  # cached "not ready"
+    instrument_parts = str(instrument or "").split()
+    segment = (
+        str(Path(path).resolve()), int(min_samples),
+        instrument_parts[0].upper() if instrument_parts else "",
+        str(timeframe or "").lower(), str(regime or "").upper(),
+    )
+    cached = _CACHE.get(segment)
+    if cached and (now - cached["at"]) < _CACHE_TTL:
+        return cached["calibrator"]
 
     confidences: List[float] = []
     outcomes: List[float] = []
@@ -92,6 +100,12 @@ def load_calibrator(
         try:
             with p.open("r", newline="", encoding="utf-8") as fh:
                 for row in csv.DictReader(fh):
+                    if segment[2] and str(row.get("instrument") or "").split()[0].upper() != segment[2]:
+                        continue
+                    if segment[3] and str(row.get("timeframe") or "").lower() != segment[3]:
+                        continue
+                    if segment[4] and str(row.get("regime") or "").upper() != segment[4]:
+                        continue
                     try:
                         conf = float(row.get("confidence") or "")
                         pnl = float(row.get("pnl") or "")
@@ -106,27 +120,53 @@ def load_calibrator(
     losses = len(outcomes) - wins
     ready = len(outcomes) >= int(min_samples) and wins > 0 and losses > 0
     if not ready:
-        _CACHE.update({"calibrator": None, "at": now, "ok": True})
+        _CACHE[segment] = {"calibrator": None, "at": now}
         return None
 
     thresholds, values = _isotonic_pava(confidences, outcomes)
     calibrator = ConfidenceCalibrator(thresholds, values, len(outcomes))
-    _CACHE.update({"calibrator": calibrator, "at": now, "ok": True})
+    _CACHE[segment] = {"calibrator": calibrator, "at": now}
     return calibrator
 
 
-def calibrate(confidence: float, settings=None, path: str = "data_store/outcome_calibration.csv") -> float:
+def calibrate(
+    confidence: float,
+    settings=None,
+    path: str = "data_store/outcome_calibration.csv",
+    *,
+    instrument: str = "",
+    timeframe: str = "",
+    regime: str = "",
+) -> float:
     """Return calibrated confidence if enabled AND data is ready, else the input.
 
     Default-OFF: `ut_confidence_calibration_enabled` must be truthy. Even when
     enabled, returns the raw confidence unchanged until the dataset is ready.
     """
     try:
-        enabled = bool(getattr(settings, "ut_confidence_calibration_enabled", False))
-        if not enabled:
+        collection_enabled = bool(getattr(settings, "ut_confidence_calibration_enabled", False))
+        live_apply = bool(
+            getattr(settings, "ut_confidence_calibration_live_apply_enabled", False)
+        )
+        if not (collection_enabled and live_apply):
             return float(confidence or 0.0)
-        min_samples = int(getattr(settings, "ut_confidence_calibration_min_samples", 200) or 200)
-        cal = load_calibrator(path, min_samples=min_samples)
+        # Live decisions require an adequately sampled exact index/TF/regime cell.
+        # A global curve is not silently substituted for a sparse segment.
+        if not instrument or not timeframe or not regime:
+            return float(confidence or 0.0)
+        global_min = int(getattr(settings, "ut_confidence_calibration_min_samples", 200) or 200)
+        if load_calibrator(path, min_samples=global_min) is None:
+            return float(confidence or 0.0)
+        segment_min = int(
+            getattr(settings, "ut_confidence_calibration_min_segment_samples", 50) or 50
+        )
+        cal = load_calibrator(
+            path,
+            min_samples=segment_min,
+            instrument=instrument,
+            timeframe=timeframe,
+            regime=regime,
+        )
         if cal is None:
             return float(confidence or 0.0)
         return cal.transform(float(confidence or 0.0))

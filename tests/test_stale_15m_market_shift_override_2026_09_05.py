@@ -48,6 +48,57 @@ def test_market_shift_never_bypasses_canonical_bplus_floor():
     assert verdict.reason_code == "BELOW_BPLUS_ELIGIBILITY"
 
 
+def test_full_core_five_minute_market_shift_admits_the_observed_banknifty_setup():
+    verdict = evaluate_quality(
+        QualityInputs(
+            timeframe="5min", inst_type="OPT", confidence=0.3645, regime="RANGING",
+            adx_value=18.01, trend_15m_agrees=False, direction="LONG",
+            market_shift_confirmed=True, market_shift_core_votes=3,
+            market_shift_total_votes=4,
+        ),
+        Settings(),
+    )
+    assert verdict.allowed is True
+    assert verdict.reason_code == "FULL_CORE_MARKET_SHIFT"
+
+
+def test_partial_core_market_shift_cannot_bypass_canonical_bplus_floor():
+    verdict = evaluate_quality(
+        QualityInputs(
+            timeframe="5min", inst_type="OPT", confidence=0.50, regime="RANGING",
+            adx_value=30.0, direction="LONG", market_shift_confirmed=True,
+            market_shift_core_votes=2, market_shift_total_votes=3,
+        ),
+        Settings(),
+    )
+    assert verdict.allowed is False
+    assert verdict.reason_code == "BELOW_BPLUS_ELIGIBILITY"
+
+
+def test_scanner_passes_only_verified_full_core_votes_to_quality_policy():
+    candidate = type("Candidate", (), {
+        "instrument": "BANKNIFTY", "timeframe": "5min", "inst_type": "OPT",
+        "direction": "LONG", "confidence": 0.3645, "grade": "C",
+        "adx_value": 18.01, "trend_15m_agrees": False,
+        "impulse_confirmed": False, "is_explosive_bypass": False,
+        "source_engines": [], "volume_ratio": 0.56, "volume_spike_entry": False,
+        "power_move": False, "market_wide_reversal_entry": True,
+        "market_wide_reversal_context": {
+            "enabled": True, "core_votes": 3, "total_votes": 4,
+        },
+    })()
+    scanner = Scanner.__new__(Scanner)
+    scanner._candidate_15m_trend_agrees = lambda value: value.trend_15m_agrees
+    scanner._get_trade_regime = lambda *args, **kwargs: "RANGING"
+
+    verdict = scanner._quality_verdict_for_candidate(candidate, regime="RANGING")
+
+    assert verdict.allowed is True
+    assert verdict.reason_code == "FULL_CORE_MARKET_SHIFT"
+    assert verdict.checks["market_shift_core_votes"] == 3
+    assert verdict.checks["market_shift_total_votes"] == 4
+
+
 def test_full_sensitivity_market_shock_window_covers_requested_afternoon():
     fields = Settings.model_fields
     assert fields["market_ltp_shock_session_start"].default == "13:00"

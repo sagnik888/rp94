@@ -160,7 +160,7 @@ def test_fyers_history_has_distinct_provider_and_receipt_clocks():
     assert row["tick_count"] == 0
 
 
-def test_history_merge_preserves_live_tick_telemetry():
+def test_history_merge_preserves_live_tick_timing_and_measured_volume_provenance():
     builder = CandleBuilder()
     idx = pd.DatetimeIndex([datetime(2026, 8, 28, 9, 15)])
     live = pd.DataFrame(
@@ -179,7 +179,10 @@ def test_history_merge_preserves_live_tick_telemetry():
     row = builder.get_candles("NIFTY", "1min").iloc[0]
     assert row["volume"] == 25
     assert row["tick_count"] == 7
-    assert row["source"] == "live_tick"
+    # Price/tick timing stays live, while source identifies authority for the
+    # independently measured cash volume used by volume-health gates.
+    assert row["source"] == "fyers_history"
+    assert row["volume_basis"] == "fyers_index"
     assert row["receipt_at"] == datetime(2026, 8, 28, 9, 15, 30)
 
 

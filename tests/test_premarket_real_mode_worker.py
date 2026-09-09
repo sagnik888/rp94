@@ -101,6 +101,22 @@ def test_auto_real_worker_forces_auto_off_when_already_real():
     assert scanner.calls == [{"auto_mode": False, "persist_settings": False}]
 
 
+def test_auto_real_worker_never_disarms_authorized_auto_after_live_start():
+    scanner = _FakeScanner(mode="REAL", auto_mode=True)
+
+    ok, reason = main._auto_real_mode_attempt(
+        scanner,
+        _settings(),
+        _ist("2026-07-03 09:34:58"),
+    )
+
+    assert ok is True
+    assert reason == "already_real"
+    assert scanner.mode == "REAL"
+    assert scanner.auto_mode is True
+    assert scanner.calls == []
+
+
 def test_auto_real_worker_skips_non_trading_day():
     scanner = _FakeScanner(auto_mode=True, trading_day=False)
 

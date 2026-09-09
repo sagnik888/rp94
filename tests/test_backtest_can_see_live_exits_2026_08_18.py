@@ -72,8 +72,8 @@ def test_the_simulator_alone_can_only_produce_stop_target_or_session_end():
         assert live_only not in produced
 
 
-def test_off_by_default():
-    assert Settings.model_fields["backtest_live_exits_enabled"].default is False
+def test_full_live_management_replay_is_default():
+    assert Settings.model_fields["backtest_live_exits_enabled"].default is True
 
 
 def test_with_the_toggle_off_nothing_changes(monkeypatch):

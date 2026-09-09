@@ -274,6 +274,76 @@ def test_live_telemetry_still_survives_a_history_refresh():
     assert restored["receipt_at"].tolist() == ["2026-08-31T09:15:00"] * 3
 
 
+def test_measured_fyers_history_repairs_price_only_live_volume_provenance():
+    """A positive cash backfill must not retain a blank price-tick volume identity."""
+    index = pd.date_range("2026-09-09 14:20", periods=1, freq="1min")
+    existing = pd.DataFrame(
+        {
+            "volume": [0.0],
+            "tick_count": [14],
+            "volume_basis": [""],
+            "source": ["live_tick"],
+            "receipt_at": ["2026-09-09T14:20:45"],
+            "provider_time": ["2026-09-09T14:20:00"],
+        },
+        index=index,
+    )
+    incoming = pd.DataFrame(
+        {
+            "volume": [703327.0],
+            "tick_count": [0],
+            "volume_basis": ["fyers_index"],
+            "source": ["fyers_history"],
+            "receipt_at": ["2026-09-09T14:21:04"],
+            "provider_time": ["2026-09-09T14:20:00"],
+        },
+        index=index,
+    )
+
+    restored = CandleBuilder._restore_candle_telemetry(incoming, existing)
+
+    assert restored.iloc[0]["volume"] == 703327.0
+    assert restored.iloc[0]["volume_basis"] == "fyers_index"
+    assert restored.iloc[0]["source"] == "fyers_history"
+    assert restored.iloc[0]["tick_count"] == 14
+    assert restored.iloc[0]["receipt_at"] == "2026-09-09T14:20:45"
+
+
+def test_price_only_tick_cannot_erase_backfilled_forming_cash_volume():
+    """The repaired forming row must stay repaired through later ticks and close."""
+    index = pd.date_range("2026-09-09 14:20", periods=1, freq="1min")
+    existing = pd.DataFrame(
+        {
+            "volume": [703327.0],
+            "tick_count": [14],
+            "volume_basis": ["fyers_index"],
+            "source": ["fyers_history"],
+            "receipt_at": ["2026-09-09T14:20:45"],
+            "provider_time": ["2026-09-09T14:20:00"],
+        },
+        index=index,
+    )
+    price_only_tick = pd.DataFrame(
+        {
+            "volume": [0.0],
+            "tick_count": [15],
+            "volume_basis": [""],
+            "source": ["live_tick"],
+            "receipt_at": ["2026-09-09T14:20:50"],
+            "provider_time": ["2026-09-09T14:20:50"],
+        },
+        index=index,
+    )
+
+    restored = CandleBuilder._restore_candle_telemetry(price_only_tick, existing)
+
+    assert restored.iloc[0]["volume"] == 703327.0
+    assert restored.iloc[0]["volume_basis"] == "fyers_index"
+    assert restored.iloc[0]["source"] == "fyers_history"
+    assert restored.iloc[0]["tick_count"] == 15
+    assert restored.iloc[0]["receipt_at"] == "2026-09-09T14:20:50"
+
+
 def test_a_populated_incoming_value_still_wins():
     """Restoring must not clobber telemetry the incoming frame genuinely carries."""
     index = pd.date_range("2026-08-31 09:15", periods=2, freq="1min")

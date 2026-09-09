@@ -573,6 +573,32 @@ def test_live_engine_lab_snapshot_serves_cache_and_throttles(monkeypatch):
     assert snapshot["updated_at"] == "refresh"
 
 
+def test_live_engine_lab_does_not_compete_with_startup_or_intelligence():
+    lab = EngineLab(get_settings().get_ut_engine_params())
+    calls = []
+    fake = SimpleNamespace(
+        engine_lab=lab,
+        mode="REAL",
+        _engine_lab_live_refreshed_at=0.0,
+        _engine_lab_refresh_inflight=False,
+        _background_history_inflight=False,
+        _background_intel_inflight=False,
+        _initial_setup_completed=False,
+        scan_count=1,
+        _last_cycle_ms=0.0,
+        _engine_lab_collect_frames=lambda copy=False: calls.append("collect") or {},
+    )
+
+    Scanner._engine_lab_snapshot_nonblocking(fake)
+    assert calls == []
+
+    fake._initial_setup_completed = True
+    fake.scan_count = 20
+    fake._background_intel_inflight = True
+    Scanner._engine_lab_snapshot_nonblocking(fake)
+    assert calls == []
+
+
 def test_live_engine_lab_compute_never_touches_live_lane():
     """REAL-mode lab refresh must be fully isolated from live trading state.
 

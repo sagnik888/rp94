@@ -117,6 +117,76 @@ def _summarize_closed(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
     return by_type
 
 
+def _entry_route(row: Dict[str, Any]) -> str:
+    for field, label in (
+        ("one_way_cascade_entry", "ONE_WAY_CASCADE"),
+        ("market_wide_reversal_entry", "MARKET_WIDE_REVERSAL"),
+        ("late_session_reclaim_entry", "LATE_SESSION_RECLAIM"),
+        ("volume_spike_entry", "VOLUME_SPIKE"),
+        ("power_move", "POWER_MOVE"),
+        ("is_reversion_scalp", "REVERSION_SCALP"),
+        ("quad_union_entry", "QUAD_UNION"),
+        ("raw_union_entry", "RAW_UNION"),
+    ):
+        if bool(row.get(field)):
+            return label
+    source = str(row.get("source_engine") or "").strip().upper()
+    lane = str(row.get("source_lane") or "").strip().upper()
+    return ":".join(part for part in (source or "STANDARD", lane) if part)
+
+
+def _dimension_summary(closed: List[Dict[str, Any]], field: str) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in closed:
+        if field == "instrument":
+            key = str(row.get(field) or "UNKNOWN").split()[0].upper()
+        elif field == "grade":
+            key = str(row.get(field) or "UNKNOWN").split()[0].upper()
+        elif field == "entry_route":
+            key = _entry_route(row)
+        else:
+            key = str(row.get(field) or "UNKNOWN").upper()
+        bucket = result.setdefault(key, {"count": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+        pnl = float(row.get("pnl") or 0.0)
+        bucket["count"] += 1
+        bucket["pnl"] += pnl
+        bucket["wins" if pnl > 0 else "losses"] += int(pnl != 0)
+    for bucket in result.values():
+        bucket["pnl"] = round(float(bucket["pnl"]), 2)
+        bucket["win_rate"] = round(
+            100.0 * int(bucket["wins"]) / int(bucket["count"]), 2
+        ) if bucket["count"] else 0.0
+    return result
+
+
+def _compact_trade(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist attribution and the complete replay path without dashboard-only noise."""
+    fields = (
+        "id", "lifecycle_id", "instrument", "inst_type", "option_type", "direction",
+        "timeframe", "grade", "confidence", "market_regime", "source_engine",
+        "source_engines", "source_lane", "entry_price", "trailing_stop", "target",
+        "exit_price", "pnl", "charges", "lots", "lot_size", "rr_ratio", "entry_time",
+        "entry_date", "entry_timestamp", "exit_time", "exit_date", "exit_timestamp",
+        "exit_reason", "data_provenance", "quality_verdict", "entry_intelligence_score",
+        "market_wide_reversal_entry", "late_session_reclaim_entry", "one_way_cascade_entry",
+        "volume_spike_entry", "power_move", "is_reversion_scalp", "quad_union_entry",
+        "raw_union_entry", "replay_price_path", "replay_exit_trace",
+    )
+    item = {field: row.get(field) for field in fields if field in row}
+    item["entry_route"] = _entry_route(row)
+    item["exit_path"] = {
+        "entry": row.get("entry_price"),
+        "initial_stop": row.get("initial_stop", row.get("trailing_stop")),
+        "final_stop": row.get("current_stop", row.get("trailing_stop")),
+        "target": row.get("target"),
+        "exit": row.get("exit_price"),
+        "reason": row.get("exit_reason"),
+        "pnl": row.get("pnl"),
+        "charges": row.get("charges"),
+    }
+    return item
+
+
 def collect_result(
     base: str,
     session: requests.Session,
@@ -158,6 +228,13 @@ def collect_result(
             },
             "row_pnl": round(sum(float(row.get("pnl") or 0.0) for row in closed), 2),
             "by_type": _summarize_closed(closed),
+            "by_index": _dimension_summary(closed, "instrument"),
+            "by_timeframe": _dimension_summary(closed, "timeframe"),
+            "by_grade": _dimension_summary(closed, "grade"),
+            "by_regime": _dimension_summary(closed, "market_regime"),
+            "by_entry_route": _dimension_summary(closed, "entry_route"),
+            "by_exit_reason": _dimension_summary(closed, "exit_reason"),
+            "trade_ledger": [_compact_trade(row) for row in closed],
             "rejects": diagnostics.get("rejects") or {},
             "scanner_freshness": diagnostics.get("scanner_freshness") or state.get("scanner_freshness"),
             "sources": diagnostics.get("sources") or {},

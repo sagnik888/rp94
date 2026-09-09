@@ -310,7 +310,19 @@ class SignalManager:
             from config.settings import get_settings as _gs2
             from intelligence.confidence_calibration import calibrate as _calibrate_conf
             _settings = _gs2()
-            confidence = max(0.0, min(1.0, _calibrate_conf(confidence, _settings)))
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    _calibrate_conf(
+                        confidence,
+                        _settings,
+                        instrument=getattr(signal, "instrument", ""),
+                        timeframe=getattr(signal, "timeframe", ""),
+                        regime=regime,
+                    ),
+                ),
+            )
         except Exception as exc:
             logger.debug(f"Confidence calibration unavailable: {exc}")
             _settings = None

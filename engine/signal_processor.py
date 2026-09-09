@@ -67,6 +67,64 @@ def _setting_enabled(value, default: bool = True) -> bool:
     return bool(value)
 
 
+class _PointInTimeCandles:
+    """Read-only candle view that never exposes rows after replay clock."""
+
+    def __init__(self, source):
+        self.source = source
+        self.as_of = None
+
+    def get_candles(self, name, timeframe):
+        if self.as_of is None or self.source is None:
+            return None
+        try:
+            base = self.source.get_candles(name, "1min")
+        except Exception:
+            return None
+        if base is None or getattr(base, "empty", True):
+            return None
+        frame = base.copy()
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            return None
+        cutoff = pd.Timestamp(self.as_of)
+        if cutoff.tzinfo is not None:
+            cutoff = cutoff.tz_convert(IST).tz_localize(None)
+        if frame.index.tz is not None:
+            frame.index = frame.index.tz_convert(IST).tz_localize(None)
+        frame = frame[frame.index <= cutoff]
+        timeframe = str(timeframe or "1min").lower()
+        if frame.empty or timeframe == "1min":
+            return frame
+        if timeframe not in {"5min", "15min"}:
+            return None
+        aggregations = {
+            key: value
+            for key, value in {
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }.items()
+            if key in frame.columns
+        }
+        if not all(key in aggregations for key in ("open", "high", "low", "close")):
+            return None
+        return frame.resample(
+            timeframe, label="left", closed="left"
+        ).agg(aggregations).dropna(subset=["open", "high", "low", "close"])
+
+    def get_latest_price(self, name):
+        frame = self.get_candles(name, "1min")
+        if frame is None or frame.empty:
+            return None
+        try:
+            return float(frame.iloc[-1]["close"])
+        except Exception:
+            return None
+
+    @staticmethod
+    def latest_candle_receipt(_name, _timeframe):
+        return None
+
+
 def directional_fut_veto(
     settings,
     *,
@@ -2411,6 +2469,350 @@ class SignalProcessor:
         self._option_history_cache[cache_key] = day_df
         return day_df, symbol, token
 
+    def _historical_live_management_probe(
+        self,
+        scanner,
+        *,
+        instrument: str,
+        direction: str,
+        option_type: str,
+        timeframe: str,
+        entry_time: datetime,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        qty: int,
+        grade: str = "",
+        confidence: float = 0.0,
+        entry_regime: str = "UNKNOWN",
+    ):
+        """Point-in-time adapter around the production live exit helpers.
+
+        Missing historical OI/PCR/depth is left unavailable.  It is never filled
+        from today's state and never manufactured.  Price/regime guards still run
+        against candles visible at the replay clock.
+        """
+        from scanner import Scanner as _Scanner
+        from intelligence.regime_detector import RegimeDetector
+
+        candle_view = _PointInTimeCandles(getattr(scanner, "candles", None))
+        probe = _Scanner.__new__(_Scanner)
+        probe.mode = "HISTORICAL"
+        probe.candles = candle_view
+        probe.active_indices = list(
+            getattr(scanner, "active_indices", None)
+            or ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+        )
+        probe.latest_regimes = {}
+        probe._timeframe_regimes = {}
+        probe._cached_results = {}
+        probe._diagnostics = {}
+        probe._timeframe_intel_cache = {}
+        probe._rupee_loss_band_states = {}
+        probe._loss_threat_confirmation = {}
+        probe._setting_enabled = _setting_enabled
+        regime_detector = RegimeDetector()
+
+        base = str(instrument or "").upper().split()[0]
+        tf = str(timeframe or "5min").lower()
+        if tf not in {"1min", "5min", "15min"}:
+            tf = "5min"
+        trade = SimpleNamespace(
+            id=f"replay:{base}:{pd.Timestamp(entry_time).isoformat()}",
+            instrument=base,
+            timeframe=tf,
+            direction=str(direction or "").upper(),
+            signal_type="BUY" if str(direction or "").upper() == "LONG" else "SELL",
+            option_type=str(option_type or "").upper(),
+            inst_type="OPT",
+            entry_time=entry_time,
+            signal_timestamp=entry_time,
+            entry_price=float(entry_price),
+            price=float(entry_price),
+            current_price=float(entry_price),
+            initial_stop=float(stop_price),
+            trailing_stop=float(stop_price),
+            current_stop=float(stop_price),
+            target=float(target_price),
+            rr_ratio=(float(target_price) - float(entry_price))
+            / max(0.05, float(entry_price) - float(stop_price)),
+            quantity=max(1, int(qty)),
+            pnl_quantity=max(1, int(qty)),
+            lots=1,
+            lot_size=max(1, int(qty)),
+            instrument_multiplier=1.0,
+            peak_pnl=0.0,
+            max_drawdown=0.0,
+            grade=str(grade or ""),
+            confidence=float(confidence or 0.0),
+            market_regime=str(entry_regime or "UNKNOWN").upper(),
+            entry_spot=0.0,
+            scalp_lock_mode=(tf == "1min"),
+            runner_mode=False,
+            original_target_distance=abs(float(target_price) - float(entry_price)),
+            market_intelligence_context={},
+            decision_intel={},
+            entered_intracandle=False,
+            repaint_guard_checked=True,
+        )
+        errors_seen = set()
+        trace = []
+        evaluated_guards = [
+            "broker_stop", "hard_target", "profit_lock", "breakeven_stop",
+            "peak_giveback_cap", "early_loss_cut", "rupee_loss_band",
+            "peak_threat", "smart_profit_lock", "profit_giveback_or_reversal",
+            "eod_loss_minimize", "low_gain_protect", "major_win_guard",
+            "stagnation_exit", "15m_fast_reversal",
+        ]
+
+        def _record_error(name: str, exc: Exception, ts) -> None:
+            key = (name, type(exc).__name__, str(exc))
+            if key in errors_seen:
+                return
+            errors_seen.add(key)
+            trace.append({
+                "time": pd.Timestamp(ts).isoformat(), "guard": name,
+                "state": "ERROR_ABSTAIN", "detail": f"{type(exc).__name__}: {exc}",
+            })
+
+        def _recover_or_exit(reason, detail, current_px, pnl_rs, peak_rs, risk_rs, now, regime):
+            if pnl_rs >= 0:
+                return reason, detail
+            try:
+                action, recovery_detail = probe._loss_recovery_watch_decision(
+                    trade,
+                    current_price=float(current_px),
+                    current_pnl_rs=float(pnl_rs),
+                    peak_pnl=float(peak_rs),
+                    initial_risk_rs=float(risk_rs),
+                    latest_time=now,
+                    regime=regime,
+                    proposed_exit_reason=reason,
+                )
+                if action == "HOLD":
+                    trace.append({
+                        "time": pd.Timestamp(now).isoformat(), "guard": reason,
+                        "state": "RECOVERY_HOLD", "detail": str(recovery_detail or ""),
+                    })
+                    return "", ""
+                if action == "EXIT":
+                    return "RECOVERY_WATCH_EXIT", str(recovery_detail or detail or "")
+            except Exception as exc:
+                _record_error("loss_recovery_watch", exc, now)
+            return reason, detail
+
+        def evaluate(ts, close_px: float, high_px: float, peak_pnl_rs: float):
+            bar_start = pd.Timestamp(ts)
+            if bar_start.tzinfo is not None:
+                bar_start = bar_start.tz_convert(IST).tz_localize(None)
+            candle_view.as_of = bar_start
+            now = bar_start.to_pydatetime() + timedelta(minutes=1)
+            trade.current_price = float(close_px)
+            trade.peak_pnl = max(float(trade.peak_pnl or 0.0), float(peak_pnl_rs or 0.0))
+            trade.max_drawdown = min(
+                float(getattr(trade, "max_drawdown", 0.0) or 0.0),
+                (float(close_px) - float(entry_price)) * max(1, int(qty)),
+            )
+
+            # Recompute every index regime at this clock. Cross-index guards therefore
+            # see contemporaneous peers, never the session's final label.
+            for peer in probe.active_indices:
+                try:
+                    frame = candle_view.get_candles(peer, tf)
+                    detected = regime_detector.detect(frame, peer, tf)
+                    value = getattr(
+                        detected.get("regime"), "value", detected.get("regime", "UNKNOWN")
+                    )
+                    value = str(value or "UNKNOWN").upper()
+                    probe.latest_regimes[peer] = value
+                    probe._timeframe_regimes[probe._timeframe_intel_key(peer, tf)] = value
+                except Exception as exc:
+                    _record_error(f"regime:{peer}", exc, now)
+            regime = str(probe.latest_regimes.get(base) or trade.market_regime or "UNKNOWN")
+            trade.market_regime = regime
+            trade.entry_spot = float(trade.entry_spot or candle_view.get_latest_price(base) or 0.0)
+
+            # Historical intelligence is itself timestamp-sliced. Chain-only fields
+            # remain absent, so helpers correctly abstain where they require them.
+            try:
+                intel_score, intel_regime = scanner._compute_historical_intel_at(base, bar_start, tf)
+                if str(intel_regime or "UNKNOWN").upper() != "UNKNOWN":
+                    regime = str(intel_regime).upper()
+                    trade.market_regime = regime
+                    probe.latest_regimes[base] = regime
+                trade.intelligence_score = float(intel_score or 0.0)
+                trade.market_intelligence_context = {
+                    "aggregate": {
+                        "score": float(intel_score or 0.0) * 100.0,
+                        "score_norm": float(intel_score or 0.0),
+                    },
+                    "regime": {"regime": regime},
+                    "as_of": bar_start.isoformat(),
+                    "historical_missing": ["option_chain", "order_flow_depth"],
+                }
+            except Exception as exc:
+                _record_error("historical_intelligence", exc, now)
+
+            current_pnl = (float(close_px) - float(entry_price)) * max(1, int(qty))
+            risk_rs = max(0.05, float(entry_price) - float(stop_price)) * max(1, int(qty))
+            peak = float(trade.peak_pnl or 0.0)
+            peak_pct = peak / max(0.05, float(entry_price) * max(1, int(qty))) * 100.0
+            current_pct = current_pnl / max(0.05, float(entry_price) * max(1, int(qty))) * 100.0
+
+            # Production runner policy. A close can arm it for the next bar; this avoids
+            # claiming knowledge of the intrabar path that produced this OHLC candle.
+            try:
+                move = max(0.0, float(high_px) - float(entry_price))
+                target_dist = max(0.05, float(trade.original_target_distance or 0.0))
+                unlock = min(1.0, max(0.50, float(getattr(get_settings(), "dynamic_rr_runner_unlock_ratio", 0.95) or 0.95)))
+                big_ok, big_reason = probe._big_move_expected(
+                    trade, gain_r=probe._trade_gain_in_r(trade, move), regime=regime
+                )
+                if not trade.runner_mode and (move >= target_dist * unlock or big_ok):
+                    trade.runner_mode = True
+                    trade.target = 0.0
+                    trace.append({
+                        "time": bar_start.isoformat(), "guard": "runner",
+                        "state": "ARMED", "detail": "target proximity" if move >= target_dist * unlock else big_reason,
+                    })
+                if trade.runner_mode:
+                    lock_pct = probe._dynamic_runner_lock_pct(
+                        float(getattr(get_settings(), "dynamic_rr_runner_lock_pct", 0.90) or 0.90),
+                        regime,
+                    )
+                    trail_dist = target_dist * (1.0 - lock_pct)
+                    trade.current_stop = max(
+                        float(trade.current_stop or stop_price),
+                        float(entry_price) + max(0.0, move - trail_dist),
+                    )
+            except Exception as exc:
+                _record_error("runner", exc, now)
+
+            lock_ratio = 0.0
+            lock_stop = 0.0
+            try:
+                lock_stop, lock_reason, lock_ratio = probe._profit_lock_floor(
+                    float(entry_price), "LONG", max(1, int(qty)), peak,
+                    bool(trade.scalp_lock_mode), inst_mult=1.0,
+                    initial_risk_rs=risk_rs, timeframe=tf, now=now, trade_like=trade,
+                )
+                if lock_stop > 0:
+                    trade.current_stop = max(float(trade.current_stop or stop_price), float(lock_stop))
+                if lock_reason and float(close_px) <= float(trade.current_stop):
+                    return lock_reason, f"production profit-lock floor {trade.current_stop:.2f}", trade.current_stop, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("profit_lock", exc, now)
+
+            try:
+                verdict = probe._peak_giveback_cap_exit(
+                    trade, current_pnl_rs=current_pnl, peak_pnl_rs=peak, evaluated_at=now
+                )
+                fired, detail = verdict
+                if fired:
+                    reason = getattr(verdict, "rule", "") or "PROFIT_FLOOR_EXIT"
+                    reason, detail = _recover_or_exit(reason, detail, close_px, current_pnl, peak, risk_rs, now, regime)
+                    if reason:
+                        return reason, detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("peak_giveback_cap", exc, now)
+
+            try:
+                fired, detail, cut_r = probe._loss_guard_decision(
+                    trade, current_pnl_rs=current_pnl, initial_risk_rs=risk_rs,
+                    latest_time=now, regime=regime, current_price=float(close_px),
+                )
+                if fired and current_pnl < 0:
+                    reason, detail = _recover_or_exit("EARLY_LOSS_CUT", f"{detail} thr={cut_r:.2f}R", close_px, current_pnl, peak, risk_rs, now, regime)
+                    if reason:
+                        return reason, detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("early_loss_cut", exc, now)
+
+            try:
+                fired, reason, detail = probe._rupee_loss_band_guard_decision(
+                    trade, current_pnl_rs=current_pnl, latest_time=now,
+                    regime=regime, current_price=float(close_px),
+                )
+                if fired and current_pnl < 0:
+                    reason, detail = _recover_or_exit(reason, detail, close_px, current_pnl, peak, risk_rs, now, regime)
+                    if reason:
+                        return reason, detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("rupee_loss_band", exc, now)
+
+            try:
+                fired, reason, detail = probe._peak_threat_exit_decision(
+                    trade, current_price=float(close_px), current_pnl_rs=current_pnl,
+                    peak_pnl=peak, initial_risk_rs=risk_rs, latest_time=now,
+                    regime=regime, inst_type="OPT", option_type=trade.option_type,
+                    direction=trade.direction,
+                )
+                if fired:
+                    return reason, detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("peak_threat", exc, now)
+
+            try:
+                smart_min = probe._profit_lock_min_peak(
+                    bool(trade.scalp_lock_mode), risk_rs, tf, now, trade_like=trade
+                )
+                ladder_peak = _Scanner._profit_ladder_pnl(probe, trade, peak, max(1, int(qty)))
+                backstop = probe._smart_lock_backstop_ratio(lock_ratio, bool(trade.scalp_lock_mode))
+                collapse = probe._smart_lock_floor_collapse(
+                    peak, current_pnl, backstop, floor_rs=probe._profit_lock_floor_rs(trade)
+                )
+                if smart_min <= peak and ladder_peak < 3000.0 and (
+                    current_pnl < peak * backstop or collapse
+                ):
+                    reason, detail = _recover_or_exit("SMART_PROFIT_LOCK", "production retention backstop", close_px, current_pnl, peak, risk_rs, now, regime)
+                    if reason:
+                        return reason, detail, close_px, regime, trace, evaluated_guards
+
+                fired, reason, detail = probe._peak_giveback_or_reversal_exit(
+                    trade, current_pnl_rs=current_pnl, peak_pnl=peak,
+                    initial_risk_rs=risk_rs, smart_min_peak=smart_min,
+                    latest_time=now, regime=regime, inst_type="OPT",
+                    option_type=trade.option_type, direction=trade.direction,
+                )
+                if fired:
+                    reason, detail = _recover_or_exit(reason, detail, close_px, current_pnl, peak, risk_rs, now, regime)
+                    if reason:
+                        return reason, detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("smart_or_giveback", exc, now)
+
+            try:
+                fired, detail = probe._eod_loss_minimize_exit(
+                    trade, current_pnl_rs=current_pnl, initial_risk_rs=risk_rs,
+                    latest_time=now, regime=regime,
+                )
+                if fired:
+                    return "EOD_LOSS_MINIMIZE", detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("eod_loss_minimize", exc, now)
+
+            if peak_pct >= 10.0 and current_pct < peak_pct * 0.40:
+                return "LOW_GAIN_PROTECT", f"peak {peak_pct:.1f}% -> {current_pct:.1f}%", close_px, regime, trace, evaluated_guards
+
+            try:
+                if _Scanner._profit_ladder_pnl(probe, trade, peak, max(1, int(qty))) >= probe._major_win_guard_arm_rs(trade) and current_pnl < peak * 0.75:
+                    return "MAJOR_WIN_GUARD", f"peak Rs.{peak:.0f} -> Rs.{current_pnl:.0f}", close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("major_win_guard", exc, now)
+
+            try:
+                fired, detail = probe._stagnation_exit_decision(
+                    trade, current_pnl, peak, now, regime=regime
+                )
+                if fired:
+                    return "STAGNATION_EXIT", detail, close_px, regime, trace, evaluated_guards
+            except Exception as exc:
+                _record_error("stagnation_exit", exc, now)
+
+            return "", "", float(trade.current_stop or stop_price), regime, trace, evaluated_guards
+
+        return evaluate
+
     def _simulate_actual_option_exit(
         self,
         option_df: pd.DataFrame,
@@ -2430,6 +2832,9 @@ class SignalProcessor:
         tf15_direction: str = "",
         tf15_option_type: str = "",
         tf15_timeframe: str = "",
+        replay_grade: str = "",
+        replay_confidence: float = 0.0,
+        replay_regime: str = "UNKNOWN",
     ) -> Optional[Dict]:
         if option_df is None or option_df.empty:
             return None
@@ -2470,7 +2875,6 @@ class SignalProcessor:
         # backtest measures entry selection and a fixed stop/target and nothing else.
         # The guard is CALLED, never copied — one implementation, no second copy to
         # drift. Imported here because scanner imports this module.
-        live_guard = None
         live_qty = 0
         fast_exit_qty = 0
         try:
@@ -2479,15 +2883,55 @@ class SignalProcessor:
             ):
                 live_qty = max(0, int(qty or 0))
                 fast_exit_qty = max(0, int(tf15_qty or 0))
-                if live_qty > 0:
-                    from scanner import Scanner as _Scanner
-
-                    live_guard = _Scanner._peak_giveback_cap_exit
         except Exception:
-            live_guard = None          # a replay must never fail on an optional probe
-        live_self = SimpleNamespace(_setting_enabled=_setting_enabled)
-        live_trade = SimpleNamespace(instrument="", inst_type="OPT")
+            live_qty = 0
         peak_rs = 0.0
+        price_path = []
+        exit_trace = []
+        evaluated_guards = []
+        live_probe = None
+        # Unit-level/premium-only callers have no historical index candle store.
+        # Preserve the exact production cap guard for that narrow case; full engine
+        # replays use the point-in-time stack below.
+        live_guard = None
+        if live_qty > 0 and tf15_exit_scanner is None:
+            try:
+                from scanner import Scanner as _Scanner
+                live_guard = _Scanner._peak_giveback_cap_exit
+            except Exception:
+                live_guard = None
+        live_self = SimpleNamespace(_setting_enabled=_setting_enabled)
+        live_trade = SimpleNamespace(
+            instrument=str(tf15_instrument or ""), inst_type="OPT",
+            entry_price=entry_premium, price=entry_premium,
+            initial_stop=sl_price, trailing_stop=sl_price,
+            quantity=live_qty, pnl_quantity=live_qty, lots=1,
+            lot_size=max(1, live_qty), entry_time=start,
+        )
+        if live_qty > 0 and tf15_exit_scanner is not None:
+            try:
+                live_probe = self._historical_live_management_probe(
+                    tf15_exit_scanner,
+                    instrument=tf15_instrument,
+                    direction=tf15_direction,
+                    option_type=tf15_option_type,
+                    timeframe=tf15_timeframe,
+                    entry_time=start,
+                    entry_price=entry_premium,
+                    stop_price=sl_price,
+                    target_price=target_price,
+                    qty=live_qty,
+                    grade=replay_grade,
+                    confidence=replay_confidence,
+                    entry_regime=replay_regime,
+                )
+            except Exception as exc:
+                exit_trace.append({
+                    "time": pd.Timestamp(start).isoformat(),
+                    "guard": "live_management_probe",
+                    "state": "ERROR_ABSTAIN",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                })
 
         # The dashboard's Backtest Live Exits switch is the explicit A/B boundary.
         # Build a point-in-time view only for 15m trades and call the production rule;
@@ -2521,49 +2965,106 @@ class SignalProcessor:
             high = float(row.get("high", row.get("close", 0.0)) or 0.0)
             op = float(row.get("open", row.get("close", 0.0)) or 0.0)
 
+            close_px = float(row.get("close", op) or op)
+            peak_qty = live_qty or fast_exit_qty
+            if peak_qty > 0:
+                peak_rs = max(peak_rs, (high - entry_premium) * peak_qty)
+            active_stop = float(sl_price)
+            active_target = float(target_price)
+            if live_probe is not None:
+                # Stop updates returned by the prior closed candle apply now. Newly
+                # computed stops below apply only to the next candle.
+                active_stop = float(getattr(live_probe, "active_stop", active_stop) or active_stop)
+                active_target = float(getattr(live_probe, "active_target", active_target) or active_target)
+
+            price_path.append({
+                "time": pd.Timestamp(ts).isoformat(), "open": op, "high": high,
+                "low": low, "close": close_px,
+                "pnl": (close_px - entry_premium) * peak_qty if peak_qty else 0.0,
+                "peak_pnl": peak_rs, "active_stop": active_stop,
+                "active_target": active_target,
+            })
+
             if live_guard is not None:
-                # Premium points -> rupees, which is what the guards are written in.
-                close_px = float(row.get("close", op) or op)
-                pnl_rs = (close_px - entry_premium) * live_qty
-                peak_rs = max(peak_rs, (high - entry_premium) * live_qty)
                 try:
                     verdict = live_guard(
                         live_self, live_trade,
-                        current_pnl_rs=pnl_rs, peak_pnl_rs=peak_rs,
+                        current_pnl_rs=(close_px - entry_premium) * live_qty,
+                        peak_pnl_rs=peak_rs,
+                        evaluated_at=pd.Timestamp(ts).to_pydatetime() + timedelta(minutes=1),
                     )
-                    fired, why = verdict
-                    # The guard hosts two rules; report the one that actually fired
-                    # so a replay's exit reasons mean the same thing as a live log's.
-                    fired_rule = getattr(verdict, "rule", "") or "PEAK_GIVEBACK_CAP"
-                except Exception:
-                    fired, why, fired_rule = False, "", ""
-                if fired:
-                    exit_price = close_px
-                    exit_time = ts
-                    exit_reason = fired_rule
-                    break
+                    fired, detail = verdict
+                    if fired:
+                        exit_price = close_px
+                        exit_time = ts
+                        exit_reason = getattr(verdict, "rule", "") or "PROFIT_FLOOR_EXIT"
+                        exit_detail = str(detail or "")
+                        exit_trace.append({
+                            "time": pd.Timestamp(ts).isoformat(), "guard": exit_reason,
+                            "state": "EXIT", "detail": exit_detail,
+                        })
+                        break
+                except Exception as exc:
+                    exit_trace.append({
+                        "time": pd.Timestamp(ts).isoformat(), "guard": "peak_giveback_cap",
+                        "state": "ERROR_ABSTAIN", "detail": f"{type(exc).__name__}: {exc}",
+                    })
 
-            if low <= sl_price and high >= target_price:
-                dist_to_sl = abs(op - sl_price)
-                dist_to_tgt = abs(op - target_price)
+            if low <= active_stop and active_target > 0 and high >= active_target:
+                dist_to_sl = abs(op - active_stop)
+                dist_to_tgt = abs(op - active_target)
                 if dist_to_sl < dist_to_tgt:
-                    exit_price = float(sl_price)
+                    exit_price = active_stop
                     exit_reason = "SL HIT"
                 else:
-                    exit_price = float(target_price)
+                    exit_price = active_target
                     exit_reason = "TARGET_HIT"
                 exit_time = ts
                 break
-            elif low <= sl_price:
-                exit_price = float(sl_price)
+            elif low <= active_stop:
+                exit_price = active_stop
                 exit_time = ts
                 exit_reason = "SL HIT"
                 break
-            elif high >= target_price:
-                exit_price = float(target_price)
+            elif active_target > 0 and high >= active_target:
+                exit_price = active_target
                 exit_time = ts
                 exit_reason = "TARGET_HIT"
                 break
+
+            if live_probe is not None:
+                try:
+                    reason, detail, next_stop, regime, probe_trace, guards = live_probe(
+                        ts, close_px, high, peak_rs
+                    )
+                    live_probe.active_stop = max(active_stop, float(next_stop or active_stop))
+                    # Runner removes the hard target only after a causal close.
+                    if any(
+                        item.get("guard") == "runner" and item.get("state") == "ARMED"
+                        for item in probe_trace
+                    ):
+                        live_probe.active_target = 0.0
+                    else:
+                        live_probe.active_target = active_target
+                    price_path[-1]["regime"] = regime
+                    price_path[-1]["next_stop"] = live_probe.active_stop
+                    exit_trace = list(probe_trace)
+                    evaluated_guards = list(guards)
+                    if reason:
+                        exit_price = float(next_stop if reason in {"SMART_PROFIT_LOCK", "MAJOR_WIN_GUARD"} and next_stop > 0 else close_px)
+                        exit_time = ts
+                        exit_reason = reason
+                        exit_detail = str(detail or "")
+                        exit_trace.append({
+                            "time": pd.Timestamp(ts).isoformat(), "guard": reason,
+                            "state": "EXIT", "detail": exit_detail,
+                        })
+                        break
+                except Exception as exc:
+                    exit_trace.append({
+                        "time": pd.Timestamp(ts).isoformat(), "guard": "live_management_probe",
+                        "state": "ERROR_ABSTAIN", "detail": f"{type(exc).__name__}: {exc}",
+                    })
 
             if tf15_probe is not None:
                 close_px = float(row.get("close", op) or op)
@@ -2583,9 +3084,6 @@ class SignalProcessor:
                     exit_detail = str(_why or "")
                     break
 
-            peak_qty = live_qty or fast_exit_qty
-            if peak_qty > 0:
-                peak_rs = max(peak_rs, (high - entry_premium) * peak_qty)
         return {
             "entry": entry_premium,
             "exit": max(0.05, exit_price),
@@ -2594,6 +3092,9 @@ class SignalProcessor:
             "exit_time": exit_time,
             "reason": exit_reason,
             "detail": exit_detail,
+            "price_path": price_path,
+            "exit_trace": exit_trace,
+            "evaluated_guards": evaluated_guards,
         }
 
     def _historical_tf15_exit_probe(
@@ -2611,63 +3112,6 @@ class SignalProcessor:
         """Return a no-future-leak adapter around the production 15m/1m exit."""
         from scanner import Scanner as _Scanner
         from intelligence.regime_detector import RegimeDetector
-
-        class _PointInTimeCandles:
-            def __init__(self, source):
-                self.source = source
-                self.as_of = None
-
-            def get_candles(self, name, timeframe):
-                if self.as_of is None:
-                    return None
-                try:
-                    base = self.source.get_candles(name, "1min")
-                except Exception:
-                    return None
-                if base is None or getattr(base, "empty", True):
-                    return None
-                frame = base.copy()
-                if not isinstance(frame.index, pd.DatetimeIndex):
-                    return None
-                cutoff = pd.Timestamp(self.as_of)
-                if cutoff.tzinfo is not None:
-                    cutoff = cutoff.tz_convert(IST).tz_localize(None)
-                if frame.index.tz is not None:
-                    frame.index = frame.index.tz_convert(IST).tz_localize(None)
-                frame = frame[frame.index <= cutoff]
-                if frame.empty or str(timeframe) == "1min":
-                    return frame
-                if str(timeframe) not in {"5min", "15min"}:
-                    return None
-                aggregations = {
-                    key: value
-                    for key, value in {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }.items()
-                    if key in frame.columns
-                }
-                if not all(key in aggregations for key in ("open", "high", "low", "close")):
-                    return None
-                return frame.resample(
-                    str(timeframe), label="left", closed="left"
-                ).agg(aggregations).dropna(subset=["open", "high", "low", "close"])
-
-            def get_latest_price(self, name):
-                frame = self.get_candles(name, "1min")
-                if frame is None or frame.empty:
-                    return None
-                try:
-                    return float(frame.iloc[-1]["close"])
-                except Exception:
-                    return None
-
-            @staticmethod
-            def latest_candle_receipt(_name, _timeframe):
-                return None
 
         candle_view = _PointInTimeCandles(getattr(scanner, "candles", None))
         probe = _Scanner.__new__(_Scanner)
@@ -3445,10 +3889,23 @@ class SignalProcessor:
                 )
             if dedup_key not in scanner._last_signal_time:
                 # ═══ Mode-Aware Historical Backfill (Atomic Lock) ═══
-                # Immediately seed to prevent concurrent backfill from other tasks
-                scanner._last_signal_time[dedup_key] = naive_ts(datetime.now(IST))
-                # Load last N days for Historical mode, or 1 day for Live modes (Warm Startup)
-                if (scanner.mode == "HISTORICAL" or is_live):
+                # REAL startup must not replay and price every earlier session signal:
+                # those rows are already persisted for the dashboard, historical trade
+                # creation is forbidden in REAL anyway, and the wasted option-history /
+                # liquidity work held all four live scan threads for 60s+. Seed just
+                # before the newest unpaired arrow so the current signal retains exactly
+                # the established live eligibility semantics.
+                if is_live:
+                    scanner._last_signal_time[dedup_key] = (
+                        naive_ts(sigs[-2].timestamp)
+                        if len(sigs) >= 2
+                        else naive_ts(sigs[-1].timestamp) - timedelta(microseconds=1)
+                    )
+                else:
+                    # Immediately seed to prevent concurrent historical backfill.
+                    scanner._last_signal_time[dedup_key] = naive_ts(datetime.now(IST))
+                # Full reconstruction belongs exclusively to HISTORICAL mode.
+                if scanner.mode == "HISTORICAL":
                     # Fetch 5min candles to determine trading dates for lookback
                     candles_df = scanner.candles.get_candles(instrument, "5min")
                     if candles_df is None or candles_df.empty:
@@ -3596,30 +4053,6 @@ class SignalProcessor:
                         
                         logger.debug(f"🔍 [AUDIT] Signal {i} for {instrument} at {s1.timestamp}: Grade={hist_grade}, Conf={hist_conf:.2f}, Regime={hist_regime}, Type={s1.signal_type}")
 
-                        # Replay 1m with same burst-only admission as live. Historical
-                        # L1 depth is unavailable, so never leak current depth into a
-                        # past decision.
-                        if tf == "1min":
-                            hist_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
-                            hist_volume_spike_metrics = (
-                                hist_burst_detector(
-                                    instrument,
-                                    tf,
-                                    s1.signal_type,
-                                    adx_value=float(getattr(s1, "adx_value", 0.0) or 0.0),
-                                    intel_score=float(hist_intel_score or 0.0),
-                                    as_of=s1.timestamp,
-                                    depth_context={},
-                                )
-                                if callable(hist_burst_detector)
-                                else None
-                            )
-                            setattr(s1, "volume_spike_entry", bool(hist_volume_spike_metrics))
-                            setattr(s1, "volume_spike_metrics", dict(hist_volume_spike_metrics or {}))
-                            if not hist_volume_spike_metrics:
-                                record_reject("1min requires confirmed directional burst", sim_inst)
-                                continue
-
                         direction = "LONG" if s1.signal_type == "BUY" else "SHORT"
                         trend_15m_agrees_hist = self._trend_15m_agrees_at(
                             mtf_result,
@@ -3666,6 +4099,32 @@ class SignalProcessor:
                             timeframe=tf,
                             five_min_true_impulse=hist_true_5min_impulse,
                         )
+
+                        # Replay 1m with same burst-only admission as live. Resolve
+                        # product first so a rejected signal is recorded against its
+                        # actual OPT/FUT lane instead of reading an unbound sim_inst.
+                        # Historical L1 depth is unavailable, so never leak current
+                        # depth into a past decision.
+                        if tf == "1min":
+                            hist_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
+                            hist_volume_spike_metrics = (
+                                hist_burst_detector(
+                                    instrument,
+                                    tf,
+                                    s1.signal_type,
+                                    adx_value=float(getattr(s1, "adx_value", 0.0) or 0.0),
+                                    intel_score=float(hist_intel_score or 0.0),
+                                    as_of=s1.timestamp,
+                                    depth_context={},
+                                )
+                                if callable(hist_burst_detector)
+                                else None
+                            )
+                            setattr(s1, "volume_spike_entry", bool(hist_volume_spike_metrics))
+                            setattr(s1, "volume_spike_metrics", dict(hist_volume_spike_metrics or {}))
+                            if not hist_volume_spike_metrics:
+                                record_reject("1min requires confirmed directional burst", sim_inst)
+                                continue
                         diag_inc_unique = getattr(scanner, "_diag_inc_unique", None)
                         if diag_inc_unique:
                             diag_inc_unique(
@@ -3940,12 +4399,16 @@ class SignalProcessor:
                                     hist_rr,
                                     natural_sl_distance=natural_sl_distance,
                                     max_sl_pct=scanner.options_sl_pct / 100.0,
+                                    qty=qty,
                                     tf15_qty=qty,
                                     tf15_exit_scanner=scanner,
                                     tf15_instrument=instrument,
                                     tf15_direction=direction,
                                     tf15_option_type=sim_option_type,
                                     tf15_timeframe=tf,
+                                    replay_grade=hist_grade,
+                                    replay_confidence=hist_conf,
+                                    replay_regime=hist_regime,
                                 )
                                 if actual_option:
                                     entry_premium = actual_option["entry"]
@@ -4141,6 +4604,17 @@ class SignalProcessor:
                                 source_engines=hist_source_engines,
                                 source_lane=hist_lane,
                                 data_provenance="BACKTEST",
+                                market_regime=str(hist_regime or "UNKNOWN"),
+                                entry_intelligence_score=float(hist_intel_score or 0.0),
+                                intelligence_score=float(hist_intel_score or 0.0),
+                                market_wide_reversal_entry=bool(getattr(s1, "market_wide_reversal_entry", False)),
+                                volume_spike_entry=bool(getattr(s1, "volume_spike_entry", False)),
+                                power_move=bool(power_move_hist or getattr(s1, "power_move", False)),
+                                quad_union_entry=bool(getattr(s1, "quad_union_entry", False)),
+                                raw_union_entry=bool(getattr(s1, "raw_union_entry", False)),
+                                initial_stop=float(sl_price or 0.0),
+                                replay_price_path=list((actual_option or {}).get("price_path") or []),
+                                replay_exit_trace=list((actual_option or {}).get("exit_trace") or []),
                                 quality_verdict=hist_quality_verdict.to_dict(),
                             )
                             
@@ -4799,6 +5273,7 @@ class SignalProcessor:
                                 else:
                                     eod_target = last_s.price + (abs(last_s.price - last_s.trailing_stop) * eod_rr) if direction == "LONG" else last_s.price - (abs(last_s.price - last_s.trailing_stop) * eod_rr)
 
+                                actual_eod = None
                                 if sim_inst == "OPT":
                                     sim_atm_strike = self._historical_option_strike(instrument, direction, last_s.price, cfg)
                                     option_df, trading_symbol, symbol_token = self._load_option_candles(
@@ -4858,12 +5333,16 @@ class SignalProcessor:
                                             eod_rr,
                                             natural_sl_distance=natural_sl_premium_dist,
                                             max_sl_pct=scanner.options_sl_pct / 100.0,
+                                            qty=eod_probe_qty,
                                             tf15_qty=eod_probe_qty,
                                             tf15_exit_scanner=scanner,
                                             tf15_instrument=instrument,
                                             tf15_direction=direction,
                                             tf15_option_type=sim_option_type,
                                             tf15_timeframe=tf,
+                                            replay_grade=eod_grade,
+                                            replay_confidence=eod_conf,
+                                            replay_regime=eod_regime,
                                         )
                                         if actual_eod:
                                             entry_premium = actual_eod["entry"]
@@ -4955,6 +5434,17 @@ class SignalProcessor:
                                     source_lane=eod_lane,
                                     quality_verdict=eod_quality_verdict.to_dict(),
                                     data_provenance="BACKTEST",
+                                    market_regime=str(eod_regime or "UNKNOWN"),
+                                    entry_intelligence_score=float(eod_intel_score or 0.0),
+                                    intelligence_score=float(eod_intel_score or 0.0),
+                                    market_wide_reversal_entry=bool(getattr(last_s, "market_wide_reversal_entry", False)),
+                                    volume_spike_entry=bool(getattr(last_s, "volume_spike_entry", False)),
+                                    power_move=bool(getattr(last_s, "power_move", False)),
+                                    quad_union_entry=bool(getattr(last_s, "quad_union_entry", False)),
+                                    raw_union_entry=bool(getattr(last_s, "raw_union_entry", False)),
+                                    initial_stop=float((opt_sl_price if sim_inst == "OPT" else eod_stop) or 0.0),
+                                    replay_price_path=list((actual_eod or {}).get("price_path") or []),
+                                    replay_exit_trace=list((actual_eod or {}).get("exit_trace") or []),
                                 )
                                 live_session_day_raw = (
                                     scanner._get_current_session_day()

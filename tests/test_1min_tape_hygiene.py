@@ -6,6 +6,7 @@ No-spike 1min rejections/detections are pure tape noise. `_suppress_1min_no_spik
 decides whether to keep such a signal off the live tape.
 """
 
+import inspect
 from types import SimpleNamespace
 
 from engine.signal_processor import SignalProcessor
@@ -54,6 +55,15 @@ def test_spike_1min_can_compete_for_entry_selection():
         one_min,
         five_min,
     ]
+
+
+def test_historical_1min_reject_resolves_product_before_recording():
+    source = inspect.getsource(SignalProcessor.process_best_signal)
+    replay_start = source.index("# Replay 1m with same burst-only admission as live")
+    product_resolution = source.rfind("sim_inst = scanner._resolve_instrument_type", 0, replay_start)
+
+    assert product_resolution >= 0
+    assert source.index('record_reject("1min requires confirmed directional burst", sim_inst)', replay_start) > replay_start
 
 
 def test_reversion_window_admits_non_spike_1min():

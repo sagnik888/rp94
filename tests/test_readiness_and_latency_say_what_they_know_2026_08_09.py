@@ -179,5 +179,15 @@ def test_the_measured_tail_is_not_trivial():
     src = _scan_source()
     tail = src[src.index("latency_ms = round(elapsed * 1000)"):src.index("cycle_ms = round(")]
     for expensive in ("_get_diagnostics_payload", "_build_dashboard_trade_payload",
-                      "_update_dashboard_cache", "_save_warm_memory", "on_update"):
+                      "_update_dashboard_cache", "on_update"):
         assert expensive in tail, f"{expensive} is no longer inside the unmeasured tail"
+    assert "_save_warm_memory" not in tail, (
+        "periodic recovery persistence must not block the scanner event loop"
+    )
+
+
+def test_periodic_warm_memory_checkpoint_runs_off_scanner_loop():
+    from scanner import Scanner
+
+    src = inspect.getsource(Scanner._background_recovery_checkpoint_worker)
+    assert "await asyncio.to_thread(self._save_warm_memory)" in src

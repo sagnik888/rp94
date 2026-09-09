@@ -775,6 +775,11 @@ class Settings(BaseSettings):
     # no-op until the dataset is ready (>= min_samples AND both win/loss classes).
     ut_confidence_calibration_enabled: bool = False
     ut_confidence_calibration_min_samples: int = 200
+    # Collection/readiness and live application are deliberately separate. A fitted
+    # curve may be inspected offline, but cannot change grades until walk-forward and
+    # shadow validation have been reviewed and this second switch is explicitly set.
+    ut_confidence_calibration_live_apply_enabled: bool = False
+    ut_confidence_calibration_min_segment_samples: int = 50
 
     # ─── Regime veto (directional FUT in chop) ───────────────
     # Block directional FUTURES entries when the regime is choppy/ranging/volatile
@@ -1023,7 +1028,9 @@ class Settings(BaseSettings):
     #
     # Default OFF: it changes backtest numbers, so it must be an explicit choice, and a
     # run with it on is not comparable to a run with it off.
-    backtest_live_exits_enabled: bool = False
+    # Historical results should represent the management policy that will trade live.
+    # The dashboard switch remains available to produce the frozen stop/target baseline.
+    backtest_live_exits_enabled: bool = True
 
     # EARLY_LOSS_CUT guards (2026-08-16). Measured over 19 sessions: 18 cuts (ex the
     # two stale-mark trades already fixed) for -Rs.9,108. The exit EARNS its place —
@@ -2060,7 +2067,10 @@ class Settings(BaseSettings):
     engine_lab_real_mode_only: bool = False # False also shows lab data during historical/offline scans
     # Live/REAL mode refreshes the lab on a worker thread at most this often; the scan
     # loop always serves the cached snapshot so the 100ms trade monitor never stalls.
-    engine_lab_refresh_seconds: float = 10.0
+    # Shadow diagnostics do not participate in trading. A 10s refresh consumed about
+    # one quarter of live samples and could overlap the minute history refresh, starving
+    # all four scanner workers. One minute is current enough for this comparison panel.
+    engine_lab_refresh_seconds: float = 60.0
     # ─── UT1 warmup stance seed ────────────────────────────
     # UTBot's flip needs price to CROSS the ATR trail. On the rare window where the
     # ATR warm-up parks the trail on the wrong side of a one-way market from the very
@@ -2737,6 +2747,12 @@ class Settings(BaseSettings):
     # Minimum canonical confidence for a strict multi-index market-shift route
     # to supersede stale regime/15-minute direction. Ordinary signals do not use it.
     quality_policy_market_shift_min_confidence: float = 0.60
+    # A fully synchronous 5m reversal across all three core indices has stronger
+    # contemporaneous evidence than a generic market shift.  It may use this lower
+    # floor only when its detector recorded all core votes and measured ADX.  This
+    # does not relax ordinary range/chop arrows or 1m/15m entries.
+    quality_policy_full_core_market_shift_min_confidence: float = 0.35
+    quality_policy_full_core_market_shift_min_adx: float = 18.0
     # Shock engine full-sensitivity IST window (normal min_move applies inside).
     market_ltp_shock_session_start: str = "13:00"
     market_ltp_shock_session_end: str = "15:15"

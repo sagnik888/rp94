@@ -683,5 +683,6 @@ def test_live_history_worker_avoids_redundant_higher_timeframe_polling():
     source = inspect.getsource(Scanner._background_history_worker)
     real_branch = source.split('if self.mode == "REAL":', 1)[1].split("else:", 1)[0]
     assert 'timeframes=["1min"]' in real_branch
+    assert "force=True" in real_branch
     assert 'timeframes=["5min", "15min"]' not in real_branch
     assert "next_minute" in real_branch

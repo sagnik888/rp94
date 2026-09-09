@@ -900,7 +900,7 @@ function syncSettingsFromConfig(data) {
         setVal('settPeakGivebackCapRs', cfg.peak_giveback_cap_rs !== undefined ? cfg.peak_giveback_cap_rs : 200.0);
         setVal('settPeakGivebackCapPct', cfg.peak_giveback_cap_pct !== undefined ? cfg.peak_giveback_cap_pct : 0.25);
         setVal('settPeakGivebackCapMaxPeak', cfg.peak_giveback_cap_max_peak_rs !== undefined ? cfg.peak_giveback_cap_max_peak_rs : 1500.0);
-        setChecked('settBacktestLiveExits', cfg.backtest_live_exits_enabled !== undefined ? cfg.backtest_live_exits_enabled : false);
+        setChecked('settBacktestLiveExits', cfg.backtest_live_exits_enabled !== undefined ? cfg.backtest_live_exits_enabled : true);
         setVal('settPeakThreatMinPeakR', cfg.peak_threat_exit_min_peak_r !== undefined ? cfg.peak_threat_exit_min_peak_r : 0.35);
         setVal('settPeakThreatRetention', cfg.peak_threat_exit_min_retention !== undefined ? cfg.peak_threat_exit_min_retention : 0.72);
         setVal('settPeakThreatScore', cfg.peak_threat_exit_min_score !== undefined ? cfg.peak_threat_exit_min_score : 5);
@@ -1203,7 +1203,7 @@ function saveSettings() {
         peak_giveback_cap_rs: numberVal('settPeakGivebackCapRs', 200.0),
         peak_giveback_cap_pct: numberVal('settPeakGivebackCapPct', 0.25),
         peak_giveback_cap_max_peak_rs: numberVal('settPeakGivebackCapMaxPeak', 1500.0),
-        backtest_live_exits_enabled: checkedVal('settBacktestLiveExits', false),
+        backtest_live_exits_enabled: checkedVal('settBacktestLiveExits', true),
         peak_threat_exit_min_peak_r: numberVal('settPeakThreatMinPeakR', 0.35),
         peak_threat_exit_min_retention: numberVal('settPeakThreatRetention', 0.72),
         peak_threat_exit_min_score: intVal('settPeakThreatScore', 5),

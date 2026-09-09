@@ -563,8 +563,14 @@ class ScannerTradePayloadBuilder:
                     row for row in signal_rows
                     if str(row.get("lifecycle_id") or "").strip() not in manager_lifecycles
                 ]
-            # Show one row per signal lifecycle: its exit when completed, or its
-            # entry while still active/watched.
+            # Only a still-actionable manual signal belongs in the trade table.
+            #
+            # A session candidate may be tracked through a virtual exit (for example
+            # REPAINT_ABORT) while Auto Mode is Manual.  It never reached the broker,
+            # so rendering that terminal row beside TradeManager's broker ledger made
+            # it look like a second closed trade and, worse, showed fictional P&L.
+            # Keep the terminal signal in the persisted/RTracker audit trail, but do
+            # not expose it as a trade, closed trade count, or money result.
             exit_rows = [r for r in signal_rows if r.get("action") == "EXIT"]
             active_signals = []
             exit_keys = {r.get("lifecycle_id") for r in exit_rows}
@@ -574,31 +580,33 @@ class ScannerTradePayloadBuilder:
                     if key not in exit_keys:
                         active_signals.append(r)
 
-            display_signal_rows = exit_rows + active_signals
+            display_signal_rows = active_signals
+            for row in display_signal_rows:
+                # A manual signal is an execution opportunity, not an open position.
+                # Do not let a mark-to-market estimate become apparent broker P&L.
+                row["pnl"] = 0.0
+                row["accounting_pnl"] = 0.0
+                row["execution_status"] = "SIGNAL_ONLY"
+                row["execution_state"] = "NOT_PLACED"
             payload["signals"] = display_signal_rows
-            # Explicit session-row contract: external consumers that read only
-            # open/closed would otherwise see zero trades when the session came
-            # back as restored signal rows (open/closed arrays intentionally stay
-            # UI-scoped). These totals are authoritative regardless of source.
+            # Explicit session-row contract: these counts are actionable, unfilled
+            # signals only.  Terminal virtual rows remain separately auditable.
             payload["session_rows_total"] = len(display_signal_rows)
-            payload["session_closed_total"] = len(exit_rows)
+            payload["session_closed_total"] = 0
             payload["session_open_total"] = len(active_signals)
             payload["meta"] = {
                 **payload.get("meta", {}),
                 "restored_signal_rows": len(display_signal_rows),
                 "session_rows_total": len(display_signal_rows),
-                "session_closed_total": len(exit_rows),
+                "session_closed_total": 0,
                 "session_open_total": len(active_signals),
+                "unexecuted_terminal_signal_rows": len(exit_rows),
                 "source": "restored_session_signals" if display_signal_rows and not (payload.get("open") or payload.get("closed")) else "mixed",
             }
             has_trade_rows = bool(payload.get("open") or payload.get("closed"))
-            if signal_rows and not has_trade_rows:
-                active_rows = [
-                    r for r in signal_rows
-                    if r.get("action") == "ENTRY"
-                    and r.get("lifecycle_id") not in exit_keys
-                ]
-                accounting_rows = exit_rows + active_rows
+            if display_signal_rows and not has_trade_rows:
+                active_rows = display_signal_rows
+                accounting_rows = active_rows
                 pnls = [accounting_pnl(r) for r in accounting_rows]
                 wins = len([p for p in pnls if p > 0])
                 losses = len([p for p in pnls if p < 0])
@@ -622,7 +630,7 @@ class ScannerTradePayloadBuilder:
                 original_closed = payload.get("closed", [])
                 try:
                     payload["open"] = active_rows
-                    payload["closed"] = exit_rows
+                    payload["closed"] = []
                     rebuild_display_accounting(accounting_lane="SIGNAL_TRACKER")
                 finally:
                     payload["open"] = original_open

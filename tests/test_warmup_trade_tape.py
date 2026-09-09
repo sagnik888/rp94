@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import inspect
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -111,15 +112,17 @@ def test_real_mid_session_initial_setup_runs_live_startup_refresh(monkeypatch):
 
     asyncio.run(s._background_initial_setup({"NIFTY": {"token": "99926000", "exchange": "NSE"}}))
 
-    assert fetch_calls == [
-        (
-            {"NIFTY": {"token": "99926000", "exchange": "NSE"}},
-            {"force": True, "timeframes": ["5min"], "days_back_override": 1},
-        )
-    ]
+    assert fetch_calls == []
     assert refresh_calls == [
         ({"NIFTY": {"token": "99926000", "exchange": "NSE"}}, "2026-06-16", True, "startup")
     ]
     assert sync_calls == []
     assert s.is_warmup is False
     assert s._initial_setup_completed is True
+
+
+def test_every_real_startup_uses_one_minute_authority_only():
+    source = inspect.getsource(Scanner._background_initial_setup)
+
+    assert 'if active_cfg and self.mode != "REAL"' in source
+    assert 'startup_timeframes = ["1min"] if self.mode == "REAL" else None' in source

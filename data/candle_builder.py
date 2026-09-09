@@ -35,6 +35,7 @@ class CandleBuilder:
         self,
         max_candles: int = 2000,
         resample_min_interval_seconds: float = 0.4,
+        partial_publish_min_interval_seconds: float = 0.0,
     ):
         self.max_candles = max_candles
         import threading
@@ -57,6 +58,15 @@ class CandleBuilder:
         self._resample_min_interval = max(0.0, float(resample_min_interval_seconds))
         self._last_resample_at: Dict[str, float] = {}
         self._pending_resample_touched: Dict[str, pd.Index] = {}
+        # The live scanner evaluates management every 100ms. Publishing the same
+        # forming pandas row faster cannot improve a decision, but repeatedly
+        # concat/copies the 1m frame under the shared candle lock. Production opts
+        # into 100ms coalescing; the class default stays unthrottled for compatibility.
+        # Closed minute bars are always published immediately.
+        self._partial_publish_min_interval = max(
+            0.0, float(partial_publish_min_interval_seconds)
+        )
+        self._last_partial_publish_at: Dict[str, float] = {}
 
         # Store 1min base candles per instrument
         self._candles_1min: Dict[str, pd.DataFrame] = {}
@@ -272,9 +282,17 @@ class CandleBuilder:
             self.update_candles(instrument, finalized, "1min")
             logger.debug(f"📊 Built 1min candle for {instrument} at {finalized.index[0]}")
 
-        if partial is not None:
+        publish_now = time.monotonic()
+        partial_due = bool(
+            finalized is not None
+            or self._partial_publish_min_interval <= 0.0
+            or publish_now - self._last_partial_publish_at.get(instrument, 0.0)
+            >= self._partial_publish_min_interval
+        )
+        if partial is not None and partial_due:
             # The forming bar only -- a closing bar went through the branch above with
             # throttling off, so closed buckets are never deferred.
+            self._last_partial_publish_at[instrument] = publish_now
             self.update_candles(instrument, partial, "1min", throttle_resample=True)
 
     def update_candles(
@@ -521,7 +539,19 @@ class CandleBuilder:
             combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         if not existing.index.is_unique:
             existing = existing[~existing.index.duplicated(keep="last")].sort_index()
-        fields = ("tick_count", "volume_basis", "source", "receipt_at", "provider_time")
+        # ``volume`` belongs in this restoration set only for one narrow but critical
+        # case: a price-only live tick must not erase positive Fyers cash volume that
+        # was backfilled for the same forming minute.  Without coupling volume to its
+        # provenance, the next tick (and especially the minute-close flush) changed the
+        # repaired row back to ``volume=0/source=live_tick`` until the next REST pass.
+        fields = (
+            "volume",
+            "tick_count",
+            "volume_basis",
+            "source",
+            "receipt_at",
+            "provider_time",
+        )
         candidates = combined.index if touched_index is None else pd.Index(touched_index)
         overlap = candidates.intersection(combined.index).intersection(existing.index)
         if len(overlap) == 0:
@@ -572,6 +602,8 @@ class CandleBuilder:
 
         old_columns = usable + (["source"] if "source" not in usable and "source" in existing.columns else [])
         new_columns = usable + (["source"] if "source" not in usable and "source" in combined.columns else [])
+        if "volume" in combined.columns and "volume" not in new_columns:
+            new_columns.append("volume")
         old_map = _gather(existing, old_columns) if indexes_unique else None
         new_map = _gather(combined, new_columns) if indexes_unique else None
 
@@ -583,6 +615,28 @@ class CandleBuilder:
                 "fyers_history", "history"
             }
             prior_source = str(old.get("source", "") or "").lower()
+            try:
+                measured_cash_history = bool(
+                    incoming_history
+                    and float(new.get("volume") or 0.0) > 0.0
+                    and str(new.get("volume_basis", "") or "").strip().lower()
+                    == "fyers_index"
+                )
+            except (TypeError, ValueError):
+                measured_cash_history = False
+            try:
+                prior_measured_cash = bool(
+                    float(old.get("volume") or 0.0) > 0.0
+                    and str(old.get("volume_basis", "") or "").strip().lower()
+                    == "fyers_index"
+                )
+                incoming_measured_volume = bool(
+                    float(new.get("volume") or 0.0) > 0.0
+                    and str(new.get("volume_basis", "") or "").strip()
+                )
+            except (TypeError, ValueError):
+                prior_measured_cash = False
+                incoming_measured_volume = False
             for field in usable:
                 value = new.get(field)
                 missing = value is None or (isinstance(value, str) and not value.strip())
@@ -591,7 +645,23 @@ class CandleBuilder:
                         missing = bool(pd.isna(value))
                     except (TypeError, ValueError):
                         pass
-                if incoming_history and prior_source not in {"", "history", "fyers_history"}:
+                if (
+                    incoming_history
+                    and prior_source not in {"", "history", "fyers_history"}
+                    and not (
+                        measured_cash_history
+                        and field in {"volume", "source", "volume_basis"}
+                    )
+                ):
+                    missing = True
+                if (
+                    prior_measured_cash
+                    and not incoming_measured_volume
+                    and field in {"volume", "source", "volume_basis"}
+                ):
+                    # Price-only ticks still own OHLC/timing/tick_count, but they have
+                    # no authority to replace the independently measured cash-volume
+                    # value or its provenance.
                     missing = True
                 if field == "tick_count" and not missing:
                     try:
@@ -813,8 +883,16 @@ class CandleBuilder:
 
     def get_candle_count(self, instrument: str, timeframe: str) -> int:
         """Get number of candles available"""
-        df = self.get_candles(instrument, timeframe)
-        return len(df) if df is not None else 0
+        with self._lock:
+            if timeframe == "1min":
+                df = self._candles_1min.get(instrument)
+            elif timeframe == "5min":
+                df = self._candles_5min.get(instrument)
+            elif timeframe == "15min":
+                df = self._candles_15min.get(instrument)
+            else:
+                return 0
+            return len(df) if df is not None else 0
 
     def get_max_timestamp(self) -> datetime:
         """Get the latest market timestamp from any candle dataframe"""

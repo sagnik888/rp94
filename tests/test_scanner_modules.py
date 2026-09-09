@@ -283,6 +283,15 @@ def test_historical_trade_reconstruction_lives_in_historical_builder():
     assert "historical_trade_manager" in historical_source
 
 
+def test_real_signal_startup_does_not_run_historical_trade_reconstruction():
+    source = inspect.getsource(SignalProcessor.process_best_signal)
+
+    assert 'if (scanner.mode == "HISTORICAL" or is_live)' not in source
+    assert 'if scanner.mode == "HISTORICAL":' in source
+    assert "if is_live:" in source
+    assert "naive_ts(sigs[-2].timestamp)" in source
+
+
 def test_loaded_exit_candidate_normalization_lives_in_engine_helper():
     scanner_source = inspect.getsource(Scanner._normalize_loaded_exit_candidate)
     helper_source = inspect.getsource(normalize_loaded_exit_candidate)
@@ -430,7 +439,7 @@ def test_signal_processor_option_entries_use_scanner_premium_resolver():
     assert "quote_probe" in source
 
 
-def test_live_dashboard_counts_completed_and_active_session_lifecycles():
+def test_live_dashboard_excludes_unexecuted_terminal_session_signals_from_trades():
     session_rows = [
         {
             "id": "entry-1",
@@ -483,11 +492,15 @@ def test_live_dashboard_counts_completed_and_active_session_lifecycles():
 
     payload = ScannerTradePayloadBuilder(scanner).build()
 
-    assert {row["id"] for row in payload["signals"]} == {"exit-1", "entry-2"}
-    assert payload["meta"]["restored_signal_rows"] == 2
+    assert {row["id"] for row in payload["signals"]} == {"entry-2"}
+    assert payload["signals"][0]["execution_status"] == "SIGNAL_ONLY"
+    assert payload["signals"][0]["execution_state"] == "NOT_PLACED"
+    assert payload["signals"][0]["pnl"] == 0.0
+    assert payload["meta"]["restored_signal_rows"] == 1
+    assert payload["meta"]["unexecuted_terminal_signal_rows"] == 1
     assert payload["meta"]["source"] == "restored_session_signals"
-    assert payload["summary"]["total_trades"] == 2
-    assert payload["summary"]["daily_pnl"] == 125.0
+    assert payload["summary"]["total_trades"] == 1
+    assert payload["summary"]["daily_pnl"] == 0.0
     assert payload["summary"]["lane"] == "SIGNAL_TRACKER"
     assert payload["summary"]["pnl_label"] == "SIGNAL P&L"
     assert payload["summary"]["pnl_is_money"] is False
@@ -496,11 +509,11 @@ def test_live_dashboard_counts_completed_and_active_session_lifecycles():
     assert "no broker fill is implied" in payload["monetary"]["accounting_basis"]["description"]
     # Session-row contract: consumers reading only open/closed must still be able
     # to see the session's true row counts via explicit totals.
-    assert payload["session_rows_total"] == 2
-    assert payload["session_closed_total"] == 1
+    assert payload["session_rows_total"] == 1
+    assert payload["session_closed_total"] == 0
     assert payload["session_open_total"] == 1
-    assert payload["meta"]["session_rows_total"] == 2
-    assert payload["meta"]["session_closed_total"] == 1
+    assert payload["meta"]["session_rows_total"] == 1
+    assert payload["meta"]["session_closed_total"] == 0
     assert payload["meta"]["session_open_total"] == 1
 
 
@@ -788,7 +801,8 @@ def test_live_dashboard_refreshes_restored_signal_premium_before_serializing():
     assert refresh_calls
     assert refresh_calls[0][1] == {"enabled": True}
     assert payload["signals"][0]["current_price"] == 812.35
-    assert payload["signals"][0]["pnl"] == 580.0
+    assert payload["signals"][0]["pnl"] == 0.0
+    assert payload["signals"][0]["execution_status"] == "SIGNAL_ONLY"
 
 
 def test_diagnostics_active_peak_ignores_closed_lifecycle_entries():

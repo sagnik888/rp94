@@ -18,6 +18,7 @@ Usage:  python scripts/backtest_exit_lifecycle.py [YYYY-MM-DD]
 from __future__ import annotations
 
 import glob
+import argparse
 import json
 import os
 import re
@@ -184,6 +185,7 @@ def load_trades(day: str) -> list[dict]:
             "instrument": str(r.get("instrument") or "").split()[0],
             "direction": str(r.get("direction") or "").upper(),
             "timeframe": r.get("timeframe"),
+            "grade": str(r.get("grade") or ""),
             "entry": float(r.get("price") or 0.0),
             "stop": float(r.get("stop") or 0.0),
             "target": float(r.get("target") or 0.0),
@@ -193,6 +195,9 @@ def load_trades(day: str) -> list[dict]:
             "option_type": "CE" if str(r.get("direction") or "").upper() == "LONG" else "PE",
             "trading_symbol": str((r.get("contract") or {}).get("trading_symbol") or "")
             if isinstance(r.get("contract"), dict) else "",
+            "entry_route": str(
+                r.get("source_lane") or r.get("source_engine") or r.get("source") or "STANDARD"
+            ),
         })
     return trades
 
@@ -427,6 +432,7 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
     tot_base_costs = tot_run_costs = 0.0
     matched = 0
     hedges = 0
+    trade_rows = []
     for t in trades:
         m = match_contract(t, contracts)
         if m is None:
@@ -437,8 +443,8 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
             continue
         matched += 1
         qty = LOT_SIZE.get(t["instrument"], 1)
-        bx, _ = sim_old(t, bars, qty)
-        rx, _ = sim_runner(t, bars, sc, qty)
+        bx, base_reason = sim_old(t, bars, qty)
+        rx, runner_reason = sim_runner(t, bars, sc, qty)
         base_gross, base_costs, _ = option_replay_pnl(
             t["entry"], bx, qty, t["instrument"], settings
         )
@@ -452,6 +458,28 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
         hx, _, hpnl, hcount = sim_runner_hedged(t, bars, sc, qty, contracts)
         tot_hedged_gross += (hx - t["entry"]) * qty + hpnl
         hedges += hcount
+        trade_rows.append({
+            "date": day,
+            "index": t["instrument"],
+            "timeframe": str(t.get("timeframe") or ""),
+            "grade": str(t.get("grade") or ""),
+            "regime": str(t.get("raw_regime") or "UNKNOWN"),
+            "entry_route": str(t.get("entry_route") or "STANDARD"),
+            "contract": str(m[0]),
+            "entry_time": pd.Timestamp(t["entry_ts"]).isoformat(),
+            "entry_price": float(t["entry"]),
+            "quantity": int(qty),
+            "baseline_exit_price": float(bx),
+            "baseline_exit_path": str(base_reason),
+            "baseline_gross": float(base_gross),
+            "baseline_costs": float(base_costs),
+            "baseline_net": float(base_gross - base_costs),
+            "candidate_exit_price": float(rx),
+            "candidate_exit_path": str(runner_reason),
+            "candidate_gross": float(run_gross),
+            "candidate_costs": float(run_costs),
+            "candidate_net": float(run_gross - run_costs),
+        })
     tot_base = tot_base_gross - tot_base_costs
     tot_run = tot_run_gross - tot_run_costs
     res = {
@@ -471,6 +499,7 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
         "delta": tot_run - tot_base,
         "gross_delta": tot_run_gross - tot_base_gross,
         "hedge_delta_gross": tot_hedged_gross - tot_run_gross,
+        "trade_ledger": trade_rows,
     }
     if not quiet:
         print(f"{day}  trades={len(trades):3} matched={matched:3}  "
@@ -511,21 +540,23 @@ def run_all(min_r_label: str = "") -> None:
 
 
 def main() -> None:
-    args = [a for a in sys.argv[1:]]
-    day = "2026-07-24"
-    min_r = None
-    for a in args:
-        if a.startswith("--min-r="):
-            min_r = float(a.split("=", 1)[1])
-        elif re.match(r"\d{4}-\d{2}-\d{2}", a):
-            day = a
+    parser = argparse.ArgumentParser(
+        description="Replay archived option-premium lifecycles through baseline and runner exits."
+    )
+    parser.add_argument("day", nargs="?", default="2026-07-24", help="Session date (YYYY-MM-DD)")
+    parser.add_argument("--all", action="store_true", help="Replay every archived session")
+    parser.add_argument("--min-r", type=float, default=None, help="Temporary runner minimum-R override")
+    parsed = parser.parse_args()
+    day = str(parsed.day)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        parser.error("day must use YYYY-MM-DD")
+    min_r = parsed.min_r
     label = ""
     if min_r is not None:
-        from config.settings import get_settings
         get_settings().trend_runner_min_peak_r_multiple = min_r
         label = f"[min_r={min_r}] "
         print(f"[override] trend_runner_min_peak_r_multiple = {min_r}")
-    if "--all" in args:
+    if parsed.all:
         run_all(label)
         return
     contracts = load_today_contracts(day)

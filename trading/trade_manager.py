@@ -311,6 +311,11 @@ class Trade:
     # Full versioned signal-quality evidence, kept as JSON-compatible data so the
     # ACCEPTED decision and eventual EXIT can be attributed to the same gate route.
     quality_verdict: Dict[str, Any] = field(default_factory=dict)
+    # Frozen entry evidence used for exit comparison and offline outcome calibration.
+    # These used to be runtime-only setattrs and disappeared on restart.
+    entry_intel: Dict[str, Any] = field(default_factory=dict)
+    decision_intel: Dict[str, Any] = field(default_factory=dict)
+    calibration_outcome_recorded: bool = False
     exit_price: float = 0.0
     exit_time: Optional[datetime] = None
     exit_reason: str = ""
@@ -330,6 +335,11 @@ class Trade:
     # that gap put the answer between -Rs.18,114 and +Rs.10,988 — a range wide enough to
     # be useless. The path closes it. See _sample_pnl_path for the cost bound.
     pnl_path: List[Tuple[float, float]] = field(default_factory=list)
+    # Historical-only point-in-time audit evidence. Empty on live trades. Keeping it
+    # on the trade row lets backtest reports prove which guards were evaluated and
+    # which minute path produced the exit instead of exposing only the final P&L.
+    replay_price_path: List[Dict[str, Any]] = field(default_factory=list)
+    replay_exit_trace: List[Dict[str, Any]] = field(default_factory=list)
     is_ghost: bool = False
     # True only when this row reconstructs exposure that already existed at the
     # broker. Persist it so a restart cannot mistake recovery reconciliation for a
@@ -588,6 +598,9 @@ class Trade:
             "entry_policy_underlying_stop_pct": self.entry_policy_underlying_stop_pct,
             "entry_policy_version": self.entry_policy_version,
             "quality_verdict": dict(self.quality_verdict or {}),
+            "entry_intel": dict(self.entry_intel or {}),
+            "decision_intel": dict(self.decision_intel or {}),
+            "calibration_outcome_recorded": bool(self.calibration_outcome_recorded),
             "instrument_multiplier": self.instrument_multiplier,
             "peak_pnl": self.peak_pnl,
             "max_drawdown": self.max_drawdown,
@@ -595,6 +608,8 @@ class Trade:
             # starts partway through — a truncated path reads as a trade that never
             # visited the levels it actually visited.
             "pnl_path": [[float(t), float(p)] for t, p in (self.pnl_path or [])],
+            "replay_price_path": list(self.replay_price_path or []),
+            "replay_exit_trace": list(self.replay_exit_trace or []),
             "signal_fire_mode": self.signal_fire_mode,
             "entered_intracandle": self.entered_intracandle,
             "repaint_guard_checked": self.repaint_guard_checked,
@@ -816,6 +831,9 @@ class Trade:
             ),
             entry_policy_version=str(data.get("entry_policy_version") or ""),
             quality_verdict=dict(data.get("quality_verdict") or {}),
+            entry_intel=dict(data.get("entry_intel") or {}),
+            decision_intel=dict(data.get("decision_intel") or {}),
+            calibration_outcome_recorded=bool(data.get("calibration_outcome_recorded", False)),
             exit_price=data.get("exit_price", data.get("current_price", 0.0)),
             exit_time=exit_time,
             exit_reason=data.get("exit_reason", ""),
@@ -833,6 +851,14 @@ class Trade:
                 (float(row[0]), float(row[1]))
                 for row in (data.get("pnl_path") or [])
                 if isinstance(row, (list, tuple)) and len(row) >= 2
+            ],
+            replay_price_path=[
+                dict(row) for row in (data.get("replay_price_path") or [])
+                if isinstance(row, dict)
+            ],
+            replay_exit_trace=[
+                dict(row) for row in (data.get("replay_exit_trace") or [])
+                if isinstance(row, dict)
             ],
             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
             entered_intracandle=bool(data.get("entered_intracandle", True)),

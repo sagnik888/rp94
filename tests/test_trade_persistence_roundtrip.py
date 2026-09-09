@@ -61,6 +61,10 @@ UNPERSISTED_BY_DESIGN = {
     # the analysis actually reads lives on the TradeCandidate, which persists whole via
     # json.dumps into session_signals.payload, so the offline record is not lost here.
     "pnl_path",
+    # Historical-only replay evidence is emitted directly into the backtest report.
+    # Persisting hundreds of minute bars per simulated trade in the live SQLite
+    # position table would add RAM/DB pressure and cannot affect position recovery.
+    "replay_price_path", "replay_exit_trace",
 }
 
 
