@@ -1186,7 +1186,9 @@ function updateInstrumentSelectors(instruments, dashboardContext = {}) {
         if (quoteEl) {
             const age = Number(d.quote_age_seconds);
             const explicitlyStale = d.quote_fresh === false || d.quote_stale === true;
-            const stale = sessionLabel === 'LIVE' && (explicitlyStale || !Number.isFinite(age) || age > 3);
+            // The backend dictates freshness based on the source's exchange capabilities.
+            // BSE indices naturally tick every 5-6s, so hardcoding >3s here causes false STALE badges.
+            const stale = sessionLabel === 'LIVE' && (explicitlyStale || !Number.isFinite(age));
             const displayLabel = stale ? 'STALE' : sessionLabel;
             quoteEl.textContent = `${displayLabel}·${formatQuoteAge(age)}`;
             quoteEl.className = 'inst-quote-status ' + quoteStatusClass(displayLabel);

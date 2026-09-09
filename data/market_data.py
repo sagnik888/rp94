@@ -1918,7 +1918,7 @@ class MarketDataProvider:
     # candle while it is fresh.  Fyers must see two ticks over a small dwell after
     # Kite goes stale before taking over; this prevents a one-packet scheduling gap
     # from flipping the active feed twice inside one candle.
-    INDEX_KITE_PRICE_FRESH_SECONDS = 6.0
+    INDEX_KITE_PRICE_FRESH_SECONDS = 7.0
     INDEX_FYERS_PRICE_FRESH_SECONDS = 15.0
     INDEX_PRICE_FAILOVER_MIN_TICKS = 2
     INDEX_PRICE_FAILOVER_HYSTERESIS_SECONDS = 0.25
