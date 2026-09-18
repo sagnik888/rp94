@@ -333,6 +333,13 @@ class Settings(BaseSettings):
     price_action_module_enabled: bool = False
     price_action_block_adverse: bool = False
     price_action_adverse_threshold: float = -0.50
+    # Deliberately SEPARATE from the setting above, which the exit-side loss-recovery
+    # checks in scanner.py read and where -0.50 has always been the effective value.
+    # The ENTRY veto has always cut at -0.40, hardcoded in intelligence/price_action.py.
+    # Pointing both at one number silently moves one of them: at -0.50 the entry veto
+    # releases 145 of 564 recorded ADVERSE refusals (25.7%), and at -0.40 the exit
+    # checks tighten. Two questions, two thresholds.
+    price_action_entry_adverse_threshold: float = -0.40
     # Day-type-aware premium/discount (2026-07-10): on a CONFIRMED aligned trend
     # day (effective phase, >= min confidence) the "chasing the extreme" penalty
     # is scaled by trend_scale — continuation entries at the top (bottom) of the
@@ -550,6 +557,12 @@ class Settings(BaseSettings):
     execution_touch_quote_shadow_enabled: bool = True
     execution_touch_quote_strict: bool = True
     execution_touch_quote_max_age_seconds: float = 1.5
+    # Reprice an accepted REAL advisory row (price/stop/target) at the acceptance-time
+    # executable quote. OFF = record-only: the quote is stamped on the row but the row
+    # keeps its stabilization-start price. Moving it shifts the gate inputs paper exits
+    # feed (loss streak, cooldown, reversion window, manual Execute refusal), and
+    # spot-mapped trailing needs entry_spot re-anchored first (2026-09-17 review).
+    accepted_entry_rebase_enabled: bool = False
     option_touch_limit_extra_ticks: int = 1
     option_touch_quote_max_spread_pct: float = 1.0
     option_touch_quote_max_spread_ticks: int = 40
@@ -1960,6 +1973,13 @@ class Settings(BaseSettings):
     auto_resource_clear_hysteresis_pct: float = 4.0
     auto_resource_clear_consecutive_samples: int = 2
     auto_resource_sample_max_age_seconds: float = 5.0
+    # Whether the RAM/commit PERCENTAGES above block new Auto entries (True) or only
+    # raise a watchdog warning (False). Blocking always applies to exhausted commit
+    # headroom (auto_resource_commit_min_available_mb) and to a missing/stale sample.
+    # 2026-09-11: the percentages refused every LONG of a 0.5-0.8% four-index rally at
+    # 92-95.8% commit with 1.2-2.3 GB of headroom still free; the headroom floor has
+    # never fired in any recorded block.
+    auto_resource_pct_blocks_entries: bool = False
     # Keep repeated backtests deterministic by default. Set this true only when
     # a recalculation should also refresh broker candle files before replay.
     backtest_refresh_data_on_recalc: bool = False
@@ -2018,6 +2038,11 @@ class Settings(BaseSettings):
         "quad_union",
         "quad_prime",
         "adaptive_dual",
+        "mantra_hybrid",
+    # The code default is what a deployment silently runs when SCANNER_ENGINE is
+    # missing from .env (a pruned .env has reverted keys before). Keep it on the
+    # engine live trades with; mantra_hybrid (added 2026-09-17, not yet evaluated)
+    # remains selectable through .env or the dashboard.
     ] = "quad_prime"
     # Quad Prime raw-entry hygiene: raw source access is allowed, but weak solo flips
     # must not skip all live quality floors or every winner becomes a tiny scalp while
@@ -2058,6 +2083,149 @@ class Settings(BaseSettings):
     quality_hybrid_thrust_volume_ratio: float = 1.6
     quality_hybrid_thrust_range_atr: float = 1.05
     quality_hybrid_thrust_close_loc: float = 0.60
+
+    # --- MANTRA Hybrid 4-Engine Settings ---
+    mantra_u_assetClassInput: str = "Auto"
+    mantra_u_tradeModeInput: str = "Auto"
+    mantra_u_profileMode: str = "Adaptive"
+    mantra_u_confirmOnClose: bool = True
+    mantra_u_manualADXThreshold: int = 24
+    mantra_u_manualVolSpike: float = 1.50
+    mantra_u_riskMode: str = "Dynamic"
+    mantra_u_dynamicSensitivity: float = 1.00
+    mantra_u_manualATRMult: float = 2.00
+    mantra_u_manualSL2ATR: float = 3.50
+    mantra_u_manualPctSL1: float = 0.80
+    mantra_u_manualPctSL2: float = 1.80
+    mantra_u_minStopMode: str = "Adaptive"
+    mantra_u_manualMinStopPct: float = 0.50
+    mantra_u_maxStopPct: float = 20.0
+    mantra_u_swingLookback: int = 10
+    mantra_u_rrRatio: float = 2.50
+    mantra_u_t1Ratio: float = 1.20
+    mantra_u_t3Ratio: float = 4.50
+    mantra_u_macdFastLength: int = 12
+    mantra_u_macdSlowLength: int = 26
+    mantra_u_macdSignalLength: int = 9
+    mantra_u_useMACDFilter: bool = True
+    mantra_u_macdMinAtrRatio: float = 0.00
+    mantra_u_minConfidence: int = 65
+    mantra_u_signalGap: int = 5
+    mantra_u_showBuy: bool = True
+    mantra_u_showSell: bool = True
+    mantra_u_showExit: bool = True
+    mantra_u_maxBarsInTrade: int = 250
+    mantra_u_useTrailing: bool = True
+    mantra_u_trailStart: float = 1.50
+    mantra_u_trailOffset: float = 2.50
+    mantra_u_lockProfit: bool = True
+    mantra_u_lockProfitR: float = 0.25
+    mantra_u_aggressiveTrail: bool = False
+    mantra_u_loosenAfterT2: bool = False
+    mantra_u_exitMode: str = "Balanced"
+    mantra_u_useSmartExit: bool = True
+    mantra_u_exitOnWeakness: bool = False
+    mantra_u_sameBarPriority: str = "Stops First"
+    mantra_u_useSessionFilter: bool = True
+    mantra_u_sessionMode: str = "Auto"
+    mantra_u_customSession: str = "0915-1530"
+    mantra_u_customDays: str = "23456"
+    mantra_u_customTimezoneInput: str = "Exchange"
+    mantra_u_mtfDeadZonePct: float = 0.15
+    mantra_u_mtfBullThreshold: float = 0.45
+    mantra_instrumentType: str = "Auto-Detect"
+    mantra_minScore: int = 70
+    mantra_conflictMargin: int = 20
+    mantra_minADX: float = 20.0
+    mantra_useHTF: bool = True
+    mantra_signalCooldown: int = 5
+    mantra_atrMult: float = 1.5
+    mantra_fixedSLPct: float = 0.2
+    mantra_t1R: float = 2.0
+    mantra_t2R: float = 3.0
+    mantra_t3R: float = 4.0
+    mantra_useTrail: bool = True
+    mantra_trailStartR: float = 1.5
+    mantra_trailMult: float = 1.8
+    mantra_lockAtT1: bool = True
+    mantra_exitConfBars: int = 3
+    mantra_targetExitMode: str = "TP3 Final Exit"
+    mantra_maxConsecLoss: int = 3
+    mantra_circuitPause: int = 10
+    mantra_horizonSensitivity: str = "Balanced"
+    mantra_cwEnable: bool = True
+    mantra_cwRsiLen: int = 14
+    mantra_cwTrendLen: int = 50
+    mantra_cwBullLo: int = 40
+    mantra_cwBullHi: int = 80
+    mantra_cwBearLo: int = 20
+    mantra_cwBearHi: int = 60
+    mantra_cwConfirmBars: int = 2
+    mantra_cwUseHtf: bool = False
+    mantra_cwUseAdx: bool = False
+    mantra_cwAdxLen: int = 14
+    mantra_cwAdxMin: int = 20
+    mantra_cwAtrLen: int = 14
+    mantra_cwSlMult: float = 1.5
+    mantra_cwTp1Mult: float = 1.0
+    mantra_cwTp2Mult: float = 2.0
+    mantra_cwTp3Mult: float = 3.0
+    mantra_showPatterns: bool = True
+    mantra_usePatScore: bool = True
+    mantra_patSingleGrp: bool = True
+    mantra_patDoubleGrp: bool = True
+    mantra_patTripleGrp: bool = True
+    mantra_patContGrp: bool = True
+    mantra_forge_cooldown: int = 5
+    mantra_forge_symTol: float = 10.0
+    mantra_forge_lvlTol: float = 3.0
+    mantra_forge_minSizePct: float = 0.5
+    mantra_forge_minAtrMult: float = 1.0
+    mantra_forge_atrLen: int = 14
+    mantra_forge_showDtTop: bool = True
+    mantra_forge_showDtBot: bool = True
+    mantra_forge_showTtTop: bool = True
+    mantra_forge_showTtBot: bool = True
+    mantra_forge_showHsStd: bool = True
+    mantra_forge_showHsInv: bool = True
+    mantra_forge_showFlagBull: bool = True
+    mantra_forge_showFlagBear: bool = True
+    mantra_forge_showPennantBull: bool = True
+    mantra_forge_showPennantBear: bool = True
+    mantra_forge_showWedgeRise: bool = True
+    mantra_forge_showWedgeFall: bool = True
+    mantra_forge_showTriGen: bool = True
+    mantra_forge_showRectGen: bool = True
+    mantra_forge_showCupStd: bool = True
+    mantra_forge_showCupInv: bool = True
+    mantra_forge_lbLeft: int = 10
+    mantra_forge_lbRight: int = 10
+    mantra_forge_maxPivHist: int = 500
+    mantra_forge_reqCloseBrk: bool = False
+    mantra_forge_reqBodyBrk: bool = False
+    mantra_forge_useAtrBrk: bool = True
+    mantra_forge_breakAtr: float = 1.0
+    mantra_forge_breakPct: float = 0.3
+    mantra_forge_brkConfirmBars: int = 1
+    mantra_forge_showIgnoreConf: bool = False
+    mantra_forge_minBrkBar: int = 1
+    mantra_forge_reqVol: bool = False
+    mantra_forge_volMult: float = 1.2
+    mantra_forge_volLen: int = 20
+    mantra_forge_minRR: float = 1.5
+    mantra_forge_slippageTicks: float = 1.0
+    mantra_forge_commissionPct: float = 0.03
+    mantra_forge_minConf: int = 5
+    mantra_forge_useHtf: bool = True
+    mantra_forge_htfFast: int = 21
+    mantra_forge_htfSlow: int = 55
+    mantra_forge_requireHtf: bool = False
+    mantra_forge_useChop: bool = True
+    mantra_forge_chopLen: int = 14
+    mantra_forge_chopMax: float = 62.0
+    mantra_forge_useSession: bool = False
+    mantra_forge_sessStart: str = "0700-2000"
+    mantra_forge_rankByQuality: bool = True
     # Macro-event blackout: block fresh ENTRIES during user-listed event windows
     # (data_store/event_blackouts.json: [{date,start,end,label}], e.g. RBI policy,
     # budget). DEFAULT OFF — zero behavior change until enabled. Exits/trailing
@@ -2203,6 +2371,13 @@ class Settings(BaseSettings):
     # entry gate and the EOD exit logic contradict each other.
     block_entries_during_eod_protect: bool = True
     ut_force_exit_time: str = "15:15"
+    # Upper bound on the force exit: from this IST time the exchange no longer accepts
+    # F&O orders, so check_session_end and the expiry-day time exits stop sending
+    # exits and the stuck position is escalated by name instead. Without it the square-off re-sent an order that could
+    # only be rejected on every scan cycle for the rest of the evening. 15:40 since
+    # SEBI's Closing Auction Session went live on 2026-08-03 (SEBI circular 16-Jan-2026
+    # para 4.2.3: the equity derivatives segment runs to 3:40 p.m.); it was 15:30 before.
+    fno_market_close_time: str = "15:40"
     # CARRYFORWARD -> Kite NRML, INTRADAY -> Kite MIS (_PRODUCT_MAP in kite_broker.py).
     # A single-member Literal until 2026-08-16, so MIS could not be selected at all even
     # though the broker mapped it. The DEFAULT is deliberately unchanged, because for a
@@ -2217,6 +2392,30 @@ class Settings(BaseSettings):
     #         cost of that net being a market order at whatever the book then shows.
     # Both are defensible; making it configurable is the fix, not picking for you.
     trade_product_type: Literal["CARRYFORWARD", "INTRADAY"] = "CARRYFORWARD"
+    # Adaptive hold for bought options (engine/adaptive_hold.py). OFF by default: at
+    # introduction (2026-09-11) its leave-one-day-out walk-forward LOST more than the
+    # current exits -- 227 accepted trades over 35 days, -Rs.233/trade vs -Rs.153
+    # (difference CI -153..-14) -- so re-run that test on newer data before enabling.
+    # When on: cut a trade whose best gain is < never_green_min_r x initial risk at
+    # never_green_minutes; once gain >= activate_r x risk, trail the stop at
+    # peak - trail_atr_mult x premium ATR (widened by momentum_widen_atr while the index
+    # keeps extending) and stand the profit-taking exits down. It releases the trade to
+    # end-of-day handling at the EOD-protect start and never touches the 15:15 exit.
+    # Refuse entries the whole option book already agrees with (no OI/PCR/flow pillar
+    # against the trade). 2,348 live signals, 2026-07-20..09-10: those moved the trade's
+    # way 45.8% of the time vs 54.1% for the rest, and lost Rs.301/trade on executable
+    # option prices (CI -704..-72). Neutral in July-mid Aug, strong since. OFF by
+    # default: it is anti-trend, and on the 2026-09-11 rally it would have refused
+    # the 13:25 BANKNIFTY/SENSEX/MIDCPNIFTY LONGs and the 13:45/14:00 SENSEX 15min
+    # LONGs while passing the 13:40 SHORTs that lost Rs.1.6-2.0k each.
+    entry_block_unanimous_book: bool = False
+    adaptive_hold_enabled: bool = False
+    adaptive_hold_never_green_minutes: float = 5.0
+    adaptive_hold_never_green_min_r: float = 0.15
+    adaptive_hold_activate_r: float = 0.5
+    adaptive_hold_trail_atr_mult: float = 3.5
+    adaptive_hold_momentum_widen_atr: float = 1.5
+    adaptive_hold_atr_period: int = 14
     live_filter_leniency_pct: float = 0.0 # Keep live gates strict; loosen only during deliberate diagnostics
     intelligence_cache_ttl_seconds: float = 90.0 # Option-chain cache TTL for live intelligence
     # How long a COMPUTED intelligence bundle stays usable. This used to be the line
@@ -2318,6 +2517,13 @@ class Settings(BaseSettings):
     # Hard ceiling on total lots after adding, whatever the adds-per-trade cap allows.
     scale_in_max_total_lots: int = 6
     auto_option_chain_min_strikes: int = 3 # Minimum fresh active-expiry strikes required for OPT Auto
+    # A confident TREND_DAY session plus an aligned breadth vote overrule a regime
+    # label pointing the other way. On 2026-09-15 the label stayed TRENDING_UP until
+    # 11:00 on a ~2% down day, costing with-trend SHORTs 0.55 of regime score and
+    # refusing 36 of them below the B+ floor.
+    regime_trend_day_contradiction_guard_enabled: bool = True
+    regime_trend_day_contradiction_min_confidence: float = 0.70
+    regime_trend_day_contradiction_min_breadth_votes: int = 3
     vix_percentile_min_sessions: int = 20 # Minimum daily India VIX observations before volatility routing is trusted
     vix_live_cache_seconds: float = 60.0 # Avoid repeated India VIX REST calls across index scans
     signal_vix_high_threshold: float = 20.0 # Configurable high-volatility grading threshold
@@ -2337,7 +2543,16 @@ class Settings(BaseSettings):
     # four-minute cache there makes every "fresh" backfill arrive 3-5 minutes late,
     # which the ghost guard correctly refuses. Keep the deep/history cache long, but
     # let the live 1m index edge refresh on each worker pass.
-    live_1min_history_cache_ttl_seconds: float = 45.0
+    # 45s against a bar that can only change once a minute meant ~1.15 history fetches
+    # per index per minute. Those calls are serialized behind the single Fyers flight
+    # (the SDK is not thread-safe and fyers.history has no transport timeout), and slow
+    # scan minutes carried 1.57 of them against 0.91 on fast minutes. 60s aligns the
+    # cache with the bar period. The entry-gate freshness window is unaffected: it is
+    # max(180.0, ttl * 3.0), which is 180s at either value.
+    live_1min_history_cache_ttl_seconds: float = 60.0
+    # Minimum seconds between full chart rebuilds when only the forming bar ticked.
+    # Structural changes (new candle, new signal, trade open/close) ignore this.
+    chart_rebuild_min_interval_seconds: float = 2.0
     # Live index LTP fallback is AngelOne. Yahoo is delayed and therefore disabled by
     # default; retain an explicit disaster-recovery opt-in for operators who accept a
     # reference-only badge. Historical candle backfill is configured separately.
@@ -2404,6 +2619,19 @@ class Settings(BaseSettings):
     # scan); it becomes ~18s. Median was 90s first-appearance-to-accept.
     live_signal_stabilization_seconds_5min: float = 15.0 # Repaint-check buffer before 5min live entry filtering
     live_signal_stabilization_seconds_15min: float = 15.0 # Repaint-check buffer before 15min live entry filtering
+    # Re-score a buffered signal's intelligence and regime pillars when it matures, on
+    # the bundle that exists then, instead of letting the live gate read the grade the
+    # signal was born with 20-60s earlier. The technical pillar is not re-scored: it
+    # describes the signal bar, which has not changed. Audited 2026-09-18 as the gap
+    # closest to "analyse during the buffer, then grade".
+    stabilization_regrade_enabled: bool = True
+    # The operator's 1-minute fast lane. A raw 1min arrow normally needs a volume burst,
+    # a post-win snapback or a confirmed cascade, and with that requirement only 4 raw
+    # 1min signals reached the buffer in 52 sessions - so there is no sample on which to
+    # judge the open lane, which is why this ships OFF. When ON, such a signal buffers on
+    # the short 1m window (volume_spike_entry_stabilization_seconds, 3-15s), not the 30s
+    # 5m/15m wait, and every downstream gate still applies.
+    one_min_raw_entry_enabled: bool = False
     midcap_15min_risky_stabilization_seconds: float = 60.0 # Extra buffer for MIDCPNIFTY 15min risky option signals in chop/weak tape
     midcap_15min_risky_stabilization_min_scans: int = 3 # Require repeated confirmation when MIDCPNIFTY 15min volume/intel is weak
     midcap_15min_risky_stabilization_min_volume_ratio: float = 1.05 # Basic volume floor for MIDCPNIFTY 15min risky stabilization
@@ -2675,6 +2903,34 @@ class Settings(BaseSettings):
     live_5min_special_min_chain_score: float = 50.0
     reversal_entry_relief_enabled: bool = True
     reversal_entry_min_confidence: float = 0.20
+    # Stale-regime reversal (2026-09-17). A 5m/15m signal AGAINST a trending regime label
+    # whose own session extreme is at least this many minutes old: the label is still
+    # "up" but price stopped making highs half an hour ago. Every grading pillar lags in
+    # that state, so these signals grade C and every veto reads them as counter-trend.
+    # Measured on 1,519 non-repainted live signals over 22 sessions (entry at the signal
+    # bar close, index points): +0.77 ATR at 30m, 59% positive, 13/21 days; both
+    # walk-forward halves positive; +0.47 ATR de-duplicated. The same staleness filter
+    # adds nothing to ranging (+0.11) or aligned (-0.12) signals.
+    #
+    # SWITCHED OFF 2026-09-18 after one live session. The backtest above is not wrong, but
+    # it measured the SIGNAL, not the route, and the route as shipped carried no floor of
+    # its own: it supersedes the B+ gate, so a signal that every other check refuses is
+    # admitted on the staleness fact alone. Live result, MIDCPNIFTY 15min, all three
+    # through route=stale_regime_reversal, all three losses totalling -Rs.2,478:
+    #   10:32 C 19%   11:05 C 19%   11:17 C 32%
+    #   confirmation_count 0 on all three, every leg false (trend_15m, impulse, volume,
+    #   multi_source), volume 0.43-0.64x against a 1.2x floor, source_count 1,
+    #   market_shift_core_votes 0, price_action_verdict ADVERSE on two, ADX 32-36 —
+    #   measured, strong, and pointing the OTHER way.
+    # The staleness test is also a one-way latch: MIDCPNIFTY set its session high at 09:24,
+    # so "extreme older than 30 minutes" was true from 09:54 until the close and never
+    # expired. It is a statement about the CLOCK, not about price reversing. All three
+    # shorts landed within 6 points of the session low in a 14,456-14,474 chop, and price
+    # was higher 15 minutes later every time (+6.25, +3.90, +3.70).
+    # Do not switch this on again without: a confirmation floor inside the route, a
+    # staleness test that requires price to have actually turned, and a re-entry cooldown.
+    stale_regime_reversal_enabled: bool = False
+    stale_regime_reversal_min_minutes: float = 30.0
     reversal_entry_thrust_min_range_atr_ratio: float = 1.20
     reversal_entry_thrust_min_close_location: float = 0.62
     reversal_entry_thrust_min_volume_ratio: float = 1.20
