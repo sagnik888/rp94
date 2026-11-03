@@ -1,0 +1,195 @@
+{
+  "settings": {
+    "scanner_engine": "quad_prime",
+    "regime_smoothing_enabled": true,
+    "regime_smoothing_window": 5,
+    "regime_er_veto_enabled": false,
+    "regime_range_day_adx_override_needs_er": false
+  },
+  "zero_volume_directional_vote": {
+    "session_delta": {
+      "source": "bar_pressure",
+      "cumulative_delta": 12.6,
+      "delta_ratio": 0.9,
+      "bias": "BULLISH"
+    },
+    "vwap_source": "price_fallback",
+    "top_down": {
+      "has_context": true,
+      "score_adjustment": 0.06,
+      "regime_multiplier_cap": 1.0,
+      "reasons": [
+        "session cumulative delta bullish +0.060"
+      ]
+    }
+  },
+  "truncated_session_history": {
+    "full_bars": 164,
+    "live_window_bars": 74,
+    "complete_history": {
+      "pdh": 140.0,
+      "pdl": 90.0,
+      "avg_10day_range_points": 50.0,
+      "range_vs_10day": 0.2
+    },
+    "live_window": {
+      "pdh": 105.0,
+      "pdl": 95.0,
+      "avg_10day_range_points": 10.0,
+      "range_vs_10day": 1.0
+    }
+  },
+  "previous_day_high_uses_older_session": {
+    "actual_previous_day_high": 140.0,
+    "reported_pdh": 180.0
+  },
+  "timeframe_horizon_contract": [
+    {
+      "bar_minutes": 1,
+      "last_bar_start": "2026-09-11 09:20:00",
+      "opening_status": "INSIDE",
+      "minute": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 1,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "minute",
+        "lookback_minutes": 1.0
+      },
+      "quarter": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 6,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "quarter",
+        "lookback_minutes": 15.0
+      }
+    },
+    {
+      "bar_minutes": 5,
+      "last_bar_start": "2026-09-11 09:40:00",
+      "opening_status": "INSIDE",
+      "minute": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 1,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "minute",
+        "lookback_minutes": 5.0
+      },
+      "quarter": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 3,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "quarter",
+        "lookback_minutes": 15.0
+      }
+    },
+    {
+      "bar_minutes": 15,
+      "last_bar_start": "2026-09-11 10:30:00",
+      "opening_status": "INSIDE",
+      "minute": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 1,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "minute",
+        "lookback_minutes": 15.0
+      },
+      "quarter": {
+        "day_type": "UNDECIDED",
+        "bias": "NEUTRAL",
+        "confidence": 0.4,
+        "move_pct": 0.0,
+        "short_move_pct": 0.0,
+        "accel_pct": 0.0,
+        "lookback_bars": 2,
+        "volume_ratio": 0.0,
+        "close_location": 0.95,
+        "horizon": "quarter",
+        "lookback_minutes": 15.0
+      }
+    }
+  ],
+  "quad_held_consensus_vote": {
+    "ema": [
+      1,
+      -1
+    ],
+    "supertrend": [
+      1,
+      1
+    ],
+    "utbot": [
+      1,
+      -1
+    ],
+    "held_consensus": [
+      1,
+      1
+    ],
+    "position": [
+      1,
+      0
+    ]
+  },
+  "mtf_volume_only_update_hash": {
+    "same_hash": true,
+    "scope": "Matters for volume-dependent adaptive_dual; current quad_prime raw signals are price-only."
+  },
+  "dashboard_36_bar_hour_vs_full_5m": {
+    "full": {
+      "regime": "BREAKOUT_UP",
+      "candle_count": 80,
+      "readiness": "FULL",
+      "full_confidence": true,
+      "confidence": 70,
+      "bb_width": 15.72,
+      "breakout_direction": "UP"
+    },
+    "dashboard_hour": {
+      "regime": "TRENDING_UP",
+      "candle_count": 36,
+      "readiness": "PARTIAL",
+      "full_confidence": false,
+      "confidence": 60,
+      "bb_width": 0,
+      "breakout_direction": "NONE"
+    }
+  },
+  "stale_exact_regime": {
+    "label_with_epoch_one_timestamp": "TRENDING_UP",
+    "counts_as_own_timeframe": true
+  },
+  "missing_15m_regime": {
+    "returned_label": "RANGING",
+    "counts_as_own_timeframe": false
+  }
+}

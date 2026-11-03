@@ -11,6 +11,7 @@ import pytest
 from data.angelone_market_data import AngelOneIndexQuoteSource
 from data.market_data import MarketDataProvider
 from engine.pre_candle_predictor import _one_min_metrics
+from engine.entry_analysis_service import EntryAnalysisService
 from scanner import Scanner
 
 
@@ -22,17 +23,18 @@ class _FakeSmartApi:
         assert client_id and password and totp
         return {"status": True, "data": {"jwtToken": "never-log-me"}}
 
-    def ltpData(self, exchange, symbol, token):
-        self.calls.append((exchange, symbol, token))
+    def getMarketData(self, mode, exchangeTokens):
+        assert mode == "FULL"
+        self.calls.append(exchangeTokens)
         return {
             "status": True,
-            "data": {
+            "data": {"fetched": [{"exchange": exchange, "symbolToken": token,
                 "ltp": 75636.9,
                 "close": 76132.81,
                 "open": 75970.28,
                 "high": 76012.11,
                 "low": 75627.17,
-            },
+            } for exchange, tokens in exchangeTokens.items() for token in tokens]},
         }
 
 
@@ -53,8 +55,8 @@ class _FakeSmartApiWithOptions(_FakeSmartApi):
             "status": True,
             "data": {
                 "fetched": [
-                    {"symbolToken": "47337", "ltp": 212.5, "opnInterest": 120000, "totTrdQty": 34000},
-                    {"symbolToken": "47338", "ltp": 198.2, "opnInterest": 135000, "totTrdQty": 41000},
+                    {"symbolToken": "47337", "ltp": 212.5, "opnInterest": 120000, "tradeVolume": 34000},
+                    {"symbolToken": "47338", "ltp": 198.2, "opnInterest": 135000, "tradeVolume": 41000},
                 ]
             },
         }
@@ -79,7 +81,7 @@ class _BatchSmartApi(_FakeSmartApi):
                         "symbolToken": token,
                         "ltp": 100.0 + position,
                         "opnInterest": 1000 + position,
-                        "totTrdQty": 2000 + position,
+                        "tradeVolume": 2000 + position,
                     }
                     for position, token in enumerate(tokens)
                 ]
@@ -99,7 +101,9 @@ def test_angel_sensex_uses_full_bse_index_token(monkeypatch):
     assert quote["ltp"] == pytest.approx(75636.9)
     assert quote["source"] == "angel_rest"
     assert quote["volume_available"] is False
-    assert source._api.calls == [("BSE", "SENSEX", "99919000")]
+    assert len(source._api.calls) == 1
+    assert source._api.calls[0]["BSE"] == ["99919000"]
+    assert len(source._api.calls[0]["NSE"]) == 3
 
 
 def test_angel_connection_is_idempotent_and_option_tokens_are_independent(monkeypatch):
@@ -501,30 +505,24 @@ def _futures_provider():
 def test_futures_minute_ratio_has_contracts_only_baseline():
     provider = _futures_provider()
     base = 1_788_849_000.0
-    cumulative = 10_000.0
-    future = {"tradingsymbol": "NIFTY26SEPFUT", "volume": cumulative}
-    provider._record_index_futures_volume_snapshot("NIFTY", future, now_ts=base + 5)
+    future = {"tradingsymbol": "NIFTY26SEPFUT", "volume": 10_000.0}
     for minute in range(7):
-        cumulative += 100.0
-        future["volume"] = cumulative
-        provider._record_index_futures_volume_snapshot(
-            "NIFTY", future, now_ts=base + minute * 60 + 50
-        )
-        if minute < 6:
+        for second in (0,15,30,45):
+            future["volume"] = 10_000.0 + (minute*60+second)*100/60
             provider._record_index_futures_volume_snapshot(
-                "NIFTY", future, now_ts=base + (minute + 1) * 60 + 5
+                "NIFTY", future, now_ts=base + minute*60+second
             )
 
     context = provider.get_index_futures_minute_volume_context(
-        "NIFTY", now_ts=base + 6 * 60 + 50
+        "NIFTY", now_ts=base + 6 * 60 + 45
     )
 
-    assert context["unit"] == "contracts"
+    assert context["unit"] == "broker_reported_quantity"
     assert context["reliable"] is True
     assert context["completed_samples"] >= 5
     assert context["baseline_volume"] == pytest.approx(100.0)
-    assert context["ratio"] == pytest.approx(1.0)
-    assert context["projected_ratio"] == pytest.approx(1.2)
+    assert context["ratio"] == pytest.approx(0.75)
+    assert context["projected_ratio"] == pytest.approx(1.0)
 
 
 def test_contract_rollover_resets_futures_baseline():
@@ -611,7 +609,7 @@ def test_prediction_context_uses_tagged_intrabar_cash_volume_only_with_fresh_bas
 
 
 def test_live_scan_analysis_is_network_free_for_index_price():
-    source = inspect.getsource(Scanner._process_instrument)
+    source = inspect.getsource(EntryAnalysisService.process)
     assert "get_cached_index_quote_snapshot" in source
     assert "self.data.get_previous_close" not in source
 

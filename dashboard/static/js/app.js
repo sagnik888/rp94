@@ -51,6 +51,8 @@ const state = {
     resistanceWallSeries: null,
     signalSeries: null,
     chartResizeFrame: null,
+    chartDefaultVisibleRangeId: null,
+    chartSnapshotPendingId: null,
     logFilter: 'all',
     activityView: 'logs',
     fullLog: [],
@@ -414,7 +416,11 @@ async function connectWebSocket() {
                 utbot_consensus: 'UT1 + Consensus (union)',
                 quad_union: 'Quad Union (UT+EMA+ST+CONS)',
                 quad_prime: 'Quad Prime (all entries + confluence exits)',
+                quad_prime_s1: 'Quad Prime + S1',
+                ut_smart_s1: 'UT Smart Exit + S1',
                 adaptive_dual: 'Adaptive Dual (Adaptive Hybrid + APEX)',
+                s1: 'S1 Confluence (10-component score + 5 gates)',
+                ut_smart: 'UT Smart Exit (UT flips + smart peak exit)',
             };
             showToast(`Signal Engine: ${labels[mode] || mode}`, mode === 'utbot' ? 'info' : 'warning');
         });
@@ -1313,7 +1319,13 @@ function scannerEngineLabel(raw) {
         utbot_consensus: 'UT1 + Consensus',
         quad_union: 'Quad Union',
         quad_prime: 'Quad Prime',
+        quad_prime_s1: 'Quad Prime + S1',
+        ut_smart_s1: 'UT Smart Exit + S1',
         adaptive_dual: 'Adaptive Dual',
+        s1: 'S1 Confluence',
+        ut_smart: 'UT Smart Exit',
+        s1s2_dual: 'S1+S2 Dual (Pine v5.4)',
+        ut_ema: 'ut/ema',
     }[mode] || titleCaseToken(mode);
 }
 
@@ -1891,18 +1903,27 @@ function updateRegimeMoodPanel(intel, config) {
     setText('intelRegimeLabel', String(regime.conviction_label || regime.direction || '').toUpperCase() || '—');
 }
 
+function updateDivergenceAlert(intel) {
+    const alertEl = document.getElementById('manipulationAlert');
+    if (!alertEl) return;
+    const flow = (intel && intel.order_flow) || {};
+    const rawRatio = flow.ratio;
+    const ratio = Number(rawRatio);
+    const usable = flow.available !== false && String(flow.source || '').toLowerCase() !== 'unavailable'
+        && rawRatio !== null && rawRatio !== undefined && String(rawRatio).trim() !== ''
+        && Number.isFinite(ratio) && ratio >= 0;
+    const show = Boolean(intel && intel.divergence_alert === true && usable);
+    alertEl.textContent = 'PRESSURE DIVERGENCE';
+    alertEl.style.display = show ? 'block' : 'none';
+    alertEl.title = show
+        ? 'Price and estimated candle/depth pressure disagree. This heuristic does not establish market manipulation.'
+        : '';
+}
+
 function updateIntelPanel(inst, data) {
     if (!inst) return;
     const intel = _resolveInstrumentIntel(inst, data);
-
-    // ═══ Manipulation Detection UI ═══
-    const alertEl = document.getElementById('manipulationAlert');
-    if (alertEl) {
-        alertEl.style.display = intel.divergence_alert ? 'block' : 'none';
-        if (intel.divergence_alert) {
-            alertEl.title = "Order Flow contradicts Price Action — Potential Institutional Trap!";
-        }
-    }
+    updateDivergenceAlert(intel);
 
     const vol = intel.volume || {};
     const oi = intel.oi || {};
@@ -1923,7 +1944,7 @@ function updateIntelPanel(inst, data) {
     // Availability is opt-in.  An absent payload must never render as a real
     // zero because index spot candles commonly do not carry traded volume.
     const volAvailable = vol.available === true && String(vol.status || '').toUpperCase() !== 'UNAVAILABLE';
-    const volRatio = Number(rawVolRatio !== undefined && rawVolRatio !== null ? rawVolRatio : 1.0);
+    const volRatio = Number(rawVolRatio !== undefined && rawVolRatio !== null ? rawVolRatio : NaN);
     setText('intelVolRatio', volAvailable && Number.isFinite(volRatio) ? `${volRatio.toFixed(1)}x` : '--');
     const volSurge = titleCaseToken(vol.surge_level || 'NORMAL');
     const buyPct = Number(vol.buy_pct !== undefined ? vol.buy_pct : 50);
@@ -1943,14 +1964,33 @@ function updateIntelPanel(inst, data) {
         ? ` Profile ${profileSignal || profileState || 'neutral'}: POC ${formatPrice(profile.poc)}, VAH ${formatPrice(profile.vah)}, VAL ${formatPrice(profile.val)}.`
         : '';
     const volMetricName = vol.is_proxy ? 'Tick-activity proxy' : 'Volume';
-    setElementTitle('intelVolRatio', volAvailable ? `${volMetricName} ratio ${volRatio.toFixed(2)}x (${volBasis}). Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)}. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${profileSummary}` : `Volume unavailable: ${vol.reason || 'missing or zero OHLCV volume'}.`);
+    // Name the frame and the bar. A 5m bar is the sum of its five 1m bars, so the raw
+    // volume agrees across timeframes while the ratio cannot: each frame compares a bar
+    // against its own 20-bar history. Unlabelled, "0.7x" reads as a contradiction.
+    const volFrame = String(vol.timeframe || vol.measurement_timeframe || '').toLowerCase().replace('min', 'm');
+    const volBarStamp = String(vol.measurement_timestamp || '').slice(11, 16);
+    // Say so when a vendor outlier was kept out of the 20-bar mean, otherwise the
+    // average appears to move for no reason the operator can see.
+    const volClipped = Number(vol.baseline_outliers_clipped || 0);
+    const volClipNote = volClipped > 0
+        ? ` ${volClipped} outlier bar${volClipped > 1 ? 's' : ''} above ${compactNumber(vol.baseline_outlier_cap)} excluded from the average (vendor spike).`
+        : '';
+    const volFrameEl = document.getElementById('intelVolFrame');
+    if (volFrameEl) {
+        volFrameEl.textContent = volAvailable && volFrame
+            ? (volBarStamp ? `${volFrame} · bar ${volBarStamp}` : volFrame)
+            : '';
+    }
+    setElementTitle('intelVolRatio', volAvailable ? `${volMetricName} ratio ${volRatio.toFixed(2)}x (${volBasis}) on the ${volFrame || 'analysis'} frame${volBarStamp ? `, last complete bar ${volBarStamp}` : ''}. Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)} for that frame. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${volClipNote}${profileSummary}` : `Volume unavailable: ${vol.reason || 'missing or zero OHLCV volume'}.`);
     
     const volBar = document.getElementById('intelVolBar');
     if (volBar) {
-        volBar.style.width = Math.max(0, Math.min(100, buyPct)) + '%';
-        if (buyPct > 50.5) {
+        volBar.style.width = volAvailable && Number.isFinite(buyPct)
+            ? Math.max(0, Math.min(100, buyPct)) + '%'
+            : '0%';
+        if (volAvailable && buyPct > 50.5) {
             volBar.style.background = 'var(--gradient-bull)';
-        } else if (buyPct < 49.5) {
+        } else if (volAvailable && buyPct < 49.5) {
             volBar.style.background = 'var(--gradient-bear)';
         } else {
             volBar.style.background = 'var(--border)';
@@ -1958,8 +1998,10 @@ function updateIntelPanel(inst, data) {
     }
     
     const oiAvailable = oi.available === true && String(oi.status || '').toUpperCase() !== 'UNAVAILABLE';
-    const absOi = Number(oi.absolute_oi_change || 0);
-    const oiVal = oiAvailable ? (absOi > 0 ? compactNumber(absOi) : titleCaseToken(oi.activity || 'NO FRESH OI')) : '--';
+    const absOi = Number(oi.absolute_oi_change);
+    const oiVal = oiAvailable
+        ? (Number.isFinite(absOi) && absOi > 0 ? compactNumber(absOi) : titleCaseToken(oi.activity || 'NO FRESH OI'))
+        : '--';
     setText('intelOI', oiVal);
     const oiLabel = oiAvailable
         ? (oi.activity === 'NO_CONFIRMED_OI_CHANGE' ? 'NO FRESH OI' : (oi.signal || 'NEUTRAL'))
@@ -1970,7 +2012,7 @@ function updateIntelPanel(inst, data) {
     // PCR also requires an explicit authoritative-data acknowledgement.  Empty
     // objects and one-strike contract-lookup fallbacks are not PCR observations.
     const pcrAvailable = pcr.available === true && String(pcr.status || '').toUpperCase() !== 'UNAVAILABLE';
-    const primaryPcr = Number(pcr.primary_pcr || pcr.pcr_value || pcr.pcr_oi || 0);
+    const primaryPcr = Number(pcr.primary_pcr ?? pcr.pcr_value ?? pcr.pcr_oi);
     setText('intelPCR', pcrAvailable && Number.isFinite(primaryPcr) ? primaryPcr.toFixed(2) : '--');
     const pcrSignal = pcrAvailable ? normalizeToken(pcr.contrarian_signal || pcr.signal || pcr.sentiment || 'NEUTRAL') : 'OPTIONS DATA UNAVAILABLE';
     setHtml(document.getElementById('intelPCRLabel'), getSentimentBadge(pcrSignal));
@@ -1981,11 +2023,16 @@ function updateIntelPanel(inst, data) {
         updateRegimeMoodPanel(intel, data && data.config);
     } catch (e) { /* non-fatal */ }
 
-    const flowRatio = Number(flow.buy_sell_ratio || flow.ratio || 0);
-    setText('intelFlow', flowRatio ? `${flowRatio.toFixed(2)}x` : '--');
-    const flowConfirm = flow.multi_source_flow?.confirmation || flow.signal || 'NEUTRAL';
+    const flowAvailable = flow.available === true && String(flow.source || '').toLowerCase() !== 'unavailable';
+    const flowRatio = Number(flow.buy_sell_ratio ?? flow.ratio);
+    setText('intelFlow', flowAvailable && Number.isFinite(flowRatio) ? `${flowRatio.toFixed(2)}x` : '--');
+    const flowConfirm = flowAvailable
+        ? (flow.multi_source_flow?.confirmation || flow.signal || 'NEUTRAL')
+        : 'FLOW UNAVAILABLE';
     setHtml(document.getElementById('intelFlowLabel'), getSentimentBadge(flowConfirm));
-    setElementTitle('intelFlow', `Order-flow proxy ${flowRatio ? flowRatio.toFixed(2) : '--'}x from ${normalizeToken(flow.source || 'unknown')}; aggressor ${normalizeToken(flow.aggressor || 'none')}. CE/PE activity ${Number(flow.options_flow?.ce_pe_activity_ratio || 1).toFixed(2)}x.`);
+    setElementTitle('intelFlow', flowAvailable
+        ? `Order-flow proxy ${flowRatio.toFixed(2)}x from ${normalizeToken(flow.source || 'unknown')}; aggressor ${normalizeToken(flow.aggressor || 'none')}. CE/PE activity ${Number(flow.options_flow?.ce_pe_activity_ratio ?? 1).toFixed(2)}x.`
+        : `Order-flow unavailable: ${flow.reason || flow.limitation || 'insufficient measured volume or depth'}.`);
 
     const maxPain = intel.max_pain || {};
     setText('intelMaxPain', maxPain.strike ? Math.round(maxPain.strike).toLocaleString('en-IN') : '--');
@@ -2016,8 +2063,14 @@ function updateIntelPanel(inst, data) {
         ? ` WaveTrend ${normalizeToken(wavetrend.bias || 'neutral')} / ${normalizeToken(wavetrend.exhaustion || 'neutral')} (dashboard-only exhaustion).`
         : '';
     setElementTitle('intelBreadth', `RSI(14) on 5m closes. This replaces broad-market breadth because this system tracks four indices, not all stocks.${wtSummary}`);
-    setText('intelATR', tradeState.atr_exhaustion || '--');
-    setElementTitle('intelATR', 'Current 5m ATR in points, used as a volatility/exhaustion context marker.');
+    const atrValue = Number(tradeState.atr_value);
+    const atrFrame = String(tradeState.atr_timeframe || '5min').toLowerCase();
+    const atrAvailable = Number.isFinite(atrValue) && atrValue > 0;
+    setText('intelATR', atrAvailable ? `ATR ${atrValue.toFixed(2)} pts` : '--');
+    setText('intelATRLabel', atrAvailable ? `${atrFrame} volatility` : 'ATR unavailable');
+    setElementTitle('intelATR', atrAvailable
+        ? `ATR ${atrValue.toFixed(2)} points on ${atrFrame}. Source: ${normalizeToken(tradeState.atr_reason || 'scanner state')}.`
+        : `ATR unavailable: ${tradeState.atr_reason || 'missing 5m candle state'}.`);
 
     const greeks = intel.greeks || {};
     if (greeks.is_fallback) {
@@ -2196,10 +2249,12 @@ function setupEventListeners() {
                 state.latestData.config.ut_timeframe_entry_policy = policy;
             }
             const labels = {
+                PRIMARY_1: '1M',
                 PRIMARY_5: '5M',
                 PRIMARY_15: '15M',
                 INCLUDE_5MIN: '5M+15M',
                 INCLUDE_1MIN_5MIN: '1M+5M',
+                INCLUDE_1MIN_15MIN: '1M+15M',
                 INCLUDE_1MIN_5MIN_15MIN: '1M+5M+15M'
             };
             showToast(`TF Policy: ${labels[policy] || policy}`, 'info');
@@ -2514,14 +2569,18 @@ async function submitFyersCode(authCode) {
 
 function updateGatewayStatus(status) {
     status = status || {};
+    const replacement = status.market_data_replacement || {};
+    const candidateRoute = replacement.route === 'kite_angel';
+    const threeProviderRoute = replacement.route === 'angel_fyers';
+    const angelSupplementary = candidateRoute || threeProviderRoute;
     const kiteSessionKnown = Object.prototype.hasOwnProperty.call(status || {}, 'kite_session_live');
     const kiteOnline = kiteSessionKnown
         ? status.kite_session_live === true && status.kite_data_fresh !== false
         : status.kite === true;
     const angel = status.angelone_index_quotes || {};
-    const angelAge = Number(angel.last_success_age_seconds);
-    const angelOnline = angel.connected === true
-        && (!Number.isFinite(angelAge) || angelAge <= 15);
+    const angelAge = Number(angelSupplementary ? status.angelone_tick_age_seconds : angel.last_success_age_seconds);
+    const angelOnline = angelSupplementary ? status.angelone === true : (angel.connected === true
+        && (!Number.isFinite(angelAge) || angelAge <= 15));
     const angelStandby = angel.configured === true && !angelOnline;
     const gateways = {
         'gw_kite': kiteOnline,
@@ -2555,6 +2614,12 @@ function updateGatewayStatus(status) {
             : (angelStandby
                 ? 'AngelOne price-only index fallback configured and standing by. It authenticates only when Kite and Fyers price sources need fallback.'
                 : `AngelOne index fallback unavailable: ${angel.last_error || 'credentials not configured'}.`);
+        if (angelSupplementary) {
+            angelEl.title = `AngelOne supplementary feed ${angelOnline ? 'active' : 'unavailable'}; ${ageText}. `
+                + (threeProviderRoute
+                    ? 'Kite retains execution authority. FYERS remains backup, including cash-index volume.'
+                    : 'Kite retains execution authority. Two broker sources; feature parity pending validation.');
+        }
     }
     const kiteEl = document.getElementById('gw_kite');
     if (kiteEl) {
@@ -2566,6 +2631,7 @@ function updateGatewayStatus(status) {
     }
     const fyersEl = document.getElementById('gw_fyers');
     if (fyersEl) {
+        fyersEl.style.display = candidateRoute ? 'none' : '';
         const authRequired = !!status.fyers_auth_required;
         const refreshDisabled = !!status.fyers_refresh_disabled;
         fyersEl.classList.toggle('auth-required', authRequired || refreshDisabled || !status.fyers);
@@ -2573,6 +2639,9 @@ function updateGatewayStatus(status) {
             ? `Fyers login required: ${status.fyers_auth_reason || 'manual authorization needed'}. Click to reconnect.`
             : (refreshDisabled ? 'Fyers refresh requires manual login. Click to reconnect.' : 'Fyers Data Status. Click to refresh login.');
         fyersEl.onclick = startFyersAuthFlow;
+        if (threeProviderRoute && !authRequired && !refreshDisabled) {
+            fyersEl.title = 'FYERS backup for feed failures and capabilities requiring cash-index volume. Click to refresh login.';
+        }
         if (authRequired && !state.fyersAuthToastShown) {
             state.fyersAuthToastShown = true;
             showToast('Fyers login required. Click FYERS badge to reconnect.', 'warning');
@@ -2600,12 +2669,26 @@ function updateDiagnosticsPanel(diagnostics) {
     updateHardwarePanel(diagnostics.system_metrics || {});
     const isHistorical = (diagnostics.mode || state.latestData?.mode) === 'HISTORICAL';
 
+    const isWaitReason = reason => /signal waiting|partial candle deferred|deferred until candle close/i.test(String(reason || ''));
+    const legacyWaitingEntries = Object.entries(rejects).filter(([reason]) => isWaitReason(reason));
     const rejectEntries = Object.entries(rejects)
         .map(([reason, count]) => [String(reason || 'Unknown'), Number(count || 0)])
-        .filter(([, count]) => Number.isFinite(count) && count > 0)
+        .filter(([reason, count]) => Number.isFinite(count) && count > 0 && !isWaitReason(reason))
         .sort((a, b) => b[1] - a[1]);
     const topReject = rejectEntries[0];
-    const totalRejects = rejectEntries.reduce((sum, [, count]) => sum + count, 0);
+    const rejectSummary = diagnostics.reject_summary || {};
+    const hasSummaryCount = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+        && Number.isFinite(Number(value)) && Number(value) >= 0;
+    const hasFullRejectTotal = hasSummaryCount(rejectSummary.total);
+    const totalRejects = hasFullRejectTotal ? Math.max(0, Number(rejectSummary.total))
+        : rejectEntries.reduce((sum, [, count]) => sum + count, 0);
+    const rejectReasonCount = hasSummaryCount(rejectSummary.reason_count)
+        ? Math.max(0, Number(rejectSummary.reason_count)) : rejectEntries.length;
+    const waitingSummary = diagnostics.waiting_summary || {};
+    const hasFullWaitingTotal = hasSummaryCount(waitingSummary.total);
+    const waitingEntries = [...Object.entries(diagnostics.waiting || {}), ...legacyWaitingEntries];
+    const totalWaiting = hasFullWaitingTotal ? Math.max(0, Number(waitingSummary.total))
+        : waitingEntries.reduce((sum, [, count]) => sum + (Number.isFinite(Number(count)) ? Math.max(0, Number(count)) : 0), 0);
 
     // Sources: A:ON F:ON Y:ON
     const yahooState = sources.yahoo_mode === 'emergency_used' ? 'EMERG' : 'STBY';
@@ -2741,8 +2824,10 @@ function updateDiagnosticsPanel(diagnostics) {
         .join(' / ');
 
     setText('diagTopReject', topReject ? topReject[0] : '--');
-    setText('diagRejectTotal', totalRejects ? totalRejects.toLocaleString('en-IN') : '--');
-    setText('diagRejectDiversity', rejectEntries.length ? `${rejectEntries.length} reasons${windowLabel}` : '--');
+    setText('diagRejectTotalLabel', hasFullRejectTotal ? 'Total Blocks' : 'Shown Blocks');
+    setText('diagRejectTotal', totalRejects.toLocaleString('en-IN'));
+    setText('diagRejectDiversity', `${rejectReasonCount} reasons${windowLabel}`);
+    setText('diagWaitingTotal', `${totalWaiting.toLocaleString('en-IN')}${hasFullWaitingTotal ? '' : ' shown'} waits; not rejected`);
     setText(
         'diagRejectContext',
         topReject ? `${topReject[1].toLocaleString('en-IN')} blocks / ${topShare.toFixed(0)}% of rejects${windowLabel}` : 'No rejects in current window'

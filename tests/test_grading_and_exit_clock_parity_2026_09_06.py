@@ -6,6 +6,7 @@ import pytest
 
 import scanner as scanner_module
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 from scanner import Scanner
 
 
@@ -55,7 +56,7 @@ def test_trade_age_prefers_confirmed_fill_over_older_signal_clock():
 
 
 def test_historical_eod_grading_uses_point_in_time_inputs_and_own_timeframe():
-    source = inspect.getsource(SignalProcessor.process_best_signal)
+    source = signal_pipeline_source()
 
     assert "eod_vix = scanner._get_historical_vix(last_s.timestamp)" in source
     assert "eod_intel_score, eod_intel_regime" in source

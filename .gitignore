@@ -77,3 +77,9 @@ diff_names.txt
 # and the entry sat permanently modified in `git status`. The directory itself belongs to
 # that other repo's worktree and is deliberately left on disk; it is only untracked here.
 .claude/worktrees/
+
+# Test runtime, profiling, and XML test outputs
+.codex-test-runtime/
+*.xml
+*.prof
+reports/*/

@@ -55,6 +55,17 @@ def test_a_real_reading_is_marked_available():
     assert OrderFlowAnalyzer().analyze(df).get("available") is True
 
 
+def test_zero_volume_ohlcv_without_depth_is_not_order_flow():
+    df = pd.DataFrame(
+        {"open": [1.0] * 30, "high": [2.0] * 30, "low": [0.5] * 30,
+         "close": [1.5] * 30, "volume": [0.0] * 30},
+        index=pd.date_range("2026-08-05 09:15", periods=30, freq="1min"),
+    )
+    result = OrderFlowAnalyzer().analyze(df)
+    assert result.get("available") is False
+    assert result.get("source") == "unavailable"
+
+
 # ── the aggregator abstains ──────────────────────────────────────────────────
 
 def _aggregate(flow):

@@ -90,6 +90,36 @@ def _segment_readiness(train: list[dict], holdout: list[dict], minimum: int) -> 
     }
 
 
+def _performance_certification_gates(
+    baseline_hold: dict,
+    candidate_hold: dict,
+) -> dict[str, bool]:
+    """Require absolute profitability as well as improvement over the baseline."""
+    baseline_pf = baseline_hold.get("profit_factor")
+    candidate_pf = candidate_hold.get("profit_factor")
+    baseline_pf = float(baseline_pf) if baseline_pf is not None else float("inf")
+    candidate_pf = float(candidate_pf) if candidate_pf is not None else float("inf")
+    return {
+        "candidate_holdout_expectancy_better": (
+            float(candidate_hold.get("expectancy") or 0.0)
+            > float(baseline_hold.get("expectancy") or 0.0)
+        ),
+        "candidate_holdout_expectancy_positive": (
+            float(candidate_hold.get("expectancy") or 0.0) > 0.0
+        ),
+        "candidate_holdout_pf_not_worse": candidate_pf >= baseline_pf,
+        "candidate_holdout_profit_factor_above_one": candidate_pf > 1.0,
+        "candidate_holdout_drawdown_not_worse": (
+            float(candidate_hold.get("max_drawdown") or 0.0)
+            <= float(baseline_hold.get("max_drawdown") or 0.0)
+        ),
+        "candidate_tail_not_worse": (
+            float(candidate_hold.get("p10_trade") or 0.0)
+            >= float(baseline_hold.get("p10_trade") or 0.0)
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Chronological frozen exit-policy A/B gate")
     parser.add_argument("--minimum-sessions", type=int, default=60)
@@ -124,15 +154,10 @@ def main() -> int:
     fingerprint, frozen_settings = _settings_fingerprint()
     baseline_hold = _metrics(hold_trades, "baseline_net")
     candidate_hold = _metrics(hold_trades, "candidate_net")
-    baseline_pf = baseline_hold["profit_factor"] or float("inf")
-    candidate_pf = candidate_hold["profit_factor"] or float("inf")
     gates = {
         "session_count_60_to_90": args.minimum_sessions <= len(sessions) <= args.maximum_sessions,
         "chronological_holdout_at_least_20": len(hold_sessions) >= args.holdout_sessions,
-        "candidate_holdout_expectancy_better": candidate_hold["expectancy"] > baseline_hold["expectancy"],
-        "candidate_holdout_pf_not_worse": candidate_pf >= baseline_pf,
-        "candidate_holdout_drawdown_not_worse": candidate_hold["max_drawdown"] <= baseline_hold["max_drawdown"],
-        "candidate_tail_not_worse": candidate_hold["p10_trade"] >= baseline_hold["p10_trade"],
+        **_performance_certification_gates(baseline_hold, candidate_hold),
     }
     segment_status = _segment_readiness(
         train_trades, hold_trades, max(1, args.minimum_segment_samples)

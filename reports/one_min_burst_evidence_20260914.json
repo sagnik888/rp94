@@ -1,0 +1,30 @@
+{
+  "NIFTY": {
+    "raw_signals": 725,
+    "measurable": 716,
+    "confirmed_with_actual_adx_no_intel": 12,
+    "confirmed_with_max_intel": 23,
+    "unavailable_metrics": 9
+  },
+  "BANKNIFTY": {
+    "raw_signals": 721,
+    "measurable": 714,
+    "confirmed_with_actual_adx_no_intel": 6,
+    "confirmed_with_max_intel": 22,
+    "unavailable_metrics": 7
+  },
+  "SENSEX": {
+    "raw_signals": 824,
+    "unavailable_metrics": 8,
+    "measurable": 816,
+    "confirmed_with_actual_adx_no_intel": 4,
+    "confirmed_with_max_intel": 17
+  },
+  "MIDCPNIFTY": {
+    "raw_signals": 712,
+    "unavailable_metrics": 9,
+    "measurable": 703,
+    "confirmed_with_actual_adx_no_intel": 13,
+    "confirmed_with_max_intel": 24
+  }
+}

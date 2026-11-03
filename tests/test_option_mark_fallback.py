@@ -7,8 +7,9 @@ from config.settings import get_settings
 
 
 def _mark(trade, spot):
-    # _synthetic_option_mark is an instance method (uses self.expiry for theta).
-    stub = SimpleNamespace(expiry=SimpleNamespace(get_dte=lambda inst, d: 5))
+    # Include the mode-aware expiry adapter used by the actual Scanner.
+    stub = SimpleNamespace(mode="REAL", expiry=SimpleNamespace(get_dte=lambda inst, d: 5))
+    stub._days_to_expiry_for = Scanner._days_to_expiry_for.__get__(stub, Scanner)
     return Scanner._synthetic_option_mark.__get__(stub, Scanner)(trade, spot)
 
 
@@ -48,11 +49,13 @@ def test_synthetic_mark_theta_halved_when_in_profit():
 
 def _decision_scanner(quote_age):
     stub = SimpleNamespace(
+        mode="REAL",
         expiry=SimpleNamespace(get_dte=lambda inst, d: 5),
         candles=SimpleNamespace(get_latest_price=lambda _instrument: 24100.0),
         log_event=lambda *_args, **_kwargs: None,
     )
     stub._option_premium_quote_plausible = Scanner._option_premium_quote_plausible.__get__(stub, Scanner)
+    stub._days_to_expiry_for = Scanner._days_to_expiry_for.__get__(stub, Scanner)
     stub._sanitize_option_mark = Scanner._sanitize_option_mark.__get__(stub, Scanner)
     stub._synthetic_option_mark = Scanner._synthetic_option_mark.__get__(stub, Scanner)
     stub._active_option_decision_mark = Scanner._active_option_decision_mark.__get__(stub, Scanner)

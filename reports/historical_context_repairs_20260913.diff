@@ -1,0 +1,483 @@
+--- before/_breadth_regime_at
++++ after/_breadth_regime_at
+@@ -6,7 +6,7 @@
+         try:
+             bucket = pd.Timestamp(as_of).floor("5min")
+             if bucket.tz is not None:
+-                bucket = bucket.tz_localize(None)
++                bucket = bucket.tz_convert("Asia/Kolkata").tz_localize(None)
+         except Exception:
+             return "UNKNOWN"
+         cache = getattr(self, "_breadth_asof_cache", None)
+@@ -20,7 +20,7 @@
+         try:
+             frame = self.candles.get_candles(instrument, "5min")
+             if frame is not None and not frame.empty:
+-                sliced = frame[frame.index <= bucket]
++                sliced = self._finalized_candles_at(frame, "5min", bucket)
+                 if len(sliced) >= 30:
+                     detected = self._detect_regime_warmed(sliced.tail(240), instrument, "5min_breadth")
+                     regime = str(detected.get("regime") or "UNKNOWN").upper()
+--- before/_build_intelligence_contexts
++++ after/_build_intelligence_contexts
+@@ -27,15 +27,14 @@
+             except Exception:
+                 pass
+             if as_of is not None and context_frame is not None:
+-                cutoff = pd.Timestamp(as_of)
+-                frame_tz = context_frame.index.tz
+-                if cutoff.tzinfo is not None:
+-                    cutoff = cutoff.tz_convert(frame_tz or "Asia/Kolkata")
+-                    if frame_tz is None:
+-                        cutoff = cutoff.tz_localize(None)
+-                elif frame_tz is not None:
+-                    cutoff = cutoff.tz_localize("Asia/Kolkata").tz_convert(frame_tz)
+-                context_frame = context_frame.loc[context_frame.index <= cutoff]
++                context_frame = self._finalized_candles_at(context_frame, "5min", as_of)
++                session_clock = pd.Timestamp(as_of)
++                if session_clock.tzinfo is not None:
++                    session_clock = session_clock.tz_convert("Asia/Kolkata")
++                if not context_frame.empty and context_frame.index[-1].date() < session_clock.date():
++                    # Before the first completed session candle, yesterday's
++                    # range/day type is not the current session's context.
++                    context_frame = context_frame.iloc[:0]
+             session_ctx = analyzer.analyze(
+                 context_frame,
+                 instrument=instrument,
+--- before/_compute_historical_confluence_at
++++ after/_compute_historical_confluence_at
+@@ -10,10 +10,8 @@
+         tf_weights = getattr(self.mtf, "tf_weights", {"1min": 0.15, "5min": 0.40, "15min": 0.45})
+ 
+         def _naive(t):
+-            try:
+-                return t.replace(tzinfo=None) if getattr(t, "tzinfo", None) else t
+-            except Exception:
+-                return t
++            stamp = pd.Timestamp(t)
++            return stamp.tz_convert("Asia/Kolkata").tz_localize(None) if stamp.tzinfo else stamp
+ 
+         naive_ts = _naive(ts)
+         cache_key = (
+@@ -51,7 +49,7 @@
+             if timeline is None:
+                 pairs = []
+                 for signal in sigs:
+-                    signal_ts = _naive(signal.timestamp)
++                    signal_ts = _naive(signal.timestamp) + pd.Timedelta(minutes={"1min": 1, "5min": 5, "15min": 15}[tf])
+                     pos = 1 if signal.signal_type == "BUY" else (-1 if signal.signal_type == "SELL" else 0)
+                     pairs.append((signal_ts, pos))
+                 pairs.sort(key=lambda item: item[0])
+--- before/_compute_historical_intel_at
++++ after/_compute_historical_intel_at
+@@ -1,9 +1,11 @@
+ def _compute_historical_intel_at(self, instrument: str, ts, tf: str = "5min"):
+         """Recompute intelligence score and regime at a historical timestamp.
+ 
+-        Slices cached candles to ``ts`` and runs the same
+-        ``IntelligenceAggregator.analyze`` used by the live path with
+-        ``options_chain=None``. Returns ``(intel_score in [-1,1], regime_str)``.
++        Includes only candles closed by ``ts`` (a decision availability time)
++        and runs the same
++        ``IntelligenceAggregator.analyze`` used by the live path. Only recorded
++        as-of chains are eligible; absent history stays unavailable. Returns
++        ``(intel_score in [-1,1], regime_str)``.
+         On any failure returns ``(0.0, 'UNKNOWN')``.
+         """
+         try:
+@@ -26,14 +28,6 @@
+         if cache_key in cache:
+             return cache[cache_key]
+ 
+-        def _slice_to(frame, cutoff):
+-            try:
+-                if getattr(frame.index, "is_monotonic_increasing", False):
+-                    return frame.loc[:cutoff]
+-            except Exception:
+-                pass
+-            return frame[frame.index <= cutoff]
+-
+         try:
+             df_5m = self.candles.get_candles(instrument, "5min")
+             df_1m = self.candles.get_candles(instrument, "1min")
+@@ -47,11 +41,11 @@
+             if df_5m is None or df_5m.empty or df_tf is None or df_tf.empty:
+                 cache[cache_key] = (0.0, "UNKNOWN")
+                 return 0.0, "UNKNOWN"
+-            sub_5m = _slice_to(df_5m, ts)
+-            sub_tf = _slice_to(df_tf, ts)
++            sub_5m = self._finalized_candles_at(df_5m, "5min", ts)
++            sub_tf = self._finalized_candles_at(df_tf, tf_key, ts)
+             sub_1m = None
+             if df_1m is not None and not df_1m.empty:
+-                sub_1m = _slice_to(df_1m, ts)
++                sub_1m = self._finalized_candles_at(df_1m, "1min", ts)
+                 if sub_1m.empty:
+                     sub_1m = None
+             if sub_5m.empty or sub_tf.empty:
+@@ -68,6 +62,32 @@
+                 pct = ((spot - previous_close) / previous_close) * 100.0
+             hist_vix = self._get_historical_vix(ts)
+             hist_vix_percentile = self._vix_percentile(hist_vix, ts)
++            hist_vix_context = self._historical_vix_context(ts)
++            as_of_ist = pd.Timestamp(ts)
++            as_of_ist = (as_of_ist.tz_localize("Asia/Kolkata") if as_of_ist.tzinfo is None
++                         else as_of_ist.tz_convert("Asia/Kolkata"))
++            historical_chain = None
++            historical_chain_quality = {
++                "intelligence_usable": False, "source": "recorded_unavailable",
++                "reason": "No recorded historical option-chain reader",
++            }
++            chain_reader = getattr(getattr(self, "data", None), "get_recorded_option_chain", None)
++            if callable(chain_reader):
++                try:
++                    # The archive owns the expiry selected at the original
++                    # observation time. Today's contract master cannot resolve
++                    # the appropriate expired historical chain.
++                    recorded_chain, recorded_quality = chain_reader(instrument, as_of_ist.timestamp())
++                    historical_chain_quality = dict(recorded_quality or {})
++                    if recorded_chain is not None and not recorded_chain.empty:
++                        observed_at = float(historical_chain_quality.get("recorded_at") or 0.0)
++                        if 0 <= as_of_ist.timestamp() - observed_at <= 120:
++                            historical_chain = recorded_chain
++                        else:
++                            historical_chain_quality.update(intelligence_usable=False,
++                                reason="Recorded option-chain timestamp is not valid at decision time")
++                except Exception as exc:
++                    historical_chain_quality.update(reason=f"Historical chain read failed: {type(exc).__name__}")
+             contexts = self._build_intelligence_contexts(
+                 instrument,
+                 sub_5m,
+@@ -89,25 +109,76 @@
+             )
+             if len(day_cache) > 8192:
+                 day_cache.clear()
+-            intel_res = self.intel.analyze(
++            replay_intel = self.intel
++            if isinstance(replay_intel, IntelligenceAggregator):
++                # Replay visits instruments/timeframes out of chronological
++                # order. Live detector/PCR histories may already contain later
++                # observations, so never borrow their smoothing state.
++                replay_intel = copy.copy(self.intel)
++                replay_intel.regime = RegimeDetector()
++                replay_intel.pcr = type(self.intel.pcr)()
++                replay_intel.oi = type(self.intel.oi)()
++                window = int(getattr(get_settings(), "regime_smoothing_window", 5) or 5)
++                steps = max(1, min(window, len(sub_tf) - 29))
++                for offset in range(steps - 1, 0, -1):
++                    replay_intel.regime.detect(sub_tf.iloc[:-offset], instrument, tf_key)
++            intel_res = replay_intel.analyze(
+                 instrument=instrument,
+                 timeframe=tf_key,
+                 candle_df=sub_tf,
+                 candle_1min_df=sub_1m,
+-                options_chain=None,
++                options_chain=historical_chain,
+                 spot_price=spot,
+                 strike_interval=50,
+                 days_to_expiry=self._days_to_expiry_for(instrument, ts),
+                 price_change_pct=pct,
+-                chain_quality=None,
+-                volatility_value=hist_vix,
++                chain_quality=historical_chain_quality,
++                volatility_value=hist_vix if hist_vix > 0 else None,
+                 volatility_percentile=hist_vix_percentile,
+-                volatility_source="india_vix_daily_percentile" if hist_vix_percentile is not None else "india_vix_insufficient_history",
++                volatility_source=str(hist_vix_context.get("source") or "india_vix_unavailable"),
+                 session_context=contexts.get("session_context"),
+                 anchor_regime=contexts.get("anchor_regime"),
+                 breadth_context=contexts.get("breadth_context"),
+             )
+             agg = intel_res.get("aggregate", {}) if isinstance(intel_res, dict) else {}
++            quality_cache = getattr(self, "_historical_intel_data_quality_cache", None)
++            if not isinstance(quality_cache, dict):
++                self._historical_intel_data_quality_cache = {}
++                quality_cache = self._historical_intel_data_quality_cache
++            derivative_context = intel_res.get("derivative_participation", {}) if isinstance(intel_res, dict) else {}
++            availability = {
++                "as_of": as_of_ist.isoformat(),
++                "option_chain_available": bool(historical_chain is not None
++                    and historical_chain_quality.get("intelligence_usable") is True),
++                "option_chain_quality": historical_chain_quality,
++                "volatility": hist_vix_context,
++                "futures_participation_available": any(row.get("entry_eligible") is True
++                    for row in derivative_context.get("futures", [])),
++                "options_participation_available": any(row.get("entry_eligible") is True
++                    for row in derivative_context.get("options", [])),
++            }
++            if len(quality_cache) > 8192:
++                quality_cache.clear()
++            quality_cache[cache_key] = availability
++            coverage = getattr(self, "_historical_intel_coverage", None)
++            if not isinstance(coverage, dict) or coverage.get("simulation_id") != cache_key[0]:
++                coverage = {"simulation_id": cache_key[0], "by_index_timeframe": {}}
++                self._historical_intel_coverage = coverage
++            tally = coverage["by_index_timeframe"].setdefault(f"{instrument}_{tf_key}", {
++                "evaluations": 0, "option_chain_available": 0, "vix_available": 0,
++                "futures_participation_available": 0, "options_participation_available": 0,
++            })
++            tally["evaluations"] += 1
++            for name in ("option_chain_available", "futures_participation_available", "options_participation_available"):
++                tally[name] += int(availability[name])
++            tally["vix_available"] += int(hist_vix_context.get("available") is True)
++            full_cache = getattr(self, "_historical_intel_result_at_cache", None)
++            if not isinstance(full_cache, dict):
++                self._historical_intel_result_at_cache = {}
++                full_cache = self._historical_intel_result_at_cache
++            if len(full_cache) >= 8192 and cache_key not in full_cache:
++                full_cache.pop(next(iter(full_cache)))
++            full_cache[cache_key] = {**intel_res, "historical_data_availability": availability}
+             intel_score = aggregate_intelligence_score(agg)
+             regime = (intel_res.get("regime", {}) or {}).get("regime", "UNKNOWN")
+             result = (intel_score, regime)
+--- before/_finalized_candles_at
++++ after/_finalized_candles_at
+@@ -0,0 +1,14 @@
++def _finalized_candles_at(frame: pd.DataFrame, timeframe: str, as_of: Any) -> pd.DataFrame:
++        """Return only opening-labelled candles whose closes are known at as_of."""
++        if frame is None or frame.empty:
++            return frame
++        cutoff = pd.Timestamp(as_of)
++        frame_tz = frame.index.tz
++        if cutoff.tzinfo is not None:
++            cutoff = cutoff.tz_convert(frame_tz or "Asia/Kolkata")
++            if frame_tz is None:
++                cutoff = cutoff.tz_localize(None)
++        elif frame_tz is not None:
++            cutoff = cutoff.tz_localize("Asia/Kolkata").tz_convert(frame_tz)
++        minutes = {"1min": 1, "5min": 5, "15min": 15, "60min": 60}[str(timeframe)]
++        return frame.loc[frame.index + pd.Timedelta(minutes=minutes) <= cutoff]--- before/_get_historical_intel_context_at
++++ after/_get_historical_intel_context_at
+@@ -0,0 +1,15 @@
++def _get_historical_intel_context_at(self, instrument: str, ts, tf: str = "5min") -> Dict[str, Any]:
++        """Full as-of intelligence for replay entries and trade management."""
++        tf_key = str(tf or "5min").lower()
++        if tf_key not in {"1min", "5min", "15min"}:
++            tf_key = "5min"
++        key = (int(getattr(self, "simulation_id", 0) or 0), str(instrument or "").upper(),
++               tf_key, ts.isoformat() if hasattr(ts, "isoformat") else str(ts))
++        full_cache = getattr(self, "_historical_intel_result_at_cache", {}) or {}
++        if key not in full_cache:
++            # A compact score may outlive an evicted full context; recompute it
++            # from the same as-of data rather than borrowing live intelligence.
++            (getattr(self, "_historical_intel_at_cache", {}) or {}).pop(key, None)
++            self._compute_historical_intel_at(instrument, ts, tf_key)
++            full_cache = getattr(self, "_historical_intel_result_at_cache", {}) or {}
++        return dict(full_cache.get(key) or {})--- before/_get_historical_vix
++++ after/_get_historical_vix
+@@ -1,58 +1,7 @@
+ def _get_historical_vix(self, ts) -> float:
+-        """Resolve VIX at a historical timestamp.
++        """Return an observed historical VIX value, or 0 for unavailable data.
+ 
+-        1) Exact minute key '%Y-%m-%d %H:%M:00' (matches vix_history.json)
+-        2) Latest minute on same date <= ts; else earliest of that date
+-        3) Fallback 15.0
++        Missing data must not masquerade as a measured neutral reading of 15.
++        The grading consumer treats the unavailable zero as an abstention.
+         """
+-        if not isinstance(self._vix_data, dict) or not self._vix_data:
+-            return 15.0
+-        try:
+-            minute_key = ts.strftime("%Y-%m-%d %H:%M:00")
+-        except Exception:
+-            return 15.0
+-        cache = getattr(self, "_historical_vix_cache", None)
+-        if not isinstance(cache, dict):
+-            self._historical_vix_cache = {}
+-            cache = self._historical_vix_cache
+-        if minute_key in cache:
+-            return float(cache[minute_key])
+-        v = self._vix_data.get(minute_key)
+-        if v is not None:
+-            try:
+-                vf = float(v)
+-                if vf > 0:
+-                    cache[minute_key] = vf
+-                    return vf
+-            except Exception:
+-                pass
+-        date_prefix = ts.strftime("%Y-%m-%d ")
+-        try:
+-            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+-            day_cache = getattr(self, "_historical_vix_day_cache", None)
+-            if not isinstance(day_cache, dict):
+-                self._historical_vix_day_cache = {}
+-                day_cache = self._historical_vix_day_cache
+-            same_day = day_cache.get(date_prefix)
+-            if same_day is None:
+-                same_day = [
+-                    (k, val)
+-                    for k, val in self._vix_data.items()
+-                    if isinstance(k, str) and k.startswith(date_prefix)
+-                ]
+-                same_day.sort(key=lambda item: item[0])
+-                day_cache[date_prefix] = same_day
+-            if same_day:
+-                before = [(k, val) for k, val in same_day if k <= ts_str]
+-                if before:
+-                    _, val = before[-1]
+-                else:
+-                    _, val = same_day[0]
+-                vf = float(val)
+-                if vf > 0:
+-                    cache[minute_key] = vf
+-                    return vf
+-        except Exception:
+-            pass
+-        cache[minute_key] = 15.0
+-        return 15.0+        return float(self._historical_vix_context(ts).get("value") or 0.0)--- before/_historical_15m_trend_agrees
++++ after/_historical_15m_trend_agrees
+@@ -4,11 +4,15 @@
+         signals = result.get("signals", []) or []
+         if not signals:
+             return False
+-        naive_ts = ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) else ts
++        naive_ts = pd.Timestamp(ts)
++        if naive_ts.tzinfo is not None:
++            naive_ts = naive_ts.tz_convert("Asia/Kolkata").tz_localize(None)
+         prior = []
+         for signal in signals:
+-            signal_ts = signal.timestamp.replace(tzinfo=None) if getattr(signal.timestamp, "tzinfo", None) else signal.timestamp
+-            if signal_ts <= naive_ts:
++            signal_ts = pd.Timestamp(signal.timestamp)
++            if signal_ts.tzinfo is not None:
++                signal_ts = signal_ts.tz_convert("Asia/Kolkata").tz_localize(None)
++            if signal_ts + pd.Timedelta(minutes=15) <= naive_ts:
+                 prior.append(signal)
+         if not prior:
+             return False
+--- before/_historical_vix_context
++++ after/_historical_vix_context
+@@ -0,0 +1,60 @@
++def _historical_vix_context(self, ts) -> Dict[str, Any]:
++        """Resolve same-session VIX without future quotes or midnight close leaks."""
++        empty = {"value": None, "available": False, "source": "india_vix_unavailable",
++                 "observed_at": None, "available_at": None}
++        data = getattr(self, "_vix_data", None)
++        if not isinstance(data, dict) or not data:
++            return {**empty, "reason": "NO_VIX_HISTORY"}
++        try:
++            cutoff = pd.Timestamp(ts)
++            if cutoff.tzinfo is not None:
++                cutoff = cutoff.tz_convert("Asia/Kolkata").tz_localize(None)
++            session_key = cutoff.date().isoformat()
++            day_cache = getattr(self, "_historical_vix_day_cache", None)
++            if not isinstance(day_cache, dict):
++                self._historical_vix_day_cache = {}
++                day_cache = self._historical_vix_day_cache
++            # Histories are fixed during replay. Rebuild when a live append or
++            # replacement changes the snapshot; do not retain a cached miss.
++            key = (int(getattr(self, "simulation_id", 0) or 0), id(data), len(data), session_key)
++            observations = day_cache.get(key)
++            if observations is None:
++                observations = []
++                for raw_ts, raw_value in data.items():
++                    try:
++                        observed = pd.Timestamp(raw_ts)
++                        if observed.tzinfo is not None:
++                            observed = observed.tz_convert("Asia/Kolkata").tz_localize(None)
++                        if observed.date() != cutoff.date():
++                            continue
++                        value = float(raw_value)
++                        if not 0 < value < float("inf"):
++                            continue
++                        daily_close = observed == observed.normalize()
++                        # Imported daily bars contain the session close despite
++                        # their midnight key. Minute keys may contain a quote
++                        # received anywhere in that minute.
++                        available = (observed + pd.Timedelta(hours=15, minutes=30)
++                                     if daily_close else observed.floor("min") + pd.Timedelta(minutes=1))
++                        observations.append((available, observed, value, daily_close))
++                    except (TypeError, ValueError, OverflowError):
++                        continue
++                observations.sort(key=lambda row: (row[0], row[1]))
++                if len(day_cache) > 256:
++                    day_cache.clear()
++                day_cache[key] = observations
++            before = [row for row in observations if row[0] <= cutoff]
++            if not before:
++                return {**empty, "reason": "NO_OBSERVATION_AVAILABLE_AS_OF", "as_of": cutoff.isoformat()}
++            available, observed, value, daily_close = before[-1]
++            # A disconnected intraday quote is not an up-to-date VIX reading.
++            # Daily closing rows remain usable only after their session closes.
++            if not daily_close and (cutoff - available).total_seconds() > 300:
++                return {**empty, "reason": "STALE_INTRADAY_VIX", "as_of": cutoff.isoformat(),
++                        "observed_at": observed.isoformat(), "available_at": available.isoformat()}
++            return {"value": value, "available": True,
++                    "source": "india_vix_daily_close" if daily_close else "india_vix_intraday",
++                    "observed_at": observed.isoformat(), "available_at": available.isoformat(),
++                    "as_of": cutoff.isoformat()}
++        except (TypeError, ValueError, OverflowError):
++            return {**empty, "reason": "INVALID_AS_OF"}--- before/_hourly_anchor_regime
++++ after/_hourly_anchor_regime
+@@ -13,10 +13,7 @@
+                 return {}
+             work = frame.copy().sort_index()
+             if as_of is not None:
+-                try:
+-                    work = work[work.index <= as_of]
+-                except Exception:
+-                    pass
++                work = self._finalized_candles_at(work, "5min", as_of)
+             if len(work) < 60:
+                 return {
+                     "regime": "UNKNOWN",
+@@ -28,8 +25,14 @@
+             agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+             if "volume" in work.columns:
+                 agg["volume"] = "sum"
+-            hourly = work.resample("60min", origin="start_day", label="right", closed="right").agg(agg)
++            # Source labels mark the start of each 5m candle. Align hourly
++            # windows to the 09:15 exchange open and publish only closed hours.
++            hourly = work.resample("60min", origin="start_day", offset="15min", label="left", closed="left").agg(agg)
+             hourly = hourly.dropna(subset=["open", "high", "low", "close"])
++            source_counts = work["close"].resample("60min", origin="start_day", offset="15min", label="left", closed="left").count()
++            hourly = hourly.loc[source_counts.reindex(hourly.index).eq(12)]
++            if as_of is not None:
++                hourly = self._finalized_candles_at(hourly, "60min", as_of)
+             if "volume" not in hourly.columns:
+                 hourly["volume"] = 0.0
+             if len(hourly) < 30:
+--- before/_vix_open_for_session
++++ after/_vix_open_for_session
+@@ -11,8 +11,13 @@
+             if cache is None:
+                 self._vix_session_open_cache = {}
+                 cache = self._vix_session_open_cache
+-            if session_key in cache:
++            # Only the live session may reuse this date-only cache. A replay can
++            # visit an earlier clock after a later one on the same session.
++            if as_of is None and session_key in cache:
+                 return cache[session_key]
++            cutoff = pd.Timestamp(as_of) if as_of is not None else None
++            if cutoff is not None and cutoff.tzinfo is not None:
++                cutoff = cutoff.tz_convert("Asia/Kolkata").tz_localize(None)
+             candidates = []
+             for key, value in (getattr(self, "_vix_data", {}) or {}).items():
+                 try:
+@@ -21,6 +26,13 @@
+                         continue
+                     hhmm = text[11:16] if len(text) >= 16 else ""
+                     if hhmm and hhmm < "09:00":
++                        continue
++                    observed_at = pd.Timestamp(text)
++                    if observed_at.tzinfo is not None:
++                        observed_at = observed_at.tz_convert("Asia/Kolkata").tz_localize(None)
++                    # Minute-keyed persisted quotes are known by the end of
++                    # that minute; daily midnight rows are not session opens.
++                    if cutoff is not None and observed_at + pd.Timedelta(minutes=1) > cutoff:
+                         continue
+                     parsed = float(value or 0.0)
+                     if parsed > 0:
+@@ -32,7 +44,8 @@
+                 # this early in the session; retry on the next call.
+                 return None
+             candidates.sort(key=lambda item: item[0])
+-            cache[session_key] = candidates[0][1]
+-            return cache[session_key]
++            if as_of is None:
++                cache[session_key] = candidates[0][1]
++            return candidates[0][1]
+         except Exception:
+             return None

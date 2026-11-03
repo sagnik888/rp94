@@ -1,0 +1,68 @@
+{
+  "mode": "HISTORICAL",
+  "scanner_running": null,
+  "scan_count": 174,
+  "is_calculating": false,
+  "simulation_id": 1790823361866,
+  "analysis_skip_reason": "inputs unchanged",
+  "runtime_build": {
+    "fingerprint": "1c371a42bbeddf7f79f5250c128ba165bf9249424c16463c229d2238231f60fc",
+    "pid": 16596,
+    "captured_at": "2026-10-01T02:53:08.182724+00:00",
+    "basis": "source_snapshot_at_scanner_import",
+    "source_files_changed_since_import": [
+      "scanner.py",
+      "engine/signal_processor.py",
+      "engine/uts_lane.py",
+      "engine/trade_row_adapter.py"
+    ],
+    "reload_required": true
+  },
+  "performance": {
+    "index_processing_ms": {
+      "NIFTY": 165,
+      "BANKNIFTY": 125,
+      "SENSEX": 156,
+      "MIDCPNIFTY": 191
+    },
+    "option_history": {
+      "attempts": 0,
+      "hits": 0,
+      "misses": 2,
+      "synthetic": 0,
+      "fallback_to_fut": 0,
+      "archived_hits": 49
+    },
+    "latency": {
+      "last_ms": 645,
+      "high_latency_events": 1,
+      "last_cycle_ms": 1055,
+      "scan_count": 182
+    },
+    "system_performance": {
+      "status": "CRITICAL",
+      "issues": [
+        {
+          "key": "ram_pressure",
+          "label": "System RAM pressure",
+          "severity": "critical",
+          "value": 94.0
+        }
+      ],
+      "latency_ms": 645.0,
+      "scan_count": 182,
+      "scanner_stale": false,
+      "recalculation_status": "idle",
+      "sampled_at": "2026-10-01T08:30:06.944422+05:30"
+    }
+  },
+  "recalculation_timing": {
+    "status": "idle",
+    "started_at": "2026-10-01T08:23:11.409636+05:30",
+    "worker_duration_seconds": 0.056,
+    "duration_seconds": 226.39,
+    "total_duration_seconds": 226.39,
+    "scan_duration_seconds": 55.93,
+    "scan_wait_duration_seconds": 170.4
+  }
+}

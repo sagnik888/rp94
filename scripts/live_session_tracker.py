@@ -1308,6 +1308,15 @@ class Tracker:
                 and not restored_signal_rows
             )
         )
+        if not skip_session_stats_compare and mode == "REAL":
+            # Rejected submissions remain visible for audit, but never entered
+            # the market and are excluded from diagnostics.session_stats.
+            rejected = sum(str(row.get("execution_status", "")).upper() == "REJECTED"
+                           for row in visible_rows)
+            rejected_closed = sum(str(row.get("execution_status", "")).upper() == "REJECTED"
+                                  for row in closed_rows)
+            comparison_rows_total = max(0, comparison_rows_total - rejected)
+            comparison_closed_total = max(0, comparison_closed_total - rejected_closed)
         if not building_source:
             if not skip_session_stats_compare and diag_entries is not None and diag_entries != comparison_rows_total:
                 mismatches.append(f"diagnostics.entries={diag_entries} vs session_rows={comparison_rows_total}")

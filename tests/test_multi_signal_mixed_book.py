@@ -18,6 +18,14 @@ from config.settings import Settings, get_settings
 from engine.signal_processor import TradeCandidate, SignalProcessor
 
 
+@pytest.fixture(autouse=True)
+def _native_scanner_mode(monkeypatch):
+    """These cases cover native mixed-book policy, regardless of the live mode."""
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
+    # Fixed-lot multiplier semantics; equal-risk sizing is covered in test_payoff_fixes_2026_10_08.
+    monkeypatch.setattr(get_settings(), "risk_based_lots_enabled", False)
+
+
 def _cand(
     instrument,
     direction="LONG",
@@ -144,13 +152,13 @@ def test_invalid_option_risk_geometry_is_rebuilt_under_configured_cap():
     sc = _scanner()
     candidate = _cand("NIFTY", inst_type="OPT", conf=0.70)
     candidate.quote_verified = True
-    candidate.initial_stop = candidate.stop = 80.0  # 20% risk exceeds the 15% cap
+    candidate.initial_stop = candidate.stop = 80.0  # 20% risk exceeds the 10% ordinary cap
     candidate.target = 120.0
 
     assert sc._force_candidate_to_options(candidate) is True
-    assert candidate.stop == pytest.approx(85.0)
-    assert candidate.initial_stop == pytest.approx(85.0)
-    assert candidate.target == pytest.approx(122.5)
+    assert candidate.stop == pytest.approx(90.0)
+    assert candidate.initial_stop == pytest.approx(90.0)
+    assert candidate.target == pytest.approx(115.0)
     assert candidate.risk_geometry_source == "option_cap_rebuilt"
 
 
@@ -548,7 +556,8 @@ def test_cascade_concurrency_allows_cross_tf_same_book():
     assert sc._prepare_candidate_for_concurrency(cand) is True
 
 
-def test_heavy_trend_eligible_when_two_indices_align():
+def test_heavy_trend_eligible_when_three_indices_align():
+    """2026-09-26 user: 3 of 4 indices (was 2 of 4)."""
     sc = _scanner()
     sc._cached_results = {
         "BANKNIFTY_15min": {
@@ -556,7 +565,10 @@ def test_heavy_trend_eligible_when_two_indices_align():
         }
     }
     sc.trades.open_trades = {}
-    # NIFTY firing LONG + BANKNIFTY cached BUY → 2 aligned
+    # NIFTY firing LONG + BANKNIFTY cached BUY → only 2 aligned
+    assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is False
+    sc._cached_results["SENSEX_15min"] = {"signals": [SimpleNamespace(signal_type="BUY", price=1.0)]}
+    # + SENSEX → 3 aligned
     assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is True
     # Only self with no peers → not enough
     sc._cached_results = {}

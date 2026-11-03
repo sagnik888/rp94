@@ -1,0 +1,211 @@
+{
+  "method": "Production AST methods with isolated collaborators; defects asserted, no broker calls or P&L claim",
+  "results": {
+    "saved_entry_context_wins": {
+      "entry_score": 0.8,
+      "live_score": -0.8,
+      "resolved_score": 0.8,
+      "live_cache_reads": 0,
+      "oi_present": false
+    },
+    "saved_vector_wins": {
+      "trend_up_prob": 0.9
+    },
+    "choppy_lock_volume_lookup": {
+      "actual_sibling_volume": [
+        1000.0,
+        "base"
+      ],
+      "wrongly_nested_volume": [
+        750.0,
+        "weak volume 0.40x"
+      ],
+      "saved_positive_entry_ratio": [
+        1000.0,
+        "base"
+      ]
+    },
+    "unavailable_flow_still_votes": [
+      1,
+      "sell-heavy flow 0.20"
+    ],
+    "buy_sell_imbalance_read_as_weak_participation": {
+      "first": [
+        false,
+        "",
+        "peak threat score 1<5; retained 100%; no price evidence in this isolated probe; weak volume 0.40x"
+      ],
+      "second": [
+        false,
+        "",
+        "peak threat score 1<5; retained 100%; no price evidence in this isolated probe; weak volume 0.40x"
+      ]
+    },
+    "saved_entry_ratio_masks_current_weak_volume": {
+      "without_entry_ratio": {
+        "first": [
+          false,
+          "",
+          "peak threat score 1<5; retained 100%; no price evidence in this isolated probe; weak volume 0.40x"
+        ],
+        "second": [
+          false,
+          "",
+          "peak threat score 1<5; retained 100%; no price evidence in this isolated probe; weak volume 0.40x"
+        ]
+      },
+      "with_entry_ratio": {
+        "first": [
+          false,
+          "",
+          "peak threat score 0<5; retained 100%; no price evidence in this isolated probe"
+        ],
+        "second": [
+          false,
+          "",
+          "peak threat score 0<5; retained 100%; no price evidence in this isolated probe"
+        ]
+      }
+    },
+    "unavailable_pillars_can_confirm_peak_exit": {
+      "first": [
+        false,
+        "",
+        "near-peak threat confirmation 1/2 (0.0/5.0s); score 6>=5; retained 100%"
+      ],
+      "second": [
+        true,
+        "PEAK_THREAT_EXIT",
+        "near-peak threat score 6>=5; retained 100% of peak Rs.1000, current Rs.1000; no price evidence in this isolated probe; adverse intel -0.80; aggregate SELL opposes LONG; OI BEARISH opposes LONG"
+      ]
+    },
+    "quality_ignores_measured_context_volume": {
+      "allowed": false,
+      "route": "bplus_setup",
+      "reason_code": "BPLUS_SETUP_INSUFFICIENT",
+      "reason": "B+ is eligible but needs ADX >= 22 and 1 contemporaneous confirmation(s)",
+      "checks": {
+        "required_adx": 22.0,
+        "required_confirmations": 1,
+        "lane": "LIVE",
+        "timeframe": "15min",
+        "inst_type": "OPT",
+        "regime": "TRENDING_UP",
+        "confidence": 0.75,
+        "confidence_calibrated": false,
+        "confidence_semantics": "heuristic_score",
+        "grade": "A",
+        "canonical_grade": "A",
+        "grade_consistent": true,
+        "adx": 30.0,
+        "trend_15m_agrees": false,
+        "impulse_confirmed": false,
+        "volume_confirmed": false,
+        "volume_ratio": 0.0,
+        "source_count": 1,
+        "power_move": false,
+        "market_shift_confirmed": false,
+        "market_shift_core_votes": 0,
+        "market_shift_total_votes": 0,
+        "confirmation_legs": {
+          "trend_15m": false,
+          "impulse_or_power": false,
+          "volume": false,
+          "multi_source": false
+        },
+        "confirmation_count": 0,
+        "configuration": {
+          "policy_version": "quality_verdict.v7-confidence-provenance",
+          "bplus_min_confidence": 0.55,
+          "standalone_5min_confidence": 0.7,
+          "bplus_min_adx": 22.0,
+          "risky_bplus_min_adx": 25.0,
+          "min_volume_ratio": 1.2,
+          "unknown_confidence": 0.7,
+          "market_shift_min_confidence": 0.6,
+          "full_core_market_shift_min_confidence": 0.35,
+          "full_core_market_shift_min_adx": 18.0,
+          "confidence_calibration_enabled": false,
+          "confidence_calibration_live_apply_enabled": false
+        }
+      },
+      "policy_version": "quality_verdict.v7-confidence-provenance",
+      "configuration_hash": "ff89dbe1e290013d"
+    },
+    "quality_accepts_tick_ratio_as_volume": {
+      "allowed": true,
+      "route": "high_confidence_confirmed",
+      "reason_code": "BPLUS_SETUP_CONFIRMED",
+      "reason": "setup confirmed by ADX >= 22 and 1 contemporaneous confirmation(s)",
+      "checks": {
+        "required_adx": 22.0,
+        "required_confirmations": 1,
+        "lane": "LIVE",
+        "timeframe": "5min",
+        "inst_type": "OPT",
+        "regime": "TRENDING_UP",
+        "confidence": 0.75,
+        "confidence_calibrated": false,
+        "confidence_semantics": "heuristic_score",
+        "grade": "A",
+        "canonical_grade": "A",
+        "grade_consistent": true,
+        "adx": 30.0,
+        "trend_15m_agrees": false,
+        "impulse_confirmed": false,
+        "volume_confirmed": true,
+        "volume_ratio": 1.3,
+        "source_count": 1,
+        "power_move": false,
+        "market_shift_confirmed": false,
+        "market_shift_core_votes": 0,
+        "market_shift_total_votes": 0,
+        "confirmation_legs": {
+          "trend_15m": false,
+          "impulse_or_power": false,
+          "volume": true,
+          "multi_source": false
+        },
+        "confirmation_count": 1,
+        "configuration": {
+          "policy_version": "quality_verdict.v7-confidence-provenance",
+          "bplus_min_confidence": 0.55,
+          "standalone_5min_confidence": 0.7,
+          "bplus_min_adx": 22.0,
+          "risky_bplus_min_adx": 25.0,
+          "min_volume_ratio": 1.2,
+          "unknown_confidence": 0.7,
+          "market_shift_min_confidence": 0.6,
+          "full_core_market_shift_min_confidence": 0.35,
+          "full_core_market_shift_min_adx": 18.0,
+          "confidence_calibration_enabled": false,
+          "confidence_calibration_live_apply_enabled": false
+        }
+      },
+      "policy_version": "quality_verdict.v7-confidence-provenance",
+      "configuration_hash": "ff89dbe1e290013d"
+    },
+    "asof_timezone_slice_fails_open": {
+      "requested_as_of": "2026-09-11T10:05:00+05:30",
+      "last_frame_bar": "2026-09-11 10:30:00",
+      "result": {
+        "volume_ratio": 3.0,
+        "range_atr_ratio": 1.0,
+        "close_location": 0.6666666666666666,
+        "volume_basis": "TRADED",
+        "surge_percentile": 100.0
+      }
+    },
+    "forming_bar_raw_ratio": {
+      "scenario": "5m bar after 30s at the same volume rate as prior 100-unit complete 5m bars",
+      "observed": {
+        "volume_ratio": 0.1,
+        "range_atr_ratio": 1.0,
+        "close_location": 0.6666666666666666,
+        "volume_basis": "TRADED",
+        "surge_percentile": 0.0
+      },
+      "equal_rate_ratio": 1.0
+    }
+  }
+}

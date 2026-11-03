@@ -1,0 +1,26 @@
+{
+  "pid": 36752,
+  "mode": "HISTORICAL",
+  "auto_mode": false,
+  "backtest_days": 5,
+  "scanner_engine": "ut_smart",
+  "active_indices": [
+    "NIFTY",
+    "BANKNIFTY",
+    "SENSEX",
+    "MIDCPNIFTY"
+  ],
+  "simulation_id": 1790783428671,
+  "analysis_skip_reason": "inputs unchanged",
+  "trade_keys": [
+    "open",
+    "closed",
+    "signals",
+    "summary",
+    "meta",
+    "closed_total",
+    "signals_total",
+    "window"
+  ],
+  "is_calculating": true
+}

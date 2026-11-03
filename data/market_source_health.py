@@ -38,6 +38,18 @@ def build_source_health(
     kite_session_live = bool(getattr(getattr(provider, "kite", None), "is_connected", False))
     fyers_available = provider.fyers is not None and not provider._fyers_auth_required
     fyers_health = bool(fyers_available and (fyers_fresh if is_live else True))
+    route = getattr(provider, "_market_data_route", "fyers")
+    replacement = route in {"kite_angel", "angel_fyers"}
+    backup_enabled = route == "angel_fyers"
+    if backup_enabled:
+        fyers_rest_age = _newest_source_age(getattr(provider, "_ltp_cache", None), "fyers", now)
+        fyers_health = bool(fyers_health or (fyers_available and fyers_rest_age is not None and fyers_rest_age < freshness_threshold))
+    angel_tick = float(getattr(provider, "_last_angel_ws_tick", 0.0) or 0.0)
+    angel_age = now - angel_tick if angel_tick > 0 else None
+    angel_rest_age = _newest_source_age(getattr(provider, "_ltp_cache", None), "angel_rest", now)
+    angel_fresh = bool((angel_age is not None and 0 <= angel_age < freshness_threshold)
+                       or (angel_rest_age is not None and angel_rest_age < freshness_threshold))
+    supplementary_health = (angel_fresh or fyers_health) if backup_enabled else (angel_fresh if replacement else fyers_health)
 
     # "Can we place an order" and "are we still receiving prices" are two questions, and
     # only the first one was ever asked. is_connected is set to `auth.kite is not None`
@@ -74,7 +86,7 @@ def build_source_health(
         or (kite_rest_age is not None and kite_rest_age < freshness_threshold)
     )
     all_brokers_unavailable = bool(
-        is_live and not (kite_health and kite_data_fresh) and not fyers_health
+        is_live and not (kite_health and kite_data_fresh) and not supplementary_health
     )
     yahoo_mode = (
         "emergency_used"
@@ -123,8 +135,13 @@ def build_source_health(
         "kite_rest_age_seconds": round(kite_rest_age, 2) if kite_rest_age is not None else None,
         "fyers": fyers_health,
         "fyers_tick_age_seconds": round(fyers_age, 2) if fyers_age is not None else None,
+        "angelone": angel_fresh,
+        "angelone_tick_age_seconds": round(angel_age, 2) if angel_age is not None else None,
+        "supplementary_provider": "angelone" if replacement else "fyers",
+        "backup_provider": "fyers" if backup_enabled else ("angelone" if not replacement else None),
+        "backup_degraded": bool(is_live and backup_enabled and not fyers_health),
         "broker_degraded": bool(
-            is_live and not (kite_health and kite_data_fresh and fyers_health)
+            is_live and not (kite_health and kite_data_fresh and (angel_fresh if replacement else fyers_health))
         ),
         "all_brokers_unavailable": all_brokers_unavailable,
         "fyers_auth_required": provider._fyers_auth_required,
@@ -265,16 +282,20 @@ def build_market_source_snapshot(
         cached = provider._ws_cache[fyers_symbol]
         records.append(_source_record("fyers_ws", cached, "REALTIME", False, now))
 
+    angel_cached = provider._ws_cache.get("angel:" + symbol)
+    if isinstance(angel_cached, dict):
+        records.append(_source_record("angel_ws", angel_cached, "REALTIME", False, now))
+
     cached_ltp = provider._ltp_cache.get(symbol)
     if isinstance(cached_ltp, dict):
         source = str(cached_ltp.get("source") or "unknown")
         if source == "yahoo":
             records.append(_source_record("yahoo", cached_ltp, "DELAYED", False, now))
-        elif source in {"kite", "fyers"}:
+        elif source in {"kite", "fyers", "angel_rest"}:
             age = _age_seconds(cached_ltp, now)
             records.append(
                 _source_record(
-                    f"{source}_rest",
+                    source if source == "angel_rest" else f"{source}_rest",
                     cached_ltp,
                     "NEAR_REALTIME",
                     age is not None and age <= 15.0,

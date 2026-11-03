@@ -18,6 +18,7 @@ import pytest
 import scanner as scanner_module
 from data.sqlite_db import TRADE_PERSISTED_COLUMNS, db
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 from trading.trade_manager import IST, Trade, TradeManager
 
 
@@ -69,7 +70,7 @@ def _historical_manager() -> TradeManager:
 
 
 def test_all_three_scanner_entry_routes_forward_candidate_attribution():
-    tree = ast.parse(Path(scanner_module.__file__).read_text(encoding="utf-8"))
+    tree = ast.parse(scanner_runtime_source())
     calls = [
         node
         for node in ast.walk(tree)

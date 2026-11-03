@@ -7,6 +7,7 @@ import pandas as pd
 from config.settings import get_settings
 from engine.engine_lab import ENGINE_LAB_MODES, EngineLab
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 from engine.ut_bot_core import UTBotSignal
 from scanner import Scanner
 
@@ -118,7 +119,8 @@ def test_apex_hybrid_adapter_emits_lane_b_signal():
     assert all(getattr(sig, "apex_context", None) for sig in signals)
 
 
-def test_adaptive_dual_historical_replay_keeps_lane_streams_separate():
+def test_adaptive_dual_historical_replay_keeps_lane_streams_separate(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
     start = datetime(2026, 7, 1, 10, 0)
     lane_a_buy = UTBotSignal(
         timestamp=start,
@@ -213,7 +215,8 @@ def _replay_signal(ts, side, source_engine="", source_engines=None):
     return sig
 
 
-def test_historical_replay_splits_true_composite_engines_by_source_family():
+def test_historical_replay_splits_true_composite_engines_by_source_family(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
     start = datetime(2026, 7, 1, 10, 0)
     both_buy = _replay_signal(start, "BUY", "multi", ["utbot", "ema"])
     utbot_sell = _replay_signal(start + timedelta(minutes=5), "SELL", "utbot", ["utbot"])
@@ -244,7 +247,8 @@ def test_historical_replay_splits_true_composite_engines_by_source_family():
     assert [sig.source_engine for _, sig in lab_entries] == ["utbot", "utbot", "ema", "ema"]
 
 
-def test_combo_replay_splits_utbot_partner_but_router_engines_stay_single_stream():
+def test_combo_replay_splits_utbot_partner_but_router_engines_stay_single_stream(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
     start = datetime(2026, 7, 1, 10, 0)
     both_buy = _replay_signal(start, "BUY", "both", ["consensus", "utbot"])
     utbot_sell = _replay_signal(start + timedelta(minutes=5), "SELL", "utbot", ["utbot"])
@@ -452,7 +456,7 @@ def test_adaptive_dual_lane_b_can_append_in_live_mode():
 
 
 def test_historical_process_best_signal_seeds_lane_b_replay_series():
-    source = inspect.getsource(SignalProcessor.process_best_signal)
+    source = signal_pipeline_source()
     assert "_apex_replay_signals" in source
     assert "scanner_engine_mode == \"adaptive_dual\"" in source
     assert "not is_live" in source

@@ -13,6 +13,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 from loguru import logger
+from data.constituent_volume import CASH_VOLUME_BASES
 
 
 def _basis_of_bucket(values) -> str:
@@ -40,6 +41,14 @@ class CandleBuilder:
         self.max_candles = max_candles
         import threading
         self._lock = threading.Lock()
+        # Quote state (_latest_prices, _last_quote_receipt) has its own lock. It is two
+        # dict entries, deliberately separate from candle state, and its readers
+        # (get_latest_price, _price_plausible, the trade monitor) never took the candle
+        # lock anyway. Writing it under _lock made every quote wait out a resample: on
+        # 2026-10-06 _lock was ~90% held and the scanner loop spent 33% of its time
+        # queued in update_latest_price. Never acquire one of these while holding the
+        # other.
+        self._quote_lock = threading.Lock()
 
         # Floor on how often a FORMING bar is re-aggregated to 5min/15min.
         #
@@ -117,7 +126,7 @@ class CandleBuilder:
                 logger.warning(f"⚠️ Ignoring implausible price {price} for {instrument} (>{int(self._MAX_PRICE_DEVIATION*100)}% from last; likely cross-index leak)")
             return
 
-        with self._lock:
+        with self._quote_lock:
             self._latest_prices[instrument] = price
             self._last_quote_receipt[instrument] = datetime.now()
 
@@ -152,7 +161,9 @@ class CandleBuilder:
         # The tick is also a quote observation. Keep its receipt clock separate from
         # the OHLC mutation below; the candle receipt is stamped only after the store
         # accepts the bar, while this clock records the arrival of the market tick.
-        with self._lock:
+        # The price is published before the candle work queues for _lock, so exits
+        # see this tick even while another feed's resample holds the candle lock.
+        with self._quote_lock:
             self._latest_prices[instrument] = price
             self._last_quote_receipt[instrument] = datetime.now()
         candle_time = timestamp.replace(second=0, microsecond=0)
@@ -188,6 +199,9 @@ class CandleBuilder:
                     # next tick's full cumulative total would then be recorded as this
                     # bar's delta.
                     "start_volume": volume if volume > 0 else None,
+                    "last_cumulative": volume if volume > 0 else None,
+                    "volume_unallocated": 0.0,
+                    "volume_complete": False,
                     "volume_basis": source if (source and volume > 0) else "",
                     "source": "live_tick",
                     "volume": float(existing_row["volume"]) if existing_row is not None else 0,
@@ -234,6 +248,7 @@ class CandleBuilder:
                         current["volume"] = max(
                             float(current["volume"]), max(0, volume - baseline)
                         )
+                    current["last_cumulative"] = volume
                 current["tick_count"] = int(current.get("tick_count", 0) or 0) + 1
 
             else:
@@ -244,6 +259,8 @@ class CandleBuilder:
                         "low": current["low"],
                         "close": current["close"],
                         "volume": current["volume"],
+                        "volume_unallocated": current.get("volume_unallocated", 0.0),
+                        "volume_complete": current.get("volume_complete", False),
                         "tick_count": int(current.get("tick_count", 0) or 0),
                         "volume_basis": current.get("volume_basis", ""),
                         "source": current.get("source", "live_tick"),
@@ -251,6 +268,10 @@ class CandleBuilder:
                         "receipt_at": receipt_at,
                     }], index=[current["timestamp"]])
 
+                boundary_delta = 0.0
+                if (not source_changed and candle_time.date() == current["timestamp"].date()
+                        and volume > 0 and current.get("last_cumulative") is not None):
+                    boundary_delta = max(0.0, volume - current["last_cumulative"])
                 current = {
                     "timestamp": candle_time,
                     "open": price,
@@ -258,6 +279,9 @@ class CandleBuilder:
                     "low": price,
                     "close": price,
                     "start_volume": volume if volume > 0 else None,
+                    "last_cumulative": volume if volume > 0 else None,
+                    "volume_unallocated": boundary_delta,
+                    "volume_complete": False,
                     "volume_basis": source if (source and volume > 0) else "",
                     "source": "live_tick",
                     "volume": 0,
@@ -265,18 +289,24 @@ class CandleBuilder:
                 }
                 self._current_candle[instrument] = current
 
-            partial = pd.DataFrame([{
+            # Snapshot the forming row as a plain dict under the lock; the DataFrame is
+            # built below only when this tick is actually published (one per tick was
+            # ~2.6% of the Kite thread for nothing, 2026-09-25).
+            partial = {
                 "open": current["open"],
                 "high": current["high"],
                 "low": current["low"],
                 "close": current["close"],
                 "volume": current["volume"],
+                "volume_unallocated": current.get("volume_unallocated", 0.0),
+                "volume_complete": current.get("volume_complete", False),
                 "tick_count": int(current.get("tick_count", 0) or 0),
                 "volume_basis": current.get("volume_basis", ""),
                 "source": current.get("source", "live_tick"),
                 "provider_time": current["timestamp"],
                 "receipt_at": receipt_at,
-            }], index=[current["timestamp"]])
+            }
+            partial_index = [current["timestamp"]]
 
         if finalized is not None:
             self.update_candles(instrument, finalized, "1min")
@@ -293,7 +323,9 @@ class CandleBuilder:
             # The forming bar only -- a closing bar went through the branch above with
             # throttling off, so closed buckets are never deferred.
             self._last_partial_publish_at[instrument] = publish_now
-            self.update_candles(instrument, partial, "1min", throttle_resample=True)
+            self.update_candles(
+                instrument, pd.DataFrame([partial], index=partial_index), "1min", throttle_resample=True
+            )
 
     def update_candles(
         self,
@@ -356,15 +388,17 @@ class CandleBuilder:
             if timeframe == "1min":
                 if key in self._candles_1min and len(self._candles_1min[key]) > 0:
                     existing = self._candles_1min[key]
-                    combined = pd.concat([existing, new_data])
-                    combined = combined[~combined.index.duplicated(keep='last')]
-                    combined = combined.sort_index()
-                    # Only rows supplied by this update can have been overwritten by
-                    # the keep-last merge.  Scanning every cached candle here made a
-                    # one-row websocket tick do O(history) work while holding _lock.
-                    touched = new_data.index
-                    combined = self._restore_zeroed_volume(combined, existing, touched)
-                    combined = self._restore_candle_telemetry(combined, existing, touched)
+                    combined = self._merge_forming_row(existing, new_data)
+                    if combined is None:
+                        combined = pd.concat([existing, new_data])
+                        combined = combined[~combined.index.duplicated(keep='last')]
+                        combined = combined.sort_index()
+                        # Only rows supplied by this update can have been overwritten by
+                        # the keep-last merge.  Scanning every cached candle here made a
+                        # one-row websocket tick do O(history) work while holding _lock.
+                        touched = new_data.index
+                        combined = self._restore_zeroed_volume(combined, existing, touched)
+                        combined = self._restore_candle_telemetry(combined, existing, touched)
                     if len(combined) > self.max_candles:
                         combined = combined.iloc[-self.max_candles:]
                     self._candles_1min[key] = combined
@@ -457,8 +491,50 @@ class CandleBuilder:
 
     def latest_quote_receipt(self, instrument: str):
         """Return the quote-lane receipt time without treating it as candle freshness."""
-        with self._lock:
+        with self._quote_lock:
             return self._last_quote_receipt.get(instrument)
+
+    @classmethod
+    def _merge_forming_row(cls, existing, new_data):
+        """Merge ONE row at or after the cache's last bar without re-merging the cache.
+
+        The forming-bar publish runs ~10 times a second per index and used to
+        concat/dedupe/sort the whole 2000-row cache and run both restores over it to
+        change one row. It was most of the Kite tick thread's GIL time
+        (2026-09-17 14:16). Restores only ever touch the supplied labels, so they run
+        against the one prior row here. Returns None whenever the result could differ
+        from the general merge -- older label, several rows, different columns or
+        index type, or any dtype change -- and the caller takes the general path.
+        """
+        try:
+            if new_data is None or len(new_data) != 1 or existing is None or len(existing) == 0:
+                return None
+            if not isinstance(existing.index, pd.DatetimeIndex) or not isinstance(new_data.index, pd.DatetimeIndex):
+                return None
+            if str(existing.index.tz) != str(new_data.index.tz):
+                return None
+            if set(new_data.columns) != set(existing.columns) or len(new_data.columns) != len(existing.columns):
+                return None
+            if not existing.index.is_unique or not existing.index.is_monotonic_increasing:
+                return None
+            label, last = new_data.index[0], existing.index[-1]
+            if label < last:
+                return None
+            row = new_data[list(existing.columns)]
+            if label == last:
+                prior = existing.iloc[[-1]]
+                row = row.copy()
+                row = cls._restore_zeroed_volume(row, prior, row.index)
+                row = cls._restore_candle_telemetry(row, prior, row.index)
+                head = existing.iloc[:-1]
+            else:
+                head = existing
+            combined = pd.concat([head, row])
+            if list(combined.columns) != list(existing.columns) or not combined.dtypes.equals(existing.dtypes):
+                return None
+            return combined
+        except Exception:
+            return None
 
     @staticmethod
     def _restore_zeroed_volume(combined, existing, touched_index=None):
@@ -476,7 +552,14 @@ class CandleBuilder:
                 return combined
             if "volume" not in getattr(combined, "columns", []) or "volume" not in getattr(existing, "columns", []):
                 return combined
-            prior = existing[~existing.index.duplicated(keep="last")]["volume"]
+            # The live cache is already unique.  Filtering it anyway copied every column
+            # of the whole frame (twice) on each tick while holding _lock.
+            prior_frame = (
+                existing
+                if existing.index.is_unique
+                else existing[~existing.index.duplicated(keep="last")]
+            )
+            prior = prior_frame["volume"]
             candidates = combined.index if touched_index is None else pd.Index(touched_index)
             overlap = candidates.intersection(combined.index).intersection(prior.index)
             if len(overlap) == 0:
@@ -484,6 +567,30 @@ class CandleBuilder:
             current = pd.to_numeric(combined.loc[overlap, "volume"], errors="coerce").fillna(0.0)
             previous = pd.to_numeric(prior.loc[overlap], errors="coerce").fillna(0.0)
             restore = (current <= 0) & (previous > 0)
+            if "volume_complete" in combined.columns and "volume_basis" in combined.columns:
+                explicit_constituent_zero = (
+                    combined.loc[overlap, "volume_basis"].eq("constituent_shares")
+                    & combined.loc[overlap, "volume_complete"].eq(True)
+                    & current.eq(0)
+                )
+                restore &= ~explicit_constituent_zero
+            # The basis check below can only clear candidates.  Most ticks have none,
+            # and its Arrow string work was the costliest part of the tick path
+            # (2026-09-17: scan latency 10-40s with main.py pinned at one core).
+            if not bool(restore.any()):
+                return combined
+            # A zero after a source/unit transition is an intentional rebase, not a
+            # damaged Yahoo-style replacement.  Restoring the old number while retaining
+            # the new basis relabels cash shares as futures activity.
+            if "volume_basis" in combined.columns and "volume_basis" in existing.columns:
+                current_basis = combined.loc[overlap, "volume_basis"].fillna("").astype(str)
+                prior_basis = prior_frame.loc[overlap, "volume_basis"].fillna("").astype(str)
+                incompatible = (
+                    current_basis.str.strip().ne("")
+                    & prior_basis.str.strip().ne("")
+                    & current_basis.ne(prior_basis)
+                )
+                restore = restore & ~incompatible
             if bool(restore.any()):
                 combined.loc[overlap[restore], "volume"] = previous[restore]
         except Exception as exc:
@@ -546,6 +653,9 @@ class CandleBuilder:
         # repaired row back to ``volume=0/source=live_tick`` until the next REST pass.
         fields = (
             "volume",
+            "volume_complete",
+            "volume_provider",
+            "membership_version",
             "tick_count",
             "volume_basis",
             "source",
@@ -604,6 +714,8 @@ class CandleBuilder:
         new_columns = usable + (["source"] if "source" not in usable and "source" in combined.columns else [])
         if "volume" in combined.columns and "volume" not in new_columns:
             new_columns.append("volume")
+        if "volume_complete" in combined.columns and "volume_complete" not in new_columns:
+            new_columns.append("volume_complete")
         old_map = _gather(existing, old_columns) if indexes_unique else None
         new_map = _gather(combined, new_columns) if indexes_unique else None
 
@@ -612,26 +724,39 @@ class CandleBuilder:
             old = old_map[idx] if indexes_unique else existing.loc[idx]
             new = new_map[idx] if indexes_unique else combined.loc[idx]
             incoming_history = str(new.get("source", "") or "").lower() in {
-                "fyers_history", "history"
+                "fyers_history", "history", "kite_constituent_history", "angel_constituent_history"
             }
             prior_source = str(old.get("source", "") or "").lower()
+            incoming_complete_constituent = bool(
+                str(new.get("volume_basis", "")) == "constituent_shares"
+                and isinstance(new.get("volume_complete"), (bool, np.bool_))
+                and bool(new.get("volume_complete"))
+                and pd.notna(new.get("volume"))
+                and float(new.get("volume")) >= 0
+            )
             try:
                 measured_cash_history = bool(
                     incoming_history
-                    and float(new.get("volume") or 0.0) > 0.0
+                    and (float(new.get("volume") or 0.0) > 0.0 or incoming_complete_constituent)
                     and str(new.get("volume_basis", "") or "").strip().lower()
-                    == "fyers_index"
+                    in CASH_VOLUME_BASES
                 )
             except (TypeError, ValueError):
                 measured_cash_history = False
             try:
                 prior_measured_cash = bool(
-                    float(old.get("volume") or 0.0) > 0.0
+                    (float(old.get("volume") or 0.0) > 0.0 or (
+                        str(old.get("volume_basis", "")) == "constituent_shares"
+                        and isinstance(old.get("volume_complete"), (bool, np.bool_))
+                        and bool(old.get("volume_complete"))
+                        and pd.notna(old.get("volume"))
+                        and float(old.get("volume")) >= 0
+                    ))
                     and str(old.get("volume_basis", "") or "").strip().lower()
-                    == "fyers_index"
+                    in CASH_VOLUME_BASES
                 )
                 incoming_measured_volume = bool(
-                    float(new.get("volume") or 0.0) > 0.0
+                    (float(new.get("volume") or 0.0) > 0.0 or incoming_complete_constituent)
                     and str(new.get("volume_basis", "") or "").strip()
                 )
             except (TypeError, ValueError):
@@ -647,17 +772,17 @@ class CandleBuilder:
                         pass
                 if (
                     incoming_history
-                    and prior_source not in {"", "history", "fyers_history"}
+                    and prior_source not in {"", "history", "fyers_history", "kite_constituent_history", "angel_constituent_history"}
                     and not (
                         measured_cash_history
-                        and field in {"volume", "source", "volume_basis"}
+                        and field in {"volume", "source", "volume_basis", "volume_complete", "volume_provider", "membership_version"}
                     )
                 ):
                     missing = True
                 if (
                     prior_measured_cash
                     and not incoming_measured_volume
-                    and field in {"volume", "source", "volume_basis"}
+                    and field in {"volume", "source", "volume_basis", "volume_complete", "volume_provider", "membership_version"}
                 ):
                     # Price-only ticks still own OHLC/timing/tick_count, but they have
                     # no authority to replace the independently measured cash-volume
@@ -797,6 +922,12 @@ class CandleBuilder:
             'close': 'last',
             'volume': 'sum',
         }
+        if 'tick_count' in df.columns:
+            agg['tick_count'] = 'sum'
+        if 'volume_unallocated' in df.columns:
+            agg['volume_unallocated'] = 'sum'
+        if 'volume_complete' in df.columns:
+            agg['volume_complete'] = lambda values: not values.eq(False).any()
         # Carry the volume unit up with the volume. Dropping it left 5min/15min frames
         # with no volume_basis at all, and the mixed-unit surge guard treats a missing
         # column as "one unit" — so the guard was inert on exactly the timeframes
@@ -831,10 +962,15 @@ class CandleBuilder:
             ):
                 reference = basis_source
             reference_col = reference['volume_basis']
-            labelled = reference_col[reference_col.astype(str).str.strip().ne('')
-                                     & reference_col.notna()]
-            if labelled.nunique() <= 1:
-                single = str(labelled.iloc[0]) if len(labelled) else ''
+            # Distinct labels in first-seen order.  Same answer as filtering all 2000
+            # rows through astype(str).str.strip() and calling nunique(), at a fraction
+            # of the cost: this runs twice per resample on the tick path.
+            labels = [
+                value for value in reference_col.dropna().unique()
+                if str(value).strip() != ''
+            ]
+            if len(labels) <= 1:
+                single = str(labels[0]) if labels else ''
             else:
                 single = None
                 agg['volume_basis'] = _basis_of_bucket
@@ -846,20 +982,40 @@ class CandleBuilder:
 
     def get_candles(self, instrument: str, timeframe: str) -> Optional[pd.DataFrame]:
         """Get candles for instrument at given timeframe"""
-        key = instrument
-        with self._lock:
-            if timeframe == "1min":
-                df = self._candles_1min.get(key)
-            elif timeframe == "5min":
-                df = self._candles_5min.get(key)
-            elif timeframe == "15min":
-                df = self._candles_15min.get(key)
-            else:
-                df = None
-        # Writers publish by replacing the dict entry; they never mutate an already
-        # published frame.  Taking the stable reference under the lock is sufficient,
-        # and copying after release keeps readers from extending writer lock holds.
+        # No lock. Writers publish by REPLACING the dict entry and never mutate a
+        # published frame (pandas copy-on-write guarantees it even where a writer's new
+        # frame shares memory with the old one), and a single dict.get is atomic under
+        # the GIL. So the reference read here is always one complete published frame.
+        #
+        # Taking the lock bought nothing and cost a great deal: every scan thread queued
+        # behind the tick thread, which holds the lock while it resamples 5m/15m. py-spy
+        # on the live process, 2026-09-23: 21.7% of per-index scan wall time sat on the
+        # `with self._lock:` line, and the scan overran its 9s per-index budget 431 times
+        # that session. Iterating readers (get_max_timestamp, get_status) keep the lock,
+        # because a new key arriving mid-iteration would raise.
+        df = self._frame_ref(instrument, timeframe)
         return df.copy() if df is not None else None
+
+    def latest_bar_start(self, instrument: str, timeframe: str):
+        """Index stamp of the newest published bar (the forming one), without a copy.
+
+        The intel worker polls this every second for every index and timeframe to
+        spot a bar close; get_candles() would copy twelve frames a second for it.
+        """
+        df = self._frame_ref(instrument, timeframe)
+        if df is None or df.empty:
+            return None
+        return df.index[-1]
+
+    def _frame_ref(self, instrument: str, timeframe: str):
+        """The currently published frame for one key, read without the writer lock."""
+        if timeframe == "1min":
+            return self._candles_1min.get(instrument)
+        if timeframe == "5min":
+            return self._candles_5min.get(instrument)
+        if timeframe == "15min":
+            return self._candles_15min.get(instrument)
+        return None
 
     def latest_candle_time(self, instrument: str, timeframe: str):
         """Timestamp of the newest bar, without copying the frame.
@@ -868,31 +1024,19 @@ class CandleBuilder:
         read the data but wasteful for one that only needs to know whether anything
         has changed since it last looked.
         """
-        with self._lock:
-            if timeframe == "1min":
-                df = self._candles_1min.get(instrument)
-            elif timeframe == "5min":
-                df = self._candles_5min.get(instrument)
-            elif timeframe == "15min":
-                df = self._candles_15min.get(instrument)
-            else:
-                return None
-            if df is None or len(df) == 0:
-                return None
-            return df.index[-1]
+        # Lock-free for the same reason as get_candles.
+        if timeframe not in ("1min", "5min", "15min"):
+            return None
+        df = self._frame_ref(instrument, timeframe)
+        if df is None or len(df) == 0:
+            return None
+        return df.index[-1]
 
     def get_candle_count(self, instrument: str, timeframe: str) -> int:
         """Get number of candles available"""
-        with self._lock:
-            if timeframe == "1min":
-                df = self._candles_1min.get(instrument)
-            elif timeframe == "5min":
-                df = self._candles_5min.get(instrument)
-            elif timeframe == "15min":
-                df = self._candles_15min.get(instrument)
-            else:
-                return 0
-            return len(df) if df is not None else 0
+        # Lock-free for the same reason as get_candles.
+        df = self._frame_ref(instrument, timeframe)
+        return len(df) if df is not None else 0
 
     def get_max_timestamp(self) -> datetime:
         """Get the latest market timestamp from any candle dataframe"""
@@ -914,6 +1058,28 @@ class CandleBuilder:
         if max_ts == datetime.min:
             return datetime.now()
         return max_ts
+
+    def get_max_timestamp_source(self):
+        """(instrument, timeframe, last_ts) of the frame holding the newest stamp.
+
+        Diagnostic only. get_max_timestamp() feeds the advance-only session clock, so a
+        single frame stamped ahead of the market moves every clock-driven decision; this
+        names which frame did it.
+        """
+        best = None
+        with self._lock:
+            for tf, tf_dict in (("1min", self._candles_1min), ("5min", self._candles_5min), ("15min", self._candles_15min)):
+                for key, df in tf_dict.items():
+                    if df is None or df.empty:
+                        continue
+                    last_ts = df.index[-1]
+                    if hasattr(last_ts, 'to_pydatetime'):
+                        last_ts = last_ts.to_pydatetime()
+                    if getattr(last_ts, 'tzinfo', None):
+                        last_ts = last_ts.replace(tzinfo=None)
+                    if best is None or last_ts > best[2]:
+                        best = (key, tf, last_ts)
+        return best
 
     def get_status(self) -> Dict:
         """Get status of all candle data"""

@@ -1,0 +1,123 @@
+{
+  "derivative_counterfactuals": [
+    {
+      "index": "NIFTY",
+      "timeframe": "1min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "NIFTY",
+      "timeframe": "5min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "NIFTY",
+      "timeframe": "15min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "BANKNIFTY",
+      "timeframe": "1min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "BANKNIFTY",
+      "timeframe": "5min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "BANKNIFTY",
+      "timeframe": "15min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "MIDCPNIFTY",
+      "timeframe": "1min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "MIDCPNIFTY",
+      "timeframe": "15min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "SENSEX",
+      "timeframe": "1min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "SENSEX",
+      "timeframe": "5min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    },
+    {
+      "index": "SENSEX",
+      "timeframe": "15min",
+      "aggregate_unchanged": true,
+      "regime_unchanged": true,
+      "entry_quality_unchanged": true
+    }
+  ],
+  "fyers_reported_oi_after_real_90_second_change": {
+    "source": "fyers_reported",
+    "horizon_seconds": 86400.0,
+    "results": {
+      "1min": {
+        "signal": "NEUTRAL",
+        "change_comparable": false
+      },
+      "5min": {
+        "signal": "NEUTRAL",
+        "change_comparable": false
+      },
+      "15min": {
+        "signal": "NEUTRAL",
+        "change_comparable": false
+      }
+    }
+  },
+  "historical_query_with_current_only_history": {
+    "timeframe": "5min",
+    "as_of": 1788762600.0,
+    "futures": [
+      {
+        "contract": "FUT",
+        "provider": "kite",
+        "clock": "exchange",
+        "unit": "broker_reported_quantity",
+        "timeframe": "5min",
+        "available": false,
+        "entry_eligible": false,
+        "reason": "stale_observation"
+      }
+    ],
+    "options": []
+  }
+}

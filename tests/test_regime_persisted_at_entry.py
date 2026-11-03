@@ -6,10 +6,11 @@ stored ''/UNKNOWN, making per-regime P&L attribution (e.g. '15min in chop')
 impossible to measure. These tests pin the forwarding and the round-trip.
 """
 import re
+from tests.source_views import scanner_runtime_source
 
 
 def test_all_scanner_open_trade_sites_forward_market_regime():
-    src = open("scanner.py", encoding="utf-8").read()
+    src = scanner_runtime_source()
     sites = [m.start() for m in re.finditer(r"\.open_trade\(", src)]
     assert len(sites) >= 3, f"expected >=3 open_trade call sites, found {len(sites)}"
     for pos in sites:

@@ -1,0 +1,31 @@
+{
+  "partial_higher_timeframe_lookahead": {
+    "as_of": "2026-09-11 10:02:00",
+    "mutated_bar": "10:00-10:05",
+    "before_session_high": 101.0,
+    "after_session_high": 150.0,
+    "before_range_pct": 2.0,
+    "after_range_pct": 51.0
+  },
+  "vix_future_observation": {
+    "as_of": "2026-09-11 09:20",
+    "sole_observation": "2026-09-11 15:30:00",
+    "returned": 28.0
+  },
+  "vix_same_day_close_at_midnight": {
+    "as_of": "2026-09-11 09:20",
+    "returned": 27.0
+  },
+  "anchor_timezone_cutoff_fail_open": {
+    "naive": {
+      "last_seen": "2026-09-08 10:00:00",
+      "timeframe": "60min",
+      "source_bars": 385
+    },
+    "aware": {
+      "last_seen": "2026-09-11 16:00:00",
+      "timeframe": "60min",
+      "source_bars": 675
+    }
+  }
+}

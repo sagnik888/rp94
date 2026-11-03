@@ -28,6 +28,7 @@ import pytest
 
 from config.settings import Settings
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 
 
 S = SignalProcessor
@@ -211,7 +212,7 @@ def test_every_knob_is_a_setting():
 def test_the_selection_uses_the_tiebreak_and_reads_only_cached_chain():
     import inspect
 
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
 
     assert "_prefer_liquid_strike(results_list, settings)" in src
     assert "allow_fetch=False" in src, "the ranking must never trigger a broker fetch"
@@ -251,7 +252,7 @@ def test_a_genuinely_better_itm_still_wins_on_measured_score():
 def test_the_bonus_is_stamped_on_the_candidate():
     import inspect
 
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
 
     assert 'setattr(candidate, "strike_preference_bonus", float(itm_bonus))' in src
 

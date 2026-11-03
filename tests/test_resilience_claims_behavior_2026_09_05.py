@@ -203,6 +203,7 @@ def test_failed_intelligence_preserves_old_bundle_age(monkeypatch, failure):
 
 @pytest.mark.parametrize("fire_mode", ["INTRACANDLE", "CANDLE_CLOSE"])
 def test_held_signal_is_graded_when_intelligence_returns(monkeypatch, fire_mode):
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
     import engine.signal_processor as processor_module
     from trading.trade_manager import IST
 

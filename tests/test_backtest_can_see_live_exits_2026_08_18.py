@@ -65,6 +65,7 @@ def test_the_simulator_alone_can_only_produce_stop_target_or_session_end():
         "TARGET_HIT",
         "PEAK_GIVEBACK_CAP",
         "TF15_FAST_REVERSAL",
+        "S12_PREMIUM_CAP",
     }
     # Nothing from the live trade-management stack is reachable without the toggle.
     for live_only in ("SMART_PROFIT_LOCK", "PEAK_THREAT_EXIT", "LOSS_THREAT_EXIT",
@@ -220,7 +221,7 @@ def test_tf15_replay_candle_view_never_exposes_future_rows(monkeypatch):
         one = scanner.candles.get_candles("NIFTY", "1min")
         fifteen = scanner.candles.get_candles("NIFTY", "15min")
         captured["one_last"] = one.index[-1]
-        captured["fifteen_close"] = float(fifteen.iloc[-1]["close"])
+        captured["fifteen_empty"] = fifteen.empty  # 15m bar has not closed at this replay instant
         captured["evaluation"] = latest_time
         captured["regime"] = scanner._get_trade_regime(trade)
         return False, ""
@@ -250,7 +251,7 @@ def test_tf15_replay_candle_view_never_exposes_future_rows(monkeypatch):
     probe(idx[2], 102.0, 103.0, 150.0)
 
     assert captured["one_last"] == idx[2]
-    assert captured["fifteen_close"] == 102.0
+    assert captured["fifteen_empty"] is True
     assert captured["evaluation"] == idx[2].to_pydatetime() + timedelta(minutes=1)
     assert captured["regime"] == "TRENDING_DOWN"
 

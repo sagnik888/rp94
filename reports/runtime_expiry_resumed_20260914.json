@@ -1,0 +1,152 @@
+{
+  "checked_at": "2026-09-14 21:03:10",
+  "mode": "HISTORICAL",
+  "auto_mode": false,
+  "backtest_days": 30,
+  "runtime_build": {
+    "fingerprint": "3b071214aca34fcd2904d93d29bff6f28d62f29222202763c1c19514d92c2522",
+    "pid": 6712,
+    "captured_at": "2026-09-14T15:32:39.044214+00:00",
+    "basis": "source_snapshot_at_scanner_import",
+    "files": {
+      "scanner.py": {
+        "sha256": "886a2cfde3e160e142e5c3d7ec28c4ecfd131fad6e3a3b6f5ede9ed5347ea43c",
+        "mtime_ns": 1789371423646001600,
+        "size": 1876110
+      },
+      "engine/signal_processor.py": {
+        "sha256": "2a5bb5ce08aa17d293d9c4ce77572ab71159cfd9bff5591bb74879c80d96030a",
+        "mtime_ns": 1789371423640001900,
+        "size": 439583
+      },
+      "engine/signal_manager.py": {
+        "sha256": "01402e74934245523a3a96f7215663ec53e4f7103b13bfe1560b6b24f8a50219",
+        "mtime_ns": 1789257797716706100,
+        "size": 21273
+      },
+      "engine/scanner_recalculation.py": {
+        "sha256": "d393b78a7c595a34b5449d8910c434fde59f834248cd66744267ef7ae9457d67",
+        "mtime_ns": 1789309380227696000,
+        "size": 24400
+      },
+      "engine/recalculation_worker.py": {
+        "sha256": "56d1b8a812ea3d3c39a4bccac07a9dc804544fae6f7298769894f8087ab1da2a",
+        "mtime_ns": 1789309380227696000,
+        "size": 7152
+      },
+      "data/candle_builder.py": {
+        "sha256": "8e22c5bd42230ef4f5d9ff35d6fe9419f31a5745bfc6c69fa6e6e0addcb27750",
+        "mtime_ns": 1789124932520801400,
+        "size": 49635
+      },
+      "data/market_data.py": {
+        "sha256": "318e957039b0d5bfe5b1a2eaa55f5a0fa3c7dfbddf724192b8b01e5306c2f9d1",
+        "mtime_ns": 1789309380239276000,
+        "size": 315487
+      },
+      "data/kite_market_data.py": {
+        "sha256": "3e7f8c5c4999b068baab8a967cca7e771cf62ce564a0c3abf49ac540dbcd28da",
+        "mtime_ns": 1789106941709072500,
+        "size": 41037
+      },
+      "data/derivative_participation.py": {
+        "sha256": "125bfb6fb4b18f89fb47f5a7a6b6bede4d81ffdbf3968d8c56eac1ee9f9c74f3",
+        "mtime_ns": 1789284133125323100,
+        "size": 12523
+      },
+      "intelligence/intelligence_aggregator.py": {
+        "sha256": "293c5f5d6b696d995268c297850b254aeb4dac0b33da8dd3d5881bfa1002a257",
+        "mtime_ns": 1789371042235788200,
+        "size": 43145
+      },
+      "intelligence/derivative_context.py": {
+        "sha256": "70c017aeade38e51d06534d3b1cbc0eeb9aa13f71fcc69f67e64781a0c5b828e",
+        "mtime_ns": 1789257627430644300,
+        "size": 6794
+      },
+      "intelligence/regime_detector.py": {
+        "sha256": "be6dee9a2cd4d18c4cfd49314a761a96ca861aeacb1562e0730d238eb3e4d8c4",
+        "mtime_ns": 1789038885471796500,
+        "size": 42053
+      },
+      "intelligence/session_context.py": {
+        "sha256": "29b2b5092a4b9d4ae2470caf7f569d8a58a9ba7c3fa6010c47bb00be71d6ffc5",
+        "mtime_ns": 1789228511131825000,
+        "size": 27954
+      },
+      "intelligence/oi_tracker.py": {
+        "sha256": "82933eddb119fc5b509433a3f60225d47c6547cd21c505e4b99e4940aa4ecc03",
+        "mtime_ns": 1789284282973976400,
+        "size": 16701
+      },
+      "engine/multi_timeframe.py": {
+        "sha256": "b026097c408b35b6897c86d5decdebf99726e447d7b322af45cb4f20f3da264c",
+        "mtime_ns": 1789125507386179600,
+        "size": 23064
+      },
+      "intelligence/confidence_calibration.py": {
+        "sha256": "2849e3d68d55abf2c5d0334e02a98d258504aa1bd8b6bbea7e9a97b09e9b293c",
+        "mtime_ns": 1789257797704213400,
+        "size": 8031
+      },
+      "engine/expiry_manager.py": {
+        "sha256": "403fe1defd2868a03d814ced90f2244a98ccae1b20b1b5f4e3a2a75fd3265b49",
+        "mtime_ns": 1789371503368517600,
+        "size": 44586
+      },
+      "trading/trade_manager.py": {
+        "sha256": "933d01c752f46c21a815ce822f2c0659f2c924004585173d9a87f58d5a356287",
+        "mtime_ns": 1789101563432497900,
+        "size": 462703
+      },
+      "engine/entry_policy.py": {
+        "sha256": "3e34b33bfffc0fc737d837537ad82b1e9806598f1bfab3506e0821fd99fde03c",
+        "mtime_ns": 1789038434920939800,
+        "size": 33264
+      },
+      "config/settings.py": {
+        "sha256": "2ee2b412ef80bc67a61ac072ebce89288857a84011faae181d967d26ec18cc66",
+        "mtime_ns": 1789121960138710900,
+        "size": 215966
+      },
+      "engine/runtime_build.py": {
+        "sha256": "70b50ee2e2390459a70f65fa79ad0030ea84642963e9d4e2d49f0719c38ddf5d",
+        "mtime_ns": 1789309478885216900,
+        "size": 2044
+      },
+      "engine/scanner_telemetry.py": {
+        "sha256": "f33759d4b6b0f76042eb69aab32925fa20702bb9ed15748f0fa6993724d27f3d",
+        "mtime_ns": 1789308355525853600,
+        "size": 59621
+      },
+      "trading/trade_dashboard.py": {
+        "sha256": "4bdafda4f82649a75aa61c10365190bc0921cbe0d711923a113a7c72259c2d85",
+        "mtime_ns": 1789283827277190200,
+        "size": 11092
+      },
+      "dashboard/server.py": {
+        "sha256": "b66e0036d158772e143d6416d726bcc5b523589239766b84556f889874cf6564",
+        "mtime_ns": 1789308297128467900,
+        "size": 169691
+      }
+    },
+    "source_files_changed_since_import": [],
+    "reload_required": false
+  },
+  "meta": {
+    "mode": "HISTORICAL",
+    "backtest_days": 30,
+    "inst_pref": "OPT",
+    "scanner_engine": "quad_prime",
+    "ut_concurrency_guard": false,
+    "futures_shadow_enabled": false,
+    "grade_preference": "B",
+    "timeframe_entry_policy": "INCLUDE_1MIN_5MIN_15MIN",
+    "simulation_id": 1789399990638,
+    "complete": false,
+    "building": true,
+    "recalculation_status": "queued",
+    "source": "historical_building_guard"
+  },
+  "open_count": 0
+}

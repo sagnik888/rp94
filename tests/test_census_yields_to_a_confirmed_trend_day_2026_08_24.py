@@ -35,6 +35,7 @@ import inspect
 
 from config.settings import Settings, get_settings
 from engine.signal_processor import SignalProcessor, directional_census_block
+from tests.source_views import signal_pipeline_source
 
 
 LONG_HEAVY = {"LONG": 18, "SHORT": 9}
@@ -103,7 +104,7 @@ def test_it_ships_enabled():
 
 def test_historical_census_receives_the_same_day_type_context_as_live():
     """The replay call must not silently omit the live waiver context."""
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
     assert "day_type=_hist_day_type" in src
     assert "day_type_confidence=_hist_day_conf" in src
 

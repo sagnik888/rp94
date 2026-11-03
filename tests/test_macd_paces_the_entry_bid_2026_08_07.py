@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from engine.order_pricing import limit_confidence_penalty, momentum_urgency
+from engine.execution_service import ExecutionService
 
 
 def _s(on=True, penalty=0.15):
@@ -138,7 +139,7 @@ def test_both_live_entry_paths_pass_it():
 
     from scanner import Scanner
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
     calls = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call)

@@ -1,0 +1,885 @@
+{
+  "captured_at_ist": "2026-09-30T13:20:21.033282+05:30",
+  "scope": "Read-only research; app-recorded realized cohorts; detached production-helper probes",
+  "filled_trade_count": 10,
+  "filled_trades": [
+    {
+      "id": "b3accac8-dd0c-5821-b04e-d6a332f856a4",
+      "day": "2026-09-28",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "symbol": "NIFTY26O0623000PE",
+      "grade": "C",
+      "confidence": 0.22153414467741625,
+      "net": -27.99999999999926,
+      "peak_gross": 52.0,
+      "entry": 255.55,
+      "recorded_stop": 242.915,
+      "quantity": 65.0,
+      "entry_time": "2026-09-28T15:12:01.897605",
+      "exit_reason": "MANUAL_SYNC",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 0,
+        "recorded_peak_premium_pct": 0.3131,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "f72e7a9d-af0d-5642-bf67-a9c38ac330e1",
+      "day": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "symbol": "SENSEX26O0172500CE",
+      "grade": "A",
+      "confidence": 0.82,
+      "net": -263.9999999999998,
+      "peak_gross": 0.0,
+      "entry": 433.2,
+      "recorded_stop": 218.15,
+      "quantity": 20.0,
+      "entry_time": "2026-09-29T11:21:29.898514",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": true,
+      "quality_reason_code": "BPLUS_SETUP_CONFIRMED",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 64,
+        "recorded_peak_premium_pct": 0.0,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "4757652c-c413-5ab8-9871-32fed07f15db",
+      "day": "2026-09-29",
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "symbol": "BANKNIFTY26SEP54100CE",
+      "grade": "A+",
+      "confidence": 0.9278720218944112,
+      "net": -84.49999999999932,
+      "peak_gross": 0.0,
+      "entry": 222.95,
+      "recorded_stop": 111.45,
+      "quantity": 30.0,
+      "entry_time": "2026-09-29T11:29:52.166762",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": false,
+      "quality_reason_code": "BPLUS_SETUP_INSUFFICIENT",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 0,
+        "recorded_peak_premium_pct": 0.0,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "e0743e51-a8ee-5438-825a-e66c56ecf97d",
+      "day": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "symbol": "NIFTY26SEP22650CE",
+      "grade": "A+",
+      "confidence": 0.9136795257346123,
+      "net": 153.99999999999963,
+      "peak_gross": 1021.9300000000001,
+      "entry": 109.45,
+      "recorded_stop": 55.4,
+      "quantity": 65.0,
+      "entry_time": "2026-09-29T11:30:38.198149",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": true,
+      "quality_reason_code": "BPLUS_SETUP_CONFIRMED",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 143,
+        "recorded_peak_premium_pct": 14.3646,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": true
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": true
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "071cd042-3772-566f-8bff-e6ec8f079765",
+      "day": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "symbol": "SENSEX26O0172400PE",
+      "grade": "C",
+      "confidence": 0.08075269238695636,
+      "net": -1158.9999999999998,
+      "peak_gross": 0.0,
+      "entry": 397.8,
+      "recorded_stop": 199.375,
+      "quantity": 20.0,
+      "entry_time": "2026-09-29T12:33:07.627686",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 55,
+        "recorded_peak_premium_pct": 0.0,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": 54.72,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": 103.24,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "1084bbee-6e48-55bd-960d-2ea14def6101",
+      "day": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "symbol": "SENSEX26O0172400PE",
+      "grade": "B",
+      "confidence": 0.4323423938361122,
+      "net": -380.0,
+      "peak_gross": 0.0,
+      "entry": 342.65,
+      "recorded_stop": 171.3,
+      "quantity": 20.0,
+      "entry_time": "2026-09-29T13:30:42.936713",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 52,
+        "recorded_peak_premium_pct": 0.0,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": 107.2,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "c70c6371-d8d7-5605-a6dd-90d6a3e8978b",
+      "day": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "symbol": "SENSEX26O0172400PE",
+      "grade": "C",
+      "confidence": 0.2760446092028507,
+      "net": -686.0000000000002,
+      "peak_gross": 0.0,
+      "entry": 369.2,
+      "recorded_stop": 184.65,
+      "quantity": 20.0,
+      "entry_time": "2026-09-29T13:40:35.969139",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 92,
+        "recorded_peak_premium_pct": 0.0,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": 283.6,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "3cfa1be0-1c0a-5ee0-9103-46459b04dbc8",
+      "day": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "symbol": "NIFTY26O0622700PE",
+      "grade": "B",
+      "confidence": 0.4795668500016489,
+      "net": -3082.999999999999,
+      "peak_gross": 217.97000000000034,
+      "entry": 162.35,
+      "recorded_stop": 81.15,
+      "quantity": 65.0,
+      "entry_time": "2026-09-29T13:37:05.588244",
+      "exit_reason": "MANUAL",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "archived_terminal_fill",
+      "path_diagnostics": {
+        "sample_count": 224,
+        "recorded_peak_premium_pct": 2.0655,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": 1891.44,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": 2268.74,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": 3215.97,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "T0001_NIFTY_09301015",
+      "day": "2026-09-30",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "direction": "LONG",
+      "symbol": "NIFTY26O0622700CE",
+      "grade": "A+",
+      "confidence": 0.91,
+      "net": -1400.0,
+      "peak_gross": 372.8599999999989,
+      "entry": 203.8,
+      "recorded_stop": 183.55,
+      "quantity": 65.0,
+      "entry_time": "2026-09-30T10:15:19.002675+05:30",
+      "exit_reason": "STOP_HIT",
+      "quality_allowed": true,
+      "quality_reason_code": "BPLUS_SETUP_CONFIRMED",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "current_sqlite_completed_real_trade",
+      "path_diagnostics": {
+        "sample_count": 0,
+        "recorded_peak_premium_pct": 2.8147,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    },
+    {
+      "id": "T0002_MIDCPNIFTY_09301056",
+      "day": "2026-09-30",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "symbol": "MIDCPNIFTY26OCT13750PE",
+      "grade": "C",
+      "confidence": 0.3,
+      "net": 448.0,
+      "peak_gross": 230.22000000000205,
+      "entry": 218.85,
+      "recorded_stop": 207.95,
+      "quantity": 120.0,
+      "entry_time": "2026-09-30T10:56:37.215499+05:30",
+      "exit_reason": "UTS_REPAINT",
+      "quality_allowed": false,
+      "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+      "confidence_semantics": "heuristic_score",
+      "evidence": "current_sqlite_completed_real_trade",
+      "path_diagnostics": {
+        "sample_count": 0,
+        "recorded_peak_premium_pct": 0.8766,
+        "by_cap_pct": {
+          "5": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "10": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          },
+          "15": {
+            "sampled_stop_cross_seconds": null,
+            "sampled_positive_recovery_after_cross": false,
+            "recorded_peak_reaches_1r": false
+          }
+        },
+        "scope": "Retained gross P&L samples only; peak may omit terminal fills; no executable fill or after-exit path claim"
+      }
+    }
+  ],
+  "quality_cohort_all": {
+    "allowed": {
+      "count": 3,
+      "wins": 1,
+      "net": -1510.0
+    },
+    "rejected": {
+      "count": 7,
+      "wins": 1,
+      "net": -4972.5
+    },
+    "unknown": {
+      "count": 0,
+      "wins": 0,
+      "net": 0
+    }
+  },
+  "quality_cohort_by_day": {
+    "2026-09-28": {
+      "allowed": {
+        "count": 0,
+        "wins": 0,
+        "net": 0
+      },
+      "rejected": {
+        "count": 1,
+        "wins": 0,
+        "net": -28.0
+      },
+      "unknown": {
+        "count": 0,
+        "wins": 0,
+        "net": 0
+      }
+    },
+    "2026-09-29": {
+      "allowed": {
+        "count": 2,
+        "wins": 1,
+        "net": -110.0
+      },
+      "rejected": {
+        "count": 5,
+        "wins": 0,
+        "net": -5392.5
+      },
+      "unknown": {
+        "count": 0,
+        "wins": 0,
+        "net": 0
+      }
+    },
+    "2026-09-30": {
+      "allowed": {
+        "count": 1,
+        "wins": 0,
+        "net": -1400.0
+      },
+      "rejected": {
+        "count": 1,
+        "wins": 1,
+        "net": 448.0
+      },
+      "unknown": {
+        "count": 0,
+        "wins": 0,
+        "net": 0
+      }
+    }
+  },
+  "profit_lock_probes": [
+    {
+      "cap_pct": 5,
+      "peak": 102,
+      "arm_premium": 105,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 95
+    },
+    {
+      "cap_pct": 5,
+      "peak": 105,
+      "arm_premium": 105,
+      "armed": true,
+      "profit_floor": 103.5,
+      "hard_stop": 95
+    },
+    {
+      "cap_pct": 5,
+      "peak": 108,
+      "arm_premium": 105,
+      "armed": true,
+      "profit_floor": 105.6,
+      "hard_stop": 95
+    },
+    {
+      "cap_pct": 5,
+      "peak": 110,
+      "arm_premium": 105,
+      "armed": true,
+      "profit_floor": 107.0,
+      "hard_stop": 95
+    },
+    {
+      "cap_pct": 5,
+      "peak": 120,
+      "arm_premium": 105,
+      "armed": true,
+      "profit_floor": 114.0,
+      "hard_stop": 95
+    },
+    {
+      "cap_pct": 10,
+      "peak": 102,
+      "arm_premium": 110,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 90
+    },
+    {
+      "cap_pct": 10,
+      "peak": 105,
+      "arm_premium": 110,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 90
+    },
+    {
+      "cap_pct": 10,
+      "peak": 108,
+      "arm_premium": 110,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 90
+    },
+    {
+      "cap_pct": 10,
+      "peak": 110,
+      "arm_premium": 110,
+      "armed": true,
+      "profit_floor": 107.0,
+      "hard_stop": 90
+    },
+    {
+      "cap_pct": 10,
+      "peak": 120,
+      "arm_premium": 110,
+      "armed": true,
+      "profit_floor": 114.0,
+      "hard_stop": 90
+    },
+    {
+      "cap_pct": 15,
+      "peak": 102,
+      "arm_premium": 115,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 85
+    },
+    {
+      "cap_pct": 15,
+      "peak": 105,
+      "arm_premium": 115,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 85
+    },
+    {
+      "cap_pct": 15,
+      "peak": 108,
+      "arm_premium": 115,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 85
+    },
+    {
+      "cap_pct": 15,
+      "peak": 110,
+      "arm_premium": 115,
+      "armed": false,
+      "profit_floor": null,
+      "hard_stop": 85
+    },
+    {
+      "cap_pct": 15,
+      "peak": 120,
+      "arm_premium": 115,
+      "armed": true,
+      "profit_floor": 114.0,
+      "hard_stop": 85
+    }
+  ],
+  "atr_stop_cap_probes": [
+    {
+      "regime": "TRENDING_UP",
+      "grade": "A",
+      "fast": false,
+      "initial_atr_stop": 50.0,
+      "cap_pct": 10.0,
+      "effective_stop": 90.0
+    },
+    {
+      "regime": "RANGING",
+      "grade": "A",
+      "fast": false,
+      "initial_atr_stop": 50.0,
+      "cap_pct": 15.0,
+      "effective_stop": 85.0
+    },
+    {
+      "regime": "VOLATILE",
+      "grade": "A",
+      "fast": false,
+      "initial_atr_stop": 50.0,
+      "cap_pct": 15.0,
+      "effective_stop": 85.0
+    },
+    {
+      "regime": "RANGING",
+      "grade": "C",
+      "fast": false,
+      "initial_atr_stop": 50.0,
+      "cap_pct": 5.0,
+      "effective_stop": 95.0
+    },
+    {
+      "regime": "TRENDING_UP",
+      "grade": "A",
+      "fast": true,
+      "initial_atr_stop": 50.0,
+      "cap_pct": 5.0,
+      "effective_stop": 95.0
+    }
+  ],
+  "quality_rule_probes": [
+    {
+      "regime": "TRENDING_UP",
+      "confidence": 0.3,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BELOW_BPLUS_ELIGIBILITY"
+    },
+    {
+      "regime": "TRENDING_UP",
+      "confidence": 0.6,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BPLUS_SETUP_INSUFFICIENT"
+    },
+    {
+      "regime": "TRENDING_UP",
+      "confidence": 0.8,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": true,
+      "reason_code": "BPLUS_SETUP_CONFIRMED"
+    },
+    {
+      "regime": "RANGING",
+      "confidence": 0.3,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BELOW_BPLUS_ELIGIBILITY"
+    },
+    {
+      "regime": "RANGING",
+      "confidence": 0.6,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BPLUS_RISKY_SETUP_INSUFFICIENT"
+    },
+    {
+      "regime": "RANGING",
+      "confidence": 0.8,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BPLUS_RISKY_SETUP_INSUFFICIENT"
+    },
+    {
+      "regime": "VOLATILE",
+      "confidence": 0.3,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BELOW_BPLUS_ELIGIBILITY"
+    },
+    {
+      "regime": "VOLATILE",
+      "confidence": 0.6,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BPLUS_RISKY_SETUP_INSUFFICIENT"
+    },
+    {
+      "regime": "VOLATILE",
+      "confidence": 0.8,
+      "one_source": true,
+      "trend_15m_agrees": true,
+      "adx": 30,
+      "allowed": false,
+      "reason_code": "BPLUS_RISKY_SETUP_INSUFFICIENT"
+    }
+  ],
+  "calibration": {
+    "record_count": 29,
+    "max_segment_count": 3,
+    "required_global_default": 200,
+    "required_segment_default": 50,
+    "has_strategy_or_source_lane_column": false
+  },
+  "observed_contract_coverage": [
+    {
+      "symbol": "BANKNIFTY26SEP54100CE",
+      "day": "2026-09-29",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "MIDCPNIFTY26OCT13750PE",
+      "day": "2026-09-30",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "NIFTY26O0622700CE",
+      "day": "2026-09-30",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "NIFTY26O0622700PE",
+      "day": "2026-09-29",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "NIFTY26O0623000PE",
+      "day": "2026-09-28",
+      "direct_csv_exists": true,
+      "session_csv_exists": true,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "NIFTY26SEP22650CE",
+      "day": "2026-09-29",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "SENSEX26O0172400PE",
+      "day": "2026-09-29",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    },
+    {
+      "symbol": "SENSEX26O0172500CE",
+      "day": "2026-09-29",
+      "direct_csv_exists": false,
+      "session_csv_exists": false,
+      "bundle_contract_present": false,
+      "bundle_rows_on_day": 0
+    }
+  ],
+  "prior_observed_option_replay": {
+    "trades": 0,
+    "net": 0,
+    "wins": 0,
+    "by_tf": {},
+    "by_reason": {},
+    "by_lane": {},
+    "by_index": {
+      "NIFTY": 0,
+      "BANKNIFTY": 0,
+      "SENSEX": 0,
+      "MIDCPNIFTY": 0
+    },
+    "network_attempts": 0,
+    "diagnostics_option_history": {
+      "attempts": 33,
+      "hits": 2,
+      "misses": 58,
+      "synthetic": 0,
+      "fallback_to_fut": 0,
+      "archived_hits": 40
+    },
+    "rejects": {
+      "UTS replay lacks a complete observed option path or compatible stop": 42,
+      "UTS replay requires observed option prices": 58,
+      "After no-entry gate 14:50": 4
+    },
+    "rejected_rows": [],
+    "scope": "Observed option OHLC only; conservative ordering; no live orders; no profit claim",
+    "all_option_prices_observed": true,
+    "all_quality_allowed": true,
+    "no_uts_fixed_targets": true,
+    "checks_vacuous_without_trades": true
+  },
+  "source_sha256": {
+    "engine/uts_lane.py": "487fd04dd4441b29f6e3d6e42872630a4f2d57052b10d75403d304e097006d7b",
+    "engine/ut_smart_engine.py": "de378cbeb395ac558b98cfda33d259708277d8a02b43e17d3fd6d86822af5e2e",
+    "engine/entry_policy.py": "aadd0bff12de0669a3d94da4228afa827b1106284aaea3f041bd32de6157b69d",
+    "engine/exit_cycle.py": "b63d5f05fbb60ef58445f816f796e8044a6419cad3ce614d6ca0d8d8fd8c8a88",
+    "engine/quality_verdict.py": "45184408260d8d497a55ee8619063995118ab19d81027f28e0a7ae248be84212",
+    "engine/signal_manager.py": "ea47bd853c33846ceec616b3432ae64fa2942db26c621d432c0e15ed04e8a58c",
+    "engine/signal_processor.py": "df2a56fb63caeaddb4719513ded9147f122d7463709e13aca0277b67071cfef6",
+    "engine/market_regime.py": "941e0ff3b692e058a75ca989f3cd3eb6c1df23a2c79e52b5ef8c0192ce71925c",
+    "scanner.py": "dd4c22140cd92b7182a313c5968b337f36b5f68e2db454809788769b2b21f680",
+    "trading/trade_manager.py": "c0fefdb18701292fb5b1720fb42449b721a4e724f7f9098c9761fb256109ce17",
+    "intelligence/confidence_calibration.py": "2849e3d68d55abf2c5d0334e02a98d258504aa1bd8b6bbea7e9a97b09e9b293c",
+    "config/settings.py": "45574859946aa4e9b029abc0084a0cc6a0ffa8e619289ff17524490a72bfda18"
+  },
+  "limitations": [
+    "Cohorts are selected executed trades under old exits, not a causal filter backtest.",
+    "App costs are not broker contract-note reconciliation.",
+    "Only ten completed UTS fills are available; correlated index trades are not independent observations.",
+    "Sampled P&L paths omit ticks and end at actual exits; later recovery cannot be inferred.",
+    "Recorded peak can omit a terminal fill: MIDCPNIFTY final gross gain exceeds its stored peak.",
+    "Missing observed contract paths block stop/re-entry and grade counterfactual validation.",
+    "Detached rule probes prove code behavior, not market profitability."
+  ],
+  "production_sources_unchanged": true
+}

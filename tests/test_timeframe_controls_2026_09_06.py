@@ -23,6 +23,8 @@ from scanner import Scanner
         ("INCLUDE_5MIN", {"5min", "15min"}),
         ("INCLUDE_1MIN_5MIN", {"1min", "5min"}),
         ("INCLUDE_1MIN_5MIN_15MIN", {"1min", "5min", "15min"}),
+        ("PRIMARY_1", {"1min"}),
+        ("INCLUDE_1MIN_15MIN", {"1min", "15min"}),
     ],
 )
 def test_timeframe_policy_modes_have_exact_frame_sets(policy, expected):
@@ -42,6 +44,8 @@ def test_settings_accept_each_dashboard_timeframe_policy():
         "INCLUDE_5MIN",
         "INCLUDE_1MIN_5MIN",
         "INCLUDE_1MIN_5MIN_15MIN",
+        "PRIMARY_1",
+        "INCLUDE_1MIN_15MIN",
     ):
         assert Settings(ut_timeframe_entry_policy=policy).ut_timeframe_entry_policy == policy
 
@@ -52,12 +56,20 @@ def test_settings_accept_each_dashboard_timeframe_policy():
         ("PRIMARY_5", "5min", True),
         ("PRIMARY_5", "1min", False),
         ("PRIMARY_5", "15min", False),
-        ("INCLUDE_1MIN_5MIN", "1min", True),
+        # 2026-09-26 user: a plain 1m signal enters only when the toggle is 1M alone;
+        # every other policy takes 1m bursts/snapbacks only (fast-entry test below).
+        ("INCLUDE_1MIN_5MIN", "1min", False),
         ("INCLUDE_1MIN_5MIN", "5min", True),
         ("INCLUDE_1MIN_5MIN", "15min", False),
-        ("INCLUDE_1MIN_5MIN_15MIN", "1min", True),
+        ("INCLUDE_1MIN_5MIN_15MIN", "1min", False),
         ("INCLUDE_1MIN_5MIN_15MIN", "5min", True),
         ("INCLUDE_1MIN_5MIN_15MIN", "15min", True),
+        ("PRIMARY_1", "1min", True),
+        ("PRIMARY_1", "5min", False),
+        ("PRIMARY_1", "15min", False),
+        ("INCLUDE_1MIN_15MIN", "1min", False),
+        ("INCLUDE_1MIN_15MIN", "5min", False),
+        ("INCLUDE_1MIN_15MIN", "15min", True),
     ],
 )
 def test_live_policy_gate_honors_all_new_modes(monkeypatch, policy, timeframe, expected):
@@ -81,7 +93,10 @@ def test_live_policy_gate_honors_all_new_modes(monkeypatch, policy, timeframe, e
     assert scanner._passes_timeframe_entry_policy(candidate) is expected
 
 
-@pytest.mark.parametrize("policy", ("PRIMARY_15", "INCLUDE_5MIN"))
+@pytest.mark.parametrize(
+    "policy",
+    ("PRIMARY_15", "INCLUDE_5MIN", "PRIMARY_5", "INCLUDE_1MIN_5MIN", "INCLUDE_1MIN_5MIN_15MIN"),
+)
 @pytest.mark.parametrize(
     "exception_flag",
     (
@@ -119,7 +134,8 @@ def test_legacy_modes_keep_confirmed_one_minute_special_entries(
     assert scanner._passes_timeframe_entry_policy(candidate) is True
 
 
-def test_primary_five_blocks_even_fast_one_minute_entry(monkeypatch):
+def test_primary_five_admits_a_fast_one_minute_entry(monkeypatch):
+    """2026-09-25 user: 1m burst/spike/snapback trades work under every policy, 5m-only too."""
     monkeypatch.setattr(
         scanner_module,
         "get_settings",
@@ -137,7 +153,7 @@ def test_primary_five_blocks_even_fast_one_minute_entry(monkeypatch):
         market_wide_reversal_entry=False,
     )
 
-    assert scanner._passes_timeframe_entry_policy(candidate) is False
+    assert scanner._passes_timeframe_entry_policy(candidate) is True
 
 
 def test_explicit_one_minute_policy_never_admits_raw_one_minute_row():

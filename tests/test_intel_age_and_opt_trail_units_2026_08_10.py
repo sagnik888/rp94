@@ -40,6 +40,7 @@ import time
 import pytest
 
 from scanner import Scanner
+from engine.exit_cycle import ExitCycleService
 
 INDICES = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
 
@@ -111,7 +112,7 @@ def test_the_reader_still_prefers_an_embedded_stamp():
 # ── 2. the option trail converts before it ratchets ──────────────────────────
 
 def _preservation_branch():
-    src = textwrap.dedent(inspect.getsource(Scanner._update_active_trades))
+    src = textwrap.dedent(inspect.getsource(ExitCycleService.update_active_trades))
     marker = "Live Trade Preservation Patch"
     assert marker in src, "the live-preservation branch moved"
     start = src.index(marker)
@@ -165,7 +166,7 @@ def test_a_zero_conversion_cannot_wipe_the_stop():
 def test_the_units_premise_still_holds():
     """new_stop is spot-space and current_stop is premium-space. If this ever changes,
     the conversion above becomes wrong and this test says so first."""
-    src = textwrap.dedent(inspect.getsource(Scanner._update_active_trades))
+    src = textwrap.dedent(inspect.getsource(ExitCycleService.update_active_trades))
     assert "new_stop = prem_to_spot(trade.current_stop)" in src, (
         "new_stop is no longer seeded from a premium->spot conversion"
     )

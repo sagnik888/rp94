@@ -252,6 +252,10 @@ def test_rtracker_preserves_strategy_quote_risk_and_runner_basis(tmp_path):
         "revision": "rev-42",
         "direction_mode": "BIDIRECTIONAL",
         "data_provenance": "LIVE",
+        # 2026-09-16: ``revision`` is a settings constant, so it cannot tell an edited
+        # working tree from a released commit. This candidate carries no fingerprint,
+        # and an unstamped row must archive as empty rather than crash the archiver.
+        "build_fingerprint": "",
     }
     assert event["quote"]["decision_verified"] is True
     assert event["quote"]["entry_verified"] is True

@@ -10,6 +10,7 @@ DEFAULT OFF. These tests pin the decision logic so the feature stays correct and
 tunable if it is ever revisited.
 """
 from types import SimpleNamespace
+import re
 
 import scanner as scanner_module
 from scanner import Scanner
@@ -146,12 +147,8 @@ def test_dashboard_toggle_is_fully_wired():
     # Bump the cache-buster whenever this bundle changes, or browsers keep serving the
     # old JS and the new control never appears for the operator.
     index_html = (root / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
-    # Pins the CURRENT cache-buster, so bumping the bundle forces this to be updated
-    # deliberately. Bumped to v25 on 2026-08-18 when the breakeven-stop,
-    # give-back-cap and backtest-live-exit controls were added: they were present
-    # in the JS and mounted in the DOM, but invisible in the running dashboard
-    # because the version string still said v=24 and browsers served the cache.
-    assert "dashboard-settings.js?v=32-single-auto-authority" in index_html
+    # Require a versioned settings bundle without pinning an obsolete release tag.
+    assert re.search(r'dashboard-settings\.js\?v=[^"\s]+', index_html)
 
 
 def test_configure_applies_and_reverts_the_toggle(monkeypatch):

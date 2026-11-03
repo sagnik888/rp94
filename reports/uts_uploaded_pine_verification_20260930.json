@@ -1,0 +1,137 @@
+{
+  "verified_at_local": "2026-09-30T16:14:16.224484+05:30",
+  "tests": {
+    "full": {
+      "tests": 7554,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 565.008
+    },
+    "integration": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 4.829
+    },
+    "focused": {
+      "tests": 523,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 62.231
+    },
+    "independent_review": {
+      "tests": 26,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 29.872
+    }
+  },
+  "total_passed": 7558,
+  "source_hashes": {
+    "config/settings.py": "f4831807773b245839da4fe7d00ca7aefd97e448975ce1b2580f8fb95726c806",
+    "engine/ut_smart_engine.py": "6148f2ecc1b72fa3c01879417177b82553f947c909d459f0d9a68625de8114ef",
+    "engine/alt_scanners.py": "52bd36c1d7f3abece26da2490739f2ce9ce8209682cf8976127d6785e8141fb9",
+    "engine/scanner_chart_mixin.py": "3e6300328de46d5d89eaabd3f61258352458e36a4bc4055d2402bc67aee5b2f5",
+    "dashboard/static/js/dashboard-settings.js": "26fada5c3fc5b24ce7623d6c3ca4dbfb7194106137e6cdb0fbd336c3799d92d6",
+    "scanner.py": "d348f8da5aa3fe6146464c2e5dcc7a484676f635d0c561256de8c7d0ed9d48d4",
+    "engine/signal_processor.py": "dded9a89eab6cbc381910db5e1ac3131edd60d8bc4b0ae837e0588b084245359",
+    "engine/uts_lane.py": "9964d914debc576ba24976d897f38447c83dc1b41889a6f7ef8a652883453df2",
+    "engine/s1_lane.py": "efb880f6e6f6cd053d06d36f08fef4eb76b5cb1c20fd4d847e1b7c591795c634",
+    "engine/exit_cycle.py": "b3a0be0676e899a9828bc4a0709767a3e03ea5c5c27edad862ea4924f0ce25c0",
+    "engine/risk_manager.py": "e34cc6da656608ed3b6b4f4455c6afb68a78ab8576dc8ebb7bd0e7054ab3df8c",
+    "trading/trade_manager.py": "cf682b2c4dc41145c817e408828680332f37e43092c7196fad36746e822cce2c"
+  },
+  "source_changed_during_tests": [],
+  "effective_fresh_process_parameters": {
+    "1min": {
+      "key_value": 1.0,
+      "atr_period": 10,
+      "use_heikin_ashi": false,
+      "smart_exit": true,
+      "arm_atr": 0.8,
+      "retrace_atr": 0.45,
+      "hard_retrace_atr": 1.1,
+      "min_bars": 2,
+      "confirmations": 2,
+      "rsi_length": 14,
+      "rsi_ob": 70.0,
+      "rsi_os": 30.0,
+      "rsi_lookback": 5,
+      "exit_ema": 5,
+      "wick_ratio": 0.35,
+      "session_end": "15:15"
+    },
+    "5min": {
+      "key_value": 1.0,
+      "atr_period": 10,
+      "use_heikin_ashi": false,
+      "smart_exit": true,
+      "arm_atr": 0.8,
+      "retrace_atr": 0.45,
+      "hard_retrace_atr": 1.1,
+      "min_bars": 2,
+      "confirmations": 2,
+      "rsi_length": 14,
+      "rsi_ob": 70.0,
+      "rsi_os": 30.0,
+      "rsi_lookback": 5,
+      "exit_ema": 5,
+      "wick_ratio": 0.35,
+      "session_end": "15:15"
+    },
+    "15min": {
+      "key_value": 1.0,
+      "atr_period": 10,
+      "use_heikin_ashi": false,
+      "smart_exit": true,
+      "arm_atr": 0.8,
+      "retrace_atr": 0.45,
+      "hard_retrace_atr": 1.1,
+      "min_bars": 2,
+      "confirmations": 2,
+      "rsi_length": 14,
+      "rsi_ob": 70.0,
+      "rsi_os": 30.0,
+      "rsi_lookback": 5,
+      "exit_ema": 5,
+      "wick_ratio": 0.35,
+      "session_end": "15:15"
+    }
+  },
+  "chart_expected_entries": [
+    {
+      "bar_time": "09:15",
+      "side": "BUY"
+    },
+    {
+      "bar_time": "10:30",
+      "side": "SELL"
+    },
+    {
+      "bar_time": "11:45",
+      "side": "BUY"
+    },
+    {
+      "bar_time": "13:30",
+      "side": "SELL"
+    }
+  ],
+  "chart_expected_smart_exit": "13:15",
+  "runtime": {
+    "pid": 31600,
+    "import_snapshot": "2026-09-30T09:04:35.317138+00:00",
+    "restart_required": true
+  },
+  "live_broker_mutations": false,
+  "capital_policy_preserved": "5% special,10% regular,15% risky 15m; guarded one-time 5m widening",
+  "limitations": [
+    "Different broker and TradingView full OHLC histories were not available for unconditional full-history parity.",
+    "FYERS frozen final-session tail remains excluded.",
+    "TradingView compiler/export execution was not available.",
+    "Option execution retains the user capital and safety rules."
+  ]
+}

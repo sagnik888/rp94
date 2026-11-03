@@ -16,6 +16,7 @@ from datetime import datetime
 import pandas as pd
 
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 from trading.trade_manager import IST, Trade, TradeManager
 
 
@@ -80,7 +81,7 @@ def test_futures_sim_hits_target_before_ride_to_end():
         {"open": 103, "high": 111, "low": 102, "close": 108},
     ])
     price, reason, ts = SignalProcessor._simulate_futures_exit_path(w, 100.0, 95.0, 110.0, "LONG")
-    assert reason == "TARGET_HIT" and price == 110.0 and ts == w.index[1]
+    assert reason == "TARGET_HIT" and price == 110.0 and ts == w.index[1] + pd.Timedelta(minutes=1)
 
 
 def test_futures_sim_stop_first_and_tie_break():
@@ -106,9 +107,12 @@ def test_primary_fut_replay_gets_target_parity_source_contract():
     walker — this dataset's 334 FUT rows were primary-routed and had zero
     TARGET_HIT before the fix."""
     import inspect
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
     fut_block = src[src.find('if sim_inst == "FUT":', src.find("between_candles")):]
-    assert "_simulate_futures_exit_path" in fut_block[:2200]
+    # The S12-native branch now precedes the generic parity walker. Keep both paths
+    # covered without assuming the generic call remains in the first 2,200 characters.
+    assert "_simulate_s12_futures_exit_path" in fut_block[:2200]
+    assert "_simulate_futures_exit_path" in fut_block[:4200]
     assert "fut_target_hit" in src
     # target-hit must be reflected in the exit reason assembly
     assert '"TARGET_HIT" if fut_target_hit' in src

@@ -18,6 +18,9 @@ SAFETY — this stays consistent with the existing ADVISORY_ONLY guardrail in
 from __future__ import annotations
 
 import csv
+import math
+from bisect import bisect_left
+from datetime import datetime
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -29,11 +32,18 @@ def _isotonic_pava(x: Sequence[float], y: Sequence[float]) -> Tuple[List[float],
     Returns (thresholds, fitted_values) describing a non-decreasing step curve.
     """
     pairs = sorted(zip(x, y), key=lambda p: p[0])
-    xs = [float(p[0]) for p in pairs]
-    # Each block: [sum_y, count, x_right]
+    # Equal x values are one observation group before enforcing monotonicity.
+    groups: List[List[float]] = []
+    for xi, yi in pairs:
+        if groups and groups[-1][2] == float(xi):
+            groups[-1][0] += float(yi)
+            groups[-1][1] += 1
+        else:
+            groups.append([float(yi), 1.0, float(xi)])
+    # Each block: [sum_y, count, x_right].
     blocks: List[List[float]] = []
-    for xi, yi in zip(xs, (p[1] for p in pairs)):
-        blocks.append([float(yi), 1.0, float(xi)])
+    for group in groups:
+        blocks.append(group)
         # Merge while previous mean > current mean (enforce non-decreasing)
         while len(blocks) >= 2 and (blocks[-2][0] / blocks[-2][1]) > (blocks[-1][0] / blocks[-1][1]):
             s2, c2, _ = blocks.pop()
@@ -55,18 +65,31 @@ class ConfidenceCalibrator:
 
     def transform(self, confidence: float) -> float:
         c = float(confidence or 0.0)
-        # Right-continuous step lookup on the isotonic blocks.
-        out = self._values[0] if self._values else c
-        for thr, val in zip(self._thresholds, self._values):
-            if c >= thr:
-                out = val
-            else:
-                break
+        # Thresholds are block right endpoints, including every pooled point.
+        if not self._values:
+            return max(0.0, min(1.0, c))
+        index = min(bisect_left(self._thresholds, c), len(self._values) - 1)
+        out = self._values[index]
         return max(0.0, min(1.0, out))
 
 
 _CACHE: dict = {}
 _CACHE_TTL = 300.0
+
+
+class CalibratedConfidence(float):
+    """Float-compatible result carrying proof that a fitted segment was applied."""
+    calibration_applied = True
+
+
+def _decision_time(value):
+    """Normalize recorded decision/outcome clocks to naive exchange time."""
+    from zoneinfo import ZoneInfo
+    try:
+        ts = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return ts.astimezone(ZoneInfo('Asia/Kolkata')).replace(tzinfo=None) if ts.tzinfo else ts
+    except (TypeError, ValueError):
+        return None
 
 
 def load_calibrator(
@@ -76,6 +99,7 @@ def load_calibrator(
     instrument: str = "",
     timeframe: str = "",
     regime: str = "",
+    as_of=None,
 ) -> Optional[ConfidenceCalibrator]:
     """Fit (and cache) a calibrator, or return None if the data is not ready.
 
@@ -83,11 +107,17 @@ def load_calibrator(
     classes present. A degenerate dataset returns None (calibration is a no-op).
     """
     now = time.monotonic()
+    cutoff = _decision_time(as_of) if as_of is not None else None
+    if as_of is not None and cutoff is None:
+        return None
+    p = Path(path)
+    signature = (p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None
     instrument_parts = str(instrument or "").split()
     segment = (
         str(Path(path).resolve()), int(min_samples),
         instrument_parts[0].upper() if instrument_parts else "",
         str(timeframe or "").lower(), str(regime or "").upper(),
+        cutoff, signature,
     )
     cached = _CACHE.get(segment)
     if cached and (now - cached["at"]) < _CACHE_TTL:
@@ -95,12 +125,16 @@ def load_calibrator(
 
     confidences: List[float] = []
     outcomes: List[float] = []
-    p = Path(path)
     if p.exists() and p.stat().st_size > 0:
         try:
             with p.open("r", newline="", encoding="utf-8") as fh:
                 for row in csv.DictReader(fh):
-                    if segment[2] and str(row.get("instrument") or "").split()[0].upper() != segment[2]:
+                    if cutoff is not None:
+                        outcome_time = _decision_time(row.get('exit_time'))
+                        if outcome_time is None or outcome_time >= cutoff:
+                            continue
+                    row_instrument = str(row.get("instrument") or "").split()
+                    if segment[2] and (not row_instrument or row_instrument[0].upper() != segment[2]):
                         continue
                     if segment[3] and str(row.get("timeframe") or "").lower() != segment[3]:
                         continue
@@ -110,6 +144,8 @@ def load_calibrator(
                         conf = float(row.get("confidence") or "")
                         pnl = float(row.get("pnl") or "")
                     except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(conf) or not 0.0 <= conf <= 1.0 or not math.isfinite(pnl):
                         continue
                     confidences.append(conf)
                     outcomes.append(1.0 if pnl > 0 else 0.0)
@@ -137,6 +173,7 @@ def calibrate(
     instrument: str = "",
     timeframe: str = "",
     regime: str = "",
+    as_of=None,
 ) -> float:
     """Return calibrated confidence if enabled AND data is ready, else the input.
 
@@ -155,7 +192,7 @@ def calibrate(
         if not instrument or not timeframe or not regime:
             return float(confidence or 0.0)
         global_min = int(getattr(settings, "ut_confidence_calibration_min_samples", 200) or 200)
-        if load_calibrator(path, min_samples=global_min) is None:
+        if load_calibrator(path, min_samples=global_min, as_of=as_of) is None:
             return float(confidence or 0.0)
         segment_min = int(
             getattr(settings, "ut_confidence_calibration_min_segment_samples", 50) or 50
@@ -166,9 +203,10 @@ def calibrate(
             instrument=instrument,
             timeframe=timeframe,
             regime=regime,
+            as_of=as_of,
         )
         if cal is None:
             return float(confidence or 0.0)
-        return cal.transform(float(confidence or 0.0))
+        return CalibratedConfidence(cal.transform(float(confidence or 0.0)))
     except Exception:
         return float(confidence or 0.0)

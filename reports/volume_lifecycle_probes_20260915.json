@@ -1,0 +1,60 @@
+{
+  "pcr_change_response": [
+    {
+      "ratio": 0.6,
+      "primary_pcr": 0.6,
+      "signal": "BEARISH",
+      "trend": "STABLE",
+      "history_count": 1,
+      "adverse_to_long": 1,
+      "adverse_to_short": 0
+    },
+    {
+      "ratio": 0.7,
+      "primary_pcr": 0.7,
+      "signal": "NEUTRAL",
+      "trend": "STABLE",
+      "history_count": 2,
+      "adverse_to_long": 0,
+      "adverse_to_short": 0
+    },
+    {
+      "ratio": 0.8,
+      "primary_pcr": 0.8,
+      "signal": "NEUTRAL",
+      "trend": "STABLE",
+      "history_count": 3,
+      "adverse_to_long": 0,
+      "adverse_to_short": 0
+    },
+    {
+      "ratio": 1.0,
+      "primary_pcr": 1.0,
+      "signal": "BULLISH",
+      "trend": "STABLE",
+      "history_count": 4,
+      "adverse_to_long": 0,
+      "adverse_to_short": 1
+    },
+    {
+      "ratio": 1.2,
+      "primary_pcr": 1.2,
+      "signal": "BULLISH",
+      "trend": "RISING",
+      "history_count": 5,
+      "adverse_to_long": 0,
+      "adverse_to_short": 1
+    },
+    {
+      "ratio": 1.5,
+      "primary_pcr": 1.5,
+      "signal": "STRONG_BULLISH",
+      "trend": "RISING",
+      "history_count": 6,
+      "adverse_to_long": 0,
+      "adverse_to_short": 1
+    }
+  ],
+  "same_snapshot_does_not_add_history": true,
+  "pcr_trend_label_alone_does_not_change_exit_votes": true
+}

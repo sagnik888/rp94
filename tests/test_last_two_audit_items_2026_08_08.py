@@ -36,6 +36,8 @@ import textwrap
 
 import pytest
 
+from engine.execution_service import ExecutionService
+
 
 # ── 1. the cascade add is offered upstream too ───────────────────────────────
 
@@ -84,9 +86,7 @@ def test_a_successful_add_does_not_also_open_a_trade():
 
 def test_the_scanner_side_seam_still_exists():
     """Both gates must offer it; this one was fixed first."""
-    from scanner import Scanner
-
-    assert "_offer_cascade_add" in inspect.getsource(Scanner._coordinate_and_execute)
+    assert "_offer_cascade_add" in inspect.getsource(ExecutionService.coordinate_and_execute)
 
 
 # ── 2. reconstructed rows are ghosts ─────────────────────────────────────────

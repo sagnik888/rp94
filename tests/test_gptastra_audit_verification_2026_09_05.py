@@ -20,7 +20,10 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from trading.trade_manager import IST, Trade, TradeManager
+from engine.entry_analysis_service import EntryAnalysisService
+from engine.exit_cycle import ExitCycleService
 from scanner import Scanner
+from tests.source_views import signal_pipeline_source
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -67,7 +70,7 @@ class TestFinding1_ScanLoopResponsiveness:
         """The scanner's event loop must pass allow_blocking=False to
         _update_active_trades so REST calls don't stall the loop."""
         source = inspect.getsource(Scanner._scan_cycle)
-        assert "_update_active_trades(allow_blocking=False)" in source
+        assert "self._run_exit_tick()" in source
 
     def test_position_sync_loop_runs_on_dedicated_thread(self):
         """Position sync must run on its own daemon thread, not the scan loop."""
@@ -137,13 +140,13 @@ class TestFinding3_IntelligenceFreshness:
     def test_exception_sets_computed_flag_false_before_using_fallback(self):
         """When intelligence analysis raises, intel_computed_this_pass must be
         set False BEFORE the fallback assignment, preventing re-caching."""
-        source = inspect.getsource(Scanner._process_instrument)
+        source = inspect.getsource(EntryAnalysisService.process)
         # Find the exception handler in the intelligence block
         except_pos = source.index(
             "except Exception as e:",
             source.index("intel_computed_this_pass")
         )
-        handler = source[except_pos:except_pos + 600]
+        handler = source[except_pos:except_pos + 900]
         flag_pos = handler.index("intel_computed_this_pass = False")
         fallback_pos = handler.index("intel_result = cached_intel")
         assert flag_pos < fallback_pos, \
@@ -152,9 +155,9 @@ class TestFinding3_IntelligenceFreshness:
     def test_cache_write_guarded_by_computed_flag(self):
         """The downstream _cache_timeframe_intel call must check
         intel_computed_this_pass, preventing stale re-stamping."""
-        source = inspect.getsource(Scanner._process_instrument)
+        source = inspect.getsource(EntryAnalysisService.process)
         # The cache write line must be guarded by the computed flag
-        cache_line = "self._cache_timeframe_intel(name, \"5min\", intel_result, at=now"
+        cache_line = "scanner._cache_timeframe_intel(name, \"5min\", intel_result, at=now"
         cache_pos = source.rindex(cache_line)
         # Walk backwards to find the if-guard containing intel_computed_this_pass
         guard_region = source[max(0, cache_pos - 800):cache_pos]
@@ -162,7 +165,7 @@ class TestFinding3_IntelligenceFreshness:
 
     def test_initial_flag_is_false(self):
         """intel_computed_this_pass must start False (pessimistic default)."""
-        source = inspect.getsource(Scanner._process_instrument)
+        source = inspect.getsource(EntryAnalysisService.process)
         first_assignment = source.index("intel_computed_this_pass = False")
         first_true = source.index("intel_computed_this_pass = True")
         assert first_assignment < first_true, \
@@ -182,7 +185,7 @@ class TestFinding4_SignalHoldRetry:
         _live_signal_recheck_eligible must be set BEFORE
         _remember_live_signal_identity is called."""
         from engine.signal_processor import SignalProcessor
-        source = inspect.getsource(SignalProcessor.process_best_signal)
+        source = signal_pipeline_source()
 
         hold_msg = "own-timeframe intelligence; fail-closed grading is active."
         hold_pos = source.index(hold_msg)
@@ -198,7 +201,7 @@ class TestFinding4_SignalHoldRetry:
         """The hold path must have a deadline check so stale holds don't
         accumulate indefinitely."""
         from engine.signal_processor import SignalProcessor
-        source = inspect.getsource(SignalProcessor.process_best_signal)
+        source = signal_pipeline_source()
 
         hold_msg = "own-timeframe intelligence; fail-closed grading is active."
         hold_pos = source.index(hold_msg)
@@ -211,7 +214,7 @@ class TestFinding4_SignalHoldRetry:
         """After a signal is successfully graded, its recheck entry must be
         removed so it doesn't re-fire."""
         from engine.signal_processor import SignalProcessor
-        source = inspect.getsource(SignalProcessor.process_best_signal)
+        source = signal_pipeline_source()
 
         # Find the code after successful grading (after _grade_signal)
         grade_pos = source.index("_grade_signal(")
@@ -276,7 +279,7 @@ class TestFinding5_FuturesQuoteProtection:
     def test_missing_spot_with_valid_contract_quote_still_processes(self):
         """If underlying spot is None but a valid futures contract quote
         exists, the trade must still be processed (not skipped)."""
-        source = inspect.getsource(Scanner._update_active_trades)
+        source = inspect.getsource(ExitCycleService.update_active_trades)
         # The fix: if price (spot) is None, but real_fut_price is valid,
         # the trade must not continue-skip
         assert "(price is None or price <= 0) and not (real_fut_price and real_fut_price > 0)" in source
@@ -284,7 +287,7 @@ class TestFinding5_FuturesQuoteProtection:
     def test_missing_both_spot_and_contract_skips_safely(self):
         """If BOTH spot and contract quote are absent, the trade must be
         skipped for this pass (no processing on garbage data)."""
-        source = inspect.getsource(Scanner._update_active_trades)
+        source = inspect.getsource(ExitCycleService.update_active_trades)
         # Line 33013-33014: both absent → continue
         assert "if (price is None or price <= 0) and not (real_fut_price and real_fut_price > 0):" in source
 
@@ -355,7 +358,7 @@ class TestFinding6_RecoveryExitReconciliation:
     def test_scanner_skips_recovery_trades_in_update_active(self):
         """_update_active_trades must skip RECOVERY_REQUIRED trades to
         prevent strategy exit spam."""
-        source = inspect.getsource(Scanner._update_active_trades)
+        source = inspect.getsource(ExitCycleService.update_active_trades)
         assert "\"RECOVERY_REQUIRED\"" in source
         # The continue after the status check
         skip_block = source[source.index("pending_exit"):]
@@ -421,7 +424,7 @@ class TestCrossCutting:
     def test_intel_cache_hit_path_does_not_write_cache(self):
         """When intelligence is a cache hit (intel_is_fresh), the code must
         NOT re-cache with a new timestamp (supports finding 3)."""
-        source = inspect.getsource(Scanner._process_instrument)
+        source = inspect.getsource(EntryAnalysisService.process)
         # The cache-hit path uses cached_intel directly
         cache_hit = source[source.index("if intel_is_fresh:"):]
         next_else = cache_hit.index("else:")

@@ -1,0 +1,29 @@
+{
+  "1min": {
+    "rows": 7892,
+    "columns": 10,
+    "copies": 50,
+    "wall_total_sec": 0.02762989979237318,
+    "cpu_total_sec": 0.03125,
+    "wall_max_sec": 0.0014272999251261353,
+    "wall_median_sec": 0.0005289500113576651
+  },
+  "5min": {
+    "rows": 1579,
+    "columns": 10,
+    "copies": 50,
+    "wall_total_sec": 0.016587599995546043,
+    "cpu_total_sec": 0.015625,
+    "wall_max_sec": 0.0008505999576300383,
+    "wall_median_sec": 0.0003105499199591577
+  },
+  "15min": {
+    "rows": 1153,
+    "columns": 10,
+    "copies": 50,
+    "wall_total_sec": 0.018172799958847463,
+    "cpu_total_sec": 0.015625,
+    "wall_max_sec": 0.000618100049905479,
+    "wall_median_sec": 0.00035375001607462764
+  }
+}

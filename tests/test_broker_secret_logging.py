@@ -1,4 +1,4 @@
-"""AngelOne's price-only fallback must not leak broker secrets.
+"""AngelOne's read-only adapter must not leak broker secrets.
 
 This file used to assert that logzero's logger was silenced to CRITICAL, because the
 AngelOne SmartAPI logs complete failing request headers through logzero. The narrow index

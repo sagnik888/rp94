@@ -20,10 +20,11 @@ import textwrap
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 
 def _buffer_source():
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     marker = "Live Anti-Repaint Stabilization Buffer"
     assert marker in src, "the stabilization buffer block moved or was renamed"
     return src[src.index(marker):]
@@ -31,7 +32,7 @@ def _buffer_source():
 
 def _closed_candle_branch():
     """The `if not entered_intracandle:` branch of the buffer block, as an AST node."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
@@ -82,7 +83,7 @@ def test_the_branch_is_the_negative_case():
     name, which was the explanatory COMMENT above the branch, so it proved nothing about
     the code and failed against a correct implementation.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
     guards = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.If)

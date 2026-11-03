@@ -285,6 +285,23 @@ class RegimeDetector:
                 range_day_guard_reason = f"confirmed_range_day_demoted_{regime.value}"
                 regime = MarketRegime.RANGING
                 confidence = min(confidence, 60)
+
+            trend_day_guard_reason = ""
+            contradicted = self._trend_day_contradicted_regime(
+                settings=_settings,
+                session_context=session_context,
+                breadth_context=breadth_context,
+                regime=regime.value,
+            )
+            if contradicted:
+                trend_day_guard_reason = (
+                    f"trend_day_contradiction_{regime.value}_to_{contradicted}"
+                )
+                regime = MarketRegime(contradicted)
+                # Corrected, not confirmed. The session and breadth agree on the side,
+                # but this label was just overruled, so it must not also carry the
+                # conviction of a label the detector arrived at on its own.
+                confidence = min(confidence, 70)
             guarded_regime = regime.value
             # Track history: one entry PER BAR, as the comment below and _smooth_regime
             # both assume. It used to append on every detect() CALL. Live, detect runs on
@@ -371,6 +388,8 @@ class RegimeDetector:
                 "er_veto_reason": er_veto_reason,
                 "range_day_trend_guard": bool(range_day_guard_reason),
                 "range_day_trend_guard_reason": range_day_guard_reason,
+                "trend_day_contradiction_guard": bool(trend_day_guard_reason),
+                "trend_day_contradiction_guard_reason": trend_day_guard_reason,
                 "breakout_direction": breakout_direction,
                 "breakout_confirmed": bool(breakout_confirmed),
                 "conviction_vector": conviction["vector"],
@@ -479,9 +498,18 @@ class RegimeDetector:
         else:
             breakout_prob = 0.10 if volatility_expansion_prob < 0.45 else 0.22
 
-        day_type = str(session_context.get("day_type") or "").upper()
+        day_type = str(
+            session_context.get("effective_day_type")
+            or session_context.get("day_type")
+            or ""
+        ).upper()
         try:
-            day_conf = float(session_context.get("confidence") or 0.0)
+            day_conf = float(
+                session_context.get("effective_confidence")
+                or session_context.get("phase_confidence")
+                or session_context.get("confidence")
+                or 0.0
+            )
         except Exception:
             day_conf = 0.0
         try:
@@ -640,9 +668,18 @@ class RegimeDetector:
         if float(er_value or 0.0) < threshold:
             return {}
         day_ctx = session_context or {}
-        day_type = str(day_ctx.get("day_type") or "").upper()
+        day_type = str(
+            day_ctx.get("effective_day_type")
+            or day_ctx.get("day_type")
+            or ""
+        ).upper()
         try:
-            day_conf = float(day_ctx.get("confidence") or 0.0)
+            day_conf = float(
+                day_ctx.get("effective_confidence")
+                or day_ctx.get("phase_confidence")
+                or day_ctx.get("confidence")
+                or 0.0
+            )
         except Exception:
             day_conf = 0.0
         range_conf = float(
@@ -670,6 +707,93 @@ class RegimeDetector:
             "confidence": confidence,
             "reason": reason,
         }
+
+    def _trend_day_contradicted_regime(
+        self,
+        *,
+        settings,
+        session_context: Optional[Dict[str, Any]],
+        breadth_context: Optional[Dict[str, Any]],
+        regime: str,
+    ) -> str:
+        """The session-aligned trend label when the current one points the wrong way.
+
+        2026-09-15: the indices fell ~2%, session context called TREND_DAY_DOWN with
+        0.76-0.91 confidence from 09:45, and market breadth read BEARISH 4/4 from 10:15 --
+        while this detector held TRENDING_UP until 11:00. That label costs a with-trend
+        SHORT -0.25 in the regime pillar instead of paying it +0.30, a 0.55 swing that
+        dropped 36 refused SHORTs to 15-37% confidence and under the 55% B+ floor. Their
+        shadow outcomes were +Rs.43,285 at the 30-minute horizon.
+
+        Note the lag is NOT the 5-bar majority vote: ``raw_regime`` itself read
+        TRENDING_UP on 34 of those 36 rows, so smoothing had nothing to do with it. The
+        fix belongs on the regime INPUT, which is what this reads.
+
+        Deliberately narrow. It needs TWO independent witnesses that already exist and
+        already disagreed with the label -- a confident TREND_DAY day-type and an aligned
+        breadth vote -- and it only ever swaps a trend label for the OPPOSING trend label.
+        It never invents a trend where the detector saw none, never touches RANGING,
+        VOLATILE or UNKNOWN, and never fires on a day-type that agrees with the label.
+
+        Returns the corrected regime value, or "" to leave the label alone.
+        """
+        if not self._setting_enabled(
+            getattr(settings, "regime_trend_day_contradiction_guard_enabled", True),
+            True,
+        ):
+            return ""
+
+        reg = str(regime or "").upper()
+        opposing = {
+            MarketRegime.TRENDING_UP.value: ("DOWN", MarketRegime.TRENDING_DOWN.value),
+            MarketRegime.BREAKOUT_UP.value: ("DOWN", MarketRegime.TRENDING_DOWN.value),
+            MarketRegime.TRENDING_DOWN.value: ("UP", MarketRegime.TRENDING_UP.value),
+            MarketRegime.BREAKOUT_DOWN.value: ("UP", MarketRegime.TRENDING_UP.value),
+        }
+        if reg not in opposing:
+            return ""
+        needed_day_side, corrected = opposing[reg]
+
+        ctx = session_context or {}
+        day_type = str(
+            ctx.get("effective_day_type") or ctx.get("day_type") or ""
+        ).upper()
+        if day_type != f"TREND_DAY_{needed_day_side}":
+            return ""
+
+        try:
+            day_conf = float(
+                ctx.get("effective_confidence")
+                or ctx.get("phase_confidence")
+                or ctx.get("confidence")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            day_conf = 0.0
+        min_conf = float(
+            getattr(settings, "regime_trend_day_contradiction_min_confidence", 0.70) or 0.70
+        )
+        if day_conf < min_conf:
+            return ""
+
+        # Breadth is the second witness, and it must be measured rather than assumed:
+        # an absent breadth read is not agreement. On 2026-09-15 breadth was still
+        # BULLISH 4/4 until 10:00, so this correctly stays silent over the first 35
+        # minutes and speaks from 10:15, when the two witnesses finally agree.
+        breadth = breadth_context or {}
+        bias = str(breadth.get("bias") or "").upper()
+        try:
+            aligned = int(float(breadth.get("aligned_count") or 0))
+        except (TypeError, ValueError):
+            aligned = 0
+        min_votes = int(
+            getattr(settings, "regime_trend_day_contradiction_min_breadth_votes", 3) or 3
+        )
+        expected_bias = "BEARISH" if needed_day_side == "DOWN" else "BULLISH"
+        if bias != expected_bias or aligned < min_votes:
+            return ""
+
+        return corrected
 
     def _range_day_guarded_regime(
         self,
@@ -722,10 +846,15 @@ class RegimeDetector:
                 return False
 
         ctx = session_context or {}
-        if str(ctx.get("day_type") or "").upper() != "RANGE_DAY":
+        if str(ctx.get("effective_day_type") or ctx.get("day_type") or "").upper() != "RANGE_DAY":
             return False
         try:
-            confidence = float(ctx.get("confidence") or 0.0)
+            confidence = float(
+                ctx.get("effective_confidence")
+                or ctx.get("phase_confidence")
+                or ctx.get("confidence")
+                or 0.0
+            )
         except Exception:
             confidence = 0.0
         min_conf = float(

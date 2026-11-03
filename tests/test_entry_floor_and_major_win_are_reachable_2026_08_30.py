@@ -32,6 +32,7 @@ from engine.entry_policy import (
     effective_expected_move_floor_pct,
 )
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 # The largest rolling q25 ever observed per index, on the BINDING 5-minute series,
@@ -171,12 +172,14 @@ def test_both_ladders_read_the_same_rung():
     """The session and live ladders priced the same exit differently once already."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
 
-    # One definition plus one call in each ladder.
-    assert src.count("_major_win_guard_arm_rs(") >= 3, (
+    # One definition plus one call in each ladder. Both ladders read the per-lot-aware
+    # wrapper (guard audit 2026-10-06, defect 3), which sizes from _major_win_guard_arm_rs.
+    assert src.count("_major_win_guard_ladder_arm_rs(") >= 3, (
         "one of the two major-win call sites is still using a hardcoded rung"
     )
+    assert "self._major_win_guard_arm_rs(trade_like)" in src
     # Scoped to the MAJOR_WIN sites specifically. scanner.py carries other Rs.3,000
     # literals -- the SMART_PROFIT_LOCK ratio tier at ~15790 is a different rule with
     # the same flat-rupee shape, noted but deliberately not changed here.

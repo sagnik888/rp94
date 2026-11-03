@@ -1,0 +1,449 @@
+{
+  "rows": [
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 7,
+          "smart_exits": 6
+        },
+        "current_pine": {
+          "arrows": 70,
+          "smart_exits": 28
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 4.5,
+        "atr_period": 21,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "9f7db40d372ed17d4f56af879daca9207057c9f9450e2189a7b2a61ceb89164c"
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 9,
+          "smart_exits": 3
+        },
+        "current_pine": {
+          "arrows": 20,
+          "smart_exits": 7
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 2.0,
+        "atr_period": 14,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "2a8ceb3e28ee6617378939a81905155e5624cd2a74f4651e093a770a1855dc74"
+    },
+    {
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 7,
+          "smart_exits": 5
+        },
+        "current_pine": {
+          "arrows": 58,
+          "smart_exits": 23
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 4.5,
+        "atr_period": 21,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "e2ada56f696eb6b0902c0ecfda61fd059976c302a8f6d0ab06dd7b12ffe47d91"
+    },
+    {
+      "instrument": "BANKNIFTY",
+      "timeframe": "15min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 7,
+          "smart_exits": 3
+        },
+        "current_pine": {
+          "arrows": 16,
+          "smart_exits": 8
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 2.0,
+        "atr_period": 14,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "f3318cd5b34d0cefcc5f38adb25002bf66dd63c776b6fe16b6a9884683de1c10"
+    },
+    {
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 9,
+          "smart_exits": 6
+        },
+        "current_pine": {
+          "arrows": 66,
+          "smart_exits": 23
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 4.5,
+        "atr_period": 21,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "2b07c1845a09e8ef9ad5d21cf2efba159b7f687d90906cb5e4da02d1cc0d268b"
+    },
+    {
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 9,
+          "smart_exits": 5
+        },
+        "current_pine": {
+          "arrows": 20,
+          "smart_exits": 6
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 2.0,
+        "atr_period": 14,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "73c5667e65c8a21910b69c735622bac21222af95349c2054ae86d0e47d61fe96"
+    },
+    {
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 9,
+          "smart_exits": 6
+        },
+        "current_pine": {
+          "arrows": 58,
+          "smart_exits": 27
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 4.5,
+        "atr_period": 21,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "822a4034eff8e2142d51f1dcdff7092a37bc8f7765311f22e5ff2aee8f98d8c6"
+    },
+    {
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "15min",
+      "window": [
+        "2026-09-22",
+        "2026-09-30"
+      ],
+      "counts": {
+        "previous_tuned": {
+          "arrows": 9,
+          "smart_exits": 2
+        },
+        "current_pine": {
+          "arrows": 15,
+          "smart_exits": 9
+        }
+      },
+      "current_params": {
+        "key_value": 1.0,
+        "atr_period": 10,
+        "use_heikin_ashi": false,
+        "smart_exit": true,
+        "arm_atr": 0.8,
+        "retrace_atr": 0.45,
+        "hard_retrace_atr": 1.1,
+        "min_bars": 2,
+        "confirmations": 2,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "previous_params": {
+        "key_value": 2.0,
+        "atr_period": 14,
+        "use_heikin_ashi": true,
+        "smart_exit": true,
+        "arm_atr": 2.5,
+        "retrace_atr": 0.7,
+        "hard_retrace_atr": 2.5,
+        "min_bars": 2,
+        "confirmations": 4,
+        "rsi_length": 14,
+        "rsi_ob": 70.0,
+        "rsi_os": 30.0,
+        "rsi_lookback": 5,
+        "exit_ema": 5,
+        "wick_ratio": 0.35,
+        "session_end": "15:15"
+      },
+      "input_sha256": "578ae8e0325403e65768249543806b44f3b3f228742b3f40020a52e4acc37a4f"
+    }
+  ],
+  "total_arrows": {
+    "previous_tuned": 66,
+    "current_pine": 323
+  },
+  "note": "Indicator signals on identical cached OHLC and seven sessions. Not an option P&L comparison."
+}

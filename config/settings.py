@@ -7,7 +7,7 @@ import json
 import dotenv
 from pathlib import Path
 from typing import Literal, Optional, Dict, Any, List
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,10 @@ TIMEFRAME_ENTRY_POLICY_TIMEFRAMES = {
     "PRIMARY_5": frozenset({"5min"}),
     "INCLUDE_1MIN_5MIN": frozenset({"1min", "5min"}),
     "INCLUDE_1MIN_5MIN_15MIN": frozenset({"1min", "5min", "15min"}),
+    # 2026-09-26 user: every 1m/5m/15m combination on the dashboard TF toggle. A 1m
+    # entry is still burst/spike/snapback only under every policy.
+    "PRIMARY_1": frozenset({"1min"}),
+    "INCLUDE_1MIN_15MIN": frozenset({"1min", "15min"}),
 }
 
 
@@ -49,6 +53,7 @@ def timeframe_entry_timeframes(value: Any) -> frozenset[str]:
 PROTECTED_SECRET_ENV_KEYS = {
     "ANGELONE_API_KEY",
     "ANGELONE_PASSWORD",
+    "ANGELONE_PIN",
     "ANGELONE_TOTP_SECRET",
     "ANGELONE_SECRET_KEY",
     "FYERS_SECRET_KEY",
@@ -162,6 +167,9 @@ class Settings(BaseSettings):
     angelone_api_key: str = ""
     angelone_client_id: str = ""
     angelone_password: str = ""
+    # Legacy MPIN input is a fallback only. A managed canonical password must
+    # not be displaced by an older process PIN. Do not persist the input alias.
+    angelone_pin: str = Field(default="", exclude=True, repr=False)
     angelone_totp_secret: str = ""
     angelone_secret_key: str = ""
     # The public IP whitelisted on your SmartAPI app (smartapi.angelone.in ->
@@ -178,8 +186,21 @@ class Settings(BaseSettings):
     fyers_password: str = ""
     fyers_redirect_uri: str = "http://127.0.0.1:8001/"
 
+    # Kite owns execution. Angel One supplements it; FYERS remains a capability
+    # backup, including constituent volume until replacement parity is proven.
+    # The earlier two-provider candidate and legacy route remain selectable.
+    supplementary_market_data: Literal["fyers", "kite_angel", "angel_fyers"] = "angel_fyers"
+    replacement_chain_strikes_each_side: int = 30
+    constituent_membership_file: str = "data_store/index_constituents.json"
+    constituent_history_refresh_seconds: float = 60.0
+    constituent_cache_dir: str = "data_store/candidate_candles"
+
     # ─── Trading Mode ────────────────────────────────────────
-    trading_mode: Literal["HISTORICAL", "REAL"] = "HISTORICAL"
+    # Canonical values separate data source from execution authority. HISTORICAL,
+    # PAPER and REAL remain accepted aliases during migration.
+    trading_mode: Literal[
+        "REPLAY", "LIVE_PAPER", "LIVE_REAL", "HISTORICAL", "PAPER", "REAL"
+    ] = "REPLAY"
     auto_mode: bool = False
     strategy_revision: str = "ut1-current"
     strategy_direction_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = "LONG_SHORT"
@@ -454,6 +475,15 @@ class Settings(BaseSettings):
     # FUT and OPT. Daily risk % and max_trade_loss_abs do NOT shrink lots.
     # Stops remain futures_sl_pct / options_sl_pct from settings.
     auto_risk_sizing_enabled: bool = False
+    # Equal-rupee-risk option sizing (2026-10-08 user): lots = floor(risk_per_trade_rs /
+    # one-lot premium risk), 1..risk_based_lots_max. One lot already over budget is kept
+    # ('allow_one') or refused beyond the tolerance ('refuse'). Lot sizes come from
+    # config/instruments.json (NIFTY 65, BANKNIFTY 30, SENSEX 20, MIDCPNIFTY 120).
+    risk_based_lots_enabled: bool = True
+    risk_per_trade_rs: float = 2000.0
+    risk_based_lots_max: int = 3
+    risk_based_lots_over_budget_action: str = "allow_one"
+    risk_based_lots_over_budget_tolerance: float = 0.5
     entry_pre_submit_lot_validation_timeout_seconds: float = 10.0
     # Optional research mode only (when auto_risk_sizing_enabled=True):
     risk_per_trade_fut_pct: float = 0.0
@@ -474,11 +504,12 @@ class Settings(BaseSettings):
     cascade_lot_max_lots_fut: int = 0
     cascade_lot_max_lots_opt: int = 0
     cascade_lot_scale_warn: bool = True
-    # Non-cascade heavy trend: 2+ of 4 indices align trend+TF → OPT ×2 only
+    # Non-cascade heavy trend: 3+ of 4 indices align trend+TF → OPT ×2 only
+    # (2026-09-26 user: was 2 of 4; every engine, S1 and UT SMART EXIT included).
     heavy_trend_lot_scale_enabled: bool = True
     heavy_trend_lot_multiplier_opt: float = 2.0
     heavy_trend_lot_multiplier_fut: float = 1.0
-    heavy_trend_min_aligned_indices: int = 2  # 2/4 indices
+    heavy_trend_min_aligned_indices: int = 3  # 3/4 indices
     # ── Multi-signal mixed book (dual engines × multi-TF × multi-index) ──
     # When several instruments/timeframes/engines fire together, take at most
     # ONE futures (fixed 1 lot) and put the rest on options (2–4 indices).
@@ -619,6 +650,9 @@ class Settings(BaseSettings):
     # buffer; the very short cache avoids duplicating funds API calls for paired
     # checks while preventing a stale balance from authorising later entries.
     entry_margin_buffer_pct: float = 10.0
+    # Buying a multi-lot entry the account cannot fund trims it to the lots it can fund
+    # (at least 1) instead of refusing the whole trade; only a 1-lot shortfall refuses.
+    entry_trim_lots_to_funds_enabled: bool = True
     entry_margin_cache_seconds: float = 2.0
     # Pre-market warning floor for broker free cash. Index option lot margins run
     # ~37k-56k, so an account below this cannot fund a single lot and every entry will
@@ -752,6 +786,8 @@ class Settings(BaseSettings):
         "PRIMARY_5",
         "INCLUDE_1MIN_5MIN",
         "INCLUDE_1MIN_5MIN_15MIN",
+        "PRIMARY_1",
+        "INCLUDE_1MIN_15MIN",
     ] = "INCLUDE_5MIN"
     ut_5min_option_min_confidence: float = 0.60
     ut_5min_loss_cooldown_minutes: int = 45
@@ -1044,6 +1080,18 @@ class Settings(BaseSettings):
     # Historical results should represent the management policy that will trade live.
     # The dashboard switch remains available to produce the frozen stop/target baseline.
     backtest_live_exits_enabled: bool = True
+    # 2026-10-08 payoff audit: QP/S1 replays entered at the signal candle's OPEN (one
+    # candle before the signal exists) and took the next opposite signal at its open.
+    # Every QP replay profit sat inside that window. True = enter and exit only once
+    # the candle has closed (as UTS always did). False only for comparison runs.
+    replay_closed_candle_entries: bool = True
+    # Replay S1 trades with the S1 lane's own premium risk, target and exit_decision
+    # (index SL1/T1 lock, trend from closed S1 bars, profit lock, premium trail) instead
+    # of the other engines' generic guards and a 2.5-3.8R target.
+    replay_s1_native_exits: bool = True
+    # Replay D1/D2 (s1s2_dual) trades with the lane's own exits -- the engine's stop and
+    # EXIT events, the premium cap and the square-off -- instead of the generic guards.
+    replay_s12_native_exits: bool = True
 
     # EARLY_LOSS_CUT guards (2026-08-16). Measured over 19 sessions: 18 cuts (ex the
     # two stale-mark trades already fixed) for -Rs.9,108. The exit EARNS its place —
@@ -1402,6 +1450,93 @@ class Settings(BaseSettings):
     quality_policy_bplus_min_confidence: float = 0.55
     quality_policy_bplus_min_adx: float = 22.0
     quality_policy_risky_bplus_min_adx: float = 25.0
+    # Risky-regime (VOLATILE/RANGING/...) B+ needs 15m trend plus an INDEPENDENT leg.
+    # False (2026-10-07): two agreeing engines no longer count as that leg, because a
+    # quad-union entry is built from exactly that agreement. True restores the old rule.
+    quality_policy_risky_bplus_count_multi_source: bool = False
+    # v10 (2026-10-08 audit AC-02): 'multi_source' no longer counts as a confirmation.
+    # 'shadow' enforces v9 and records the v10 result; 'enforce' uses v10; 'legacy' off.
+    quality_policy_multi_source_mode: str = "shadow"
+    # Tracker exit P&L at executable prices: buy at the acceptance ask, sell at the mark less
+    # the index half-spread, plus the statutory opt_cost (2026-10-08 audit PA8). Recording only;
+    # management still runs on marks.
+    tracker_executable_pricing_enabled: bool = True
+    # Manual/session rows: price a stop exit at the first recorded contract tick through the
+    # stop since the previous pass, not the later scan-cycle mark (2026-10-08 audit).
+    session_tick_stop_check_enabled: bool = True
+    # Telemetry: flag a broker fill paired with an acceptance more than this many seconds
+    # away (e.g. a MANUAL_SYNC pairing hours later) so fill statistics can exclude it.
+    fill_pairing_suspect_seconds: float = 2700.0
+    # Regime/trend market-context gate for every lane and timeframe (2026-10-08 user;
+    # engine/entry_context_gate.py). 'shadow' records what it would refuse without
+    # refusing; 'enforce' refuses; 'off'. The regime table starts in shadow because the
+    # 20-session audit found no single filter with a robust edge. The MIDCPNIFTY 15m
+    # peer rule (choppy/range-bound context needs >= 2 of the other 3 indices moving the
+    # same way, from closed bars) is enforced as the user asked.
+    ctx_gate_mode: str = "shadow"
+    ctx_peer_alignment_mode: str = "enforce"
+    ctx_peer_alignment_required_indices: str = "MIDCPNIFTY"
+    ctx_peer_alignment_timeframes: str = "15min"
+    ctx_peer_alignment_min: int = 2
+    ctx_trend_min_adx: float = 18.0
+    ctx_trend_rsi_band: float = 2.0
+    ctx_breakout_min_adx: float = 20.0
+    ctx_breakout_min_volume: float = 1.0
+    ctx_range_min_adx: float = 22.0
+    ctx_range_rsi_band: float = 5.0
+    ctx_range_min_peers: int = 2
+    ctx_volatile_min_adx: float = 20.0
+    ctx_volatile_min_peers: int = 2
+    ctx_unknown_min_adx: float = 20.0
+    ctx_min_atr_pct_1min: float = 0.025
+    # Opening volume (2026-10-09 user). Fyers cash-index volume reaches a bar only with
+    # the next history poll, so at the open the signal bar is still unmeasured when the
+    # gate decides. When that happens, the closed bar of the near-month Kite future,
+    # against its own previous bars, counts as measured volume (data/futures_bar_volume.py).
+    volume_futures_fallback_enabled: bool = True
+    volume_futures_fallback_timeout_seconds: float = 2.0
+    volume_futures_fallback_baseline_bars: int = 20
+    volume_futures_fallback_min_baseline_bars: int = 10
+    # A Fyers cash total older than this marks the feed degraded (health and alerts).
+    # 120s flapped every morning against the ~2 minute history poll.
+    volume_cash_freshness_seconds: float = 180.0
+    # Special entries (A+, LTP shock, volume spike) need fresh 1-minute volume. While
+    # the Fyers cash minutes are missing, the Kite futures minute series stands in
+    # (engine/entry_data_quality.py).
+    entry_data_quality_futures_fallback_enabled: bool = True
+    # Engine lab (comparison-only, never orders) refresh during 09:15-15:30. Its
+    # full-CPU passes overlapped live scan timeouts on 2026-10-09.
+    engine_lab_market_refresh_seconds: float = 300.0
+    # Shadow only (2026-10-09): log when a trend-day QP peak between the give-back arm and
+    # the 1R smart lock fades past half (data_store/trend_gap_shadow.jsonl).
+    trend_gap_shadow_enabled: bool = True
+    # Early-entry build-up detector, shadow only (2026-10-09, user; engine/buildup_shadow.py).
+    # Logs when a futures price impulse comes with volume, OI and/or PCR building, to
+    # data_store/buildup_shadow.jsonl; scripts/evaluate_buildup_shadow.py judges it.
+    buildup_shadow_enabled: bool = True
+    buildup_window_seconds: float = 180.0
+    buildup_impulse_min_pct: float = 0.08
+    buildup_impulse_baseline_mult: float = 2.0
+    buildup_baseline_minutes: float = 60.0
+    buildup_min_baseline_windows: int = 5
+    buildup_volume_ratio: float = 1.5
+    buildup_oi_window_seconds: float = 300.0
+    buildup_oi_min_pct: float = 0.05
+    buildup_pcr_window_seconds: float = 300.0
+    buildup_pcr_max_age_seconds: float = 240.0
+    buildup_pcr_min_change: float = 0.02
+    buildup_min_legs: int = 2
+    buildup_cooldown_seconds: float = 600.0
+    # Gap-open shadow rule (2026-10-09 user): after a gap of at least this size that
+    # holds, with this many of the four indices gapped and holding the same way, the
+    # prior session's swing structure is stale for the first minutes. Shadow only:
+    # verdicts are recorded on candidates and logged, nothing is admitted or refused.
+    gap_open_shadow_enabled: bool = True
+    gap_open_min_gap_pct: float = 0.8
+    gap_open_min_aligned: int = 3
+    gap_open_window_minutes: float = 5.0
+    ctx_min_atr_pct_5min: float = 0.05
+    ctx_min_atr_pct_15min: float = 0.09
     quality_policy_min_volume_ratio: float = 1.20
 
     # Deprecated compatibility input.  The versioned evaluator intentionally ignores
@@ -1586,6 +1721,11 @@ class Settings(BaseSettings):
     option_chain_entry_max_age_seconds: float = 120.0
     option_chain_high_vol_entry_max_age_seconds: float = 90.0
     option_chain_high_vol_percentile: float = 70.0
+    # The background chain refresh shares the 90s high-volatility limit as its TTL, so
+    # scan latency alone aged chains past it at decision time (2026-10-09: MIDCPNIFTY
+    # refused at 96s and 101s). Fetch once on demand before refusing an entry for age.
+    option_chain_entry_refresh_on_stale: bool = True
+    option_chain_entry_refresh_cooldown_seconds: float = 15.0
     option_chain_intelligence_max_age_seconds: float = 300.0
     # ── Stop-out re-entry (2026-07-25) ───────────────────────────────────────
     # A trade stopped out early on a trend day, then the move ran without us. When the
@@ -1660,6 +1800,9 @@ class Settings(BaseSettings):
     # the previous 30 it began at 14:45 and overlapped the entry gate by 20 minutes.
     # Changing either time without the other re-opens that overlap.
     eod_protect_window_minutes: float = 14.0
+    # 2026-09-26 user: every exit is rechecked by 15:15:30 -- one broker reconcile and a
+    # critical alert naming anything still open this many seconds after the force exit.
+    eod_exit_recheck_seconds: float = 30.0
     eod_protect_arm_r_multiple: float = 0.0
     # Floored at the round-trip cost by _profit_protect_cost_floor_rs — on its own this
     # Rs.1 armed protective exits that banked less than they paid to close.
@@ -2026,10 +2169,17 @@ class Settings(BaseSettings):
     # "quad_prime": all four raw sources can enter like quad_union, but opposite exits
     # need cross-family confirmation (UT1 + EMA/Supertrend/Consensus) unless the
     # trade is losing or protected profit is threatened.
+    # "ut_smart": UT SMART EXIT (2026-09-25), the user's "UT Bot + Smart Peak Exit v6"
+    # Pine script with its own ATR entries and exits (engine/ut_smart_engine.py and
+    # engine/uts_lane.py). It replaced ADAPTIVE DUAL in the dashboard selector;
+    # adaptive_dual stays accepted here for .env/engine-lab compatibility only.
     # "adaptive_dual": Engine 11. Lane A is adaptive_hybrid v2; Lane B runs the
     # uploaded APEX v5.5 five-gate confluence engine (regime, HTF direction,
     # score, conflict margin, volume/body confirmation), then sends both lanes
     # through the same gates, sizing, quote, risk, and exit stack.
+    # "s1s2_dual": S1+S2 Dual (2026-10-10), the user's Pine v5.4 S1 + S2 Dual script
+    # (engine/s12_engine.py, engine/s12_lane.py): two independent lanes, D1 and D2,
+    # each with its own stop and exits.
     scanner_engine: Literal[
         "utbot",
         "ema",
@@ -2038,11 +2188,16 @@ class Settings(BaseSettings):
         "quad_union",
         "quad_prime",
         "adaptive_dual",
-        "mantra_hybrid",
+        "s1",
+        "ut_smart",
+        "quad_prime_s1",
+        "ut_smart_s1",
+        "s1s2_dual",
+        "ut_ema",
     # The code default is what a deployment silently runs when SCANNER_ENGINE is
     # missing from .env (a pruned .env has reverted keys before). Keep it on the
-    # engine live trades with; mantra_hybrid (added 2026-09-17, not yet evaluated)
-    # remains selectable through .env or the dashboard.
+    # engine live trades with; s1 (added 2026-09-23) is selectable through .env or
+    # the dashboard.
     ] = "quad_prime"
     # Quad Prime raw-entry hygiene: raw source access is allowed, but weak solo flips
     # must not skip all live quality floors or every winner becomes a tiny scalp while
@@ -2084,148 +2239,298 @@ class Settings(BaseSettings):
     quality_hybrid_thrust_range_atr: float = 1.05
     quality_hybrid_thrust_close_loc: float = 0.60
 
-    # --- MANTRA Hybrid 4-Engine Settings ---
-    mantra_u_assetClassInput: str = "Auto"
-    mantra_u_tradeModeInput: str = "Auto"
-    mantra_u_profileMode: str = "Adaptive"
-    mantra_u_confirmOnClose: bool = True
-    mantra_u_manualADXThreshold: int = 24
-    mantra_u_manualVolSpike: float = 1.50
-    mantra_u_riskMode: str = "Dynamic"
-    mantra_u_dynamicSensitivity: float = 1.00
-    mantra_u_manualATRMult: float = 2.00
-    mantra_u_manualSL2ATR: float = 3.50
-    mantra_u_manualPctSL1: float = 0.80
-    mantra_u_manualPctSL2: float = 1.80
-    mantra_u_minStopMode: str = "Adaptive"
-    mantra_u_manualMinStopPct: float = 0.50
-    mantra_u_maxStopPct: float = 20.0
-    mantra_u_swingLookback: int = 10
-    mantra_u_rrRatio: float = 2.50
-    mantra_u_t1Ratio: float = 1.20
-    mantra_u_t3Ratio: float = 4.50
-    mantra_u_macdFastLength: int = 12
-    mantra_u_macdSlowLength: int = 26
-    mantra_u_macdSignalLength: int = 9
-    mantra_u_useMACDFilter: bool = True
-    mantra_u_macdMinAtrRatio: float = 0.00
-    mantra_u_minConfidence: int = 65
-    mantra_u_signalGap: int = 5
-    mantra_u_showBuy: bool = True
-    mantra_u_showSell: bool = True
-    mantra_u_showExit: bool = True
-    mantra_u_maxBarsInTrade: int = 250
-    mantra_u_useTrailing: bool = True
-    mantra_u_trailStart: float = 1.50
-    mantra_u_trailOffset: float = 2.50
-    mantra_u_lockProfit: bool = True
-    mantra_u_lockProfitR: float = 0.25
-    mantra_u_aggressiveTrail: bool = False
-    mantra_u_loosenAfterT2: bool = False
-    mantra_u_exitMode: str = "Balanced"
-    mantra_u_useSmartExit: bool = True
-    mantra_u_exitOnWeakness: bool = False
-    mantra_u_sameBarPriority: str = "Stops First"
-    mantra_u_useSessionFilter: bool = True
-    mantra_u_sessionMode: str = "Auto"
-    mantra_u_customSession: str = "0915-1530"
-    mantra_u_customDays: str = "23456"
-    mantra_u_customTimezoneInput: str = "Exchange"
-    mantra_u_mtfDeadZonePct: float = 0.15
-    mantra_u_mtfBullThreshold: float = 0.45
-    mantra_instrumentType: str = "Auto-Detect"
-    mantra_minScore: int = 70
-    mantra_conflictMargin: int = 20
-    mantra_minADX: float = 20.0
-    mantra_useHTF: bool = True
-    mantra_signalCooldown: int = 5
-    mantra_atrMult: float = 1.5
-    mantra_fixedSLPct: float = 0.2
-    mantra_t1R: float = 2.0
-    mantra_t2R: float = 3.0
-    mantra_t3R: float = 4.0
-    mantra_useTrail: bool = True
-    mantra_trailStartR: float = 1.5
-    mantra_trailMult: float = 1.8
-    mantra_lockAtT1: bool = True
-    mantra_exitConfBars: int = 3
-    mantra_targetExitMode: str = "TP3 Final Exit"
-    mantra_maxConsecLoss: int = 3
-    mantra_circuitPause: int = 10
-    mantra_horizonSensitivity: str = "Balanced"
-    mantra_cwEnable: bool = True
-    mantra_cwRsiLen: int = 14
-    mantra_cwTrendLen: int = 50
-    mantra_cwBullLo: int = 40
-    mantra_cwBullHi: int = 80
-    mantra_cwBearLo: int = 20
-    mantra_cwBearHi: int = 60
-    mantra_cwConfirmBars: int = 2
-    mantra_cwUseHtf: bool = False
-    mantra_cwUseAdx: bool = False
-    mantra_cwAdxLen: int = 14
-    mantra_cwAdxMin: int = 20
-    mantra_cwAtrLen: int = 14
-    mantra_cwSlMult: float = 1.5
-    mantra_cwTp1Mult: float = 1.0
-    mantra_cwTp2Mult: float = 2.0
-    mantra_cwTp3Mult: float = 3.0
-    mantra_showPatterns: bool = True
-    mantra_usePatScore: bool = True
-    mantra_patSingleGrp: bool = True
-    mantra_patDoubleGrp: bool = True
-    mantra_patTripleGrp: bool = True
-    mantra_patContGrp: bool = True
-    mantra_forge_cooldown: int = 5
-    mantra_forge_symTol: float = 10.0
-    mantra_forge_lvlTol: float = 3.0
-    mantra_forge_minSizePct: float = 0.5
-    mantra_forge_minAtrMult: float = 1.0
-    mantra_forge_atrLen: int = 14
-    mantra_forge_showDtTop: bool = True
-    mantra_forge_showDtBot: bool = True
-    mantra_forge_showTtTop: bool = True
-    mantra_forge_showTtBot: bool = True
-    mantra_forge_showHsStd: bool = True
-    mantra_forge_showHsInv: bool = True
-    mantra_forge_showFlagBull: bool = True
-    mantra_forge_showFlagBear: bool = True
-    mantra_forge_showPennantBull: bool = True
-    mantra_forge_showPennantBear: bool = True
-    mantra_forge_showWedgeRise: bool = True
-    mantra_forge_showWedgeFall: bool = True
-    mantra_forge_showTriGen: bool = True
-    mantra_forge_showRectGen: bool = True
-    mantra_forge_showCupStd: bool = True
-    mantra_forge_showCupInv: bool = True
-    mantra_forge_lbLeft: int = 10
-    mantra_forge_lbRight: int = 10
-    mantra_forge_maxPivHist: int = 500
-    mantra_forge_reqCloseBrk: bool = False
-    mantra_forge_reqBodyBrk: bool = False
-    mantra_forge_useAtrBrk: bool = True
-    mantra_forge_breakAtr: float = 1.0
-    mantra_forge_breakPct: float = 0.3
-    mantra_forge_brkConfirmBars: int = 1
-    mantra_forge_showIgnoreConf: bool = False
-    mantra_forge_minBrkBar: int = 1
-    mantra_forge_reqVol: bool = False
-    mantra_forge_volMult: float = 1.2
-    mantra_forge_volLen: int = 20
-    mantra_forge_minRR: float = 1.5
-    mantra_forge_slippageTicks: float = 1.0
-    mantra_forge_commissionPct: float = 0.03
-    mantra_forge_minConf: int = 5
-    mantra_forge_useHtf: bool = True
-    mantra_forge_htfFast: int = 21
-    mantra_forge_htfSlow: int = 55
-    mantra_forge_requireHtf: bool = False
-    mantra_forge_useChop: bool = True
-    mantra_forge_chopLen: int = 14
-    mantra_forge_chopMax: float = 62.0
-    mantra_forge_useSession: bool = False
-    mantra_forge_sessStart: str = "0700-2000"
-    mantra_forge_rankByQuality: bool = True
+    # --- S1 confluence engine (SCANNER_ENGINE=s1; engine/s1_engine.py) ---
+    # Port of the user's "S1" TradingView script. Defaults are the user's 2026-09-23
+    # inputs (the Pine's own defaults in brackets). Editable from the dashboard.
+    s1_candle_type: Literal["standard", "heikin_ashi"] = "heikin_ashi"
+    s1_min_score: float = 60.0          # Min bull/bear confluence score [70]
+    s1_conflict_margin: float = 20.0    # Min bull-minus-bear score gap [20]
+    s1_min_adx: float = 20.0            # Regime gate: ADX(14) floor [20]
+    s1_use_htf: bool = True             # Require closed-15m EMA9/21 alignment and slope [on]
+    s1_signal_cooldown: int = 0         # Min bars between S1 signals [5]
+    s1_sl_mode: str = "anchor"         # Live SL1: dynamic 0.10-0.25% (anchor = 3-bar extreme) | atr | fixed
+    s1_sl1_pct: float = 0.10            # Initial SL1 % of index LTP (user setting)
+    s1_sl_min_pct: float = 0.10         # Dynamic SL1 floor, % of index price
+    s1_sl_max_pct: float = 0.25         # Dynamic SL1 cap, % of index price
+    s1_sl_atr_mult: float = 1.0         # atr mode: SL1 distance = k x ATR(14)
+    s1_use_sl2: bool = False            # SL2 gap stop on the live order [chart: always on]
+    s1_sl2_pct: float = 0.40            # Live SL2 % (only when s1_use_sl2 is on)
+    # The chart's own SL inputs, used by the TradingView state machine that decides which
+    # bars signal (the user's chart labels print SL1 0.20% / SL2 0.40%).
+    s1_chart_sl1_pct: float = 0.20
+    s1_chart_sl2_pct: float = 0.40
+    # TradingView's index charts end at 15:15; later feed bars are dropped before S1 runs.
+    s1_session_end: str = "15:15"
+    s1_t1_r: float = 2.0                # Targets as multiples of the SL1 distance [2/3/4]
+    s1_t2_r: float = 3.0
+    s1_t3_r: float = 4.0
+    s1_trail_start_r: float = 1.5       # Trail starts at this R [1.5]
+    s1_trail_mult: float = 1.8          # Trail = peak -/+ k x ATR [1.8]
+    s1_exit_conf_bars: int = 3          # Momentum-exit confirmation bars [3]
+    s1_circuit_pause: int = 5           # Bars paused after the loss streak [10]
+    # Consecutive losses before the pause, per index. 0 = follow the system setting
+    # max_consecutive_losses ("Stop After Consecutive Losses"); any other value is a
+    # custom per-index count. The run is per index and resets on a win.
+    s1_max_consec_loss_nifty: int = 0
+    s1_max_consec_loss_banknifty: int = 0
+    s1_max_consec_loss_sensex: int = 0
+    s1_max_consec_loss_midcpnifty: int = 0
+    # pine = the supplied indicator state rules; close = close-entry replay.
+    s1_entry_mode: Literal["pine", "close"] = "pine"
+    # S1 lane (engine/s1_lane.py): S1 signals skip the other engines' quality/grading
+    # selection and are managed by S1 exits; every safety control still applies.
+    s1_lane_enabled: bool = True
+    s1_lane_guard_pct_1min: float = 5.0    # Max premium loss per trade by signal timeframe
+    s1_lane_guard_pct_5min: float = 10.0
+    s1_lane_guard_pct_15min: float = 15.0
+    s1_lane_guard_late_after: str = "14:30"  # Entries from here get one guard step tighter
+    s1_lane_guard_strong_score: float = 80.0  # S1 score at/above this gets one step wider
+    # Guard cap by regime is fixed: 10% in a clear trend, 15% in choppy/volatile/unknown.
+    s1_lane_t1_lock_r: float = 0.7         # Index stop moves to entry + this R once T1 prints
+    # Profit lock arms at this multiple of premium risk. 1.0R (2026-10-09, user): live S1
+    # rows Oct 5-9 (30) averaged +Rs406 per win against -Rs1,609 per loss, the lock arming at
+    # 0.5R and closing winners on the first 10% dip. The 2026-09-25 0.5R study ran on the
+    # look-ahead replay with 1-minute bars, which cannot reproduce a tight trail.
+    s1_lane_lock_arm_r: float = 1.0
+    # 2026-10-08 payoff audit (user-approved): the entry RR floor is the base target
+    # (0.5R admitted 0.7R-target geometry that cannot pay after costs), and a breakeven
+    # premium stop (entry + round-trip cost) arms once the peak gain reaches 0.25R so a
+    # trade that worked a little no longer runs to a full -1R.
+    s1_lane_rr_floor_at_target: bool = True
+    # S1 stays signal-only under Auto until a look-ahead-free replay shows edge (audit 2026-10-08).
+    s1_lane_signal_only: bool = True
+    s1_lane_breakeven_enabled: bool = True
+    # 1.0R (2026-10-09, user): at 0.25R the breakeven stop sat a few points under the peak
+    # and closed winners for a scratch (SENSEX 72300CE +Rs29 on 2026-10-09).
+    s1_lane_breakeven_arm_r: float = 1.0
+    s1_lane_breakeven_cost_rs: float = 140.0
+    # Fixed index stop per timeframe for live S1 levels (% of index LTP); 0 keeps s1_sl_mode.
+    # User proposal 2026-10-08 (5m 0.10%, 15m 0.15%). Corrected 20-session replay with native
+    # S1 exits (Sep 9-Oct 8, 15 trades): -4.7k vs -8.7k for the anchor stop and -8.6k for a
+    # fixed 0.25% -- least negative, still negative, tiny sample. S1 stays signal-only.
+    s1_sl1_pct_5min: float = 0.10
+    s1_sl1_pct_15min: float = 0.15
+    # ...then exits on a giveback from the peak gain that follows the S1 trend (the score
+    # gap on the last closed bar, >= s1_lane_trend_margin counts as a clear trend).
+    s1_lane_giveback_with_trend: float = 25.0
+    s1_lane_giveback_neutral: float = 10.0
+    s1_lane_giveback_against: float = 0.0
+    # UNKNOWN trend: no closed bar after the signal yet, engine state missing, or a stale
+    # bar; capped at s1_lane_giveback_with_trend whatever it is set to. 25% (2026-10-09,
+    # user): UNKNOWN covers every trade's first bar (5 or 15 minutes), where 10% closed
+    # winners on the first dip.
+    s1_lane_giveback_unknown: float = 25.0
+    s1_lane_trend_margin: float = 20.0
+    # S1 entries end at the system-wide last-entry times (ut_no_entry_after and siblings,
+    # engine/entry_window.py; no EOD-protect clamp; the 15:15 force exit still applies).
+    # Buffer for an S1 signal on a forming bar: 15s, 5s on 1min (2026-10-09, user; was 30s).
+    s1_lane_intrabar_wait_seconds: float = 15.0
+    s1_lane_intrabar_wait_seconds_1min: float = 5.0
+    # While only the forming bar changes, S1 recomputes a chart at most this often; a new
+    # closed bar (or a stabilization request) always recomputes at once. 0 = every scan.
+    s1_lane_forming_recompute_seconds: float = 15.0
+    # S1 target (2026-09-25 user): 1R on a normal trade, 0.7R when the move is weak (at
+    # entry, or later when a closed bar shows the move has died); while the S1 trend is
+    # clearly with the trade the target does not close it and it may run to
+    # s1_lane_runner_max_r. Weak = at least two of: volume below s1_lane_weak_rel_volume x
+    # its 20-bar average, ADX below s1_lane_weak_adx, ATR below its 50-bar average.
+    s1_lane_base_rr: float = 1.0
+    s1_lane_weak_rr: float = 0.7
+    s1_lane_runner_max_r: float = 30.0
+    # The runner may reach s1_lane_runner_max_r only in a special trend: S1's closed-bar
+    # score gap on the trade's side >= s1_lane_special_trend_margin AND a clear trend regime
+    # on its side, or a heavy-trend entry. Otherwise it is capped at s1_t3_r (4R).
+    s1_lane_special_trend_margin: float = 40.0
+    s1_lane_weak_adx: float = 20.0
+    s1_lane_weak_rel_volume: float = 1.2
+    # Final entry check floor for S1 (below 0.7R so a fill a tick worse still passes).
+    s1_lane_min_entry_rr: float = 0.5
+    # Missed-signal re-entry for S1: a refused or repainted S1 signal may re-enter while
+    # the S1 score on the latest closed bar is the same or stronger than the missed one's.
+    s1_lane_reentry_enabled: bool = True
+    # Re-entry window in bars after the signal candle closes (2026-09-25 user: one bar on
+    # 15m and 5m, three bars on 1m).
+    s1_lane_reentry_bars_1min: int = 3
+    s1_lane_reentry_bars_5min: int = 1
+    s1_lane_reentry_bars_15min: int = 1
+    # ── UT SMART EXIT engine (scanner_engine="ut_smart") ──
+    # Match the uploaded "UT Bot + Smart Peak Exit v6" inputs. The earlier
+    # research tuning was a different signal profile, not Pine chart parity.
+    # Option admission and the user's 5%/10%/15% premium stops are separate.
+    uts_key_value: float = 1.0
+    uts_atr_period: int = 10
+    # Independent overrides remain available, with the same Pine defaults.
+    uts_key_value_5min: float = 1.0
+    uts_atr_period_5min: int = 10
+    uts_key_value_1min: float = 1.0
+    uts_atr_period_1min: int = 10
+    uts_use_heikin_ashi: bool = False
+    uts_smart_exit: bool = True
+    uts_arm_atr: float = 0.8
+    uts_retrace_atr: float = 0.45
+    uts_hard_retrace_atr: float = 1.1
+    uts_min_bars: int = 2
+    uts_confirmations: int = 2
+    uts_rsi_length: int = 14
+    uts_rsi_ob: float = 70.0
+    uts_rsi_os: float = 30.0
+    uts_rsi_lookback: int = 5
+    uts_exit_ema: int = 5
+    uts_wick_ratio: float = 0.35
+    # This index feed appends a 15:15 settlement/frozen bar absent from the
+    # uploaded chart. Exclude it; including it erases today's 09:15 BUY.
+    uts_session_end: str = "15:15"
+    # The lane: UT entries with binding quality, own exits, every safety control.
+    uts_lane_enabled: bool = True
+    # The main timing toggle also controls UTS. Intrabar mode includes closed signals.
+    uts_lane_allow_intrabar_entries: bool = True
+    uts_lane_result_max_age_seconds: float = 30.0
+    # Timeframes: the dashboard TF toggle (ut_timeframe_entry_policy), as for every engine
+    # (2026-09-26 user). Tested: 15m is the tuned frame; 5m had 0 of 4,920 parameter sets
+    # positive in both halves, 1m 0 of 4,920 (1m bursts only: 14 trades, -Rs.1.1k).
+    # Entries (2026-09-26 user): normal UT SMART signals trade from 09:15 until the
+    # system-wide last-entry times -- 15m 14:50, 5m 15:10, 1m 15:14 (ut_no_entry_after and
+    # siblings, engine/entry_window.py) -- then the 15:15 hard exit. The lane's own early
+    # cutoffs (15m 12:45 / 5m 14:00 bar start, from the replay study: 15m entries after
+    # 13:00 were flat or negative) are gone; the user wants late big moves traded.
+    # Late big-move check from this time, on every timeframe: the late_session_reclaim
+    # test (3+ indices with the same late 1m and 5m move, volume and strong closes),
+    # voting on the move itself. A confirmed move admits a 1m signal without the 1m frame
+    # selected and labels 5m/15m entries.
+    uts_lane_reclaim_start: str = "13:00"
+    # Index stop ceiling for the final policy: the UT stop is key x ATR (median 0.29-0.41%
+    # of the index on 15m at key 2.0).
+    uts_lane_sl_max_pct: float = 1.0
+    uts_lane_min_entry_rr: float = 0.5
+    # The chart has no target: nominal only (RR checks); it never closes the trade.
+    uts_lane_target_r: float = 3.0
+    # Premium broker stop = the UT stop distance through delta x this multiple, clamped.
+    # The chart reacts on the close only; its worst intrabar excursion was 1.89R (winners
+    # 1.16R), and a 2R catastrophe stop cost nothing in the study.
+    uts_lane_guard_mult: float = 2.0
+    uts_lane_guard_min_pct: float = 10.0
+    uts_lane_guard_max_pct: float = 15.0
+    # Protect observed option gains before the index ATR exit can arm.
+    uts_lane_lock_arm_r: float = 1.0
+    uts_lane_lock_giveback_pct: float = 30.0
+    # 5m UTS intel gate (2026-10-06 user): a plain 5m UT SMART flip enters only when the
+    # market-intelligence read of that index agrees. 19-session replay (Sep 7-Oct 5):
+    # ungated 5m UTS 480 trades, -17.1k at realistic cost; requiring volume >= 1.0x,
+    # ADX >= 20 and directional RSI together kept 59 trades at +5.9k. Each leg alone did
+    # not help (volume alone was worse), so the legs are joint. PCR uses the intel
+    # engine's own PCR signal and vetoes only a clearly opposing read; replay has no
+    # chain history, so the PCR leg is untested. Unmeasured volume fails the gate.
+    uts_lane_5m_intel_gate_enabled: bool = True
+    uts_lane_5m_min_volume_ratio: float = 1.0
+    uts_lane_5m_min_adx: float = 20.0
+    uts_lane_5m_require_directional_rsi: bool = True
+    uts_lane_5m_pcr_veto_enabled: bool = True
+    # When both UTS opt-in and the general intra-candle toggle are enabled, a
+    # UT flip on the forming 5m/15m candle must hold this long before entry. Closed-candle
+    # signals never wait.
+    # 15s, 5s on 1min (2026-10-09, user; was 20s / 6s).
+    uts_lane_intrabar_wait_seconds: float = 15.0
+    uts_lane_intrabar_wait_seconds_1min: float = Field(default=5.0, ge=5.0, le=7.0)
+    # After an intra-candle entry, re-check the flip this often until its candle closes;
+    # it exits (UTS_REPAINT) if the flip is gone or the closed candle does not confirm it.
+    uts_lane_repaint_check_seconds: float = 10.0
+    # After a UTS_REPAINT exit, the same closed-bar signal may re-enter within this many
+    # seconds of that exit (2026-10-08 audit: the bar-close freshness deadline blocked it).
+    uts_lane_repaint_reentry_grace_seconds: float = 90.0
+    # ── S1+S2 DUAL engine (scanner_engine="s1s2_dual"; engine/s12_engine.py) ──
+    # The user's "S1 + S2 Dual Independent v1.2" Python port of their Pine v5.4 script,
+    # vendored in engine/s12dual. Two independent lanes: D1 is the package's S1 and D2
+    # its S2 (neither is the host's S1 lane). Bounds follow the package's Pine inputs;
+    # defaults below are the selected bot policy. Intraday modes, no BTST and the engine's own 15:15 EOD are fixed
+    # (s12_engine.FIXED_CONFIG). Editable from the dashboard.
+    # D1 (the package's S1): confluence gates, % stop, weakness-confirmed early cut and R runner.
+    s12_d1_min_score: int = 60
+    s12_d1_conflict_margin: int = 20
+    s12_d1_min_adx: float = 20.0
+    s12_d1_use_15m_gate: bool = True
+    s12_d1_cooldown_bars: int = 1
+    s12_d1_stop_pct: float = 0.1
+    s12_d1_exit_at_t3: bool = False
+    s12_d1_trail: bool = True
+    s12_d1_trail_start_r: float = 1.5
+    s12_d1_trail_atr: float = 1.8
+    s12_d1_lock_at_t1: bool = True
+    s12_d1_exit_confirm_bars: int = 3
+    s12_d1_patterns: bool = True
+    s12_d1_pattern_scoring: bool = True
+    # Shared by both lanes: the intraday hard stop cap, the R ladder and the loss circuit.
+    s12_hard_stop_intraday_pct: float = 1.5
+    s12_t1_r: float = 1.5
+    s12_t2_r: float = 2.25
+    s12_t3_r: float = 4.0
+    s12_share_target_ladder: bool = True
+    s12_consecutive_loss_limit: int = 3
+    s12_circuit_pause_bars: int = 5
+    # D2 (the package's S2): stop mode, target milestones, R runner/early cut, exits, burst/ORB/divergence.
+    s12_d2_settings_mode: Literal["Auto", "Manual"] = "Auto"
+    s12_d2_risk_mode: Literal["Dynamic", "ATR", "Percentage", "Swing"] = "Percentage"
+    s12_d2_min_stop_pct: float = 0.1
+    s12_d2_max_stop_pct: float = 0.0
+    s12_d2_dynamic_sensitivity: float = 1.0
+    s12_d2_atr_stop_mult: float = 2.0
+    s12_d2_percent_stop_pct: float = 0.1
+    s12_d2_t1_manual: float = 1.5
+    s12_d2_t2_manual: float = 2.25
+    s12_d2_t3_manual: float = 4.0
+    s12_d2_circuit: bool = True
+    s12_d2_require_15m_alignment: bool = False
+    s12_d2_confidence_floor: int = 60
+    s12_d2_exit_confirm_input: int = 3
+    s12_d2_gap_skip: bool = True
+    s12_d2_daily_trend_lock: bool = False
+    s12_d2_max_bars_in_trade: int = 250
+    s12_d2_macd_entry_filter: bool = True
+    s12_d2_signal_gap: int = 0
+    s12_d2_trailing: bool = True
+    s12_d2_trail_start_manual: float = 1.5
+    s12_d2_trail_atr_manual: float = 2.5
+    s12_d2_lock_at_t1: bool = True
+    s12_d2_profit_lock_r: float = 0.6
+    s12_d2_aggressive_trail: bool = False
+    s12_d2_tsl_use_close: bool = True
+    s12_d2_early_be: bool = False
+    s12_d2_early_be_r: float = 0.8
+    s12_d2_exit_mode: Literal["Conservative", "Balanced", "Trend-Following"] = "Trend-Following"
+    s12_d2_smart_exit: bool = False
+    s12_d2_exit_weakness: bool = False
+    s12_d2_burst: bool = True
+    s12_d2_burst_bars: int = 0
+    s12_d2_burst_index_pct: float = 0.25
+    s12_d2_burst_volume_mult: float = 1.1
+    s12_d2_burst_score_boost: int = 20
+    s12_d2_patterns: bool = True
+    s12_d2_orb: bool = True
+    s12_d2_orb_minutes: int = 30
+    s12_d2_divergence: bool = True
+    s12_d2_div_lookback: int = 14
+    s12_d2_div_score_boost: int = 15
+    # The lanes (engine/s12_lane.py): 1m burst/spike, 5m and 15m by default, Auto from day
+    # one, each index may hold one D1 and one D2 trade. Exits
+    # are the engine's own (early-loss ratchet, R runner, its EXIT) plus the UTS premium-cap
+    # tiers and the square-off.
+    s12_timeframes: Literal[
+        "5min,15min", "5min", "15min", "1min,5min,15min", "1min,5min", "1min,15min", "1min",
+    ] = "1min,5min,15min"
+    s12_d1_enabled: bool = True
+    s12_d2_enabled: bool = True
+    s12_signal_only: bool = False
+    s12_square_off: str = "15:15"
+    # S1+S2 option premium hard cap; global options_sl_pct may tighten it, never widen it.
+    s12_options_operator_cap_pct: float = Field(default=10.0, ge=0.5, le=10.0)
+    # Index stop ceiling at admission (the engine's own intraday hard cap is 1.5%).
+    s12_sl_max_pct: float = 1.5
+    s12_min_entry_rr: float = 0.5
+    # Nominal premium target for RR checks only: T1-T3 are milestones and never close.
+    s12_target_r: float = 4.0
+    # Operator lots per index, saved when changed on the dashboard and restored at start
+    # (they used to reset to 1 on every restart).
+    user_lots_by_index: Dict[str, int] = Field(default_factory=dict)
+    user_lots_fut_by_index: Dict[str, int] = Field(default_factory=dict)
     # Macro-event blackout: block fresh ENTRIES during user-listed event windows
     # (data_store/event_blackouts.json: [{date,start,end,label}], e.g. RBI policy,
     # budget). DEFAULT OFF — zero behavior change until enabled. Exits/trailing
@@ -2364,8 +2669,14 @@ class Settings(BaseSettings):
     # logic closed them on the next tick — four such entries on 11 Aug round-tripped in
     # 0.06-0.19s, each paying ~Rs.80 of round-trip charges for a fraction of a second of
     # exposure, and across the stored book that window cost -Rs.8,864 over 13 trades.
-    ut_no_entry_after: str = "14:55" # Block fresh 15min entries at/after this IST time
-    ut_5min_no_entry_after: str = "15:01" # Qualified 5min/1min entries have a later cutoff
+    # System-wide last NEW entry per timeframe (2026-09-26 user): 15m 14:50 (entries stop
+    # at 14:51), 5m 15:10, 1m 15:14, then the 15:15 hard exit. The lanes (UT SMART EXIT,
+    # S1) apply them on the entry clock (engine/entry_window.py); the other engines keep
+    # their bar-time check AND the EOD-protect clamp below, so their 5m/1m entries still
+    # end when EOD protection starts (15:01).
+    ut_no_entry_after: str = "14:50" # 15m last entry
+    ut_5min_no_entry_after: str = "15:10" # 5m last entry
+    ut_1min_no_entry_after: str = "15:14" # 1m last entry
     # Enforces the invariant above: whatever the two cutoffs say, no entry is admitted
     # once EOD protection is active. Off restores the previous behaviour of letting the
     # entry gate and the EOD exit logic contradict each other.
@@ -2429,6 +2740,12 @@ class Settings(BaseSettings):
     # 1% duty. Lower it if you want fresher evidence and can spare the CPU; a genuinely
     # per-tick bundle is not on the table (all twelve pairs is ~580ms).
     intelligence_analysis_ttl_seconds: float = 30.0
+    # Background refresh of each index's 1m/5m/15m bundles, all three together on one
+    # spot/chain snapshot. Capped at 80% of the TTL above so the scan never finds an
+    # expired bundle and recomputes it inline. In REAL mode a bar close on any of the
+    # three frames also refreshes at once, and the scan treats a bundle computed before
+    # its frame's last bar close as stale.
+    intelligence_background_refresh_seconds: float = 20.0
     # Ceiling on the profit-retention ladder, as a fraction of peak P&L. The major-win
     # rung used to run to 1.0 at a Rs.5000 peak, which places the protective floor ON the
     # peak price — breached by the very next tick, so the "trailing lock" became a fixed
@@ -2563,6 +2880,13 @@ class Settings(BaseSettings):
     history_rate_limit_per_second: float = 0.35
     option_history_miss_ttl_seconds: float = 900.0
     live_index_timeout_seconds: float = 9.0 # Per-index live scan budget before serving a stale fallback that cycle. Raised 6->9 so heavy indices (SENSEX/BANKNIFTY, large option chains) finish during volatile periods. NOTE: this is a CAP, not a wait — fast indices still return early, so the higher cap costs nothing on healthy cycles.
+    # Keep the 1s heartbeat and trade monitor, but run full signal analysis only when
+    # candle/data/settings inputs change or an explicit replay step requests it.
+    event_driven_scan_enabled: bool = True
+    kite_http_timeout_seconds: float = 7.0
+    # Scanner-runtime and replay-robustness knobs moved to typed subsystem groups in
+    # config.runtime_groups. Retired flat .env names remain readable there during the
+    # compatibility window, but no longer inflate this global model.
     # Background broker position-reconciliation cadence. Base rate applies while
     # positions are open (need close-reconciliation); idle rate when flat (nothing
     # to reconcile); exponential backoff up to max when the broker API fails
@@ -2591,7 +2915,9 @@ class Settings(BaseSettings):
     circuit_breaker_slippage_bps: float = 10.0 # Conservative projected exit slippage for open-position loss checks
     position_sizing_min_atr_fraction: float = 0.10 # Stop-distance floor used for sizing only
     position_sizing_min_price_fraction: float = 0.00005 # Absolute fallback when ATR is unavailable
-    live_signal_stabilization_seconds: float = 20.0 # Legacy/default anti-flicker window for non-5m/15m paths
+    live_signal_stabilization_seconds: float = 15.0 # Legacy/default anti-flicker window for non-5m/15m paths (15s, 2026-10-09 user)
+    # Floor for option signals in a risky regime (volatile/ranging); was a hard-coded 30s.
+    live_signal_stabilization_risky_floor_seconds: float = 15.0
     # Anti-repaint buffer before a forming signal may be entered. 30.0 -> 15.0 on
     # 2026-09-01.
     #
@@ -2617,6 +2943,7 @@ class Settings(BaseSettings):
     #
     # Measured effect on the wait: the floor was 33s bar-open-to-entry (30s window +
     # scan); it becomes ~18s. Median was 90s first-appearance-to-accept.
+    live_signal_stabilization_seconds_1min: float = 5.0 # Repaint-check buffer before a qualifying 1min live entry (2026-10-09 user)
     live_signal_stabilization_seconds_5min: float = 15.0 # Repaint-check buffer before 5min live entry filtering
     live_signal_stabilization_seconds_15min: float = 15.0 # Repaint-check buffer before 15min live entry filtering
     # Re-score a buffered signal's intelligence and regime pillars when it matures, on
@@ -2636,7 +2963,7 @@ class Settings(BaseSettings):
     midcap_15min_risky_stabilization_min_scans: int = 3 # Require repeated confirmation when MIDCPNIFTY 15min volume/intel is weak
     midcap_15min_risky_stabilization_min_volume_ratio: float = 1.05 # Basic volume floor for MIDCPNIFTY 15min risky stabilization
     midcap_15min_risky_stabilization_min_intel_score: float = 0.35 # Absolute signed-intel floor to skip the extra MIDCPNIFTY buffer
-    live_15min_entry_cutoff_grace_seconds: float = 90.0 # Let a 15min signal formed by cutoff finish its live buffer
+    live_15min_entry_cutoff_grace_seconds: float = 60.0 # 15m entries stop one minute after ut_no_entry_after (14:51)
     live_intrabar_signal_entries: bool = True # Detect forming-candle UT1 arrows before candle close
     # ─── Late-Session Power-Move Override ────────────────────
     # A data-confirmed "big move" may bypass the grade floor (any time) and the
@@ -2858,6 +3185,9 @@ class Settings(BaseSettings):
     # before it exits a live trade and hands the slot to the reverse entry.
     # Multi-index LTP shock force-exit bypasses this window by design.
     opposite_flip_confirm_min_seconds: float = 30.0
+    # Normal QP reversals belong to the entry timeframe. Keep the old policy
+    # available for controlled policy comparison; emergency shock exits are independent.
+    qp_cross_timeframe_opposite_exits: bool = False
     opposite_flip_confirm_max_seconds: float = 60.0
     opposite_flip_intel_filter_enabled: bool = True
     # Hold confirm while the flip's own move has gone adverse by more than this
@@ -2950,6 +3280,20 @@ class Settings(BaseSettings):
     market_wide_reversal_min_close_location: float = 0.65
     market_wide_reversal_max_skew_seconds_5min: float = 180.0
     market_wide_reversal_max_skew_seconds_15min: float = 900.0
+    # Completed bars of the SAME session that must precede the bar a vote measures.
+    #
+    # A vote is "range >= k x ATR14 of the prior bars, close in the top 35%". At the open
+    # the prior bars are the previous session's closing bars, which are the quietest of the
+    # day, and the measured bar is the opening auction that absorbed the overnight gap. So
+    # any gap that has not faded yet scores as a market-wide thrust. 2026-09-18 09:17:30:
+    # SENSEX gapped +260 (74,314.59 -> 74,575.24), the 2.5-minute-old 09:15 15min bar read
+    # 1.39x ATR / close 0.69, BANKNIFTY 1.99x / 0.98, MIDCPNIFTY 2.39x / 0.96, and "core 3/3"
+    # carried a RANGING, ADX-14.9 B+ LONG past the floor that had refused the same signal
+    # two minutes earlier. The gap faded 77 points the next minute; cut at 69s, -Rs.599,
+    # never green. Market-shift entries before 09:30 in the trade table: 6, 1 winner,
+    # -Rs.1,525. Three bars gives the ATR a same-session reference: 15min votes resume at
+    # the 10:00 bar, 5min at 09:30.
+    market_wide_reversal_min_session_bars: int = 3
     momentum_override_threshold: float = 25.0 # ADX threshold to bypass choppy market block
     max_trades_per_index: int = 5
     # Dynamic daily trade budget: scale max_trades_per_index by the current
@@ -3003,6 +3347,15 @@ class Settings(BaseSettings):
     # Minimum canonical confidence for a strict multi-index market-shift route
     # to supersede stale regime/15-minute direction. Ordinary signals do not use it.
     quality_policy_market_shift_min_confidence: float = 0.60
+    # Whether the confirmed_market_shift route exists at all. OFF since 2026-09-23: 12 real
+    # trades through it, 3 winners, -Rs.2,447; on the executable shadow ledger its accepted
+    # signals averaged -277 at 30 min and -574 at 60 min (negative in both halves) against
+    # +906 / +440 for the normal route. See engine/quality_verdict.py.
+    quality_policy_market_shift_route_enabled: bool = False
+    # Measured-volume floor the route applies when it is switched on (RP50's value). The
+    # route waives the regime/ADX/confirmation fence, so it must at least see real
+    # participation; tick proxies and unavailable volume never count.
+    quality_policy_market_shift_min_volume_ratio: float = 1.05
     # A fully synchronous 5m reversal across all three core indices has stronger
     # contemporaneous evidence than a generic market shift.  It may use this lower
     # floor only when its detector recorded all core votes and measured ADX.  This
@@ -3197,6 +3550,12 @@ class Settings(BaseSettings):
         extra='ignore'
     )
 
+    @model_validator(mode="after")
+    def resolve_angelone_pin_fallback(self):
+        if not self.angelone_password.strip() and self.angelone_pin.strip():
+            self.angelone_password = self.angelone_pin
+        return self
+
     @field_validator('active_indices')
     @classmethod
     def validate_active_indices(cls, values: list[str]) -> list[str]:
@@ -3383,6 +3742,8 @@ class Settings(BaseSettings):
         intrabar_enabled = normalized == "INTRACANDLE"
         self.live_intrabar_signal_entries = intrabar_enabled
         self.ut_signal_mode = "realtime" if intrabar_enabled else "confirmed"
+        if str(getattr(self, "scanner_engine", "")).lower() in {"ut_smart", "ut_smart_s1"}:
+            self.uts_lane_allow_intrabar_entries = intrabar_enabled
         return normalized
 
 

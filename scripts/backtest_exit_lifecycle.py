@@ -178,9 +178,15 @@ def load_trades(day: str) -> list[dict]:
         reg = r.get("regime")
         raw_regime = (reg.get("raw_regime") if isinstance(reg, dict) else "") or ""
         adx = float(reg.get("adx") if isinstance(reg, dict) else 0.0) or 0.0
-        entry_ts = _market_timestamp(r.get("signal_timestamp") or r.get("entry_timestamp"))
+        # Candle-open signal stamps are not executable entry timestamps.
+        accepted = r.get("accepted_decision_record") or {}
+        entry_ts = _market_timestamp(r.get("entry_timestamp") or accepted.get("accepted_at") or r.get("decided_at"))
         if pd.isna(entry_ts):
             continue
+        contract = r.get("contract") if isinstance(r.get("contract"), dict) else {}
+        quantity = contract.get("quantity") or (
+            int(contract.get("lots") or 1) * int(contract.get("lot_size") or LOT_SIZE.get(str(r.get("instrument") or ""), 1))
+        )
         trades.append({
             "instrument": str(r.get("instrument") or "").split()[0],
             "direction": str(r.get("direction") or "").upper(),
@@ -190,6 +196,7 @@ def load_trades(day: str) -> list[dict]:
             "stop": float(r.get("stop") or 0.0),
             "target": float(r.get("target") or 0.0),
             "entry_ts": entry_ts,
+            "quantity": int(quantity),
             "raw_regime": str(raw_regime).upper(),
             "adx": adx,
             "option_type": "CE" if str(r.get("direction") or "").upper() == "LONG" else "PE",
@@ -203,29 +210,12 @@ def load_trades(day: str) -> list[dict]:
 
 
 def match_contract(trade: dict, contracts: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame] | None:
-    """Exact match on the recorded traded contract when available (rtracker now stores
-    contract identity); otherwise fall back to premium-proximity guessing."""
+    """Only the recorded contract can establish a replayable price path."""
     sym = str(trade.get("trading_symbol") or "").strip()
     if sym:
         for name, df in contracts.items():
             if name.startswith(sym + "_"):
                 return name, df
-    best = None
-    best_err = 1e9
-    ts = trade["entry_ts"]
-    for name, df in contracts.items():
-        if _instrument_of(name) != trade["instrument"] or _type_of(name) != trade["option_type"]:
-            continue
-        at = df[df["timestamp"] <= ts]
-        if not len(at):
-            continue
-        prem = float(at.iloc[-1]["close"])
-        err = abs(prem - trade["entry"]) / max(1.0, trade["entry"])
-        if err < best_err:
-            best_err, best = err, (name, df)
-    # require a reasonable premium match (<8%)
-    if best is not None and best_err <= 0.08:
-        return best
     return None
 
 
@@ -442,7 +432,7 @@ def run_day(day: str, *, quiet: bool = False) -> dict:
         if len(bars) < 2:
             continue
         matched += 1
-        qty = LOT_SIZE.get(t["instrument"], 1)
+        qty = int(t.get("quantity") or LOT_SIZE.get(t["instrument"], 1))
         bx, base_reason = sim_old(t, bars, qty)
         rx, runner_reason = sim_runner(t, bars, sc, qty)
         base_gross, base_costs, _ = option_replay_pnl(
@@ -579,7 +569,7 @@ def main() -> None:
             rows.append((t, name, None, None, None, "NO_BARS"))
             continue
         matched += 1
-        qty = LOT_SIZE.get(t["instrument"], 1)
+        qty = int(t.get("quantity") or LOT_SIZE.get(t["instrument"], 1))
         bx, br = sim_old(t, bars, qty)
         rx, rr = sim_runner(t, bars, sc, qty)
         _, _, base_pnl = option_replay_pnl(

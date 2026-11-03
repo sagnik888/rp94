@@ -23,10 +23,11 @@ import textwrap
 import pytest
 
 from scanner import Scanner
+from engine.exit_cycle import ExitCycleService
 
 
 def _exit_loop_source():
-    return textwrap.dedent(inspect.getsource(Scanner._update_active_trades))
+    return textwrap.dedent(inspect.getsource(ExitCycleService.update_active_trades))
 
 
 def test_the_fast_path_bounds_the_age_of_its_cached_intelligence():

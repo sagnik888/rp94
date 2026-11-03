@@ -251,8 +251,11 @@ def test_pillar_breakdown_is_attached_to_the_graded_signal():
 def test_pillars_reconcile_with_the_reported_confidence():
     sig, _, conf = _graded_signal()
     p = sig.grade_pillars
-    # total_score is exactly the pillar sum minus the VIX penalty...
-    assert abs(p["total_score"] - (p["tech"] + p["intel"] + p["regime"] - p["vix_penalty"])) < 1e-3
+    # Correlated trend evidence shares one bounded contribution in v2. Raw
+    # tech/regime telemetry is retained for explanation, not summed again.
+    assert p["scoring_version"] == "bounded_evidence.v2"
+    assert -0.30 <= p["trend_group"] <= 0.30
+    assert abs(p["total_score"] - (p["trend_group"] + p["nontrend"] + p["intel"] - p["vix_penalty"])) < 1e-3
     # ...and the recorded final confidence is the one actually returned.
     assert abs(p["confidence_final"] - conf) < 1e-3
     assert abs(p["adjustments"] - (p["confidence_final"] - p["confidence_pre_adjust"])) < 1e-3

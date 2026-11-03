@@ -20,6 +20,7 @@ import pytest
 from config.settings import get_settings
 from engine.signal_processor import TradeCandidate
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 from trading.trade_manager import IST
 
 
@@ -427,9 +428,7 @@ def test_settings_product_arms_and_slow_bleed_defaults():
 
 def test_pipeline_order_contains_ladder_after_loss_guard():
     """Static audit: session + live paths call ladder near loss guard."""
-    from pathlib import Path
-
-    src = Path("scanner.py").read_text(encoding="utf-8")
+    src = scanner_runtime_source()
     # Both management paths must invoke ladder
     assert src.count("_rupee_loss_band_guard_decision(") >= 3  # def + 2 call sites
     # Session path: loss guard then ladder (by source order)

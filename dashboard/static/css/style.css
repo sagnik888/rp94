@@ -2694,8 +2694,9 @@ input:checked + .slider-mini:before { transform: translateX(16px); }
 }
 
 #resultsTable .conf-grade-cell {
-    display: inline-flex;
-    align-items: center;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
     gap: 3px;
     min-width: 60px;
     max-width: 100%;

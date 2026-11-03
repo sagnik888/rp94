@@ -5,8 +5,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+from config.settings import get_settings
 from engine.signal_processor import TradeCandidate
 from scanner import Scanner
+
+
+@pytest.fixture(autouse=True)
+def _native_scanner_mode(monkeypatch):
+    """These cases cover native conversion policy, regardless of the live mode."""
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
 
 
 def _cand(instrument, inst_type="FUT", **kwargs):

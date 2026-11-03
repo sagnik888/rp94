@@ -50,7 +50,8 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "is_ghost", "market_regime", "data_provenance", "price_action_verdict",
     "entry_intelligence_score", "intelligence_score", "strategy_revision", "strategy_direction_mode",
     "initial_stop", "scalp_lock_mode", "market_wide_reversal_entry",
-    "volume_spike_entry", "power_move", "source_lane",
+    "volume_spike_entry", "power_move", "source_lane", "exit_policy_owner",
+    "s1_best_spot", "s1_t1_locked", "s1_peak_premium",
     # Immutable entry-decision evidence.  These fields are needed after a restart
     # to distinguish the two price domains and to audit the exact forecast/policy
     # verdict that authorised fresh exposure.
@@ -63,7 +64,8 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     "expected_move_data_as_of", "expected_move_model_version", "expected_move_source",
     "entry_policy_allowed", "entry_policy_phase", "entry_policy_checked_at",
     "entry_policy_reason", "entry_policy_actual_rr",
-    "entry_policy_underlying_stop_pct", "entry_policy_version", "quality_verdict",
+    "entry_policy_underlying_stop_pct", "entry_policy_version", "quality_verdict", "decision_record",
+    "exit_decision_record",
     "entry_intel", "decision_intel", "calibration_outcome_recorded",
     "is_recovery",
     # Exchange-side protection + recovery state: read by from_dict(), so it has to
@@ -81,7 +83,7 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # repaint_guard_checked: without it a restart rehydrates every intracandle trade as
     # "structurally unconfirmed", which disables let-winners-run and arms the blunt
     # sub-1R give-back guard on a position whose source candle closed hours earlier.
-    "repaint_guard_checked",
+    "repaint_guard_checked", "entered_intracandle", "uts_confirmed", "uts_repaint_exit_required",
     # gtt_arm_uncertain: a possible orphaned server-side trigger. Losing this on a
     # restart is how a duplicate GTT goes unreconciled until both it and the SL-M
     # fire, double-exiting the position into a naked reversed leg.
@@ -115,6 +117,7 @@ TRADE_PERSISTED_COLUMNS = frozenset({
     # a live position is managed, so its state and provenance are operational data.
     "lifecycle_id",
     "runner_mode",
+    "original_target_distance",
     "runner_activation_timestamp",
     "runner_activation_reason",
     "runner_stop",
@@ -123,7 +126,9 @@ TRADE_PERSISTED_COLUMNS = frozenset({
 })
 
 
-_TRADE_JSON_COLUMNS = frozenset({"quality_verdict", "entry_intel", "decision_intel"})
+_TRADE_JSON_COLUMNS = frozenset({
+    "quality_verdict", "decision_record", "exit_decision_record", "entry_intel", "decision_intel",
+})
 
 
 def _encode_trade_value(column: str, value: Any) -> Any:
@@ -475,6 +480,7 @@ class DatabaseManager:
                     calibration_outcome_recorded INTEGER,
                     lifecycle_id TEXT,
                     runner_mode INTEGER,
+                    original_target_distance REAL,
                     runner_activation_timestamp TEXT,
                     runner_activation_reason TEXT,
                     runner_stop REAL,
@@ -511,6 +517,10 @@ class DatabaseManager:
                     "volume_spike_entry": "INTEGER",
                     "power_move": "INTEGER",
                     "source_lane": "TEXT",
+                    "exit_policy_owner": "TEXT",
+                    "s1_best_spot": "REAL",
+                    "s1_t1_locked": "INTEGER DEFAULT 0",
+                    "s1_peak_premium": "REAL",
                     "underlying_entry": "REAL",
                     "underlying_stop": "REAL",
                     "underlying_target": "REAL",
@@ -539,6 +549,8 @@ class DatabaseManager:
                     "entry_policy_underlying_stop_pct": "REAL",
                     "entry_policy_version": "TEXT",
                     "quality_verdict": "TEXT",
+                    "decision_record": "TEXT",
+                    "exit_decision_record": "TEXT",
                     "entry_intel": "TEXT",
                     "decision_intel": "TEXT",
                     "calibration_outcome_recorded": "INTEGER",
@@ -559,6 +571,9 @@ class DatabaseManager:
                     "reversal_watch_required": "INTEGER",
                     "is_reversion_scalp": "INTEGER",
                     "repaint_guard_checked": "INTEGER",
+                    "entered_intracandle": "INTEGER",
+                    "uts_confirmed": "INTEGER",
+                    "uts_repaint_exit_required": "INTEGER",
                     "entry_slippage": "REAL",
                     "exit_slippage": "REAL",
                     # Present in long-lived databases from an earlier schema, absent from
@@ -580,6 +595,7 @@ class DatabaseManager:
                     "scale_in_requested_quantity": "INTEGER",
                     "lifecycle_id": "TEXT",
                     "runner_mode": "INTEGER",
+                    "original_target_distance": "REAL",
                     "runner_activation_timestamp": "TEXT",
                     "runner_activation_reason": "TEXT",
                     "runner_stop": "REAL",
@@ -1024,7 +1040,14 @@ class DatabaseManager:
                     )
                     signal_dict = dict(signal_dict)
                     signal_dict["id"] = sig_id
-                rows_to_save.append((sig_id, signal_dict))
+                # An exit inherits its entry's trade_id, so both rows of one lifecycle
+                # arrive with the same id and INSERT OR REPLACE kept only the later one.
+                # 2026-09-15 that stored MIDCPNIFTY 15min as an open TRADE SIGNAL after
+                # LIVE_REVERSAL_EXIT had closed it, so a restart would restore a closed
+                # lifecycle as actionable. Key the row by action; the payload id is kept.
+                action = str(signal_dict.get("action") or "ENTRY").upper()
+                row_key = sig_id if action == "ENTRY" or f"|{action}|" in sig_id else f"{sig_id}|{action}"
+                rows_to_save.append((row_key, signal_dict))
 
             cursor.execute("SELECT COUNT(*) AS row_count FROM session_signals WHERE date = ?", (date_str,))
             existing = int(cursor.fetchone()["row_count"] or 0)

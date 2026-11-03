@@ -4,6 +4,7 @@ from inspect import getsource
 from types import SimpleNamespace
 
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 
 
 def _settings():
@@ -95,9 +96,10 @@ def test_shared_callsite_passes_measured_adx_instead_of_defaulting_eod_to_zero()
 
 
 def test_historical_recovery_and_eod_use_the_shared_evidence_callsite():
-    source = getsource(SignalProcessor.process_best_signal)
+    source = signal_pipeline_source()
 
     assert "hist_quality_verdict = self._quality_verdict_for_signal(" in source
     assert "rec_quality_verdict = self._quality_verdict_for_signal(" in source
     assert "eod_quality_verdict = self._quality_verdict_for_signal(" in source
-    assert source.count("self._quality_verdict_for_signal(") == 3
+    assert "final_native_verdict = self._quality_verdict_for_signal(" in source
+    assert source.count("self._quality_verdict_for_signal(") == 4

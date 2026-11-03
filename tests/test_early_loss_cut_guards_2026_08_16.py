@@ -39,6 +39,7 @@ import pytz
 
 from config.settings import Settings, get_settings
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 IST = pytz.timezone("Asia/Kolkata")
 ENTRY = IST.localize(dt.datetime(2026, 8, 14, 12, 37, 25))
@@ -219,5 +220,6 @@ def test_the_guards_sit_before_the_r_arithmetic():
 
 def test_both_monitor_paths_inherit_the_guards():
     """The ordering split is why these live in the decision, not at a call site."""
-    src = inspect.getsource(Scanner)
-    assert src.count("self._loss_guard_decision(") == 2, "call-site count changed"
+    src = scanner_runtime_source()
+    sites = src.count("self._loss_guard_decision(") + src.count("scanner._loss_guard_decision(")
+    assert sites == 2, "call-site count changed"

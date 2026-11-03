@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 @pytest.fixture(autouse=True)
@@ -147,7 +148,7 @@ def test_maturation_is_recorded_to_rtracker():
     """Only deaths were recorded, so no survival rate was computable from rtracker."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     assert 'decision="STABILIZED"' in src
     idx = src.index('decision="STABILIZED"')
     window = src[max(0, idx - 900):idx + 700]
@@ -159,7 +160,7 @@ def test_stabilized_is_its_own_decision():
     """It must not be counted as an entry in the funnel arithmetic."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     idx = src.index('decision="STABILIZED"')
     assert 'decision="ACCEPTED"' not in src[idx - 200:idx + 200]
 

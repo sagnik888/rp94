@@ -1,0 +1,21 @@
+{
+  "root_cause": "UTS retry helpers interrupted _analysis_input_signature, leaving its return block unreachable and every completed-warmup scan signature None. Applied historical generations then looked unchanged, leaving awaiting_scan stuck.",
+  "reproduction_failures": 6,
+  "runs": {
+    "backtest_loading_focused_20260930.xml": {
+      "passed": 172,
+      "failed": 0
+    },
+    "backtest_loading_gate_20260930.xml": {
+      "passed": 274,
+      "failed": 0
+    }
+  },
+  "unique_passed": 411,
+  "unresolved_failures": 0,
+  "scanner_sha256": "e286370ec569e4ee56fbe40c35d3740f03148cd0205212e39451604e8e3bad1c",
+  "runtime_before": "HISTORICAL/manual, 5 days, UT SMART EXIT, awaiting_scan, inputs unchanged",
+  "runtime_restarted": false,
+  "restart_rejection": "blocked by policy",
+  "live_orders_submitted": false
+}

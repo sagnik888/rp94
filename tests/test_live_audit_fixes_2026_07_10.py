@@ -101,18 +101,11 @@ def test_arm_helper_respects_source_tf_and_toggle(monkeypatch):
 
 def test_candidate_exit_path_consults_reversion_arm():
     """create_exit (virtual/manual ledger) must arm, not just real closes."""
-    src = inspect.getsource(Scanner._check_session_candidate_exits) if hasattr(
-        Scanner, "_check_session_candidate_exits"
-    ) else ""
-    if "_maybe_arm_reversion_from_exit" not in src:
-        # Fallback: locate the nested create_exit body anywhere in scanner.py.
-        import scanner as scanner_module
-
-        full = inspect.getsource(scanner_module)
-        anchor = full.find("def create_exit(")
-        assert anchor != -1
-        block = full[anchor : anchor + 4000]
-        assert "_maybe_arm_reversion_from_exit" in block
+    # The helper is nested inside this method; inspect the complete method instead
+    # of truncating create_exit at a fixed source-character count.
+    src = inspect.getsource(Scanner._check_session_candidates_breaches_locked)
+    assert "def create_exit(" in src
+    assert "_maybe_arm_reversion_from_exit" in src
     real_close = inspect.getsource(Scanner._close_and_record_internal)
     assert "_maybe_arm_reversion_from_exit" in real_close
 
@@ -235,6 +228,7 @@ def test_heavy_trend_margin_warning_once_per_key():
 
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         heavy_trend_lot_scale_enabled=True,
         heavy_trend_lot_multiplier_opt=2.0,
     )

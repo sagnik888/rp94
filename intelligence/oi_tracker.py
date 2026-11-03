@@ -18,6 +18,11 @@ from loguru import logger
 class OITracker:
     """Tracks and analyzes Open Interest changes"""
 
+    _ANALYSIS_COLUMNS = (
+        "strike", "call_oi", "put_oi", "call_oi_change", "put_oi_change",
+        "oi_change_source", "oi_change_horizon_seconds",
+    )
+
     def __init__(self):
         self._oi_history: Dict[str, List[Dict]] = {}
 
@@ -28,6 +33,8 @@ class OITracker:
         spot_price: Optional[float] = None,
         strike_interval: int = 50,
         near_strikes: int = 5,
+        timeframe_seconds: Optional[float] = None,
+        derivative_features: Optional[Dict] = None,
     ) -> Dict:
         """
         Analyze OI changes with price movement.
@@ -44,7 +51,10 @@ class OITracker:
             return self._empty_result()
 
         try:
-            analysis_chain = options_chain.copy()
+            # Only the columns this analysis reads (attrs travel with the selection).
+            # Copying and re-assigning the full chain dragged its symbol/token string
+            # columns through every step: 20% of IntelligenceAggregator.analyze.
+            analysis_chain = options_chain[[c for c in self._ANALYSIS_COLUMNS if c in options_chain.columns]]
             analysis_basis = "FULL_CHAIN"
             broad_call_oi = pd.to_numeric(
                 options_chain.get("call_oi", pd.Series(0, index=options_chain.index)),
@@ -63,9 +73,9 @@ class OITracker:
                 atm = round(float(spot_price) / interval) * interval
                 width = max(int(near_strikes or 0), 0) * interval
                 strike_values = pd.to_numeric(options_chain["strike"], errors="coerce")
-                near_chain = options_chain.loc[
+                near_chain = analysis_chain.loc[
                     strike_values.between(atm - width, atm + width, inclusive="both")
-                ].copy()
+                ]
                 near_call_oi = pd.to_numeric(
                     near_chain.get("call_oi", pd.Series(0, index=near_chain.index)),
                     errors="coerce",
@@ -98,6 +108,26 @@ class OITracker:
                             ).fillna(0)
                         }
                     )
+            measured = self._measured_changes(analysis_chain, derivative_features, timeframe_seconds)
+            if measured:
+                for side in ("call", "put"):
+                    analysis_chain[f"{side}_oi_change"] = analysis_chain["strike"].map(
+                        {strike: values[side] for strike, values in measured.items()}).fillna(0.0)
+                    analysis_chain[f"{side}_oi"] = analysis_chain["strike"].map(
+                        {strike: values[f"{side}_oi"] for strike, values in measured.items()}).fillna(0.0)
+                analysis_chain["oi_change_source"] = "exchange_measured_interval"
+            horizon = float(timeframe_seconds) if measured else options_chain.attrs.get("oi_change_horizon_seconds")
+            if horizon is None and "oi_change_horizon_seconds" in analysis_chain:
+                horizons = pd.to_numeric(analysis_chain["oi_change_horizon_seconds"], errors="coerce").dropna().unique()
+                horizon = float(horizons[0]) if len(horizons) == 1 else -1.0
+            change_comparable = True
+            if timeframe_seconds is not None:
+                # A 90-second poll delta and a day-reported change are neither a
+                # 5-minute nor a 15-minute measurement. Unknown is not comparable.
+                change_comparable = bool(horizon is not None and
+                    abs(float(horizon)-float(timeframe_seconds)) <= 1.0)
+            if not change_comparable:
+                analysis_chain = analysis_chain.assign(call_oi_change=0.0, put_oi_change=0.0)
             total_call_oi = int(analysis_chain['call_oi'].sum())
             total_put_oi = int(analysis_chain['put_oi'].sum())
             total_call_oi_change = int(analysis_chain['call_oi_change'].sum())
@@ -170,10 +200,16 @@ class OITracker:
             if not oi_available:
                 signal = "NEUTRAL"
                 interpretation = "Call/put OI breadth unavailable; directional inference withheld"
+            elif timeframe_seconds is not None and ((signal == "BULLISH" and price_change <= 0)
+                    or (signal == "BEARISH" and price_change >= 0)):
+                signal = "NEUTRAL"
+                interpretation = "OI pressure lacks independent underlying-price confirmation"
 
             # ── Key Strikes (max OI) ──
             score = int(round(50.0 + (pressure_imbalance * 25.0))) if oi_available else 50
             score = max(0, min(100, score))
+            if timeframe_seconds is not None and signal == "NEUTRAL":
+                score = 50  # SignalProcessor also consumes this scalar directly.
             if signal != "NEUTRAL" and abs(price_change) < 0.05:
                 score = 55 if signal == "BULLISH" else 45
 
@@ -203,6 +239,8 @@ class OITracker:
                 "pressure_imbalance": round(float(pressure_imbalance), 3),
                 "directional_model": "CALL_PUT_PRESSURE_V1",
                 "oi_change_source": oi_change_source,
+                "oi_change_horizon_seconds": horizon,
+                "change_comparable": change_comparable,
                 "activity": activity,
                 "signal": signal,
                 "score": score,
@@ -223,6 +261,53 @@ class OITracker:
         except Exception as e:
             logger.error(f"OI analysis error: {e}")
             return self._empty_result()
+
+    @staticmethod
+    def _measured_changes(chain, payload, seconds):
+        """Prefer full-window exchange OI without mixing provider/expiry/strike legs."""
+        from intelligence.derivative_context import _expiry, _number, SECONDS
+        if not seconds or not isinstance(payload, dict) or SECONDS.get(payload.get("timeframe")) != seconds:
+            return {}
+        expiry = _expiry(chain.attrs.get("expiry"))
+        as_of = _number(payload.get("as_of"))
+        if (expiry is None or as_of is None
+                or payload.get("instrument") != chain.attrs.get("instrument")):
+            return {}
+        max_gap = min(120.0, seconds/2)
+        groups = {}
+        for row in payload.get("options", []):
+            if not isinstance(row, dict):
+                continue
+            start, end, span, gap, change, strike, oi = (_number(row.get(k)) for k in
+                ("start_at", "end_at", "coverage_seconds", "max_observation_gap_seconds", "oi_change", "strike", "oi"))
+            if (row.get("available") is not True or row.get("entry_eligible") is not True
+                    or row.get("clock") != "exchange" or row.get("family") != "options"
+                    or row.get("instrument") != payload.get("instrument")
+                    or row.get("timeframe") != payload.get("timeframe")
+                    or not row.get("provider") or _expiry(row.get("expiry")) != expiry
+                    or row.get("option_type") not in {"CE", "PE"} or not row.get("unit")
+                    or any(v is None for v in (start, end, span, gap, change, strike, oi)) or oi <= 0
+                    or not 0 <= as_of-end <= max_gap or not seconds <= span <= seconds+max_gap
+                    or abs(end-start-span) > 1 or not 0 <= gap <= max_gap):
+                continue
+            groups.setdefault((row["provider"], row["unit"]), {}).setdefault(strike, {}).setdefault(row["option_type"], []).append(row)
+        # Independent Kite intervals can replace FYERS reported day changes, but
+        # their levels must travel with them. No baseline/provider mixing.
+        strikes = set(pd.to_numeric(chain["strike"], errors="coerce").dropna())
+        cohorts = [rows for rows in groups.values() if strikes.issubset(rows)]
+        if len(cohorts) != 1:
+            return {}
+        changes = {}
+        for strike, legs in cohorts[0].items():
+            if len(legs.get("CE", [])) == len(legs.get("PE", [])) == 1:
+                ce, pe = legs["CE"][0], legs["PE"][0]
+                if ce["unit"] == pe["unit"] and all(abs(ce[k]-pe[k]) <= min(15, seconds/4)
+                                                     for k in ("start_at", "end_at")):
+                    changes[strike] = {"call": ce["oi_change"], "put": pe["oi_change"],
+                                       "call_oi": ce["oi"], "put_oi": pe["oi"]}
+        # A varying subset is not the broad chain's change. Every analyzed strike
+        # needs the same paired window, with enough breadth for the OI model.
+        return changes if len(strikes) >= 3 and strikes.issubset(changes) else {}
 
     def _empty_result(self) -> Dict:
         return {

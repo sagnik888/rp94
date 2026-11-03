@@ -359,6 +359,7 @@ def test_volume_spike_option_execution_uses_tight_candidate_stop(settings):
         log_signal_decision_once=lambda *args, **kwargs: None,
     )
     st._execution_levels = Scanner._execution_levels.__get__(st, Scanner)
+    st._candidate_market_regime = Scanner._candidate_market_regime.__get__(st, Scanner)
 
     entry, stop, target = st._execution_levels(candidate)
 

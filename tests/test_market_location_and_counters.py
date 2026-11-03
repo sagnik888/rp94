@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ def _location_scanner(frame, regime="RANGING"):
     scanner.mode = "REAL"
     scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
     scanner.latest_regimes = {"BANKNIFTY": regime}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(
         getattr(candidate, "trend_15m_agrees", False)
     )
@@ -360,6 +362,9 @@ def test_late_session_reclaim_context_rejects_quiet_basket(monkeypatch):
 
 def test_late_session_reclaim_context_respects_time_box(monkeypatch):
     settings = get_settings()
+    # The generic 14:25 box; UT SMART EXIT has its own 12:45 reclaim window (2026-09-26),
+    # and the operator's .env may select that engine.
+    monkeypatch.setattr(settings, "scanner_engine", "quad_prime")
     monkeypatch.setattr(settings, "late_session_reclaim_override_enabled", True)
     monkeypatch.setattr(settings, "late_session_reclaim_start", "14:25")
     monkeypatch.setattr(settings, "late_session_reclaim_end", "15:10")
@@ -392,6 +397,7 @@ def test_late_session_reclaim_location_block_becomes_tight_scalp(monkeypatch):
     scanner.mode = "REAL"
     scanner.candles = SimpleNamespace(get_candles=lambda *_args: frame)
     scanner.latest_regimes = {"NIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     scanner._candidate_15m_trend_agrees = lambda candidate: False
     scanner._set_scalp_lock = Scanner._set_scalp_lock.__get__(scanner, Scanner)
@@ -513,6 +519,7 @@ def _missed_reentry_scanner(frames, now):
     scanner.user_lots_fut = {"NIFTY": 1, "BANKNIFTY": 1, "SENSEX": 1, "MIDCPNIFTY": 1}
     scanner.trades = SimpleNamespace(open_trades={})
     scanner.latest_regimes = {"NIFTY": "TRENDING_DOWN"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._missed_reentry_candidates = {}
     scanner._session_squareoff_clock = lambda: now
     scanner._configured_session_time = lambda _name, default: datetime.strptime(default, "%H:%M").time()
@@ -839,8 +846,10 @@ def test_market_wide_reversal_live_gate_bypasses_single_index_location_block(mon
     monkeypatch.setattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
 
     scanner = Scanner.__new__(Scanner)
+    _supply_current_volume(scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"NIFTY": "TRENDING_UP"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     candidate = _location_candidate(
@@ -881,6 +890,40 @@ def test_location_gate_blocks_unconfirmed_countertrend_extreme(monkeypatch):
     assert not allowed
     assert reason
     assert candidate.location_decision == "BLOCK"
+
+
+def test_location_gate_uses_decision_clock_and_current_session_range(monkeypatch):
+    previous = pd.DataFrame(
+        {
+            "open": [500.0] * 12,
+            "high": [1000.0] * 12,
+            "low": [10.0] * 12,
+            "close": [500.0] * 12,
+        },
+        index=pd.date_range("2026-06-14 14:00", periods=12, freq="min"),
+    )
+    today_index = pd.date_range("2026-06-15 09:45", periods=12, freq="min")
+    today = pd.DataFrame(
+        {
+            "open": [100.0 + i for i in range(12)],
+            "high": [101.0 + i for i in range(12)],
+            "low": [99.0 + i for i in range(12)],
+            "close": [100.5 + i for i in range(12)],
+        },
+        index=today_index,
+    )
+    scanner = _location_scanner(pd.concat([previous, today]))
+    candidate = _location_candidate(
+        direction="LONG",
+        option_type="CE",
+        signal_timestamp=today_index[0].to_pydatetime(),
+        decision_timestamp=today_index[-1].to_pydatetime(),
+    )
+
+    scanner._market_location_entry_gate(candidate)
+
+    assert candidate.entry_spot == today.iloc[-1]["close"]
+    assert candidate.location_position_pct > 0.80
 
 
 def test_location_gate_allows_only_confirmed_aligned_impulse_as_reduced_risk():
@@ -949,7 +992,7 @@ def test_choppy_option_location_risk_allows_strict_intel_exception():
         impulse_confirmed=True,
         trend_15m_agrees=True,
         is_explosive_bypass=True,
-        intelligence_score=0.75,
+        intelligence_score=-0.75,  # Signed intelligence must support this SHORT.
     )
 
     allowed, reason = scanner._market_location_entry_gate(candidate)
@@ -963,6 +1006,7 @@ def test_choppy_5min_option_live_gate_requires_trend_and_impulse():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
@@ -990,8 +1034,10 @@ def test_choppy_5min_option_live_gate_requires_trend_and_impulse():
 
 def test_choppy_5min_option_live_gate_allows_confirmed_bplus_sixty_setup():
     scanner = Scanner.__new__(Scanner)
+    _supply_current_volume(scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
@@ -1019,6 +1065,7 @@ def test_choppy_5min_special_bplus_sixty_blocks_bad_premium_health():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
@@ -1045,6 +1092,7 @@ def test_choppy_5min_special_bplus_sixty_blocks_missing_premium_health():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
@@ -1068,6 +1116,7 @@ def test_choppy_5min_special_sixty_ignores_stale_premium_ok_without_iv():
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: bool(getattr(candidate, "trend_15m_agrees", False))
@@ -1097,9 +1146,12 @@ def test_choppy_15min_bplus_uses_canonical_evidence_gate(monkeypatch):
     monkeypatch.setattr(settings, "live_filter_leniency_pct", 0.0)
     monkeypatch.setattr(settings, "live_15min_min_confidence", 0.62)
     scanner = Scanner.__new__(Scanner)
+    _supply_current_volume(scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{name: time.time() for name in scanner._timeframe_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
@@ -1132,7 +1184,9 @@ def test_15min_live_gate_blocks_below_independent_floor(monkeypatch):
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{name: time.time() for name in scanner._timeframe_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
@@ -1159,9 +1213,12 @@ def test_15min_live_gate_allows_confirmed_bplus_at_lower_floor(monkeypatch):
     monkeypatch.setattr(settings, "live_15min_trending_momentum_min_confidence", 0.58)
     monkeypatch.setattr(settings, "live_15min_trending_momentum_adx_threshold", 24.0)
     scanner = Scanner.__new__(Scanner)
+    _supply_current_volume(scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{name: time.time() for name in scanner._timeframe_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
@@ -1187,9 +1244,12 @@ def test_15min_live_gate_allows_confirmed_bplus_at_lower_floor(monkeypatch):
 def test_15min_quality_uses_the_fresh_adx_read_before_its_verdict():
     def scanner_with_refresh(fresh_adx):
         scanner = Scanner.__new__(Scanner)
+        _supply_current_volume(scanner)
         scanner.mode = "REAL"
         scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+        scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
         scanner._timeframe_regimes = {"BANKNIFTY_15min": "RANGING"}
+        scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{name: time.time() for name in scanner._timeframe_regimes}}
         scanner._passes_timeframe_entry_policy = lambda candidate: True
         scanner._market_location_entry_gate = lambda candidate: (True, "")
         scanner._candidate_15m_trend_agrees = lambda candidate: True
@@ -1224,8 +1284,10 @@ def test_15min_quality_uses_the_fresh_adx_read_before_its_verdict():
 
 def test_unknown_regime_requires_a_confidence_and_three_confirmations():
     scanner = Scanner.__new__(Scanner)
+    _supply_current_volume(scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "UNKNOWN"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._passes_timeframe_entry_policy = lambda candidate: True
     scanner._market_location_entry_gate = lambda candidate: (True, "")
     scanner._candidate_15m_trend_agrees = lambda candidate: True
@@ -1268,6 +1330,7 @@ def test_choppy_option_stabilization_uses_configured_buffer_and_two_scans(monkey
     monkeypatch.setattr(settings, "live_signal_stabilization_seconds_5min", 30.0)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"BANKNIFTY": "VOLATILE"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     candidate = _location_candidate(timeframe="5min", inst_type="OPT")
 
     seconds, scans, adaptive = scanner._live_signal_stabilization_requirements(candidate)
@@ -1283,6 +1346,7 @@ def test_timeframe_stabilization_buffers_are_operator_configured(monkeypatch):
     monkeypatch.setattr(settings, "live_signal_stabilization_seconds_15min", 30.0)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"BANKNIFTY": "TRENDING_UP"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
 
     five = _location_candidate(timeframe="5min", inst_type="FUT")
     fifteen = _location_candidate(timeframe="15min", inst_type="FUT")
@@ -1301,6 +1365,7 @@ def test_midcap_15min_choppy_weak_tape_uses_longer_stabilization(monkeypatch):
     monkeypatch.setattr(settings, "midcap_15min_risky_stabilization_min_intel_score", 0.25)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"MIDCPNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
 
     candidate = _location_candidate(
         instrument="MIDCPNIFTY",
@@ -1320,6 +1385,7 @@ def test_midcap_15min_choppy_confirmed_tape_keeps_base_stabilization(monkeypatch
     monkeypatch.setattr(settings, "midcap_15min_risky_stabilization_min_intel_score", 0.25)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"MIDCPNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
 
     candidate = _location_candidate(
         instrument="MIDCPNIFTY",
@@ -1460,11 +1526,14 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
         monkeypatch.setattr(settings, "scanner_engine", mode)
         for instrument in all_indices:
             scanner = _late_reclaim_scanner(frames, signal_ts)
+            _supply_current_volume(scanner)
             scanner.mode = "REAL"
             scanner.latest_regimes = {name: "RANGING" for name in all_indices}
+            scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
             scanner._timeframe_regimes = {
                 f"{instrument}_15min": "RANGING"
             }
+            scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{name: time.time() for name in scanner._timeframe_regimes}}
             scanner._late_entry_scalp_active = lambda _candidate: False
             scanner._passes_timeframe_entry_policy = lambda _candidate: True
             scanner._late_session_entry_block_reason = lambda _candidate: ""
@@ -1486,8 +1555,24 @@ def test_15min_choppy_scalp_guard_is_engine_mode_agnostic(monkeypatch):
                 # Above fifteen_min_choppy_scalp_min_intel_score (0.35 since 2026-08-11) so the
         # VOLUME condition under test is what blocks, not the intel floor. Was 0.24 when
         # that floor was 0.20.
-        intelligence_score=0.40,
+                intelligence_score=0.40,
             )
+            # This test asserts the 15m scalp treatment after an admissible
+            # option entry. Model the same fresh cash/contract evidence that a
+            # live A+ option route now requires.
+            scanner._prediction_volume_context = lambda *_args: {
+                "volume_available": True,
+                "volume_reliable": True,
+                "volume_comparable": True,
+            }
+            candidate.chain_quality = {
+                "intelligence_usable": True,
+                "stale": False,
+                "fallback": False,
+            }
+            candidate.strike_oi_available = True
+            candidate.strike_volume_available = True
+            candidate.strike_liquidity_available = True
 
             assert scanner._passes_live_trade_ready_gate(candidate) is True, f"{mode} {instrument}"
             assert candidate.fifteen_min_choppy_scalp_entry is True
@@ -1566,6 +1651,7 @@ def test_late_session_choppy_option_blocks_without_momentum(monkeypatch):
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     scanner._entry_reversal_relief_context = lambda *args, **kwargs: None
     candidate = _location_candidate(signal_timestamp=datetime(2026, 6, 29, 15, 5))
@@ -1584,6 +1670,7 @@ def test_late_session_choppy_option_allows_confirmed_momentum_scalp(monkeypatch)
     scanner = Scanner.__new__(Scanner)
     scanner.mode = "REAL"
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     candidate = _location_candidate(
         signal_timestamp=datetime(2026, 6, 29, 15, 5),
@@ -1612,6 +1699,7 @@ def test_stabilization_preflight_waits_for_last_10_seconds_and_does_not_mutate()
     scanner._signal_preflight_cache = {}
     scanner._diagnostics = {"stabilization": {}}
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner.inst_pref = "AUTO"
     scanner._apply_strict_instrument_pref_to_entries = lambda rows: rows
     scanner._subscribe_candidate_quote = lambda *_args, **_kwargs: None
@@ -1663,6 +1751,7 @@ def test_stabilization_preflight_applies_only_after_fingerprint_still_matches():
     scanner._signal_preflight_cache = {}
     scanner._diagnostics = {"stabilization": {}}
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner.inst_pref = "AUTO"
     scanner._apply_strict_instrument_pref_to_entries = lambda rows: rows
     scanner._subscribe_candidate_quote = lambda *_args, **_kwargs: None
@@ -1703,6 +1792,7 @@ def test_stabilization_preflight_stale_cache_is_ignored():
     scanner._signal_preflight_cache = {}
     scanner._diagnostics = {"stabilization": {}}
     scanner.latest_regimes = {"BANKNIFTY": "RANGING"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner.inst_pref = "AUTO"
     scanner._apply_strict_instrument_pref_to_entries = lambda rows: rows
     scanner._subscribe_candidate_quote = lambda *_args, **_kwargs: None
@@ -1736,6 +1826,7 @@ def test_sell_flicker_repaint_override_is_not_readmitted(monkeypatch):
     monkeypatch.setattr(settings, "stabilization_momentum_override_enabled", True)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"BANKNIFTY": "TRENDING_DOWN"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     calls = []
     scanner._entry_reversal_relief_context = lambda *args, **kwargs: calls.append(args) or {
@@ -1783,6 +1874,7 @@ def test_late_buy_flicker_repaint_override_requires_reclaim_basket(monkeypatch):
     monkeypatch.setattr(settings, "stabilization_momentum_override_enabled", True)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"NIFTY": "TRENDING_UP"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     scanner._late_session_reclaim_context = lambda *args, **kwargs: None
     calls = []
@@ -1835,6 +1927,7 @@ def test_midday_buy_flicker_repaint_override_still_uses_confirmed_relief(monkeyp
     monkeypatch.setattr(settings, "stabilization_momentum_override_enabled", True)
     scanner = Scanner.__new__(Scanner)
     scanner.latest_regimes = {"NIFTY": "TRENDING_UP"}
+    scanner._intel_cache_time = {**getattr(scanner, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in scanner.latest_regimes}}
     scanner._setting_enabled = lambda value, default=True: bool(default if value is None else value)
     scanner._late_session_reclaim_context = lambda *args, **kwargs: None
     scanner._entry_reversal_relief_context = lambda *args, **kwargs: {
@@ -2026,3 +2119,8 @@ def test_index_halt_message_matches_uninterrupted_same_index_semantics():
     assert scanner._can_trade_instrument(
         "NIFTY", datetime.now(IST).replace(tzinfo=None)
     )[0] is True
+
+
+def _supply_current_volume(scanner):
+    # Policy fixtures carry a fresh measured observation, independently of entry flags.
+    scanner._fresh_exact_trade_intel = lambda *a, **k: {"volume": {"available": True, "measurement_basis": "TRADED", "relative_volume_ratio": 1.30}}

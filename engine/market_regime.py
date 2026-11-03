@@ -89,6 +89,44 @@ def futures_stop_tolerance_pct(configured_cap_pct: float, regime) -> float:
     return min(configured_cap, regime_cap)
 
 
+def option_stop_tolerance_pct(
+    configured_cap_pct: float,
+    regime,
+    *,
+    confidence=None,
+    grade: str = "",
+    fast_entry: bool = False,
+    setup=None,
+) -> float:
+    """Absolute premium-loss ceiling for every bought option entry.
+
+    Strong/ordinary setups get at most 10%; range/chop/volatility can use 15%.
+    Fast burst entries and demonstrably weak setups get at most 5%. A lower
+    operator limit always wins. Natural/ATR stops may be tighter than this cap.
+    UTS supplies its native setup policy instead of using grade-based overrides.
+    """
+    if setup is not None:
+        from engine import uts_lane
+        if uts_lane.is_uts(setup):
+            return uts_lane.premium_cap_pct(setup, operator_cap=configured_cap_pct, regime=regime)
+    try:
+        operator_cap = float(configured_cap_pct)
+    except (TypeError, ValueError):
+        operator_cap = 15.0
+    if not 0.0 < operator_cap < float("inf"):
+        operator_cap = 15.0
+    cap = min(operator_cap, 15.0)
+    if normalize_regime(regime) not in {MarketRegime.RANGING, MarketRegime.VOLATILE}:
+        cap = min(cap, 10.0)
+    try:
+        weak_confidence = confidence is not None and float(confidence) <= 0.35
+    except (TypeError, ValueError):
+        weak_confidence = False
+    if fast_entry or weak_confidence or str(grade or "").strip().upper().split(" ")[0] == "C":
+        cap = min(cap, 5.0)
+    return cap
+
+
 def is_risky_regime(value) -> bool:
     return normalize_regime(value) in {
         MarketRegime.RANGING,

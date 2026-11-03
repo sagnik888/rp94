@@ -64,9 +64,9 @@ def test_risky_regimes_do_not_widen_the_operator_option_cap_off_expiry():
     assert _stop_pct(False, "RANGING") == pytest.approx(15.0)
 
 
-def test_a_trending_regime_is_unaffected_either_way():
+def test_a_trending_regime_is_capped_at_ten_percent_either_way():
     assert _stop_pct(True, "TRENDING_UP") == pytest.approx(10.0)
-    assert _stop_pct(False, "TRENDING_UP") == pytest.approx(15.0)
+    assert _stop_pct(False, "TRENDING_UP") == pytest.approx(10.0)
 
 
 def test_the_tightening_is_worth_real_money():

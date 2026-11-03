@@ -53,6 +53,7 @@ import pytz
 from config.settings import get_settings
 from engine.trade_accounting import estimate_trade_charges
 from scanner import Scanner
+from engine.exit_cycle import ExitCycleService
 from trading.trade_manager import Trade
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -99,16 +100,16 @@ def test_peak_pnl_on_a_bare_trade_really_is_net():
 def test_the_gap_between_the_units_is_three_figures_in_this_build():
     """Why the trap is tempting rather than a rounding detail.
 
-    On a FRESH Settings, never the singleton: other tests legitimately zero the
-    slippage component while exercising the charge model, and a suite-order-dependent
-    magnitude assertion reads whatever they left behind (observed: 80.0, the flat
-    opt_cost alone, with slippage stripped).
+    Pin the static model: production calibration legitimately replaces this percentage
+    when enough broker fills exist, so the machine's fill database must not change the
+    result of this unit test.
     """
     from config.settings import Settings
 
     t = _trade()
+    settings = Settings(slippage_auto_calibration_enabled=False)
     charges = estimate_trade_charges(
-        200.0, 210.0, t.pnl_quantity, "OPT", Settings(), 1.0, t.instrument
+        200.0, 210.0, t.pnl_quantity, "OPT", settings, 1.0, t.instrument
     )
 
     assert charges > 85.0, "these contracts carry a substantial round trip cost"
@@ -193,7 +194,7 @@ def test_the_live_call_site_passes_the_trades_own_peak():
     """
     import inspect
 
-    src = inspect.getsource(Scanner._update_active_trades)
+    src = inspect.getsource(ExitCycleService.update_active_trades)
     ratchet = src.find("trade.peak_pnl = max(")
     call = src.find("_peak_giveback_cap_exit(")
 

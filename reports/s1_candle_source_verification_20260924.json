@@ -1,0 +1,1294 @@
+{
+  "date": "2026-09-23",
+  "cutoff": "2026-09-23 15:15:00",
+  "engine_sha256": "03ccd20c414204f00993624037de97429846afe20af529d0475b26174cc28b47",
+  "frames": [
+    {
+      "symbol": "NIFTY",
+      "timeframe": "1min",
+      "rows": 8252,
+      "input_hash": "5050cf951f5d2979c200fb71b69874166efb02bd7a760616ed797fb38a1b740b",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:45:00",
+              "side": "BUY",
+              "market_close": 23416.85,
+              "chart_entry": 23414.15,
+              "chart_close": 23416.85,
+              "exit_bar_open": "2026-09-23 11:18:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 11:31:00",
+              "side": "BUY",
+              "market_close": 23435.3,
+              "chart_entry": 23436.95,
+              "chart_close": 23435.3,
+              "exit_bar_open": "2026-09-23 11:50:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 12:02:00",
+              "side": "BUY",
+              "market_close": 23443.35,
+              "chart_entry": 23439.75,
+              "chart_close": 23443.35,
+              "exit_bar_open": "2026-09-23 12:25:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 23416.05,
+            "high": 23435.15,
+            "low": 23415.8,
+            "close": 23431.65
+          },
+          "last_features": {
+            "rsi": 60.18356830351438,
+            "rsi5m": 40.70763533969667,
+            "adx": 29.098884966752337,
+            "bull_score": 54.09178415175719,
+            "bear_score": 18.0
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:45:00",
+              "side": "BUY",
+              "market_close": 23416.85,
+              "chart_entry": 23409.940651357334,
+              "chart_close": 23415.0875,
+              "exit_bar_open": "2026-09-23 11:19:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 11:31:00",
+              "side": "BUY",
+              "market_close": 23435.3,
+              "chart_entry": 23430.188781588615,
+              "chart_close": 23435.625,
+              "exit_bar_open": "2026-09-23 11:51:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 12:02:00",
+              "side": "BUY",
+              "market_close": 23443.35,
+              "chart_entry": 23432.86262551356,
+              "chart_close": 23441.387499999997,
+              "exit_bar_open": "2026-09-23 12:26:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 23419.777830395178,
+            "high": 23435.15,
+            "low": 23415.8,
+            "close": 23424.6625
+          },
+          "last_features": {
+            "rsi": 52.12525573918495,
+            "rsi5m": 34.9340829752836,
+            "adx": 33.7454062256653,
+            "bull_score": 46.062627869592475,
+            "bear_score": 18.0
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "NIFTY",
+      "timeframe": "5min",
+      "rows": 1651,
+      "input_hash": "4377f0bffff4f1831331a94f23af04c2bf70a96d583c9a7f61da7128f724ebed",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 12:00:00",
+              "side": "BUY",
+              "market_close": 23448.05,
+              "chart_entry": 23431.2,
+              "chart_close": 23448.05,
+              "exit_bar_open": "2026-09-23 13:30:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 23418.9,
+            "high": 23435.15,
+            "low": 23414.35,
+            "close": 23431.65
+          },
+          "last_features": {
+            "rsi": 48.900497113353495,
+            "rsi5m": 40.70763533969667,
+            "adx": 18.681892070924373,
+            "bull_score": 19.0,
+            "bear_score": 21.549751443323252
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 11:35:00",
+              "side": "BUY",
+              "market_close": 23436.65,
+              "chart_entry": 23431.851838532537,
+              "chart_close": 23438.487499999996,
+              "exit_bar_open": "2026-09-23 13:30:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 14:25:00",
+              "side": "BUY",
+              "market_close": 23457.55,
+              "chart_entry": 23445.26604061523,
+              "chart_close": 23452.7625,
+              "exit_bar_open": "2026-09-23 14:50:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 23419.987262774637,
+            "high": 23435.15,
+            "low": 23414.35,
+            "close": 23425.012499999997
+          },
+          "last_features": {
+            "rsi": 43.0410516972585,
+            "rsi5m": 34.9340829752836,
+            "adx": 22.00377275804504,
+            "bull_score": 13.0,
+            "bear_score": 38.48701966746083
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "NIFTY",
+      "timeframe": "15min",
+      "rows": 1152,
+      "input_hash": "25821ffd460d149f3e35f1402072728125b6fd044af5fc56733c25024b57add2",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 12:00:00",
+              "side": "BUY",
+              "market_close": 23458.1,
+              "chart_entry": 23431.2,
+              "chart_close": 23458.1,
+              "exit_bar_open": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 23422.55,
+            "high": 23435.15,
+            "low": 23408.4,
+            "close": 23431.65
+          },
+          "last_features": {
+            "rsi": 53.0462877190274,
+            "rsi5m": 41.25118477964534,
+            "adx": 22.72256327783598,
+            "bull_score": 49.96827041518566,
+            "bear_score": 22.0
+          },
+          "at_1045": {
+            "open": 23414.15,
+            "high": 23424.0,
+            "low": 23411.1,
+            "close": 23415.5,
+            "adx": 19.247573220233544,
+            "atr": 31.049049422316187,
+            "body_pct": 0.3410852713179038,
+            "bull_score": 59.5634722676582,
+            "bear_score": 6.0,
+            "rel_vol": 1.3135187002291975,
+            "ema9_15": 23379.061355592294,
+            "ema21_15": 23374.295659682273,
+            "ema9_15_slope": 15.669645451100223,
+            "body_size": 1.3499999999985448,
+            "minimum_body": 4.657357413347428
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:45:00",
+              "side": "BUY",
+              "market_close": 23415.5,
+              "chart_entry": 23391.07005812657,
+              "chart_close": 23416.1875,
+              "exit_bar_open": null,
+              "exit_reason": ""
+            }
+          ],
+          "final_position": 1,
+          "last_chart_ohlc": {
+            "open": 23434.654485760177,
+            "high": 23435.15,
+            "low": 23408.4,
+            "close": 23424.4375
+          },
+          "last_features": {
+            "rsi": 51.30143159117281,
+            "rsi5m": 40.84886264746716,
+            "adx": 23.012734099667576,
+            "bull_score": 51.67618399492156,
+            "bear_score": 22.0
+          },
+          "at_1045": {
+            "open": 23391.07005812657,
+            "high": 23424.0,
+            "low": 23391.07005812657,
+            "close": 23416.1875,
+            "adx": 21.031640863267896,
+            "atr": 36.44335298462512,
+            "body_pct": 0.7627539085848297,
+            "bull_score": 78.89190007351574,
+            "bear_score": 0.0,
+            "rel_vol": 1.3135187002291975,
+            "ema9_15": 23376.081049002758,
+            "ema21_15": 23373.33393008369,
+            "ema9_15_slope": 12.228609544250503,
+            "body_size": 25.117441873429925,
+            "minimum_body": 5.466502947693768
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "timeframe": "1min",
+      "rows": 8252,
+      "input_hash": "0d43564081545c2cdff7adb71c15ae50d3cead21099848573ac18fa8f0e4d144",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56513.05,
+            "high": 56552.35,
+            "low": 56513.05,
+            "close": 56542.85
+          },
+          "last_features": {
+            "rsi": 61.540146323972614,
+            "rsi5m": 38.818727226368985,
+            "adx": 28.796566362877318,
+            "bull_score": 54.7700731619863,
+            "bear_score": 18.0
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 13:02:00",
+              "side": "BUY",
+              "market_close": 56599.25,
+              "chart_entry": 56559.011590521535,
+              "chart_close": 56581.175,
+              "exit_bar_open": "2026-09-23 13:15:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 14:17:00",
+              "side": "BUY",
+              "market_close": 56592.75,
+              "chart_entry": 56599.368615629326,
+              "chart_close": 56593.5625,
+              "exit_bar_open": "2026-09-23 14:22:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 14:30:00",
+              "side": "BUY",
+              "market_close": 56612.3,
+              "chart_entry": 56601.59747694283,
+              "chart_close": 56612.787500000006,
+              "exit_bar_open": "2026-09-23 14:34:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56515.71081202564,
+            "high": 56552.35,
+            "low": 56513.05,
+            "close": 56530.325000000004
+          },
+          "last_features": {
+            "rsi": 57.08761309474771,
+            "rsi5m": 31.383418280811213,
+            "adx": 37.91332816684892,
+            "bull_score": 48.543806547373855,
+            "bear_score": 18.0
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "timeframe": "5min",
+      "rows": 1651,
+      "input_hash": "8efd3c08c776ad0aea140bb8ff108970b68bf2b22fefaa6b21db01798f2c7a9f",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:05:00",
+              "side": "BUY",
+              "market_close": 56469.45,
+              "chart_entry": 56479.85,
+              "chart_close": 56469.45,
+              "exit_bar_open": "2026-09-23 11:55:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 12:00:00",
+              "side": "BUY",
+              "market_close": 56567.55,
+              "chart_entry": 56531.55,
+              "chart_close": 56567.55,
+              "exit_bar_open": "2026-09-23 13:35:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56495.2,
+            "high": 56552.35,
+            "low": 56486.05,
+            "close": 56542.85
+          },
+          "last_features": {
+            "rsi": 48.58794282766617,
+            "rsi5m": 38.818727226368985,
+            "adx": 19.24586762529021,
+            "bull_score": 19.0,
+            "bear_score": 21.706028586166916
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:55:00",
+              "side": "BUY",
+              "market_close": 56593.35,
+              "chart_entry": 56543.71328497336,
+              "chart_close": 56578.6875,
+              "exit_bar_open": "2026-09-23 12:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56503.49080873362,
+            "high": 56552.35,
+            "low": 56486.05,
+            "close": 56519.112499999996
+          },
+          "last_features": {
+            "rsi": 41.06461546840023,
+            "rsi5m": 31.383418280811213,
+            "adx": 22.898103114733686,
+            "bull_score": 0.0,
+            "bear_score": 54.263898495267256
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "timeframe": "15min",
+      "rows": 1152,
+      "input_hash": "7f7b69c9ecb203a2fd29d4ec63a80dfdbb70c61aa1eec0cd0e518c72f5812845",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:00:00",
+              "side": "BUY",
+              "market_close": 56475.3,
+              "chart_entry": 56454.95,
+              "chart_close": 56475.3,
+              "exit_bar_open": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56513.45,
+            "high": 56552.35,
+            "low": 56465.4,
+            "close": 56542.85
+          },
+          "last_features": {
+            "rsi": 53.41753003656562,
+            "rsi5m": 39.02064642033443,
+            "adx": 22.48395947211275,
+            "bull_score": 44.70876501828281,
+            "bear_score": 36.9679189442255
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:15:00",
+              "side": "BUY",
+              "market_close": 56523.15,
+              "chart_entry": 56420.15471893572,
+              "chart_close": 56500.975,
+              "exit_bar_open": "2026-09-23 15:00:00",
+              "exit_reason": "TSL"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 56558.33848157829,
+            "high": 56558.33848157829,
+            "low": 56465.4,
+            "close": 56518.5125
+          },
+          "last_features": {
+            "rsi": 51.24268565623045,
+            "rsi5m": 36.831475055011346,
+            "adx": 27.55359320087051,
+            "bull_score": 28.621342828115225,
+            "bear_score": 49.0
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "MIDCPNIFTY",
+      "timeframe": "1min",
+      "rows": 8252,
+      "input_hash": "213a626bc4a70f37f85f8583741555196dff778d46a4f1cbda6c1c7ff948026e",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 09:17:00",
+              "side": "BUY",
+              "market_close": 14562.95,
+              "chart_entry": 14552.6,
+              "chart_close": 14562.95,
+              "exit_bar_open": "2026-09-23 09:29:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 11:31:00",
+              "side": "BUY",
+              "market_close": 14538.7,
+              "chart_entry": 14536.55,
+              "chart_close": 14538.7,
+              "exit_bar_open": "2026-09-23 11:44:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 13:01:00",
+              "side": "BUY",
+              "market_close": 14538.05,
+              "chart_entry": 14536.35,
+              "chart_close": 14538.05,
+              "exit_bar_open": "2026-09-23 13:58:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 14552.8,
+            "high": 14567.25,
+            "low": 14551.15,
+            "close": 14562.8
+          },
+          "last_features": {
+            "rsi": 56.78411968950552,
+            "rsi5m": 45.53644276843298,
+            "adx": 36.84112665369804,
+            "bull_score": 52.392059844752765,
+            "bear_score": 18.0
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 11:30:00",
+              "side": "BUY",
+              "market_close": 14536.65,
+              "chart_entry": 14533.141464539865,
+              "chart_close": 14535.675000000001,
+              "exit_bar_open": "2026-09-23 11:45:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 13:46:00",
+              "side": "BUY",
+              "market_close": 14559.6,
+              "chart_entry": 14555.244776458674,
+              "chart_close": 14558.925000000001,
+              "exit_bar_open": "2026-09-23 13:59:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 14552.670759547453,
+            "high": 14567.25,
+            "low": 14551.15,
+            "close": 14558.5
+          },
+          "last_features": {
+            "rsi": 49.175934871281086,
+            "rsi5m": 46.24297856314388,
+            "adx": 38.54198912762422,
+            "bull_score": 49.0,
+            "bear_score": 18.412032564359457
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "rows": 1651,
+      "input_hash": "219c92d38de231b06804623253f7da8a2606c94a497f92665f6d46ce8c31f69c",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 09:20:00",
+              "side": "BUY",
+              "market_close": 14563.0,
+              "chart_entry": 14557.85,
+              "chart_close": 14563.0,
+              "exit_bar_open": "2026-09-23 09:45:00",
+              "exit_reason": "Hard SL1"
+            },
+            {
+              "bar_open": "2026-09-23 13:40:00",
+              "side": "BUY",
+              "market_close": 14556.45,
+              "chart_entry": 14553.45,
+              "chart_close": 14556.45,
+              "exit_bar_open": "2026-09-23 15:05:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 14551.15,
+            "high": 14567.25,
+            "low": 14546.85,
+            "close": 14562.8
+          },
+          "last_features": {
+            "rsi": 54.99388194184481,
+            "rsi5m": 45.53644276843298,
+            "adx": 25.92134032308656,
+            "bull_score": 78.49694097092241,
+            "bear_score": 14.0
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 13:40:00",
+              "side": "BUY",
+              "market_close": 14556.45,
+              "chart_entry": 14552.26031501302,
+              "chart_close": 14554.425,
+              "exit_bar_open": "2026-09-23 15:10:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 14557.94020504118,
+            "high": 14567.25,
+            "low": 14546.85,
+            "close": 14557.0125
+          },
+          "last_features": {
+            "rsi": 50.52036900079118,
+            "rsi5m": 46.24297856314388,
+            "adx": 30.518752938126003,
+            "bull_score": 49.26018450039559,
+            "bear_score": 28.0
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "MIDCPNIFTY",
+      "timeframe": "15min",
+      "rows": 1152,
+      "input_hash": "9067628ab51ce4fc80a55abd66685b28ff9c946f05c729400e387fa4943f0fe2",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 14560.0,
+            "high": 14567.25,
+            "low": 14546.85,
+            "close": 14562.8
+          },
+          "last_features": {
+            "rsi": 58.759876433384534,
+            "rsi5m": 52.670009487820835,
+            "adx": 19.682282659172966,
+            "bull_score": 69.37993821669227,
+            "bear_score": 0.0
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 15:00:00",
+              "side": "BUY",
+              "market_close": 14562.8,
+              "chart_entry": 14565.996579115817,
+              "chart_close": 14559.224999999999,
+              "exit_bar_open": null,
+              "exit_reason": ""
+            }
+          ],
+          "final_position": 1,
+          "last_chart_ohlc": {
+            "open": 14565.996579115817,
+            "high": 14567.25,
+            "low": 14546.85,
+            "close": 14559.224999999999
+          },
+          "last_features": {
+            "rsi": 60.171534713817444,
+            "rsi5m": 61.94508173308509,
+            "adx": 23.433639563549654,
+            "bull_score": 76.95304648400803,
+            "bear_score": 15.0
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "SENSEX",
+      "timeframe": "1min",
+      "rows": 8247,
+      "input_hash": "281f50d091c2676231dc66b5f6c9d37f977e1e5130c9ebdf48cc0d520a652a9f",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 11:30:00",
+              "side": "BUY",
+              "market_close": 74888.96,
+              "chart_entry": 74851.65,
+              "chart_close": 74888.96,
+              "exit_bar_open": "2026-09-23 11:42:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 12:02:00",
+              "side": "BUY",
+              "market_close": 74898.21,
+              "chart_entry": 74883.85,
+              "chart_close": 74898.21,
+              "exit_bar_open": "2026-09-23 12:25:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74790.6,
+            "high": 74825.75,
+            "low": 74788.85,
+            "close": 74801.04
+          },
+          "last_features": {
+            "rsi": 48.60723645997431,
+            "rsi5m": 41.83050190568843,
+            "adx": 15.890553043513162,
+            "bull_score": 18.0,
+            "bear_score": 25.696381770012845
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 10:46:00",
+              "side": "BUY",
+              "market_close": 74817.72,
+              "chart_entry": 74797.06989974284,
+              "chart_close": 74815.7475,
+              "exit_bar_open": "2026-09-23 11:19:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 11:30:00",
+              "side": "BUY",
+              "market_close": 74888.96,
+              "chart_entry": 74858.60742019874,
+              "chart_close": 74869.82,
+              "exit_bar_open": "2026-09-23 11:41:00",
+              "exit_reason": "Momentum Exit"
+            },
+            {
+              "bar_open": "2026-09-23 12:02:00",
+              "side": "BUY",
+              "market_close": 74898.21,
+              "chart_entry": 74862.13002243091,
+              "chart_close": 74891.03,
+              "exit_bar_open": "2026-09-23 12:25:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74794.82761646647,
+            "high": 74825.75,
+            "low": 74788.85,
+            "close": 74801.56
+          },
+          "last_features": {
+            "rsi": 48.46703331208504,
+            "rsi5m": 33.87574699746126,
+            "adx": 21.67566403747551,
+            "bull_score": 31.35132807495102,
+            "bear_score": 25.76648334395748
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "SENSEX",
+      "timeframe": "5min",
+      "rows": 1650,
+      "input_hash": "7403578042589583e233a6532d0387cb0a546c6e66b8998845acae5fe5eb3f48",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 11:30:00",
+              "side": "BUY",
+              "market_close": 74902.43,
+              "chart_entry": 74851.65,
+              "chart_close": 74902.43,
+              "exit_bar_open": "2026-09-23 13:15:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74785.93,
+            "high": 74825.75,
+            "low": 74772.8,
+            "close": 74801.04
+          },
+          "last_features": {
+            "rsi": 43.32478342606719,
+            "rsi5m": 41.83050190568843,
+            "adx": 20.008441519644986,
+            "bull_score": 6.0,
+            "bear_score": 48.35449132625638
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 12:10:00",
+              "side": "BUY",
+              "market_close": 74946.4,
+              "chart_entry": 74894.58844538659,
+              "chart_close": 74935.03,
+              "exit_bar_open": "2026-09-23 13:20:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74792.94916822584,
+            "high": 74825.75,
+            "low": 74772.8,
+            "close": 74796.37999999999
+          },
+          "last_features": {
+            "rsi": 38.71069772950257,
+            "rsi5m": 33.87574699746126,
+            "adx": 23.827550660429203,
+            "bull_score": 10.0,
+            "bear_score": 57.29975245610712
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    },
+    {
+      "symbol": "SENSEX",
+      "timeframe": "15min",
+      "rows": 1152,
+      "input_hash": "cd0c0161f0ac75b3b31a37fe3bcf0af86d5f698f63052f59e6b058229eb66f90",
+      "settings": {
+        "candle_type": "heikin_ashi",
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "variants": {
+        "standard": {
+          "events": [],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74801.38,
+            "high": 74825.75,
+            "low": 74755.21,
+            "close": 74801.04
+          },
+          "last_features": {
+            "rsi": 48.5751224469295,
+            "rsi5m": 41.280125702882195,
+            "adx": 17.34779737370198,
+            "bull_score": 26.0,
+            "bear_score": 29.71243877653525
+          }
+        },
+        "heikin_ashi": {
+          "events": [
+            {
+              "bar_open": "2026-09-23 12:15:00",
+              "side": "BUY",
+              "market_close": 74924.72,
+              "chart_entry": 74884.5868068482,
+              "chart_close": 74939.6525,
+              "exit_bar_open": "2026-09-23 14:45:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ],
+          "final_position": 0,
+          "last_chart_ohlc": {
+            "open": 74835.14513882171,
+            "high": 74835.14513882171,
+            "low": 74755.21,
+            "close": 74795.845
+          },
+          "last_features": {
+            "rsi": 47.177532992761776,
+            "rsi5m": 40.43348768980165,
+            "adx": 19.49480219581077,
+            "bull_score": 20.0,
+            "bear_score": 30.411233503619112
+          }
+        }
+      },
+      "scanner_matches_ha_reference": true,
+      "full_and_900_bar_event_times_match": true
+    }
+  ],
+  "actual_chart_1045_marker": {
+    "time": 1790140500,
+    "position": "belowBar",
+    "color": "#22c55e",
+    "shape": "arrowUp",
+    "text": "BUY S1 @ 23416"
+  },
+  "actual_chart_candle_type": "heikin_ashi"
+}

@@ -345,3 +345,10 @@ def test_a_rare_burst_reversal_is_exempt():
     c = _candidate("SHORT")
     c.rare_burst_entry = True
     assert s._opposite_direction_stack_block(c, [_open("LONG"), _open("LONG", tf="5min")]) == ""
+
+
+@pytest.fixture(autouse=True)
+def _native_scanner_mode(monkeypatch):
+    """Buffer keys here carry no lane suffix; combined modes scope eviction per owner lane."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")

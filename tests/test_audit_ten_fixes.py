@@ -26,6 +26,7 @@ def test_default_sizing_honors_user_lots_without_hardcap():
         risk_opt_pct=8.0,
         max_trade_loss_abs=12_000.0,
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
     )
     # Premium 400, stop 340 (60 pts), lot 15 → would be risk-capped under old policy
     result = resolve_trade_lots(
@@ -77,6 +78,7 @@ def test_fut_sizing_honors_user_lots_when_cap_raised():
 def test_cascade_multiplies_configured_lots():
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         cascade_lot_scale_enabled=True,
         cascade_lot_multiplier=2.0,
         cascade_lot_multiplier_fut=1.0,
@@ -149,6 +151,7 @@ def test_heavy_trend_opt_scales_2x_only_fut_flat():
     """Non-cascade heavy trend (2/4 align): OPT ×2 max; FUT 1×."""
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         heavy_trend_lot_scale_enabled=True,
         heavy_trend_lot_multiplier_opt=2.0,
         heavy_trend_lot_multiplier_fut=1.0,
@@ -182,6 +185,7 @@ def test_heavy_trend_opt_scales_2x_only_fut_flat():
 def test_cascade_wins_over_heavy_trend_when_both():
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         cascade_lot_scale_enabled=True,
         cascade_lot_multiplier_opt=3.0,
         cascade_lot_multiplier_opt_min=2.0,
@@ -225,6 +229,7 @@ def test_cascade_opt_mult_clamped_between_2_and_3():
 def test_rest_always_1x_without_cascade_or_heavy_trend():
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         cascade_lot_scale_enabled=True,
         fut_lots_hard_cap=3,  # cap above request so 1× (no multiply) is observable
     )
@@ -247,6 +252,7 @@ def test_rest_always_1x_without_cascade_or_heavy_trend():
 def test_r7_cascade_max_lots_cap():
     s = Settings(
         auto_risk_sizing_enabled=False,
+        risk_based_lots_enabled=False,
         cascade_lot_scale_enabled=True,
         cascade_lot_multiplier=3.0,
         cascade_lot_max_lots=5,
@@ -400,6 +406,7 @@ def test_option_trail_premium_space_ratchet():
         entry_spot=25_000.0,
         is_ghost=True,
         initial_stop=80.0,
+        confidence=0.8,  # Ordinary setup; an omitted 0.0 score requires the 5% cap.
     )
     tid = trade.id
     tm.update_trade(

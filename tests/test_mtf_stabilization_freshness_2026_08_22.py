@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 from engine.multi_timeframe import MultiTimeframeEngine
+from engine.execution_service import ExecutionService
 from scanner import Scanner
 
 
@@ -171,7 +172,7 @@ def test_repaint_status_requires_provenance_newer_than_the_buffer():
 
 
 def _coordinate_tree():
-    return ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    return ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
 
 
 def test_stabilization_passes_the_buffer_cutoff_into_the_repaint_read():

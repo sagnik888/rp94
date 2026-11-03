@@ -231,8 +231,11 @@ def test_auto_instrument_selection_routes_iv_momentum_and_late_expiry():
     scanner.signal_processor = SimpleNamespace(
         _option_grade_allowed=lambda *args, **kwargs: True
     )
-    scanner.expiry = SimpleNamespace(
-        is_expiry_day=lambda instrument, target_date: target_date == date(2026, 6, 18)
+    scanner._historical_expiry_resolver = SimpleNamespace(
+        resolve=lambda instrument, as_of: {
+            "is_expiry_day": pd.Timestamp(as_of).date() == date(2026, 6, 18),
+            "in_gamma_window": False,
+        }
     )
     settings = SimpleNamespace(ut_backtest_more_results=True)
 

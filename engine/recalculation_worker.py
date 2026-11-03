@@ -18,10 +18,14 @@ from typing import Any, Dict, Iterable, Optional
 
 
 def _fetch_days(user_days: int, timeframe: str) -> int:
+    # Broker ranges count calendar days; the UI window counts market sessions.
+    # Sixty days fits Kite's minute-request limit (and FYERS' larger limit),
+    # while allowing a 30-session replay plus weekend/holiday warmup. Yahoo's
+    # shorter range belongs at its fallback call, not on broker requests.
     fetch_days = max(15, int(user_days or 1) * 3)
     if timeframe == "1min":
-        return min(7, fetch_days)
-    return min(30, max(20, fetch_days))
+        return min(60, fetch_days)
+    return min(60, max(20, fetch_days))
 
 
 def _candle_cache_file(instrument: str, timeframe: str) -> Path:
@@ -91,15 +95,30 @@ def _worker_target(job: Dict[str, Any], out_path: str) -> None:
         timeframes = job.get("timeframes") or ["1min", "5min", "15min"]
         backtest_days = int(job.get("backtest_days") or 1)
         refresh_data = bool(job.get("refresh_data", False))
+        offline_only = bool(job.get("offline_only", False))
         for name, cfg in indices.items():
             for tf in timeframes:
                 try:
                     days_back = _fetch_days(backtest_days, tf)
-                    if not refresh_data:
+                    if not refresh_data or offline_only:
                         cached = _cached_candle_manifest(name, tf, days_back)
                         if cached:
                             result["files"].append(cached)
                             continue
+                    if offline_only:
+                        result["errors"].append(
+                            f"{name} {tf}: offline historical candle cache unavailable"
+                        )
+                        result["files"].append({
+                            "instrument": name,
+                            "timeframe": tf,
+                            "path": str(_candle_cache_file(name, tf)),
+                            "rows": 0,
+                            "days_back": days_back,
+                            "exists": False,
+                            "source": "offline_missing",
+                        })
+                        continue
                     provider = get_provider()
                     df = provider.get_historical_candles(
                         cfg.get("token", ""),
@@ -122,6 +141,8 @@ def _worker_target(job: Dict[str, Any], out_path: str) -> None:
                     )
                 except Exception as exc:
                     result["errors"].append(f"{name} {tf}: {exc}")
+        if offline_only and result["errors"]:
+            result["status"] = "incomplete"
     except Exception as exc:
         result["status"] = "error"
         result["errors"].append(f"{type(exc).__name__}: {exc}")

@@ -8,12 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.source_views import scanner_runtime_source
 
 
 def test_scanner_has_no_orphan_process_best_signal():
-    text = Path("scanner.py").read_text(encoding="utf-8")
+    text = scanner_runtime_source()
     assert "def _process_best_signal" not in text
-    assert "self.signal_processor.process_best_signal" in text
+    assert "scanner.signal_processor.process_best_signal" in text
 
 
 def test_audit_session_ledger_offline_json_and_hygiene():

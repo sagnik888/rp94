@@ -1,0 +1,228 @@
+{
+  "cutoff_ist": "2026-09-23 15:15:00",
+  "timestamp_convention": "bar open; include bars closing by cutoff",
+  "settings": {
+    "scanner_engine": "s1",
+    "ut_session_start": "09:15",
+    "ut_session_end": "15:25",
+    "ut_force_exit_time": "15:15",
+    "ut_no_entry_after": "14:55",
+    "ut_5min_no_entry_after": "15:01",
+    "eod_protect_enabled": true,
+    "eod_protect_window_minutes": 14.0,
+    "block_entries_during_eod_protect": true
+  },
+  "engine_sha256": "3dc2c14044238e9706a8d748bc7d0f26309b6e91d72a156214305339950e2adf",
+  "cases": [
+    {
+      "symbol": "NIFTY",
+      "timeframe": "5min",
+      "effective_entry_cutoff": "15:01",
+      "last_completed_bar_open": "2026-09-23 15:10:00",
+      "last_completed_ohlcv": {
+        "open": 23418.9,
+        "high": 23435.15,
+        "low": 23414.35,
+        "close": 23431.65,
+        "volume": 11265434.0
+      },
+      "raw_s1_position_at_cutoff_before_execution_squareoff": 0,
+      "raw_s1_session_rules": false,
+      "features_at_cutoff": {
+        "rsi": 48.900497113353495,
+        "rsi5m": 40.70763533969667,
+        "adx": 18.681892070924373,
+        "di_plus": 18.49537127841871,
+        "di_minus": 22.92052830134965,
+        "bull_score": 19.0,
+        "bear_score": 21.549751443323252
+      },
+      "events_through_cutoff": [
+        {
+          "entry_bar_open": "2026-09-23 12:00:00",
+          "entry_available_at": "2026-09-23 12:05:00",
+          "direction": 1,
+          "chart_entry": 23431.2,
+          "signal_close": 23448.05,
+          "exit_bar_open": "2026-09-23 13:30:00",
+          "exit_available_at": "2026-09-23 13:35:00",
+          "exit_reason": "Momentum Exit"
+        }
+      ],
+      "causality_checks": {
+        "full": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        },
+        "future_poisoned": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        }
+      }
+    },
+    {
+      "symbol": "NIFTY",
+      "timeframe": "15min",
+      "effective_entry_cutoff": "14:55",
+      "last_completed_bar_open": "2026-09-23 15:00:00",
+      "last_completed_ohlcv": {
+        "open": 23422.55,
+        "high": 23435.15,
+        "low": 23408.4,
+        "close": 23431.65,
+        "volume": 26552928.0
+      },
+      "raw_s1_position_at_cutoff_before_execution_squareoff": 0,
+      "raw_s1_session_rules": false,
+      "features_at_cutoff": {
+        "rsi": 53.0462877190274,
+        "rsi5m": 41.25118477964534,
+        "adx": 22.72256327783598,
+        "di_plus": 22.57595801934459,
+        "di_minus": 20.67379321514521,
+        "bull_score": 49.96827041518566,
+        "bear_score": 22.0
+      },
+      "events_through_cutoff": [
+        {
+          "entry_bar_open": "2026-09-23 12:00:00",
+          "entry_available_at": "2026-09-23 12:15:00",
+          "direction": 1,
+          "chart_entry": 23431.2,
+          "signal_close": 23458.1,
+          "exit_bar_open": "2026-09-23 15:00:00",
+          "exit_available_at": "2026-09-23 15:15:00",
+          "exit_reason": "Momentum Exit"
+        }
+      ],
+      "causality_checks": {
+        "full": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        },
+        "future_poisoned": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        }
+      }
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "timeframe": "15min",
+      "effective_entry_cutoff": "14:55",
+      "last_completed_bar_open": "2026-09-23 15:00:00",
+      "last_completed_ohlcv": {
+        "open": 56513.45,
+        "high": 56552.35,
+        "low": 56465.4,
+        "close": 56542.85,
+        "volume": 16643266.0
+      },
+      "raw_s1_position_at_cutoff_before_execution_squareoff": 0,
+      "raw_s1_session_rules": false,
+      "features_at_cutoff": {
+        "rsi": 53.41753003656562,
+        "rsi5m": 39.02064642033443,
+        "adx": 22.48395947211275,
+        "di_plus": 19.475410527935285,
+        "di_minus": 21.6717887832783,
+        "bull_score": 44.70876501828281,
+        "bear_score": 36.9679189442255
+      },
+      "events_through_cutoff": [
+        {
+          "entry_bar_open": "2026-09-23 10:00:00",
+          "entry_available_at": "2026-09-23 10:15:00",
+          "direction": 1,
+          "chart_entry": 56454.95,
+          "signal_close": 56475.3,
+          "exit_bar_open": "2026-09-23 15:00:00",
+          "exit_available_at": "2026-09-23 15:15:00",
+          "exit_reason": "Momentum Exit"
+        }
+      ],
+      "causality_checks": {
+        "full": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        },
+        "future_poisoned": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        }
+      }
+    },
+    {
+      "symbol": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "effective_entry_cutoff": "15:01",
+      "last_completed_bar_open": "2026-09-23 15:10:00",
+      "last_completed_ohlcv": {
+        "open": 14551.15,
+        "high": 14567.25,
+        "low": 14546.85,
+        "close": 14562.8,
+        "volume": 8087569.0
+      },
+      "raw_s1_position_at_cutoff_before_execution_squareoff": 0,
+      "raw_s1_session_rules": false,
+      "features_at_cutoff": {
+        "rsi": 54.99388194184481,
+        "rsi5m": 45.53644276843298,
+        "adx": 25.92134032308656,
+        "di_plus": 22.65234822301888,
+        "di_minus": 19.4744537744975,
+        "bull_score": 78.49694097092241,
+        "bear_score": 14.0
+      },
+      "events_through_cutoff": [
+        {
+          "entry_bar_open": "2026-09-23 09:20:00",
+          "entry_available_at": "2026-09-23 09:25:00",
+          "direction": 1,
+          "chart_entry": 14557.85,
+          "signal_close": 14563.0,
+          "exit_bar_open": "2026-09-23 09:45:00",
+          "exit_available_at": "2026-09-23 09:50:00",
+          "exit_reason": "Hard SL1"
+        },
+        {
+          "entry_bar_open": "2026-09-23 13:40:00",
+          "entry_available_at": "2026-09-23 13:45:00",
+          "direction": 1,
+          "chart_entry": 14553.45,
+          "signal_close": 14556.45,
+          "exit_bar_open": "2026-09-23 15:05:00",
+          "exit_available_at": "2026-09-23 15:10:00",
+          "exit_reason": "Momentum Exit"
+        }
+      ],
+      "causality_checks": {
+        "full": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        },
+        "future_poisoned": {
+          "feature_differences": [],
+          "positions_identical": true,
+          "stops_identical": true,
+          "events_identical": true
+        }
+      }
+    }
+  ]
+}

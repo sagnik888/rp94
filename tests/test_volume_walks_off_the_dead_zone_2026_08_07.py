@@ -57,14 +57,11 @@ def _measured(tail, **kw):
 # ── the live capture ─────────────────────────────────────────────────────────
 
 def test_the_live_nifty_tail_no_longer_reads_as_no_participation():
-    """0.011x was the symptom. Anything near it means the walk-back never happened.
-
-    `available` is asserted alongside the ratio deliberately: the UNAVAILABLE result
-    shape carries volume_ratio=1.0 as a neutral sentinel, so a ratio bound ALONE is
-    satisfied by the profiler giving up. That is not the outcome under test.
-    """
+    """Preserve the measured quantity but do not score three-bar-old activity now."""
     res = _measured(LIVE_NIFTY_TAIL)
-    assert res["available"] is True, "gave up instead of finding the complete bar"
+    assert res["available"] is False
+    assert res["measurement_lag_bars"] == 3
+    assert res["current_volume"] == 210_220
     assert res["volume_ratio"] > 0.25, (
         f"still measuring inside the dead zone: {res['volume_ratio']:.3f}x"
     )
@@ -91,7 +88,9 @@ def test_a_single_step_back_would_not_have_been_enough():
 )
 def test_every_index_that_showed_zero_now_reads(name, tail, avg):
     res = VolumeProfiler().analyze(_frame(tail, healthy=avg), name)
-    assert res["available"] is True, f"{name} gave up instead of measuring"
+    assert res["available"] is False
+    assert res["measurement_lag_bars"] == 3
+    assert res["current_volume"] == tail[-4]
     assert res["volume_ratio"] > 0.25, f"{name} still reads {res['volume_ratio']:.3f}x"
 
 

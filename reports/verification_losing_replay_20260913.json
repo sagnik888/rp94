@@ -1,0 +1,632 @@
+{
+  "capture_sha256": "4129d7d70d04138a53a7228b4723c24fbb67a1e77d9fef2afb1fd75e278da9ae",
+  "capture_simulation_id": 1789237249558,
+  "total": {
+    "trades": 96,
+    "wins": 22,
+    "losses": 74,
+    "pnl": -60093.48,
+    "gross_winners": 15607.17,
+    "gross_losers": -75700.65,
+    "average_winner": 709.42,
+    "average_loser": -1022.98,
+    "profit_factor": 0.2061695639337311
+  },
+  "calculated_option_price_pnl_before_charges": -52413.48,
+  "charges_inferred_from_rounded_prices": 7680.0,
+  "timeframe": {
+    "15min": {
+      "trades": 32,
+      "wins": 5,
+      "losses": 27,
+      "pnl": -27920.23,
+      "gross_winners": 4047.32,
+      "gross_losers": -31967.55,
+      "average_winner": 809.46,
+      "average_loser": -1183.98,
+      "profit_factor": 0.12660713755042222
+    },
+    "1min": {
+      "trades": 4,
+      "wins": 0,
+      "losses": 4,
+      "pnl": -3028.45,
+      "gross_winners": 0,
+      "gross_losers": -3028.45,
+      "average_winner": 0,
+      "average_loser": -757.11,
+      "profit_factor": 0.0
+    },
+    "5min": {
+      "trades": 60,
+      "wins": 17,
+      "losses": 43,
+      "pnl": -29144.8,
+      "gross_winners": 11559.85,
+      "gross_losers": -40704.65,
+      "average_winner": 679.99,
+      "average_loser": -946.62,
+      "profit_factor": 0.2839933521108768
+    }
+  },
+  "grade": {
+    "A (Hist)": {
+      "trades": 29,
+      "wins": 6,
+      "losses": 23,
+      "pnl": -20463.82,
+      "gross_winners": 3772.66,
+      "gross_losers": -24236.48,
+      "average_winner": 628.78,
+      "average_loser": -1053.76,
+      "profit_factor": 0.15566039292834602
+    },
+    "A+ (Hist)": {
+      "trades": 65,
+      "wins": 16,
+      "losses": 49,
+      "pnl": -37190.26,
+      "gross_winners": 11834.51,
+      "gross_losers": -49024.77,
+      "average_winner": 739.66,
+      "average_loser": -1000.51,
+      "profit_factor": 0.24139858279804272
+    },
+    "B+ (Hist)": {
+      "trades": 2,
+      "wins": 0,
+      "losses": 2,
+      "pnl": -2439.4,
+      "gross_winners": 0,
+      "gross_losers": -2439.4,
+      "average_winner": 0,
+      "average_loser": -1219.7,
+      "profit_factor": 0.0
+    }
+  },
+  "index": {
+    "BANKNIFTY": {
+      "trades": 16,
+      "wins": 4,
+      "losses": 12,
+      "pnl": -10303.08,
+      "gross_winners": 4130.22,
+      "gross_losers": -14433.3,
+      "average_winner": 1032.55,
+      "average_loser": -1202.77,
+      "profit_factor": 0.28615909043669846
+    },
+    "MIDCPNIFTY": {
+      "trades": 34,
+      "wins": 8,
+      "losses": 26,
+      "pnl": -27534.39,
+      "gross_winners": 6266.41,
+      "gross_losers": -33800.8,
+      "average_winner": 783.3,
+      "average_loser": -1300.03,
+      "profit_factor": 0.18539235757733544
+    },
+    "NIFTY": {
+      "trades": 19,
+      "wins": 4,
+      "losses": 15,
+      "pnl": -8853.44,
+      "gross_winners": 1950.03,
+      "gross_losers": -10803.47,
+      "average_winner": 487.51,
+      "average_loser": -720.23,
+      "profit_factor": 0.18050033924285439
+    },
+    "SENSEX": {
+      "trades": 27,
+      "wins": 6,
+      "losses": 21,
+      "pnl": -13402.57,
+      "gross_winners": 3260.51,
+      "gross_losers": -16663.08,
+      "average_winner": 543.42,
+      "average_loser": -793.48,
+      "profit_factor": 0.19567270876692663
+    }
+  },
+  "engine": {
+    "ema": {
+      "trades": 11,
+      "wins": 3,
+      "losses": 8,
+      "pnl": -2967.86,
+      "gross_winners": 1578.94,
+      "gross_losers": -4546.8,
+      "average_winner": 526.31,
+      "average_loser": -568.35,
+      "profit_factor": 0.3472640098530835
+    },
+    "supertrend": {
+      "trades": 21,
+      "wins": 5,
+      "losses": 16,
+      "pnl": -12001.08,
+      "gross_winners": 3201.57,
+      "gross_losers": -15202.65,
+      "average_winner": 640.31,
+      "average_loser": -950.17,
+      "profit_factor": 0.2105928900553522
+    },
+    "utbot": {
+      "trades": 64,
+      "wins": 14,
+      "losses": 50,
+      "pnl": -45124.54,
+      "gross_winners": 10826.66,
+      "gross_losers": -55951.2,
+      "average_winner": 773.33,
+      "average_loser": -1119.02,
+      "profit_factor": 0.19350183731537485
+    }
+  },
+  "exit": {
+    "EARLY_LOSS_CUT": {
+      "trades": 8,
+      "wins": 0,
+      "losses": 8,
+      "pnl": -6312.0,
+      "gross_winners": 0,
+      "gross_losers": -6312.0,
+      "average_winner": 0,
+      "average_loser": -789.0,
+      "profit_factor": 0.0
+    },
+    "EOD_LOSS_MINIMIZE": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "pnl": -135.5,
+      "gross_winners": 0,
+      "gross_losers": -135.5,
+      "average_winner": 0,
+      "average_loser": -135.5,
+      "profit_factor": 0.0
+    },
+    "HISTORICAL": {
+      "trades": 2,
+      "wins": 2,
+      "losses": 0,
+      "pnl": 1317.18,
+      "gross_winners": 1317.18,
+      "gross_losers": 0,
+      "average_winner": 658.59,
+      "average_loser": 0,
+      "profit_factor": null
+    },
+    "LIVE_REVERSAL_EXIT": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "pnl": 433.0,
+      "gross_winners": 433.0,
+      "gross_losers": 0,
+      "average_winner": 433.0,
+      "average_loser": 0,
+      "profit_factor": null
+    },
+    "MAJOR_WIN_GUARD": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "pnl": 703.25,
+      "gross_winners": 703.25,
+      "gross_losers": 0,
+      "average_winner": 703.25,
+      "average_loser": 0,
+      "profit_factor": null
+    },
+    "PEAK_THREAT_EXIT": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "pnl": 612.0,
+      "gross_winners": 612.0,
+      "gross_losers": 0,
+      "average_winner": 612.0,
+      "average_loser": 0,
+      "profit_factor": null
+    },
+    "PROFIT_GIVEBACK_GUARD": {
+      "trades": 3,
+      "wins": 1,
+      "losses": 2,
+      "pnl": -190.5,
+      "gross_winners": 185.5,
+      "gross_losers": -376.0,
+      "average_winner": 185.5,
+      "average_loser": -188.0,
+      "profit_factor": 0.4933510638297872
+    },
+    "SESSION_END": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "pnl": -872.72,
+      "gross_winners": 0,
+      "gross_losers": -872.72,
+      "average_winner": 0,
+      "average_loser": -872.72,
+      "profit_factor": 0.0
+    },
+    "SL HIT": {
+      "trades": 56,
+      "wins": 0,
+      "losses": 56,
+      "pnl": -67889.74,
+      "gross_winners": 0,
+      "gross_losers": -67889.74,
+      "average_winner": 0,
+      "average_loser": -1212.32,
+      "profit_factor": 0.0
+    },
+    "SMART_PROFIT_LOCK": {
+      "trades": 22,
+      "wins": 16,
+      "losses": 6,
+      "pnl": 12241.55,
+      "gross_winners": 12356.24,
+      "gross_losers": -114.69,
+      "average_winner": 772.26,
+      "average_loser": -19.11,
+      "profit_factor": 107.73598395675299
+    }
+  },
+  "date": {
+    "2026-08-13": {
+      "trades": 4,
+      "wins": 2,
+      "losses": 2,
+      "pnl": -1477.66,
+      "gross_winners": 1430.94,
+      "gross_losers": -2908.6,
+      "average_winner": 715.47,
+      "average_loser": -1454.3,
+      "profit_factor": 0.4919686447087946
+    },
+    "2026-08-14": {
+      "trades": 2,
+      "wins": 1,
+      "losses": 1,
+      "pnl": -808.0,
+      "gross_winners": 148.0,
+      "gross_losers": -956.0,
+      "average_winner": 148.0,
+      "average_loser": -956.0,
+      "profit_factor": 0.15481171548117154
+    },
+    "2026-08-17": {
+      "trades": 2,
+      "wins": 0,
+      "losses": 2,
+      "pnl": -2192.55,
+      "gross_winners": 0,
+      "gross_losers": -2192.55,
+      "average_winner": 0,
+      "average_loser": -1096.28,
+      "profit_factor": 0.0
+    },
+    "2026-08-18": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "pnl": -720.8,
+      "gross_winners": 0,
+      "gross_losers": -720.8,
+      "average_winner": 0,
+      "average_loser": -720.8,
+      "profit_factor": 0.0
+    },
+    "2026-08-19": {
+      "trades": 5,
+      "wins": 2,
+      "losses": 3,
+      "pnl": -991.78,
+      "gross_winners": 990.52,
+      "gross_losers": -1982.3,
+      "average_winner": 495.26,
+      "average_loser": -660.77,
+      "profit_factor": 0.49968218735811937
+    },
+    "2026-08-20": {
+      "trades": 4,
+      "wins": 1,
+      "losses": 3,
+      "pnl": -1208.78,
+      "gross_winners": 306.75,
+      "gross_losers": -1515.53,
+      "average_winner": 306.75,
+      "average_loser": -505.18,
+      "profit_factor": 0.20240443937104508
+    },
+    "2026-08-21": {
+      "trades": 2,
+      "wins": 1,
+      "losses": 1,
+      "pnl": -1429.0,
+      "gross_winners": 58.0,
+      "gross_losers": -1487.0,
+      "average_winner": 58.0,
+      "average_loser": -1487.0,
+      "profit_factor": 0.03900470746469401
+    },
+    "2026-08-24": {
+      "trades": 7,
+      "wins": 1,
+      "losses": 6,
+      "pnl": -2795.73,
+      "gross_winners": 861.07,
+      "gross_losers": -3656.8,
+      "average_winner": 861.07,
+      "average_loser": -609.47,
+      "profit_factor": 0.23547090352220523
+    },
+    "2026-08-25": {
+      "trades": 4,
+      "wins": 0,
+      "losses": 4,
+      "pnl": -3753.95,
+      "gross_winners": 0,
+      "gross_losers": -3753.95,
+      "average_winner": 0,
+      "average_loser": -938.49,
+      "profit_factor": 0.0
+    },
+    "2026-08-26": {
+      "trades": 5,
+      "wins": 2,
+      "losses": 3,
+      "pnl": -1629.31,
+      "gross_winners": 649.89,
+      "gross_losers": -2279.2,
+      "average_winner": 324.94,
+      "average_loser": -759.73,
+      "profit_factor": 0.28513952263952264
+    },
+    "2026-08-27": {
+      "trades": 9,
+      "wins": 2,
+      "losses": 7,
+      "pnl": -6876.31,
+      "gross_winners": 1147.14,
+      "gross_losers": -8023.45,
+      "average_winner": 573.57,
+      "average_loser": -1146.21,
+      "profit_factor": 0.1429734091942992
+    },
+    "2026-08-31": {
+      "trades": 3,
+      "wins": 0,
+      "losses": 3,
+      "pnl": -3259.2,
+      "gross_winners": 0,
+      "gross_losers": -3259.2,
+      "average_winner": 0,
+      "average_loser": -1086.4,
+      "profit_factor": 0.0
+    },
+    "2026-09-01": {
+      "trades": 5,
+      "wins": 1,
+      "losses": 4,
+      "pnl": -7150.38,
+      "gross_winners": 634.82,
+      "gross_losers": -7785.2,
+      "average_winner": 634.82,
+      "average_loser": -1946.3,
+      "profit_factor": 0.08154190001541387
+    },
+    "2026-09-02": {
+      "trades": 7,
+      "wins": 3,
+      "losses": 4,
+      "pnl": -2796.83,
+      "gross_winners": 2522.57,
+      "gross_losers": -5319.4,
+      "average_winner": 840.86,
+      "average_loser": -1329.85,
+      "profit_factor": 0.47422077677933594
+    },
+    "2026-09-03": {
+      "trades": 4,
+      "wins": 0,
+      "losses": 4,
+      "pnl": -4761.95,
+      "gross_winners": 0,
+      "gross_losers": -4761.95,
+      "average_winner": 0,
+      "average_loser": -1190.49,
+      "profit_factor": 0.0
+    },
+    "2026-09-04": {
+      "trades": 3,
+      "wins": 0,
+      "losses": 3,
+      "pnl": -1300.2,
+      "gross_winners": 0,
+      "gross_losers": -1300.2,
+      "average_winner": 0,
+      "average_loser": -433.4,
+      "profit_factor": 0.0
+    },
+    "2026-09-07": {
+      "trades": 9,
+      "wins": 0,
+      "losses": 9,
+      "pnl": -6830.09,
+      "gross_winners": 0,
+      "gross_losers": -6830.09,
+      "average_winner": 0,
+      "average_loser": -758.9,
+      "profit_factor": 0.0
+    },
+    "2026-09-08": {
+      "trades": 4,
+      "wins": 0,
+      "losses": 4,
+      "pnl": -2985.3,
+      "gross_winners": 0,
+      "gross_losers": -2985.3,
+      "average_winner": 0,
+      "average_loser": -746.32,
+      "profit_factor": 0.0
+    },
+    "2026-09-09": {
+      "trades": 6,
+      "wins": 2,
+      "losses": 4,
+      "pnl": -2790.98,
+      "gross_winners": 1453.54,
+      "gross_losers": -4244.52,
+      "average_winner": 726.77,
+      "average_loser": -1061.13,
+      "profit_factor": 0.3424509720769368
+    },
+    "2026-09-10": {
+      "trades": 3,
+      "wins": 2,
+      "losses": 1,
+      "pnl": 2405.69,
+      "gross_winners": 2414.25,
+      "gross_losers": -8.56,
+      "average_winner": 1207.12,
+      "average_loser": -8.56,
+      "profit_factor": 282.03855140186914
+    },
+    "2026-09-11": {
+      "trades": 7,
+      "wins": 2,
+      "losses": 5,
+      "pnl": -6740.37,
+      "gross_winners": 2989.68,
+      "gross_losers": -9730.05,
+      "average_winner": 1494.84,
+      "average_loser": -1946.01,
+      "profit_factor": 0.30726255260764335
+    }
+  },
+  "completed_before_signal_bar_close": {
+    "summary": {
+      "trades": 42,
+      "wins": 10,
+      "losses": 32,
+      "pnl": -24358.38,
+      "gross_winners": 6759.21,
+      "gross_losers": -31117.59,
+      "average_winner": 675.92,
+      "average_loser": -972.42,
+      "profit_factor": 0.21721508638683137
+    },
+    "by_timeframe": {
+      "15min": 26,
+      "5min": 16
+    },
+    "by_exit": {
+      "SL HIT": 20,
+      "SMART_PROFIT_LOCK": 14,
+      "PEAK_THREAT_EXIT": 1,
+      "EOD_LOSS_MINIMIZE": 1,
+      "PROFIT_GIVEBACK_GUARD": 1,
+      "EARLY_LOSS_CUT": 4,
+      "LIVE_REVERSAL_EXIT": 1
+    },
+    "ids": [
+      "H_SENSEX_15min_UTBOT_20260911091500",
+      "H_MIDCPNIFTY_5min_UTBOT_20260911091500",
+      "H_MIDCPNIFTY_15min_UTBOT_20260911091500",
+      "H_BANKNIFTY_5min_UTBOT_20260911091500",
+      "H_BANKNIFTY_15min_UTBOT_20260911091500",
+      "H_SENSEX_5min_UTBOT_20260910105000",
+      "H_BANKNIFTY_5min_SUPERTREND_20260910092500",
+      "H_SENSEX_15min_UTBOT_20260909114500",
+      "H_NIFTY_15min_UTBOT_20260908114500",
+      "H_BANKNIFTY_15min_UTBOT_20260908113000",
+      "H_SENSEX_5min_SUPERTREND_20260908091500",
+      "H_BANKNIFTY_15min_UTBOT_20260904144500",
+      "H_MIDCPNIFTY_15min_SUPERTREND_20260904124500",
+      "H_SENSEX_5min_SUPERTREND_20260903110500",
+      "H_NIFTY_5min_SUPERTREND_20260903110000",
+      "H_BANKNIFTY_15min_UTBOT_20260903110000",
+      "H_SENSEX_5min_UTBOT_20260902091500",
+      "H_SENSEX_15min_UTBOT_20260902091500",
+      "H_BANKNIFTY_5min_SUPERTREND_20260901130500",
+      "H_MIDCPNIFTY_15min_UTBOT_20260901110000",
+      "H_SENSEX_15min_UTBOT_20260831091500",
+      "H_SENSEX_15min_UTBOT_20260827124500",
+      "H_NIFTY_15min_UTBOT_20260827124500",
+      "H_SENSEX_5min_UTBOT_20260827100000",
+      "H_SENSEX_5min_UTBOT_20260826112000",
+      "H_MIDCPNIFTY_5min_UTBOT_20260825143000",
+      "H_SENSEX_5min_UTBOT_20260825110000",
+      "H_NIFTY_15min_UTBOT_20260825091500",
+      "H_SENSEX_5min_EMA_20260824150000",
+      "H_MIDCPNIFTY_5min_UTBOT_20260821100500",
+      "H_BANKNIFTY_15min_UTBOT_20260821091500",
+      "H_NIFTY_15min_UTBOT_20260820150000",
+      "H_BANKNIFTY_15min_SUPERTREND_20260820150000",
+      "H_NIFTY_15min_SUPERTREND_20260820091500",
+      "H_MIDCPNIFTY_15min_EMA_20260819141500",
+      "H_NIFTY_15min_EMA_20260817131500",
+      "H_MIDCPNIFTY_15min_UTBOT_20260817124500",
+      "H_MIDCPNIFTY_15min_EMA_20260814101500",
+      "H_MIDCPNIFTY_5min_EMA_20260814093000",
+      "H_MIDCPNIFTY_15min_UTBOT_20260813120000",
+      "H_SENSEX_15min_EMA_20260813111500",
+      "H_SENSEX_15min_EMA_20260813110000"
+    ],
+    "qualification": "Comparison allows exit at the END of the labelled 1m option candle; these rows still finish before their signal timeframe closes. It is not the P&L impact of correcting timing."
+  },
+  "simulator_timing_probe": {
+    "signal_bar_start": "2026-09-11 09:15:00",
+    "signal_bar_close": "2026-09-11 09:30:00",
+    "result": {
+      "entry": 100.0,
+      "exit": 85.0,
+      "stop": 85.0,
+      "target": 145.0,
+      "exit_time": "2026-09-11 09:17:00",
+      "reason": "SL HIT",
+      "detail": "",
+      "price_path": [
+        {
+          "time": "2026-09-11T09:16:00",
+          "open": 100.0,
+          "high": 102.0,
+          "low": 99.0,
+          "close": 101.0,
+          "pnl": 0.0,
+          "peak_pnl": 0.0,
+          "active_stop": 85.0,
+          "active_target": 145.0
+        },
+        {
+          "time": "2026-09-11T09:17:00",
+          "open": 98.0,
+          "high": 100.0,
+          "low": 84.0,
+          "close": 90.0,
+          "pnl": 0.0,
+          "peak_pnl": 0.0,
+          "active_stop": 85.0,
+          "active_target": 145.0
+        }
+      ],
+      "exit_trace": [],
+      "evaluated_guards": []
+    },
+    "interpretation": "Simulator accepts bar-start entry and exits before a 15m signal can be confirmed."
+  },
+  "prior_certified_sources": {
+    "count": 16,
+    "changed": []
+  },
+  "source_mtimes": {
+    "scanner.py": "2026-09-12T21:28:46.014823",
+    "engine/signal_processor.py": "2026-09-11T11:42:04.572936"
+  }
+}

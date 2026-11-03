@@ -1,0 +1,20 @@
+{
+  "date": "2026-09-30",
+  "tests": 618,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "live_broker_mutations": false,
+  "process_restarted": false,
+  "files": {
+    "engine/uts_lane.py": "eeb5c7762029ed056049572ffab048e14af43ccdd6fca22d9029892812a8b2e4",
+    "engine/market_regime.py": "9e6736b2ce0f772b5a7f117ba7d59979ed06fb4300e99f71ecf9d561a68e111b",
+    "engine/candidate_selection.py": "3c4db8e315bb12df740a61399325e5716b8ba1bd587f4bef080cd9876ed4fb35",
+    "engine/execution_service.py": "13f494ac4e57943b02806bdff8f803a2b722f546a54b972f375dc0144c598f0e",
+    "engine/exit_cycle.py": "d09dfd3e409aacda1824fc3a81517cbfaf2599399ccb2bffa26e0a7405185929",
+    "engine/signal_processor.py": "361127a37be9c7822a5372781259ce44879f56840054b37a3ee650caf275d4c8",
+    "engine/alt_scanners.py": "e966fb0288a6cbb15cc958d5b017e016ff13bd3fbd77c1c941aee41e64b21214",
+    "scanner.py": "464588a90417d785b77eeee9a221e578114707b14f2509e3d38de3f6c846ca87",
+    "trading/trade_manager.py": "942938f55f08cda4888387b9b22d0c1e4ee203c2a13ad14aa178080cebca4d4a"
+  }
+}

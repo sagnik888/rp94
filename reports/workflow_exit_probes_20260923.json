@@ -1,0 +1,78 @@
+{
+  "scope": "Extracted CURRENT source with source-default policy values and explicit synthetic market inputs; no live mutations.",
+  "source_sha256": {
+    "scanner.py": "9d3745147ae8e03ba3e447a72806d2cc9ed88a877a6efbd85774f4236f06cbc7",
+    "trading/trade_manager.py": "fa297e01b183e9d8f741605de80e54f256dc5d74da5f4303ed07986d68b26558",
+    "config/settings.py": "3762554d2df0cc6fa70ee00e1e1408569a40f6bd4afad200292a435875bd1906"
+  },
+  "option_profit_lock_wrong_price_space": {
+    "timeframe": "15min",
+    "trade_age_seconds": 30,
+    "verified_option_mark": 116.0,
+    "actual_peak_pnl_rs": 1040.0,
+    "initial_risk_rs": 650.0,
+    "lock_arm_rs": 325.0,
+    "premium_lock_stop": 110.432,
+    "retention": 0.652,
+    "breathing_bypass_arm_rs": 1000.0,
+    "breathing_bypass_context": "base",
+    "breathing_clamped": false,
+    "trend_deferral": false,
+    "current_index_spot": 25000.0,
+    "compared_index_stop": 25020.864,
+    "premium_stop_actually_crossed": false,
+    "resulting_close_reason": "SMART_PROFIT_LOCK",
+    "requested_close_price": 110.4320000000007,
+    "scope": "Current live-loop profit-lock region and close gate; unrelated earlier exits assumed idle."
+  },
+  "early_loss_cut_two_owners": {
+    "cost_floor": {
+      "scanner_decision": [
+        false,
+        "loss Rs.75 is under the Rs.80 round trip",
+        0.8
+      ],
+      "trade_manager_min_hold_passed": true,
+      "trade_manager_backstop_cuts": true,
+      "hard_stop_crossed": false,
+      "initial_risk_rs": 80.0,
+      "gross_pnl_rs": -75.0,
+      "round_trip_cost_rs": 80.0,
+      "limitation": "Narrow-risk/legacy/recovered position fixture; does not prove current entry policy admits this risk geometry."
+    },
+    "green_trade_deferral": {
+      "scanner_decision": [
+        false,
+        "peaked Rs.900 (>= Rs.200 lock arm) \u2014 a give-back belongs to the profit lock",
+        0.8
+      ],
+      "trade_manager_min_hold_passed": true,
+      "trade_manager_backstop_cuts": true,
+      "hard_stop_crossed": false,
+      "initial_risk_rs": 1000.0,
+      "gross_pnl_rs": -900.0,
+      "round_trip_cost_rs": 80.0,
+      "limitation": "Local rule disagreement; preceding profit exits may mask it in the full loop."
+    }
+  },
+  "source_references": {
+    "_loss_guard_decision": "scanner.py:23068",
+    "_profit_lock_min_peak": "scanner.py:17602",
+    "_profit_lock_arm_base_rs": "scanner.py:17756",
+    "_profit_protect_cost_floor_rs": "scanner.py:18444",
+    "_profit_lock_arm_cap_rs": "scanner.py:17937",
+    "_profit_lock_floor": "scanner.py:17986",
+    "_profit_lock_ratio_floor": "scanner.py:17959",
+    "_profit_lock_ratio_ceiling": "scanner.py:17971",
+    "_first_rung_regime_retention": "scanner.py:17891",
+    "_apply_option_stop_breathing_room": "scanner.py:21072",
+    "_choppy_profit_lock_bypass_peak_threshold": "scanner.py:18687",
+    "_should_defer_trend_option_profit_lock": "scanner.py:23848",
+    "_spread_aware_exit_decision": "scanner.py:35735",
+    "_close_and_record": "scanner.py:35932",
+    "_position_cost_rs": "scanner.py:17677",
+    "_early_loss_cut_min_hold_met": "trading/trade_manager.py:7381",
+    "_early_loss_cut_hit": "trading/trade_manager.py:7429",
+    "_update_active_trades": "scanner.py:36112"
+  }
+}

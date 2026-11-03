@@ -3,6 +3,7 @@ Intelligence Aggregator — Combines all intelligence into a unified score
 ═══════════════════════════════════════════════════════════════
 """
 import time
+import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Optional
 from loguru import logger
@@ -12,6 +13,7 @@ from intelligence.pcr_engine import PCREngine
 from intelligence.greeks_engine import GreeksEngine
 from intelligence.regime_detector import RegimeDetector
 from intelligence.order_flow import OrderFlowAnalyzer
+from intelligence.derivative_context import derivative_corroboration
 
 
 #: Evidence mass a HEALTHY live read carries -- the sum of the maximum vote of the pillars
@@ -138,7 +140,7 @@ class IntelligenceAggregator:
         options_chain: Optional[pd.DataFrame] = None,
         spot_price: float = 0,
         strike_interval: int = 50,
-        days_to_expiry: float = 7,
+        days_to_expiry: Optional[float] = 7,
         price_change_pct: float = 0,
         chain_quality: Optional[Dict] = None,
         volatility_value: Optional[float] = None,
@@ -191,9 +193,14 @@ class IntelligenceAggregator:
                 "strike_count": actual_strike_count,
                 "score": 95 if actual_strike_count >= 10 else (60 if actual_strike_count >= 3 else 0),
                 "fallback": actual_strike_count < 3,
-                "stale": False,
                 "expiry_aligned": actual_strike_count >= 3,
-                "age_seconds": 0,
+                # No freshness claim. This branch runs when the CALLER supplied no
+                # chain_quality, so nothing here has measured an age -- and
+                # "stale": False with "age_seconds": 0 asserted the strongest
+                # possible freshness from nothing. The option-chain age gate in
+                # scanner._option_chain_entry_freshness_blocker already fails
+                # closed on a missing age, which is the correct answer here.
+                "age_measured": False,
             }
         else:
             chain_quality = dict(chain_quality)
@@ -214,17 +221,43 @@ class IntelligenceAggregator:
         )
         results["data_quality"] = chain_quality
         intelligence_chain = options_chain if chain_authoritative else None
+        # Separate contract lanes are never poured into cash-index candle volume.
+        # Snapshot intervals without exchange clocks remain descriptive, not entry
+        # confirmations. As-of queries cannot see later observations in replay.
+        derivatives = {"timeframe": timeframe, "futures": [], "options": []}
+        derivative_as_of = None
+        derivative_source = getattr(self, "derivative_source", None)
+        if callable(derivative_source) and candle_df is not None and not candle_df.empty:
+            try:
+                edge = pd.Timestamp(candle_df.index[-1])
+                if edge.tzinfo is None:
+                    edge = edge.tz_localize("Asia/Kolkata")
+                edge += pd.Timedelta(minutes={"1min":1,"5min":5,"15min":15}[timeframe])
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                derivative_as_of = min(edge,now).timestamp()
+                derivatives = derivative_source(instrument, timeframe, derivative_as_of)
+            except Exception as exc:
+                derivatives["reason"] = str(exc)
+        results["derivative_participation"] = derivatives
         if not chain_authoritative:
             chain_quality["reason"] = (
                 "Option chain unavailable" if actual_strike_count == 0 else
                 "Option chain is not authoritative (fallback, stale, expiry mismatch, or insufficient strikes)"
             )
 
-        # Use 1m data for high-resolution intelligence if available
-        intel_df = candle_1min_df if candle_1min_df is not None and not candle_1min_df.empty else candle_df
+        # The requested analysis timeframe owns its volume/order-flow measurement.
+        # A 1m frame may be used by explicit microstructure features elsewhere, but
+        # silently scoring it inside a 5m/15m bundle made the bundle's labels untrue.
+        intel_df = candle_df
 
         # 1. Volume
         vol = self.volume.analyze(intel_df, instrument)
+        if isinstance(vol, dict):
+            # Name the frame the ratio was measured on. A 5m bar is the sum of its five
+            # 1m bars, so the RAW volume agrees across timeframes while the ratio cannot:
+            # each frame compares a bar with its own 20-bar history. Without the label a
+            # reader cannot tell which yardstick produced the number on screen.
+            vol["timeframe"] = str(timeframe or "")
         results["volume"] = vol
         profile_ctx = vol.get("market_structure_profile", {}) if isinstance(vol, dict) else {}
         aroon_ctx = vol.get("aroon", {}) if isinstance(vol, dict) else {}
@@ -272,7 +305,9 @@ class IntelligenceAggregator:
 
         # 2. OI
         if intelligence_chain is not None:
-            oi_result = self.oi.analyze(intelligence_chain, price_change_pct, spot_price, strike_interval)
+            oi_result = self.oi.analyze(intelligence_chain, price_change_pct, spot_price, strike_interval,
+                timeframe_seconds={"1min":60,"5min":300,"15min":900}.get(timeframe,300),
+                derivative_features=derivatives)
             if not isinstance(oi_result, dict): oi_result = {}
             results["oi"] = oi_result
             if oi_result.get("available") is True:
@@ -298,22 +333,23 @@ class IntelligenceAggregator:
 
         # 4. Greeks & Gamma Awareness
         if intelligence_chain is not None and spot_price > 0:
-            iv_ctx = self._chain_iv_context(intelligence_chain, spot_price, days_to_expiry)
-            greeks_atm = self.greeks.analyze_atm(
-                spot_price,
-                strike_interval,
-                days_to_expiry,
-                iv_call=iv_ctx["call_iv"],
-                iv_put=iv_ctx["put_iv"],
-            )
-            greeks_chain = self.greeks.analyze_chain(
-                spot_price,
-                strike_interval,
-                days_to_expiry,
-                iv_call=iv_ctx["call_iv"],
-                iv_put=iv_ctx["put_iv"],
-                iv_source=iv_ctx["source"],
-            )
+            expiry_available = days_to_expiry is not None and pd.notna(days_to_expiry) and days_to_expiry >= 0
+            if expiry_available:
+                iv_ctx = self._chain_iv_context(intelligence_chain, spot_price, days_to_expiry)
+                greeks_atm = self.greeks.analyze_atm(
+                    spot_price, strike_interval, days_to_expiry,
+                    iv_call=iv_ctx["call_iv"], iv_put=iv_ctx["put_iv"],
+                )
+                greeks_chain = self.greeks.analyze_chain(
+                    spot_price, strike_interval, days_to_expiry,
+                    iv_call=iv_ctx["call_iv"], iv_put=iv_ctx["put_iv"], iv_source=iv_ctx["source"],
+                )
+            else:
+                # OI/PCR and measured VIX remain usable. A missing contract expiry
+                # cannot become invented time-to-expiry for IV inversion or Greeks.
+                iv_ctx = {"source": "default_expiry_unavailable"}
+                greeks_atm = {"available": False, "is_fallback": True, "msg": "Contract expiry unavailable"}
+                greeks_chain = {"strikes": []}
             # ── Volatility percentile for routing ──
             # Preference order: (1) instrument-specific option IV-Rank computed
             # from this instrument's own prior-session ATM IV, (2) India VIX
@@ -339,7 +375,9 @@ class IntelligenceAggregator:
 
             vix_available = volatility_percentile is not None
             vix_percentile = (
-                max(0.0, min(100.0, float(volatility_percentile))) if vix_available else 50.0
+                max(0.0, min(100.0, float(volatility_percentile)))
+                if vix_available
+                else None
             )
             vix_source = (
                 str(volatility_source or "india_vix_percentile")
@@ -356,8 +394,16 @@ class IntelligenceAggregator:
                 iv_percentile = round(vix_percentile, 1)
                 iv_basis = "india_vix_percentile"
             else:
-                iv_percentile = 50.0
-                iv_basis = "unavailable_neutral"
+                # Abstain. A published 50.0 was read as a MEASURED percentile by
+                # every downstream gate, and it is the most permissive value in
+                # the range: 50 < 70 selected the looser 120s option-chain age
+                # limit over 90s, 50 < 80 kept FUT/OPT routing off the high-IV
+                # branch, and 50 < the 70.0 special-5min ceiling turned that gate
+                # into a pass. Publishing None makes the existing
+                # ``if iv_percentile is None`` branches reachable, which is what
+                # they were written for.
+                iv_percentile = None
+                iv_basis = "unavailable"
 
             # ``percentile_available``/``percentile_source`` keep their original
             # meaning (India VIX availability) for existing dashboard consumers.
@@ -389,11 +435,15 @@ class IntelligenceAggregator:
             results["entry_quality"] = "EXCELLENT" if (dist_sup < dynamic_threshold or dist_res < dynamic_threshold) else "GOOD"
             results["greeks"] = {
                 **greeks_atm,
-                "iv_percentile": round(iv_percentile, 1),
+                "iv_percentile": (
+                    round(iv_percentile, 1) if iv_percentile is not None else None
+                ),
                 "iv_percentile_basis": iv_basis,
                 "instrument_iv": current_atm_iv,
                 "instrument_iv_sessions": len(iv_obs),
-                "volatility_percentile": round(vix_percentile, 1),
+                "volatility_percentile": (
+                    round(vix_percentile, 1) if vix_percentile is not None else None
+                ),
                 "volatility_percentile_available": percentile_available,
                 "volatility_percentile_source": percentile_source,
                 "volatility_value": (
@@ -404,8 +454,15 @@ class IntelligenceAggregator:
                 "chain": greeks_chain["strikes"],
                 "iv_source": iv_ctx["source"],
             }
-            components += 1
-            max_possible += 0.2  # oi_wall
+            # Claim the oi_wall weight only when a wall was actually measured.
+            # Taking 0.2 of the denominator with no level on either side diluted
+            # every real observation, because the divisor has a hard
+            # FULL_EVIDENCE_MASS floor and a silent pillar therefore costs exactly
+            # as much as one voting zero. This is also the branch reached when the
+            # contract expiry is unavailable and greeks_atm is {"available": False}.
+            if res_level > 0 or sup_level > 0:
+                components += 1
+                max_possible += 0.2  # oi_wall
         elif intelligence_chain is None and spot_price > 0:
             # Fallback for when options chain is missing but we have price
             results["oi"] = self.oi._empty_result()
@@ -442,10 +499,23 @@ class IntelligenceAggregator:
             score += 0.25 # Increased from 0.15
         elif regime_result["regime"] in ["TRENDING_DOWN", "BREAKOUT_DOWN"]:
             score -= 0.25 # Increased from 0.15
-        elif regime_result["regime"] in ["VOLATILE", "RANGING", "UNKNOWN"]:
-            regime_score_multiplier = 0.15  # Institutional Dampening (was 0.3)
-        components += 1
-        max_possible += 0.25  # regime
+        # RANGING/VOLATILE/UNKNOWN add no directional regime vote here. Do not
+        # multiply every independent OI/PCR/flow/volume observation by that label;
+        # SignalManager already applies the explicit regime risk penalty.
+        #
+        # RANGING and VOLATILE are measured readings and keep their weight: "no
+        # direction" is information. An UNKNOWN regime is the ABSENCE of a reading,
+        # and the detector says so itself through ready_for_grading=False -- a flag
+        # it has always published and this aggregator never read. Claiming 0.25 of
+        # the denominator for it diluted every other pillar against the
+        # FULL_EVIDENCE_MASS floor.
+        regime_measured = bool(
+            regime_result.get("ready_for_grading", True)
+            and str(regime_result.get("regime") or "UNKNOWN").upper() != "UNKNOWN"
+        )
+        if regime_measured:
+            components += 1
+            max_possible += 0.25  # regime
 
         # 6. Order Flow
         flow_result = self.order_flow.analyze(
@@ -477,7 +547,7 @@ class IntelligenceAggregator:
         # Do not stamp a real-looking source onto a reading that did not happen.
         results["candle_pressure"] = {
             **flow_result,
-            "source": "ohlcv_close_position" if flow_available else "unavailable",
+            "source": (flow_result.get("source") or "ohlcv_close_position") if flow_available else "unavailable",
         }
         if flow_available:
             if flow_result["signal"] == "BULLISH":
@@ -487,26 +557,33 @@ class IntelligenceAggregator:
             components += 1
             max_possible += 0.2  # order_flow
 
-        # ═══ STRESS TEST: Manipulation & Divergence Detection ═══
-        # Outsmarting "Stop-loss Hunting" and "False Breakouts"
+        # Price versus estimated pressure is a heuristic divergence, not proof
+        # of manipulation or participant intent. Missing pressure cannot vote.
         divergence_detected = False
+        try:
+            flow_ratio = float(flow_result.get("ratio"))
+            price_move = float(price_change_pct)
+        except (TypeError, ValueError, OverflowError):
+            flow_ratio, price_move = float("nan"), float("nan")
+        divergence_usable = bool(flow_available and np.isfinite(flow_ratio)
+                                 and flow_ratio >= 0 and np.isfinite(price_move))
         # Case A: Price Up but Order Flow Bearish (Distribution Trap)
-        if price_change_pct > 0.1 and flow_result["ratio"] < 0.8:
+        if divergence_usable and price_move > 0.1 and flow_ratio < 0.8:
             score -= 0.3
             divergence_detected = True
             self._warn_divergence_once(
                 instrument,
                 "distribution_trap",
-                f"⚠️ DIVERGENCE: {instrument} Price rising but Order Flow shows Distribution (Trap?)",
+                f"DIVERGENCE: {instrument} Price rising; estimated pressure suggests Distribution. Heuristic context only.",
             )
         # Case B: Price Down but Order Flow Bullish (Accumulation Trap)
-        elif price_change_pct < -0.1 and flow_result["ratio"] > 1.25:
+        elif divergence_usable and price_move < -0.1 and flow_ratio > 1.25:
             score += 0.3
             divergence_detected = True
             self._warn_divergence_once(
                 instrument,
                 "accumulation_shakeout",
-                f"⚠️ DIVERGENCE: {instrument} Price falling but Order Flow shows Accumulation (Shakeout?)",
+                f"DIVERGENCE: {instrument} Price falling; estimated pressure suggests Accumulation. Heuristic context only.",
             )
         
         if divergence_detected:
@@ -521,6 +598,14 @@ class IntelligenceAggregator:
             max_possible += 0.3  # divergence
 
         results["divergence_alert"] = divergence_detected
+        results["divergence"] = {
+            "available": divergence_usable,
+            "detected": divergence_detected,
+            "price_change_pct": price_move if np.isfinite(price_move) else None,
+            "pressure_ratio": flow_ratio if np.isfinite(flow_ratio) and flow_ratio >= 0 else None,
+            "pressure_source": flow_result.get("source") or ("ohlcv_close_position" if flow_available else "unavailable"),
+            "interpretation": "Price and estimated pressure disagree; this does not establish market manipulation.",
+        }
 
         # ═══ STRESS TEST: System CA OI (Cumulative Analysis) ═══
         if intelligence_chain is not None and not intelligence_chain.empty:
@@ -559,14 +644,22 @@ class IntelligenceAggregator:
             try:
                 if 'call_oi' in intelligence_chain.columns and 'strike' in intelligence_chain.columns and spot_price > 0:
                     oc = intelligence_chain.dropna(subset=['strike'])
-                    strikes = oc['strike'].astype(float)
-                    coi = oc['call_oi'].astype(float).fillna(0.0)
-                    poi = oc['put_oi'].astype(float).fillna(0.0)
-                    best_k, best_pain = None, None
-                    for P in strikes:
-                        pain = (coi * (P - strikes).clip(lower=0)).sum() + (poi * (strikes - P).clip(lower=0)).sum()
-                        if best_pain is None or pain < best_pain:
-                            best_pain, best_k = pain, float(P)
+                    strikes = oc['strike'].astype(float).to_numpy()
+                    coi = oc['call_oi'].astype(float).fillna(0.0).to_numpy()
+                    poi = oc['put_oi'].astype(float).fillna(0.0).to_numpy()
+                    # One strike-by-strike matrix instead of a pandas loop. The loop ran
+                    # two Series.clip per strike (122 on a 61-strike chain), and each
+                    # pandas op also deep-copied chain.attrs: 50% of analyze() time,
+                    # 117ms a call (2026-09-25). Row P is the payout if expiry settles
+                    # at strike P; argmin keeps the old first-minimum tie-break.
+                    best_k = None
+                    if strikes.size:
+                        settle_minus_strike = strikes[:, None] - strikes[None, :]
+                        pain = (
+                            (coi * np.clip(settle_minus_strike, 0, None)).sum(axis=1)
+                            + (poi * np.clip(-settle_minus_strike, 0, None)).sum(axis=1)
+                        )
+                        best_k = float(strikes[int(np.argmin(pain))])
                     if best_k:
                         results["max_pain"] = {
                             "strike": best_k,
@@ -596,6 +689,17 @@ class IntelligenceAggregator:
         # Final Score Aggregation (Scaled to -100 to +100 for SignalManager)
         score_before_regime_dampening = score
         score *= regime_score_multiplier
+        # Participation corroborates the existing conviction exactly once. It is
+        # not another directional price/OI vote or a new gate, and missing inputs
+        # leave the existing score unchanged.
+        derivative_context = derivative_corroboration(
+            derivatives, instrument, timeframe, derivative_as_of, score,
+            spot_price=spot_price,
+            option_expiry=(intelligence_chain.attrs.get("expiry", "")
+                           if intelligence_chain is not None else ""),
+        )
+        results["derivative_context"] = derivative_context
+        score *= derivative_context["multiplier"]
         # Divide by at least the evidence mass of a fully-informed read. Below that floor
         # this reduces to score / FULL_EVIDENCE_MASS, so a thin pillar set is scored on the
         # same yardstick as a complete one instead of being graded against itself.
@@ -644,7 +748,10 @@ class IntelligenceAggregator:
             "components_analyzed": components,
             "instrument": instrument,
             "timeframe": timeframe,
-            "futures_volume": vol_data.get("current_volume", 0),
+            "measured_volume": vol_data.get("current_volume", 0),
+            "measurement_timeframe": vol_data.get("measurement_timeframe", timeframe),
+            "measurement_timestamp": vol_data.get("measurement_timestamp", ""),
+            "measurement_basis": vol_data.get("measurement_basis", ""),
             "order_ratio": flow_data.get("ratio", 1.0),
             "regime": regime_data.get("regime", "RANGING"),
             "regime_conviction_label": regime_data.get("conviction_label", ""),
@@ -652,6 +759,7 @@ class IntelligenceAggregator:
             "regime_conviction_vector": dict(regime_data.get("conviction_vector", {}) or {}),
             "score_before_regime_dampening": round(score_before_regime_dampening, 4),
             "regime_score_multiplier": regime_score_multiplier,
+            "derivative_participation_multiplier": round(derivative_context["multiplier"], 4),
             "day_type": (session_context or {}).get("day_type", ""),
             "session_bias": (session_context or {}).get("bias", ""),
             "effective_day_type": (session_context or {}).get("effective_day_type", ""),
@@ -685,8 +793,18 @@ class IntelligenceAggregator:
         anchor_regime = anchor_regime or {}
         breadth_context = breadth_context or {}
 
-        day_type = str(session_context.get("day_type") or "").upper()
-        day_conf = self._bounded_float(session_context.get("confidence"), 0.0, 1.0)
+        day_type = str(
+            session_context.get("effective_day_type")
+            or session_context.get("day_type")
+            or ""
+        ).upper()
+        day_conf = self._bounded_float(
+            session_context.get("effective_confidence")
+            or session_context.get("phase_confidence")
+            or session_context.get("confidence"),
+            0.0,
+            1.0,
+        )
         if day_conf >= 0.45:
             if day_type == "TREND_DAY_UP":
                 delta = 0.12 * day_conf
@@ -701,7 +819,7 @@ class IntelligenceAggregator:
                 reasons.append("range-day dampens directional conviction")
 
         delta_ctx = session_context.get("session_delta", {})
-        if isinstance(delta_ctx, dict):
+        if isinstance(delta_ctx, dict) and str(delta_ctx.get("source") or "").lower() == "volume":
             delta_bias = str(delta_ctx.get("bias") or "").upper()
             delta_ratio = abs(self._bounded_float(delta_ctx.get("delta_ratio"), -1.0, 1.0))
             if delta_bias == "BULLISH" and delta_ratio >= 0.15:
@@ -714,7 +832,11 @@ class IntelligenceAggregator:
                 reasons.append(f"session cumulative delta bearish {delta:+.3f}")
 
         vix_change = self._bounded_float(session_context.get("vix_change_pct"), -20.0, 20.0)
-        session_bias = str(session_context.get("bias") or "").upper()
+        session_bias = str(
+            session_context.get("effective_bias")
+            or session_context.get("bias")
+            or ""
+        ).upper()
         if abs(vix_change) >= 2.0:
             if vix_change > 0 and session_bias == "BULLISH":
                 adjustment -= 0.04

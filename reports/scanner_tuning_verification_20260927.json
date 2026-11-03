@@ -1,0 +1,52 @@
+{
+  "schema": "scanner_tuning_verification.v1",
+  "baseline_fingerprint": "7f2b786eed647e23f26b517beb838a8aa10b00321d6e53fd33f615b5528e5c86",
+  "candidate_fingerprint": "5d8dd1470a7526df6528ed91f8798fde63478df1ddc5f5e34b1269889560ba4b",
+  "head": "0790b94375b8bc0d390f000bfb01620934c4c3c6",
+  "verification": [
+    {
+      "scope": "new tuning plus hot-path, broker-timeout, tick-lane, and decision tests",
+      "result": "200 passed",
+      "duration_seconds": 23.25
+    },
+    {
+      "scope": "scanner parity, settings, engine plugability, timeframe, closed-candle, and pipeline speed tests",
+      "result": "214 passed",
+      "duration_seconds": 104.42
+    },
+    {
+      "scope": "final intracandle throttle, tick lane, hot-path, and decision regression rerun",
+      "result": "37 passed",
+      "duration_seconds": 18.07
+    },
+    {
+      "scope": "scanner module boundaries and external-call telemetry",
+      "result": "36 passed",
+      "duration_seconds": 14.90
+    },
+    {
+      "scope": "typed-setting zero-value and paired-evaluation pass/fail regressions",
+      "result": "5 passed",
+      "duration_seconds": 5.90
+    },
+    {
+      "scope": "changed Python modules",
+      "result": "py_compile passed"
+    },
+    {
+      "scope": "changed files",
+      "result": "git diff --check passed"
+    }
+  ],
+  "paired_evaluation": {
+    "report": "reports/paired_causal_evaluation_20260927.json",
+    "promotable": false,
+    "reason": "Available corrected replay does not meet pairing, net-improvement, concentration, unseen-period, or all-index robustness gates."
+  },
+  "limitations": [
+    "The two pytest selections overlap; their pass counts must not be summed as a unique-test count.",
+    "A complete non-integration suite was not rerun because the earlier audit attempt exceeded ten minutes without a final result.",
+    "No live-market latency claim is made until post-change market-session telemetry exists.",
+    "The baseline manifest proves exact inputs but is not a source backup or Git commit."
+  ]
+}

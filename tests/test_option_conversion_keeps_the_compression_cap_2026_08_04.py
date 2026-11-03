@@ -30,6 +30,12 @@ COMPRESSED = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _fixed_lot_policy(monkeypatch):
+    """The cap is proven on the fixed-lot policy; equal-risk sizing has its own tests."""
+    monkeypatch.setattr(get_settings(), "risk_based_lots_enabled", False)
+
+
 def _size(compression_state, **flags):
     return resolve_trade_lots(
         settings=get_settings(),

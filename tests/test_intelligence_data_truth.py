@@ -75,7 +75,19 @@ def test_volatility_routing_uses_real_vix_percentile_not_price_velocity():
         assert greeks["chain"][0]["iv_source"] == "chain_iv"
 
 
-def test_missing_vix_percentile_is_neutral_and_explicit():
+def test_missing_vix_percentile_abstains_and_stays_explicit():
+    """An absent percentile publishes None, not a neutral 50.
+
+    The original contract paired a neutral 50.0 with an explicit
+    ``volatility_percentile_available: False`` flag, so a consumer COULD tell. None did:
+    every downstream gate read the number. 50.0 is also the most permissive value in the
+    range -- 50 < 70 chose the looser 120s option-chain age limit over 90s, 50 < 80 kept
+    FUT/OPT routing off the high-IV branch, and 50 < the 70.0 special-5min ceiling turned
+    that gate into a pass. Meanwhile ``signal_quality_policy`` already carried an
+    ``if iv_percentile is None: return False`` branch that could never be reached.
+
+    The explicit half of the contract is unchanged and still asserted below.
+    """
     result = IntelligenceAggregator().analyze(
         instrument="NIFTY",
         timeframe="5min",
@@ -86,9 +98,20 @@ def test_missing_vix_percentile_is_neutral_and_explicit():
         days_to_expiry=7,
         price_change_pct=4.0,
     )
-    assert result["greeks"]["iv_percentile"] == 50.0
+    assert result["greeks"]["iv_percentile"] is None
+    assert result["greeks"]["volatility_percentile"] is None
     assert result["greeks"]["volatility_percentile_available"] is False
     assert result["greeks"]["volatility_percentile_source"] == "unavailable_neutral"
+
+
+def test_an_absent_percentile_refuses_the_special_5min_gate():
+    """The abstain branch that was unreachable while 50.0 was published."""
+    from engine.signal_quality_policy import option_premium_health_ok
+    from config.settings import Settings
+
+    settings = Settings()
+    assert option_premium_health_ok(iv_percentile=None, settings=settings) is False
+    assert option_premium_health_ok(iv_percentile=50.0, settings=settings) is True
 
 
 def test_divergence_warnings_are_throttled(monkeypatch):
@@ -142,7 +165,7 @@ def test_divergence_warnings_are_throttled(monkeypatch):
     assert len(warnings) == 2
 
 
-def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
+def test_ranging_regime_does_not_erase_measured_order_flow_and_divergence():
     aggregator = IntelligenceAggregator()
     aggregator.volume = SimpleNamespace(
         analyze=lambda *args, **kwargs: {
@@ -171,25 +194,13 @@ def test_choppy_regime_dampening_applies_after_order_flow_and_divergence():
     # Weight-normalised (2026-08-08): the vote sum is unchanged, the divisor is now the
     # sum of the counted pillars' MAXIMUM votes rather than their count.
     assert aggregate["score_before_regime_dampening"] == 0.5
-    assert aggregate["regime_score_multiplier"] == 0.15
+    assert aggregate["regime_score_multiplier"] == 1.0
     # A non-authoritative option chain (here options_chain=None) does not feed the
     # OI/PCR components into the score, and the published value is rounded to 1dp.
-    # The dampening chain itself is unchanged, which the two assertions above pin.
-    #
-    # 5.8, previously 10.0 (and 2.5 / 3.8 before that). The dampening chain above is
-    # untouched; what changed is the DIVISOR.
-    #
-    # This read carries three pillars -- order_flow 0.20 + regime 0.25 + divergence 0.30 =
-    # 0.75 of evidence -- out of the 1.30 a healthy read carries (no option chain, no traded
-    # volume). Dividing 0.075 by its OWN 0.75 scored it as though partial evidence were the
-    # whole picture and published 10.0. That is the same defect that let a regime-only read
-    # publish 100.0 / STRONG_BUY: conviction measured against whatever happened to be
-    # available. Divided by the FULL_EVIDENCE_MASS floor it is 0.075 / 1.30 = 5.8.
-    #
-    # A RANGING-dampened read on 58% of the evidence should sit near zero, so 5.8 is the
-    # honest number here and 10.0 was the flattering one.
-    assert aggregate["score"] == 5.8
-    assert aggregate["signal"] == "HOLD"
+    # RANGING contributes no directional vote. It must not also multiply independent
+    # flow/divergence measurements by 0.15; the quality policy applies regime risk once.
+    assert aggregate["score"] == 38.5
+    assert aggregate["signal"] == "BUY"
     # The evidence this rests on is now stated rather than implied.
     assert aggregate["evidence_mass"] == 0.75
     assert aggregate["evidence_ratio"] == round(0.75 / 1.30, 3)

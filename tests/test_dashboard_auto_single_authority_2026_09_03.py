@@ -44,4 +44,4 @@ def test_auto_switch_renders_fail_safe_off_until_server_state_arrives():
 
     assert tag, "the dedicated Auto switch is missing"
     assert not re.search(r"\bchecked\b", tag.group(0))
-    assert "dashboard-settings.js?v=32-single-auto-authority" in html
+    assert re.search(r'dashboard-settings\.js\?v=[^"\s]+', html)

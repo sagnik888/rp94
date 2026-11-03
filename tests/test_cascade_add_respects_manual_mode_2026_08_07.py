@@ -28,11 +28,12 @@ import textwrap
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 
 def _concurrency_block():
     """The `if not self._prepare_candidate_for_concurrency(sig):` body, as an AST node."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue

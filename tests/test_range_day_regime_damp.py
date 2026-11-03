@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from config.settings import get_settings
 from engine.signal_manager import SignalManager
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source, signal_pipeline_source
 
 
 def _grade(day_type="", day_conf=0.0, regime="TRENDING_UP"):
@@ -65,10 +66,11 @@ def test_damp_respects_toggle():
 def test_day_type_threaded_into_live_and_historical_grading():
     from engine.signal_processor import SignalProcessor
 
-    live = inspect.getsource(SignalProcessor.process_best_signal)
-    assert "day_type=str(_live_session_ctx.get" in live
+    live = signal_pipeline_source()
+    assert '_live_session_ctx.get("effective_day_type")' in live
+    assert '_live_session_ctx.get("phase_confidence")' in live
     hist_sp = inspect.getsource(SignalProcessor)
     assert "_historical_day_type_at" in hist_sp
-    sc = inspect.getsource(Scanner)
+    sc = scanner_runtime_source()
     assert "_historical_day_type_at" in sc
     assert "_historical_day_type_cache" in sc

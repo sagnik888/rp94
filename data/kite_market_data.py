@@ -17,6 +17,7 @@ Two things here are genuine upgrades over the AngelOne path, not just translatio
 from __future__ import annotations
 
 import threading
+import math
 import time as _time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import pytz
 from loguru import logger
-from data.kite_auth import is_kite_auth_failure, kite_auth_failure_reason
+from data.kite_auth import is_kite_auth_failure, is_kite_permission_refusal, kite_auth_failure_reason
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -59,6 +60,7 @@ class KiteDataSource:
         self._kite = kite
         self._lock = threading.RLock()
         self._instruments: Dict[str, List[Dict[str, Any]]] = {}
+        self._option_series: Dict[Tuple[str, str, str, date], Tuple[Dict[str, Any], ...]] = {}
         self._by_symbol: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._loaded_on: Optional[date] = None
         # Per-endpoint throttle cooldown. AngelOne had this (_mark_angel_rest_backoff and
@@ -148,6 +150,19 @@ class KiteDataSource:
             "kite_rest_backoff_contexts": active,
             "kite_rest_backoff_failures": sum(self._throttle_failures.values()),
         }
+
+    def rest_throttle_remaining(
+        self, context: str, *, now_ts: Optional[float] = None
+    ) -> float:
+        """Seconds left in the broker-imposed cooldown for ``context``; 0.0 when clear.
+
+        A throttled request is answered with ``default`` — an empty frame for candles,
+        which is exactly what a symbol that simply did not trade looks like. Callers
+        that must not mistake a refusal for an answer (the constituent-share builder)
+        read the cooldown here instead of guessing from an empty frame.
+        """
+        now = _time.time() if now_ts is None else float(now_ts)
+        return max(0.0, float(self._throttle_until.get(context, 0.0) or 0.0) - now)
 
     def _begin_historical_rest_call(self, context: str) -> int:
         if context != "historical_data":
@@ -282,6 +297,12 @@ class KiteDataSource:
                     self._auth.invalidate(reason)
                 if self._kite is api:
                     self._kite = None
+            elif is_kite_permission_refusal(exc) and self._auth is not None:
+                # One API the app lacks, or a session Kite has reset? profile() decides.
+                probe = getattr(self._auth, "confirm_dead_session", None)
+                if callable(probe) and probe(kite_auth_failure_reason(context, exc), failed_client=api):
+                    if self._kite is api:
+                        self._kite = None
             failure = f"{type(exc).__name__}: {exc}"
             if self._is_throttle(exc):
                 cooldown = self._mark_throttled(context, now_ts)
@@ -385,13 +406,27 @@ class KiteDataSource:
             for row in normalised:
                 by_symbol[(row["tradingsymbol"].upper(), exchange)] = row
 
+        option_series = self._index_option_series(loaded)
         with self._lock:
             self._instruments = loaded
+            self._option_series = option_series
             self._by_symbol = by_symbol
             self._loaded_on = today
         total = sum(len(rows) for rows in loaded.values())
         logger.info(f"Kite contract master loaded: {total} instruments across {', '.join(exchanges)}")
         return total
+
+    @staticmethod
+    def _index_option_series(instruments):
+        """Partition the published master once instead of scanning it for each leg."""
+        series = {}
+        for exchange, rows in instruments.items():
+            for row in rows:
+                side = row["instrument_type"]
+                if side in {"CE", "PE"}:
+                    key = (exchange, row["name"], side, row["expiry"])
+                    series.setdefault(key, []).append(row)
+        return {key: tuple(rows) for key, rows in series.items()}
 
     @staticmethod
     def _normalise_instrument(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -506,11 +541,11 @@ class KiteDataSource:
         exchange = INDEX_EXCHANGE.get(index, ("NFO", "NSE"))[0]
         cutoff = on_or_after or datetime.now(IST).date()
         with self._lock:
-            rows = list(self._instruments.get(exchange, []))
+            series = self._option_series
         found = {
-            row["expiry"] for row in rows
-            if row["name"] == index and row["instrument_type"] in {"CE", "PE"}
-            and row["expiry"] is not None and row["expiry"] >= cutoff
+            expiry for (venue, name, side, expiry) in series
+            if venue == exchange and name == index
+            and expiry is not None and expiry >= cutoff
         }
         return sorted(found)
 
@@ -533,7 +568,7 @@ class KiteDataSource:
                 return None
             expiry = expiries[0]
         with self._lock:
-            rows = list(self._instruments.get(exchange, []))
+            rows = self._option_series.get((exchange, index, option_type, expiry), ())
         target = round(float(strike), 2)
         for row in rows:
             if (
@@ -558,7 +593,7 @@ class KiteDataSource:
                 return []
             expiry = expiries[0]
         with self._lock:
-            rows = list(self._instruments.get(exchange, []))
+            rows = self._option_series.get((exchange, index, str(option_type).upper(), expiry), ())
         return sorted(
             row["strike"] for row in rows
             if row["name"] == index and row["instrument_type"] == str(option_type).upper()
@@ -636,6 +671,7 @@ class KiteDataSource:
             "usable": usable,
             "reason": reason,
             "source": "kite",
+            "timestamp": row.get("timestamp"),
         }
 
     # A book can be present, positive and uncrossed while still being nonsense to
@@ -723,7 +759,11 @@ class KiteDataSource:
             "oi_day_high": _num(row.get("oi_day_high")),
             "oi_day_low": _num(row.get("oi_day_low")),
             "last_price": _num(row.get("last_price")),
-            "unit": "contracts",
+            # Kite documents a broker-reported traded quantity.  Do not advertise it
+            # as lots/contracts without a lot-size conversion and vendor guarantee.
+            "unit": "broker_reported_quantity",
+            "exchange_timestamp": row.get("exchange_timestamp") or row.get("timestamp"),
+            "last_trade_time": row.get("last_trade_time") or row.get("last_traded_time"),
         }
 
     # ── option chain ─────────────────────────────────────────────────────────
@@ -790,6 +830,14 @@ class KiteDataSource:
             except (TypeError, ValueError):
                 return 0.0
 
+        def _volume(row):
+            value = row.get("volume", row.get("volume_traded"))
+            try:
+                value = float(value)
+                return value if math.isfinite(value) and value >= 0 else float("nan")
+            except (TypeError, ValueError):
+                return float("nan")
+
         def _mid(row):
             """Top-of-book mid, or 0.0 when the book cannot be trusted.
 
@@ -813,14 +861,20 @@ class KiteDataSource:
                 continue
             records.append({
                 "strike": strike,
+                "call_symbol": contracts.get((strike, "CE"), ""),
+                "put_symbol": contracts.get((strike, "PE"), ""),
+                "call_quote_at": call.get("timestamp"),
+                "put_quote_at": put.get("timestamp"),
                 "call_mid": _mid(call),
                 "put_mid": _mid(put),
                 "call_oi": _num(call, "oi"),
                 "put_oi": _num(put, "oi"),
                 "call_oi_change": 0.0,
                 "put_oi_change": 0.0,
-                "call_volume": _num(call, "volume") or _num(call, "volume_traded"),
-                "put_volume": _num(put, "volume") or _num(put, "volume_traded"),
+                "call_volume": _volume(call),
+                "put_volume": _volume(put),
+                "call_volume_available": math.isfinite(_volume(call)),
+                "put_volume_available": math.isfinite(_volume(put)),
                 "call_ltp": _num(call, "last_price"),
                 "put_ltp": _num(put, "last_price"),
             })

@@ -10,12 +10,14 @@ import json
 import threading
 import uuid
 from collections import Counter, defaultdict, deque
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
 
+from engine.build_identity import build_fingerprint, process_build_stamp
 from intelligence.entry_policy_evaluation import evaluate_entry_shadow_walk_forward
 
 try:
@@ -66,8 +68,14 @@ class RegimeTracker:
         max_weeks: int = 8,
         dedupe_size: int = 4096,
         retention_days: int = 0,
+        strategy_revision: str = "",
+        strategy_direction_mode: str = "",
     ) -> None:
         self.root_dir = Path(root_dir)
+        # The writing process's own strategy identity, used only to fill a row whose
+        # producer never stamped one (see _stamp_build_identity).
+        self.strategy_revision = str(strategy_revision or "")
+        self.strategy_direction_mode = str(strategy_direction_mode or "")
         self.events_dir = self.root_dir / "events"
         self.reports_dir = self.root_dir / "reports"
         self.enabled = bool(enabled)
@@ -89,12 +97,22 @@ class RegimeTracker:
 
     @classmethod
     def from_settings(cls, settings: Any) -> "RegimeTracker":
-        return cls(
+        tracker = cls(
             root_dir=str(getattr(settings, "rtracker_data_dir", "data_store/rtracker") or "data_store/rtracker"),
             enabled=_setting_enabled(getattr(settings, "rtracker_enabled", True), True),
             max_weeks=int(getattr(settings, "rtracker_report_weeks", 8) or 8),
             retention_days=int(getattr(settings, "rtracker_retention_days", 0) or 0),
+            strategy_revision=str(getattr(settings, "strategy_revision", "") or ""),
+            strategy_direction_mode=str(getattr(settings, "strategy_direction_mode", "") or ""),
         )
+        # Resolve the build stamp here, at start-up, so its one-off git calls never
+        # land inside the first decision of the scan loop -- and so it describes the
+        # tree this process started from, not one edited later in the session.
+        try:
+            process_build_stamp()
+        except Exception as exc:
+            logger.debug(f"rtracker build stamp warm-up skipped: {exc}")
+        return tracker
 
     def prune_events(self, *, retention_days: Optional[int] = None,
                      as_of: Optional[datetime] = None) -> Dict[str, Any]:
@@ -183,6 +201,17 @@ class RegimeTracker:
             # day's funnel can be counted per signal rather than per row without
             # re-deriving the key from every consumer.
             event.setdefault("signal_id", self._signal_id(event))
+            # After the ids on purpose: neither the wall clock nor the build may enter
+            # row identity, or every re-evaluation of one refusal would mint a new row.
+            # ``timestamp`` stays the bar/entry/exit clock that joins key on; decided_at
+            # is when this process wrote the verdict (09-16: a 13:00 bar decided 13:06).
+            if str(event.get("decision") or "").upper() != "SHADOW_OUTCOME":
+                event.setdefault("decided_at", _now().isoformat())
+            try:
+                self._stamp_build_identity(event)
+            except Exception as exc:
+                # Attribution must never cost the row itself.
+                logger.debug(f"rtracker build stamp skipped: {exc}")
             with _RTRACKER_FILE_LOCK:
                 self.events_dir.mkdir(parents=True, exist_ok=True)
                 path = self.events_dir / f"{event['date']}.jsonl"
@@ -473,6 +502,9 @@ class RegimeTracker:
             # grading used — without this the per-timeframe grading flag cannot be A/B'd
             # from archived sessions.
             "grading": {
+                "setup_score": _candidate_value(candidate, "setup_score", _candidate_value(candidate, "confidence", None)),
+                "calibrated_win_probability": _candidate_value(candidate, "calibrated_win_probability", None),
+                "expected_net_r": _candidate_value(candidate, "expected_net_r", None),
                 "timeframe": str(_candidate_value(candidate, "graded_timeframe", "") or ""),
                 # Falls back to the position's own intelligence_score. `graded_intel_score`
                 # is set on the CANDIDATE at grading time; an EXIT event is built from the
@@ -498,6 +530,7 @@ class RegimeTracker:
                 # and a taken A+ are indistinguishable beyond the score itself.
                 "pillars": _candidate_value(candidate, "grade_pillars", {}) or {},
             },
+            "signal_learning": _candidate_value(candidate, "signal_learning", {}) or {},
             # Strategy/data and quote provenance are separate from the score.  This
             # makes outcomes attributable to the exact deployed logic and prevents
             # an inherited entry quote flag from being mistaken for EXIT evidence.
@@ -508,6 +541,13 @@ class RegimeTracker:
                 ),
                 "data_provenance": str(
                     _candidate_value(candidate, "data_provenance", "") or ""
+                ),
+                # Identifies the exact decision code, uncommitted hunks included.
+                # ``revision`` above is a settings constant and cannot tell two builds
+                # apart, which is why a 2026-09-15 refusal matched neither HEAD nor the
+                # working tree.
+                "build_fingerprint": str(
+                    _candidate_value(candidate, "build_fingerprint", "") or ""
                 ),
             },
             "quote": {
@@ -582,6 +622,12 @@ class RegimeTracker:
                     "source": str(_candidate_value(candidate, "expected_move_source", "") or ""),
                 }
             ),
+            "option_exposure": (
+                dict(_candidate_value(candidate, "option_exposure_verdict", {}) or {})
+                if isinstance(_candidate_value(candidate, "option_exposure_verdict", {}), dict) else {}),
+            "exit_decision_record": (
+                dict(_candidate_value(candidate, "exit_decision_record", {}) or {})
+                if isinstance(_candidate_value(candidate, "exit_decision_record", {}), dict) else {}),
             "entry_policy": (
                 dict(_candidate_value(candidate, "entry_policy_verdict", {}) or {})
                 if isinstance(_candidate_value(candidate, "entry_policy_verdict", {}), dict)
@@ -604,6 +650,9 @@ class RegimeTracker:
                 if isinstance(_candidate_value(candidate, "quality_verdict", {}), dict)
                 else {}
             ),
+            # Generic quality is advisory for S1. Preserve the canonical lane owner,
+            # final safety verdict and acceptance clocks beside that legacy field.
+            "decision_record": deepcopy(_candidate_value(candidate, "decision_record", {}) or {}),
             "regime": {
                 "raw_regime": str(regime_ctx.get("raw_regime") or ""),
                 "guarded_regime": str(regime_ctx.get("guarded_regime") or ""),
@@ -619,6 +668,15 @@ class RegimeTracker:
                 "bb_width": _measured_float(regime_ctx, "bb_width"),
                 "range_day_trend_guard": bool(regime_ctx.get("range_day_trend_guard", False)),
                 "range_day_trend_guard_reason": str(regime_ctx.get("range_day_trend_guard_reason") or ""),
+                # The regime block copies a FIXED key list, so a detector field that is
+                # not named here never reaches the archive. The trend-day contradiction
+                # guard was rewriting labels invisibly until these two were added.
+                "trend_day_contradiction_guard": bool(
+                    regime_ctx.get("trend_day_contradiction_guard", False)
+                ),
+                "trend_day_contradiction_guard_reason": str(
+                    regime_ctx.get("trend_day_contradiction_guard_reason") or ""
+                ),
                 # Index SPOT at decision time (2026-08-17). Nothing on an event recorded
                 # the underlying level, so the day's actual index range could not be
                 # measured from the tracker at all — a post-session review could only
@@ -740,24 +798,146 @@ class RegimeTracker:
             _candidate_value(candidate, "trade_id", ""),
         )
         event["lifecycle_id"] = explicit_lifecycle or self._lifecycle_id(event)
+        accepted_record = _candidate_value(candidate, "accepted_decision_record", {}) or {}
+        if final_decision == "ACCEPTED" and not accepted_record:
+            accepted_record = deepcopy(event["decision_record"])
+            if accepted_record:
+                if isinstance(candidate, dict):
+                    candidate["accepted_decision_record"] = accepted_record
+                else:
+                    setattr(candidate, "accepted_decision_record", accepted_record)
+        event["accepted_decision_record"] = deepcopy(accepted_record)
+        from intelligence.signal_learning import admission_evidence
+        event["admission"] = admission_evidence(candidate, final_decision)
         if final_decision == "EXIT":
             # Additive fields keep rtracker.v1 readers compatible while making every
-            # newly-written exit self-describing.  TradeCandidate paths are gross;
-            # Trade paths are net.  The discriminator below uses the fields each holder
-            # actually exposes and honours an explicit producer override.
+            # newly-written exit self-describing.  TradeCandidate paths are gross; a
+            # Trade declares its path basis (gross since 2026-09-17, net before).  The
+            # discriminator below honours that declaration, then the holder's fields.
             event.update(
                 {
                     "pnl_basis": _candidate_pnl_basis(candidate),
                     "pnl_path_basis": _candidate_pnl_path_basis(candidate),
+                    "peak_pnl_basis": _canonical_pnl_basis(
+                        _candidate_value(candidate, "peak_pnl_basis", None), default=PNL_BASIS_GROSS
+                    ),
+                    "max_drawdown_basis": _canonical_pnl_basis(
+                        _candidate_value(candidate, "max_drawdown_basis", None), default=PNL_BASIS_GROSS
+                    ),
                     "round_trip_cost": _candidate_round_trip_cost(candidate),
                 }
             )
+            # A fill beyond the tracked high-water mark belongs in its declared units.
+            # The last sampled mark may miss the exit fill. Fold the realised value
+            # into the recorded peak in its declared basis; never mutate the live
+            # object's peak that an exit guard reads.
+            realized_gross = _event_realized_gross_pnl(event)
+            if realized_gross is not None:
+                tracked_peak = _safe_float(event.get("peak_pnl"))
+                event["realized_gross_pnl"] = round(realized_gross, 2)
+                event["tracked_peak_pnl"] = tracked_peak
+                cost = event.get("round_trip_cost")
+                realized_peak = realized_gross
+                if event["peak_pnl_basis"] == PNL_BASIS_NET:
+                    realized_peak = _safe_float(event.get("pnl"))
+                    if event["pnl_basis"] == PNL_BASIS_GROSS and cost is not None:
+                        realized_peak -= cost
+                event["peak_pnl"] = max(tracked_peak, round(realized_peak, 2))
+                if cost is not None:
+                    # Prefer an exact sampled gross peak. A native net peak may be
+                    # clamped at zero, so adding fees to that zero can invent profit.
+                    sampled_gross = _measured_candidate_float(candidate, "peak_pnl_gross")
+                    if sampled_gross is None:
+                        if event["peak_pnl_basis"] != PNL_BASIS_NET:
+                            sampled_gross = tracked_peak
+                        elif tracked_peak > 0:
+                            sampled_gross = tracked_peak + cost
+                    # A zero-clamped net peak without a separate sampled gross peak
+                    # cannot reveal whether the best gross mark was below the fees.
+                    event["peak_pnl_gross"] = (
+                        round(max(sampled_gross, realized_gross), 2)
+                        if sampled_gross is not None else None
+                    )
+                    event["peak_pnl_net"] = round(
+                        event["peak_pnl"] if event["peak_pnl_basis"] == PNL_BASIS_NET
+                        else event["peak_pnl"] - cost, 2
+                    )
+                for field in ("max_drawdown_gross", "max_drawdown_net"):
+                    measured = _measured_candidate_float(candidate, field)
+                    if measured is not None:
+                        event[field] = measured
             exit_provenance = _exit_provenance(candidate)
             if exit_provenance:
                 event["exit_provenance"] = exit_provenance
+        # The entry data-quality verdict, beside the intelligence volume reading. The
+        # two measure different things (exchange traded volume vs fresh comparable
+        # 1-minute cash volume), so on 2026-09-16 five ONE_MINUTE_VOLUME_UNAVAILABLE
+        # refusals archived available=True and read as self-contradicting. Only added
+        # when the gate actually evaluated one; absence is not an "unavailable" verdict.
+        data_quality = _entry_data_quality_block(
+            _candidate_value(candidate, "entry_data_quality", None)
+        )
+        if data_quality:
+            event["volume"]["entry_data_quality"] = data_quality
+        # The acceptance-time entry basis (Scanner._rebase_accepted_entry_basis). ``price``
+        # is then the executable basis; the price carried through stabilization and the
+        # quote at acceptance sit beside it. Absent on rows that were never accepted.
+        if _candidate_has(candidate, "stabilization_start_price"):
+            event["stabilization_start_price"] = _safe_float(
+                _candidate_value(candidate, "stabilization_start_price", 0.0)
+            )
+            event["entry_price_source"] = str(
+                _candidate_value(candidate, "entry_price_source", "") or ""
+            )
+            quote = _candidate_value(candidate, "acceptance_quote", None)
+            if isinstance(quote, dict):
+                event["acceptance_quote"] = {
+                    "ltp": _safe_float(quote.get("ltp")),
+                    "bid": _safe_float(quote.get("bid")),
+                    "ask": _safe_float(quote.get("ask")),
+                    "observed_at": str(quote.get("observed_at") or ""),
+                    "source": str(quote.get("source") or ""),
+                    "age_seconds": _safe_float(quote.get("age_seconds")),
+                    "usable": bool(quote.get("usable", False)),
+                    "executable_price": _safe_float(quote.get("executable_price")),
+                    "executable_source": str(quote.get("executable_source") or ""),
+                }
         if extra:
             event["extra"] = _compact(extra)
         return event
+
+    def _stamp_build_identity(self, event: Dict[str, Any]) -> None:
+        """Give every row the writing build, and fill a blank strategy stamp.
+
+        On 2026-09-16 strategy.revision was blank on both missed_reentry lifecycles and
+        six filtered refusals, and build_fingerprint existed only where a producer had
+        remembered to stamp it. Rows are written synchronously by the process that
+        decided them, so that process's identity is the correct fill. A value the
+        producer did stamp is never overwritten. The stamp is cached per process.
+        """
+        event.setdefault("build", process_build_stamp())
+        strategy = event.get("strategy")
+        if not isinstance(strategy, dict):
+            return
+        strategy = dict(strategy)
+        if not str(strategy.get("revision") or "").strip() and self.strategy_revision:
+            strategy["revision"] = self.strategy_revision
+        if (
+            not str(strategy.get("direction_mode") or "").strip()
+            and self.strategy_direction_mode
+        ):
+            strategy["direction_mode"] = self.strategy_direction_mode
+        run_mode = str(event.get("run_mode") or "").strip().upper()
+        if (
+            not str(strategy.get("data_provenance") or "").strip()
+            and run_mode
+            and run_mode != "UNSPECIFIED"
+        ):
+            # Same rule as engine.build_identity.build_identity.
+            strategy["data_provenance"] = "LIVE" if run_mode == "REAL" else "BACKTEST"
+        if not str(strategy.get("build_fingerprint") or "").strip():
+            strategy["build_fingerprint"] = build_fingerprint()
+        event["strategy"] = strategy
 
     def _remember(self, event_id: str) -> None:
         if len(self._seen_order) == self._seen_order.maxlen:
@@ -1177,6 +1357,25 @@ def _entry_intel_block(value: Any) -> dict:
     return out
 
 
+def _entry_data_quality_block(value: Any) -> dict:
+    """Compact engine.entry_data_quality verdict for the volume block; {} when absent."""
+    if not isinstance(value, dict) or not value:
+        return {}
+    checks = value.get("checks") if isinstance(value.get("checks"), dict) else {}
+    allowed = value.get("allowed")
+    cash_volume = checks.get("one_minute_cash_volume")
+    return {
+        "verdict": (
+            "ALLOWED" if allowed is True else ("BLOCKED" if allowed is False else "")
+        ),
+        "allowed": allowed if isinstance(allowed, bool) else None,
+        "reason_code": str(value.get("reason_code") or ""),
+        "reason": str(value.get("reason") or ""),
+        "cash_volume_available": cash_volume if isinstance(cash_volume, bool) else None,
+        "version": str(value.get("version") or ""),
+    }
+
+
 def _pnl_path_rows(value: Any) -> list:
     """Normalise a trade's pnl_path into JSON-safe [seconds, pnl] pairs.
 
@@ -1386,6 +1585,20 @@ def _candidate_round_trip_cost(candidate: Any) -> Optional[float]:
     if cost < -0.01:
         return None
     return round(max(0.0, cost), 2)
+
+
+def _event_realized_gross_pnl(event: Dict[str, Any]) -> Optional[float]:
+    """Gross outcome of a new exit row from its own booked pnl and declared cost."""
+    booked = _number_or_none(event.get("pnl"))
+    if booked is None:
+        return None
+    pnl_basis = _canonical_pnl_basis(event.get("pnl_basis"), default=PNL_BASIS_NET)
+    if pnl_basis == PNL_BASIS_GROSS:
+        return booked
+    cost = _number_or_none(event.get("round_trip_cost"))
+    if cost is None or cost < 0:
+        return None
+    return booked + cost
 
 
 def _event_round_trip_cost(event: Dict[str, Any]) -> Optional[float]:

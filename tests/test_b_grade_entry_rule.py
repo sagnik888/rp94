@@ -7,6 +7,7 @@ still required. Tracker outcomes never lower this floor.
 """
 
 from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -131,7 +132,13 @@ _STATIC_METHODS = [
 def _stub(regime, tf_regimes=None):
     scanner = SimpleNamespace(
         mode="REAL", latest_regimes={"NIFTY": regime},
+        mtf=SimpleNamespace(engines={
+            "NIFTY_15min": SimpleNamespace(
+                get_state=lambda _key: SimpleNamespace(position=1)
+            ),
+        }),
         _timeframe_regimes=dict(tf_regimes or {}),
+        _intel_cache_time={key: time.time() for key in {'NIFTY_5min', *(tf_regimes or {})}},
     )
     for name in _INST_METHODS:
         setattr(scanner, name, getattr(Scanner, name).__get__(scanner, Scanner))

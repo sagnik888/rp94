@@ -15,6 +15,7 @@ import time
 import pytest
 
 from data.market_data import MarketDataProvider
+from engine.exit_cycle import ExitCycleService
 from scanner import Scanner
 from trading.trade_manager import IST, TradeManager
 
@@ -70,6 +71,46 @@ def test_contract_tick_history_reports_bounded_buffer_overflow():
     assert overflowed is True
 
 
+def test_open_position_retains_long_burst_while_candidate_stays_bounded():
+    provider = _provider()
+    provider._contract_tick_history_size = 16
+    provider._active_contract_tick_history_size = 8192
+    provider.set_active_contract_tick_tokens({"LIVE"})
+    for index in range(5000):
+        provider._record_contract_tick("LIVE", 100.0 + index / 100.0, 1_780_000_000.0 + index / 1000.0)
+        provider._record_contract_tick("CANDIDATE", 100.0, 1_780_000_000.0 + index / 1000.0)
+    live, live_cursor, live_overflow = provider.get_contract_ticks_since("LIVE", 1)
+    candidate, _, candidate_overflow = provider.get_contract_ticks_since("CANDIDATE", 1)
+    assert len(live) == 4999 and live_cursor == 5000 and live_overflow is False
+    assert len(candidate) == 16 and candidate_overflow is True
+
+
+def test_active_position_tick_history_is_not_evicted_before_candidates():
+    provider = _provider()
+    provider._contract_tick_history_token_limit = 8
+    provider.set_active_contract_tick_tokens({"LIVE"})
+    base = 1_780_000_000.0
+    provider._record_contract_tick("LIVE", 100.0, base)
+    for index in range(8):
+        provider._record_contract_tick(f"C{index}", 100.0, base + index + 1)
+    ticks, _, _ = provider.get_contract_ticks_since("LIVE")
+    assert len(ticks) == 1
+
+
+def test_exit_worker_prioritizes_only_open_position_contracts(monkeypatch):
+    selected = []
+    data = SimpleNamespace(set_active_contract_tick_tokens=lambda tokens: selected.append(set(tokens)))
+    trades = SimpleNamespace(open_trades={
+        "open": SimpleNamespace(symbol_token="LIVE", status="OPEN"),
+        "closed": SimpleNamespace(symbol_token="OLD", status="CLOSED"),
+    })
+    scanner = SimpleNamespace(data=data, trades=trades)
+    service = ExitCycleService(scanner)
+    monkeypatch.setattr(service, "update_active_trades", lambda **_kw: None)
+    service.run_tick()
+    assert selected == [{"LIVE"}]
+
+
 def test_concurrent_socket_writers_keep_sequence_order_and_bounded_memory():
     provider = _provider()
     provider._contract_tick_history_size = 2048
@@ -111,6 +152,7 @@ def _manager_with_trade(*, inst_type="OPT", direction="LONG", stop=90.0, target=
         lots=1,
         lot_size=25,
         grade="A",
+        confidence=0.8,
         target=target,
         inst_type=inst_type,
         option_type="CE" if inst_type == "OPT" else "",

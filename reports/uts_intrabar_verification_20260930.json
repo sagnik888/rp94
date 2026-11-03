@@ -1,0 +1,35 @@
+{
+  "runs": [
+    {
+      "file": "uts_intrabar_full_20260930.xml",
+      "passed": 7583,
+      "failed": 1,
+      "skipped": 0
+    },
+    {
+      "file": "uts_intrabar_followup_20260930.xml",
+      "passed": 42,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "file": "uts_intrabar_optional_integration_20260930.xml",
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0
+    }
+  ],
+  "unique_current_tests_passed": 7591,
+  "unresolved": [],
+  "production_sources_stable": true,
+  "runtime": "Dashboard status unavailable; no live settings or broker mutations performed.",
+  "timing": {
+    "forming_1min_default_seconds": 6,
+    "forming_1min_range_seconds": [
+      5,
+      7
+    ],
+    "forming_5min_15min_default_seconds": 20,
+    "post_entry_repaint_default_seconds": 10
+  }
+}

@@ -125,12 +125,13 @@ def _serialize_trade_row(manager: Any, trade: Any) -> Dict[str, Any]:
         "exit_price": trade.exit_price if trade.status == "CLOSED" else 0.0,
         "trailing_stop": round(display_stop, 2) if display_stop is not None else 0.0,
         "target": round(display_target, 2) if display_target is not None and display_target > 0 else 0,
-        "pnl": round(trade.pnl, 0) if trade.pnl is not None else 0.0,
+        "pnl": round(trade.pnl, 2) if trade.pnl is not None else 0.0,
         "lots": trade.lots,
         "lot_size": trade.lot_size,
         "grade": trade.grade,
         "confidence": round(trade.confidence, 2) if trade.confidence is not None else 0.0,
         "rr_ratio": trade.rr_ratio,
+        "entry_policy_actual_rr": float(getattr(trade, "entry_policy_actual_rr", 0.0) or 0.0),
         "atm_strike": trade.atm_strike,
         "option_type": trade.option_type,
         "inst_type": trade.inst_type,
@@ -148,6 +149,14 @@ def _serialize_trade_row(manager: Any, trade: Any) -> Dict[str, Any]:
         "source_engine": str(getattr(trade, "source_engine", "") or ""),
         "source_engines": list(getattr(trade, "source_engines", []) or []),
         "source_lane": str(getattr(trade, "source_lane", "") or ""),
+        "trading_symbol": str(getattr(trade, "trading_symbol", "") or ""),
+        "data_provenance": str(getattr(trade, "data_provenance", "") or ""),
+        "market_regime": str(getattr(trade, "market_regime", "") or ""),
+        "entry_intelligence_score": float(getattr(trade, "entry_intelligence_score", 0.0) or 0.0),
+        "initial_stop": float(getattr(trade, "initial_stop", 0.0) or 0.0),
+        "charges": float(getattr(trade, "charges", 0.0) or 0.0),
+        "replay_input": next((dict(row) for row in getattr(trade, "replay_exit_trace", [])
+                              if row.get("guard") == "replay_input"), {}),
     }
 
 

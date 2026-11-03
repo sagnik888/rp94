@@ -1,0 +1,79 @@
+{
+  "configuration": {
+    "scanner_engine": "quad_prime",
+    "inst_pref": "OPT",
+    "live_signal_stabilization_seconds_5min": 30.0,
+    "live_signal_stabilization_seconds_15min": 30.0,
+    "ut_confidence_calibration_enabled": true,
+    "ut_confidence_calibration_live_apply_enabled": false,
+    "regime_smoothing_enabled": true,
+    "regime_smoothing_window": 5,
+    "regime_er_veto_enabled": false,
+    "regime_range_day_adx_override_needs_er": false,
+    "ut_market_location_gate": true,
+    "peak_giveback_cap_enabled": false
+  },
+  "opening_phase_conflict": {
+    "has_context": true,
+    "score_adjustment": 0.096,
+    "regime_multiplier_cap": 1.0,
+    "reasons": [
+      "session trend-up prior +0.096"
+    ]
+  },
+  "zero_volume_order_flow": {
+    "signal": "BULLISH",
+    "aggressor": "BUYERS",
+    "available": true,
+    "source": "ohlcv_close_position",
+    "buy_volume": 0,
+    "sell_volume": 0,
+    "ratio": 1.0,
+    "true_tick_footprint_available": false
+  },
+  "illustrative_grading": [
+    {
+      "regime": "TRENDING_UP",
+      "intel": 0.5,
+      "result": [
+        "A+",
+        0.9496693674025232,
+        [
+          "Momentum: Healthy (ADX: 25.0)",
+          "Technical: Moderate Multi-TF Confluence",
+          "Technical: Tight Risk-Window (1.0x ATR)",
+          "Intelligence: Moderate Data Support",
+          "Regime: Trend-Following alignment"
+        ]
+      ]
+    },
+    {
+      "regime": "RANGING",
+      "intel": 0.075,
+      "result": [
+        "B+",
+        0.574442516811659,
+        [
+          "Momentum: Healthy (ADX: 25.0)",
+          "Technical: Moderate Multi-TF Confluence",
+          "Technical: Tight Risk-Window (1.0x ATR)",
+          "Regime: Range-bound noise (RANGING)"
+        ]
+      ]
+    },
+    {
+      "regime": "UNKNOWN",
+      "intel": 0.075,
+      "result": [
+        "C",
+        0.3318122278318339,
+        [
+          "Momentum: Healthy (ADX: 25.0)",
+          "Technical: Moderate Multi-TF Confluence",
+          "Technical: Tight Risk-Window (1.0x ATR)",
+          "Regime: UNKNOWN (High Risk Penalty)"
+        ]
+      ]
+    }
+  ]
+}

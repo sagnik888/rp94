@@ -1,8 +1,9 @@
 """
 Market Data Provider — Institutional Broker-Master Integration
 ═══════════════════════════════════════════════════════════════
-Primary: Kite execution-broker quotes; secondary: Fyers stream/history
-Tertiary live index price: AngelOne SmartAPI; Yahoo is delayed opt-in only
+Primary: Kite execution-broker quotes; supplementary: Angel One
+Backup: FYERS, including capability-specific cash-volume and reference data
+Yahoo is delayed opt-in only; legacy and two-provider routes remain selectable
 """
 
 import os
@@ -63,6 +64,26 @@ FYERS_INDEX_SYMBOLS = {
     "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
 }
 FYERS_SYMBOL_TO_INDEX = {v: k for k, v in FYERS_INDEX_SYMBOLS.items()}
+# Quotable instruments that are NOT tradable indices, so they must stay out of
+# FYERS_INDEX_SYMBOLS: that map feeds the tradable-index websocket list, reverse
+# lookup and several "which index is this" helpers. Auxiliary quotes can still use
+# their own websocket subscription and remain ordinary cached quotes.
+#
+# India VIX reached the system as AngelOne token 99926017 through the AngelOne socket.
+# The Kite migration retired that socket and nothing re-subscribed the token, so
+# get_ltp("NSE", "INDIAVIX", "99926017") has had no live tier since: Kite has no
+# INDIAVIX instrument, FYERS_INDEX_SYMBOLS has no entry, INDEX_SPOT_TOKENS has no entry
+# and YAHOO_TICKERS has no entry. data_store/vix_history.json stopped at
+# 2026-08-01 00:06 for that reason. Fyers does quote it, verified live at 13.39.
+FYERS_AUX_SYMBOLS = {
+    "INDIAVIX": "NSE:INDIAVIX-INDEX",
+}
+
+
+def fyers_quote_symbol(symbol: str) -> str:
+    """The Fyers symbol for a tradable index or a quotable auxiliary instrument."""
+    key = str(symbol or "").upper()
+    return FYERS_INDEX_SYMBOLS.get(key) or FYERS_AUX_SYMBOLS.get(key, "")
 INDEX_STRIKE_INTERVALS = {"NIFTY": 50, "BANKNIFTY": 100, "SENSEX": 100, "MIDCPNIFTY": 25}
 YAHOO_INTERVALS = {"1min": "1m", "5min": "5m", "15min": "15m"}
 YAHOO_MAX_DAYS = {"1m": 7, "5m": 60, "15m": 60}
@@ -250,7 +271,10 @@ def retry_on_exception(retries: int = 3, delay: float = 1.0, backoff: float = 2.
         return wrapper
     return decorator
 
-class MarketDataProvider:
+from data.kite_angel_migration import KiteAngelMigration
+
+
+class MarketDataProvider(KiteAngelMigration):
     _option_oi_snapshot_file_lock = threading.RLock()
     _bounded_call_init_lock = threading.Lock()
 
@@ -279,6 +303,7 @@ class MarketDataProvider:
         # sanitized logging and accepts only index quotes plus independently resolved
         # option contracts; it never receives execution authority.
         self.smart_api = None
+        _settings = None
         try:
             from config.settings import get_settings
 
@@ -372,6 +397,10 @@ class MarketDataProvider:
         self._contract_tick_history: Dict[str, deque] = {}
         self._contract_tick_sequences: Dict[str, int] = {}
         self._contract_tick_history_size = 2048
+        # Open positions need a longer ordered tail when synchronous scan work
+        # delays the 100 ms monitor. Keep candidate subscriptions at 2048.
+        self._active_contract_tick_history_size = 32768
+        self._active_contract_tick_tokens: set[str] = set()
         self._contract_tick_history_token_limit = 128
         # Kite and Fyers websocket callbacks run on different SDK threads.  Index
         # quotes therefore need their own short-lived guard: without one, a reader can
@@ -409,7 +438,9 @@ class MarketDataProvider:
         self._fyers_auth_reason = ""
         self._fyers_token_updated_at = None
         self.fyers: Optional[fyersModel.FyersModel] = None
-        self._load_fyers_token()
+        self._initialize_replacement(_settings)
+        if self._fyers_enabled():
+            self._load_fyers_token()
 
     def _angel_rest_backoff_config(self) -> Tuple[float, float]:
         try:
@@ -428,6 +459,10 @@ class MarketDataProvider:
         chain errors/stale fallbacks; re-initialising the client from the
         stored token is what that restart effectively did, so do it
         automatically instead of waiting for an operator."""
+        # Endpoint failures in an optional backup must not recycle its shared
+        # session/socket or trigger token refresh while preferred brokers work.
+        if self._fyers_backup_enabled():
+            return
         try:
             from config.settings import get_settings
             settings = get_settings()
@@ -580,7 +615,7 @@ class MarketDataProvider:
             code = int(profile.get("code"))
         except (TypeError, ValueError):
             code = profile.get("code")
-        return profile.get("s") == "error" and code in {-8, -17, -300}
+        return profile.get("s") == "error" and code in {-8, -15, -16, -17, -300}
 
     @staticmethod
     def _fyers_ws_gateway_timeout(error: Any) -> bool:
@@ -688,6 +723,12 @@ class MarketDataProvider:
         configured transport timeout.
         """
         client = getattr(self, "fyers", None)
+        if bool(getattr(self, "_fyers_auth_required", False)):
+            return False, None
+        retry_at = self.__dict__.setdefault("_fyers_endpoint_retry_at", {})
+        request_key = (method_name, json.dumps(kwargs.get("data"), sort_keys=True, default=str))
+        if time.time() < max(float(retry_at.get(method_name, 0.0)), float(retry_at.get(request_key, 0.0))):
+            return False, None
         method = getattr(client, str(method_name or ""), None)
         if not callable(method):
             return False, None
@@ -701,7 +742,7 @@ class MarketDataProvider:
             )
         except Exception:
             timeout = float(timeout_seconds if timeout_seconds is not None else 8.0)
-        return self._call_bounded(
+        ok, response = self._call_bounded(
             method,
             *args,
             timeout=timeout,
@@ -709,6 +750,25 @@ class MarketDataProvider:
             wait_if_busy=wait_if_busy,
             **kwargs,
         )
+        if client is not getattr(self, "fyers", None):
+            # An old request can finish after a manual login installs a new
+            # session. Its rejection must not quarantine the replacement client.
+            return ok, response
+        if self._fyers_profile_token_error(response):
+            self._mark_fyers_auth_required("FYERS backup session rejected; preferred broker sessions are unchanged")
+        elif ok and isinstance(response, dict) and response.get("s") == "error":
+            detail = str(response.get("message") or "").lower()
+            limited = response.get("code") in {-360, 429} or any(
+                term in detail for term in ("requests/minute", "requests/day", "too many requests"))
+            retry_at[method_name if limited else request_key] = time.time() + (60.0 if limited else 180.0)
+            # A bad symbol/expiry must not disable this endpoint for other indices.
+            if len(retry_at) > 64:
+                expired = [key for key, until in retry_at.items() if until <= time.time()]
+                for key in expired:
+                    retry_at.pop(key, None)
+        elif ok:
+            retry_at.pop(request_key, None)
+        return ok, response
 
     def _fyers_ws_token_ready_for_reconnect(self, access_token: str, ws_generation: int) -> bool:
         token_data = self._read_fyers_token_file()
@@ -756,6 +816,8 @@ class MarketDataProvider:
             return True
 
     def _load_fyers_token(self):
+        if not self._fyers_enabled():
+            return
         try:
             token_data = self._read_fyers_token_file()
             if not token_data:
@@ -820,7 +882,8 @@ class MarketDataProvider:
                     )
                     logger.warning(
                         "⚠️ Fyers session validation did not return an authenticated "
-                        "profile; data stays fail-closed until validation succeeds."
+                        "profile; the FYERS feed stays unavailable until validation succeeds. "
+                        "Preferred broker sessions are evaluated independently."
                     )
             else:
                 logger.warning("⚠️ Fyers access token missing in fyers_token.json")
@@ -1065,7 +1128,12 @@ class MarketDataProvider:
         self._fyers_ws_connected = False
         self._fyers_ws_connected_since = 0.0
         self._kite_ws_connected = False
+        replacement_stop = getattr(self, "_replacement_stop", None)
+        if replacement_stop is not None:
+            replacement_stop.set()
+            self._replacement_closed = True
         sockets = [
+            ("angel shutdown", getattr(self, "angel_index", None)),
             ("fyers shutdown", getattr(self, "_fyers_ws", None)),
             ("kite shutdown", getattr(self, "kws", None)),
         ]
@@ -1099,6 +1167,54 @@ class MarketDataProvider:
         self.kws = None
         return all(results.values())
 
+    def enable_live_streams(self) -> bool:
+        """Enable broker sockets after a runtime REPLAY -> live-mode switch.
+
+        The provider can be constructed while the scanner is in REPLAY, which keeps
+        both sockets off.  A later dashboard/premarket switch to PAPER or REAL used to
+        change only scanner state; ``start_streams`` stayed false for the lifetime of
+        the provider.  Manual broker logins then refreshed REST clients successfully
+        but deliberately skipped their sockets, leaving the live dashboard degraded.
+
+        Return True only for the first transition.  Later auth callbacks use the now
+        enabled flag to restart their own socket with the new token.
+        """
+        if bool(getattr(self, "start_streams", False)):
+            return False
+
+        self.start_streams = True
+        self._prewarm_angelone_fallback()
+        started = []
+
+        try:
+            token_data = self._read_fyers_token_file()
+            access_token = str(token_data.get("access_token") or "")
+            if (
+                access_token
+                and getattr(self, "fyers", None) is not None
+                and not bool(getattr(self, "_fyers_auth_required", False))
+            ):
+                self.start_fyers_websocket(access_token)
+                started.append("Fyers")
+        except Exception as exc:
+            logger.error(f"Fyers WebSocket activation after live-mode switch failed: {exc}")
+
+        try:
+            kite = getattr(self, "kite", None)
+            if bool(getattr(self, "is_connected", False)) and bool(
+                getattr(kite, "is_connected", False)
+            ):
+                if self.start_kite_ticker():
+                    started.append("Kite")
+        except Exception as exc:
+            logger.error(f"Kite WebSocket activation after live-mode switch failed: {exc}")
+
+        logger.info(
+            "Live market-data streams enabled after runtime mode switch"
+            + (f": {', '.join(started)}" if started else "; awaiting broker login")
+        )
+        return True
+
     @staticmethod
     def _fyers_ws_tick_stalled(last_tick: float, connected_since: float,
                                now_ts: float, stall_seconds: float) -> bool:
@@ -1119,7 +1235,9 @@ class MarketDataProvider:
         return bool(no_tick_after_open or stale_tick_after_open)
 
     def start_fyers_websocket(self, access_token: str):
-        """Start Fyers WebSocket in a separate thread"""
+        """Start Fyers WebSocket in a separate thread."""
+        if not self._fyers_enabled():
+            return
         self._fyers_ws_generation = getattr(self, "_fyers_ws_generation", 0) + 1
         ws_generation = self._fyers_ws_generation
         self._fyers_ws_connected = False
@@ -1259,7 +1377,7 @@ class MarketDataProvider:
                 # grace window to deliver its first tick (no_tick_after_open branch,
                 # measured from the fresh connected_since).
                 self._last_fyers_ws_tick = 0.0
-                symbols = list(FYERS_INDEX_SYMBOLS.values())
+                symbols = [*FYERS_INDEX_SYMBOLS.values(), *FYERS_AUX_SYMBOLS.values()]
                 self._fyers_ws.subscribe(symbols=symbols)
                 logger.info(f"Subscribed to Fyers symbols: {symbols}")
 
@@ -1526,18 +1644,24 @@ class MarketDataProvider:
             return False
 
     def get_fyers_auth_status(self) -> Dict[str, Any]:
+        if not self._fyers_enabled():
+            return {"enabled": False, "connected": False, "auth_required": False,
+                    "reason": "Retained for rollback; Kite/Angel route selected", "recovery": "none"}
         token_path = Path("fyers_token.json")
         token_mtime = None
         token_data: Dict[str, Any] = {}
         if token_path.exists():
             token_mtime = datetime.fromtimestamp(token_path.stat().st_mtime).isoformat()
             token_data = self._read_fyers_token_file()
-        connected = self.fyers is not None
         auth_required = bool(self._fyers_auth_required)
+        connected = self.fyers is not None and not auth_required
         reason = str(self._fyers_auth_reason or "")
         if not connected and not reason:
             reason = "Fyers authenticated session unavailable"
         return {
+            "enabled": True,
+            "role": "backup" if self._fyers_backup_enabled() else "primary",
+            "required_for_preferred_data": not self._fyers_backup_enabled(),
             "connected": connected,
             "auth_required": auth_required,
             "reason": reason,
@@ -1633,6 +1757,8 @@ class MarketDataProvider:
 
         self._fyers_token_updated_at = token_data["timestamp"]
         self._fyers_refresh_disabled = False
+        self._fyers_endpoint_retry_at = {}
+        self._fyers_history_retry_at = 0.0
         self._clear_fyers_auth_required()
         logger.success("✅ Fyers manual authorization completed successfully.")
         if getattr(self, "start_streams", True):
@@ -1784,6 +1910,8 @@ class MarketDataProvider:
 
     def _prewarm_angelone_fallback(self) -> bool:
         """Authenticate AngelOne off-loop once; Kite still owns all execution."""
+        if getattr(self, "_replacement_closed", False):
+            return False
         source = getattr(self, "angel_index", None)
         if source is None or not bool(getattr(source, "configured", False)):
             return False
@@ -1803,8 +1931,12 @@ class MarketDataProvider:
                     prewarm()
                 else:
                     source.connect()
+                self._start_replacement_stream()
             except Exception:
                 logger.warning("AngelOne fallback prewarm failed.")
+            finally:
+                if self._replacement_enabled():
+                    self._angel_prewarm_started = False
 
         threading.Thread(
             target=_connect, daemon=True, name="AngelOneFallbackPrewarm"
@@ -2133,6 +2265,7 @@ class MarketDataProvider:
                     self._last_ltp_time = now_ts
                     index_name = self._kite_index_names.get(token)
                     if not index_name:
+                        self._record_option_participation_tick(token, tick, now_ts)
                         self._record_contract_tick(
                             token,
                             price,
@@ -2207,6 +2340,16 @@ class MarketDataProvider:
         def on_error(ws, code, reason):
             self._kite_ws_connected = False
             logger.error(f"Kite WebSocket error ({code}): {reason}")
+            if "403" in str(reason):
+                # Kite refused the socket upgrade: the session was reset (2026-09-25:
+                # a dead token reconnected here every few seconds for hours). Settle
+                # it off the socket thread; a proven-dead session stops the retries.
+                threading.Thread(
+                    target=self._on_kite_ticker_forbidden,
+                    args=(ws, str(reason)),
+                    name="kite-ticker-403",
+                    daemon=True,
+                ).start()
 
         def on_reconnect(ws, attempts):
             logger.warning(f"Kite WebSocket reconnecting (attempt {attempts})")
@@ -2263,6 +2406,42 @@ class MarketDataProvider:
             logger.error(f"Kite ticker failed to start: {exc}")
             return False
         logger.info("🚀 Kite WebSocket thread started")
+        return True
+
+    def _on_kite_ticker_forbidden(self, ws, reason: str) -> bool:
+        """A 403 on the ticker upgrade: confirm the session is dead, then stop retrying.
+
+        A new browser login rebinds Kite and starts a fresh ticker (rebind_kite), so the
+        stopped socket is never needed again.
+        """
+        auth = getattr(getattr(self, "kite", None), "_auth", None)
+        if auth is None:
+            return False
+        dead = False
+        probe = getattr(auth, "confirm_dead_session", None)
+        if callable(probe):
+            try:
+                dead = bool(probe(f"Kite WebSocket upgrade refused: {reason}"))
+            except Exception as exc:
+                logger.debug(f"Kite ticker 403 probe failed: {exc}")
+        try:
+            dead = dead or bool((auth.status() or {}).get("auth_required"))
+        except Exception as exc:
+            logger.debug(f"Kite auth status unreadable after ticker 403: {exc}")
+        if not dead:
+            return False
+        try:
+            stop_retry = getattr(ws, "stop_retry", None)
+            if callable(stop_retry):
+                stop_retry()
+        except Exception as exc:
+            logger.debug(f"Kite ticker stop_retry failed: {exc}")
+        self._close_ws_socket(ws, "kite ticker (session refused)")
+        self._kite_ws_connected = False
+        logger.critical(
+            "Kite WebSocket stopped: Kite refused the session (403). Log in again at "
+            "/api/kite_login; the ticker restarts on the new session."
+        )
         return True
 
     @staticmethod
@@ -2409,6 +2588,7 @@ class MarketDataProvider:
     def get_source_health(self) -> Dict[str, Any]:
         """Check each provider independently; Yahoo is an idle emergency source."""
         health = build_source_health(self)
+        health["market_data_replacement"] = self._replacement_health()
         remaining = max(
             0.0,
             float(getattr(self, "_angel_rest_backoff_until", 0.0) or 0.0) - time.time(),
@@ -2805,6 +2985,18 @@ class MarketDataProvider:
         ).lower().startswith("fyers"):
             fyers = None
 
+        if broker is None and self._fyers_backup_enabled():
+            primary_rest = dict((getattr(self, "_ltp_cache", {}) or {}).get(symbol) or {})
+            primary_age = self._quote_age_components(primary_rest, now).get("age")
+            if (str(primary_rest.get("source", "")).startswith("kite")
+                    and float(primary_rest.get("ltp") or 0) > 0
+                    and primary_age is not None and 0 <= primary_age <= broker_window):
+                broker = (primary_age, primary_rest)
+
+        angel = self._freshest_cached_index_quote(("angel:" + symbol,), broker_window, now) if self._replacement_enabled() else None
+        if broker is not None and angel is not None:
+            self._flag_quote_divergence(symbol, "kite", float(broker[1]["ltp"]), "angelone", float(angel[1]["ltp"]))
+
         if broker is not None and fyers is not None:
             broker_ltp = float(broker[1].get("ltp", 0.0) or 0.0)
             fyers_ltp = float(fyers[1].get("ltp", 0.0) or 0.0)
@@ -2816,7 +3008,7 @@ class MarketDataProvider:
             # while both callbacks independently mutated one OHLC candle.
             return broker[1], broker[0]
 
-        selected = broker or fyers
+        selected = broker or angel or fyers
         if selected is None:
             return None, None
         return selected[1], selected[0]
@@ -2838,6 +3030,8 @@ class MarketDataProvider:
         Kite stops, two fresh Fyers packets over a short dwell are required before Fyers
         owns price. A recovering Kite tick takes ownership immediately.
         """
+        if self._fyers_backup_enabled():
+            return self._emit_three_broker_tick(index_name, price, volume, volume_source, price_source, received_at, exchange_at)
         now = time.time() if received_at is None else float(received_at)
         try:
             value = float(price or 0.0)
@@ -2849,7 +3043,8 @@ class MarketDataProvider:
         source = str(price_source or "").lower()
         is_kite = source.startswith("kite")
         is_fyers = source.startswith("fyers")
-        if not (is_kite or is_fyers):
+        is_angel = source.startswith("angel") and self._replacement_enabled()
+        if not (is_kite or is_fyers or is_angel):
             return False
 
         try:
@@ -2889,7 +3084,9 @@ class MarketDataProvider:
         ).lower().startswith("kite"):
             stale_broker = None
 
+        secondary_source = "angel_ws" if self._replacement_enabled() else "fyers_ws"
         emit_price = None
+        emit_native_price = False
         with self._index_quote_guard():
             routes = getattr(self, "_index_price_route", None)
             if not isinstance(routes, dict):
@@ -2926,7 +3123,7 @@ class MarketDataProvider:
                 # alter close/high/low. Price-only packets add no information.
                 if emit_volume > 0 and authoritative > 0:
                     emit_price = authoritative
-            elif str(route.get("active_source") or "") == "fyers_ws":
+            elif str(route.get("active_source") or "") == secondary_source:
                 route["last_authoritative_price"] = value
                 emit_price = value
             else:
@@ -2949,7 +3146,7 @@ class MarketDataProvider:
                 if ready:
                     route.update(
                         {
-                            "active_source": "fyers_ws",
+                            "active_source": secondary_source,
                             "last_authoritative_price": value,
                             "last_switch_at": now,
                             "fyers_candidate_since": 0.0,
@@ -2964,6 +3161,8 @@ class MarketDataProvider:
                     prior = float(route.get("last_authoritative_price", 0.0) or 0.0)
                     if prior > 0:
                         emit_price = prior
+            emit_native_price = bool(is_kite or (broker is None
+                and route.get("active_source") == secondary_source and source == secondary_source))
 
         if emit_price is None:
             return False
@@ -2973,6 +3172,7 @@ class MarketDataProvider:
             emit_volume,
             str(volume_source or ""),
             timestamp=datetime.fromtimestamp(now),
+            native_price=emit_native_price,
         )
         return True
 
@@ -2999,6 +3199,7 @@ class MarketDataProvider:
         volume,
         source: str,
         timestamp: Optional[datetime] = None,
+        *, native_price: bool = True,
     ) -> None:
         """Hand a tick to the candle builder, telling it which feed the volume came from.
 
@@ -3017,7 +3218,12 @@ class MarketDataProvider:
             self._tick_callback_ref = callback
             self._tick_callback_takes_source = self._accepts_five_args(callback)
         stamp = timestamp or datetime.now()
-        if self._tick_callback_takes_source:
+        if getattr(callback, "_utema_accepts_native_price", False) is True:
+            # A standby volume receipt repeats the owner's cached price. Keep its
+            # candle/volume update, but do not advance the native price clock and
+            # reject a later-delivered owner tick from an older callback batch.
+            callback(index_name, price, volume, stamp, source, native_price=native_price)
+        elif self._tick_callback_takes_source:
             callback(index_name, price, volume, stamp, source)
         else:
             callback(index_name, price, volume, stamp)
@@ -3062,6 +3268,8 @@ class MarketDataProvider:
         source = str(self._index_cum_volume_source.get(index_name, "") or "")
         fyers_ts = float(self._index_cum_volume_at.get(index_name, 0.0) or 0.0)
         fyers_fresh = carried > 0 and (now_ts - fyers_ts) <= self.FYERS_VOLUME_STALE_SECONDS
+        # Derivative participation is independent of cash-volume availability.
+        self._request_index_volume_refresh(index_name, now_ts)
         if fyers_fresh:
             return carried, source or "fyers_index"
 
@@ -3071,7 +3279,6 @@ class MarketDataProvider:
         # for EVERY instrument for the duration. Kick the refresh onto a worker and serve
         # whatever the last one resolved; cumulative volume only grows, so a slightly old
         # total is a small undercount, never a fabricated surge.
-        self._request_index_volume_refresh(index_name, now_ts)
         return carried, source
 
     def _request_index_volume_refresh(self, index_name: str, now_ts: float) -> None:
@@ -3118,9 +3325,28 @@ class MarketDataProvider:
             volume = float(activity.get("volume") or 0.0)
             futures = dict(activity.get("futures") or {})
             if futures.get("available") and float(futures.get("volume") or 0.0) > 0:
-                self._record_index_futures_volume_snapshot(
-                    index_name, futures, now_ts=time.time()
-                )
+                exchange_at = self._exchange_timestamp_from_payload(futures)
+                receipt_at = time.time()
+                # A REST receipt clock cannot turn yesterday's derivative quote into a
+                # current-volume observation.  Snapshot increments are only valid when
+                # the broker supplied an exchange/last-trade clock and it is current.
+                if exchange_at is not None and abs(receipt_at - exchange_at) <= 90.0:
+                    self._participation_store().observe(index_name, "futures", "kite",
+                        str(futures.get("tradingsymbol") or ""), exchange_at,
+                        float(futures.get("volume") or 0), oi=float(futures.get("oi") or 0),
+                        price=float(futures.get("last_price") or 0), expiry=str(futures.get("expiry") or ""),
+                        unit=str(futures.get("unit") or "broker_reported_quantity"))
+                    self._record_index_futures_volume_snapshot(
+                        index_name, futures, now_ts=exchange_at
+                    )
+                    # Read-only listener (the build-up shadow); it never touches this feed.
+                    observer = getattr(self, "futures_observer", None)
+                    if callable(observer):
+                        try:
+                            observer(index_name, exchange_at, float(futures.get("last_price") or 0),
+                                     float(futures.get("volume") or 0), float(futures.get("oi") or 0))
+                        except Exception as exc:
+                            logger.debug(f"Futures observer failed for {index_name}: {exc}")
             if volume <= 0:
                 return
             if source == "fyers_index":
@@ -3143,12 +3369,121 @@ class MarketDataProvider:
                     "oi": float(activity.get("oi") or 0.0),
                     "at": time.time(),
                     "tradingsymbol": str(futures.get("tradingsymbol") or ""),
+                    "unit": str(activity.get("volume_unit") or activity.get("unit") or futures.get("unit") or "broker_reported_quantity"),
                 }
         except Exception as exc:
             logger.debug(f"Index activity fallback failed for {index_name}: {exc}")
         finally:
+            # This worker is off the price/order path; tick collection itself does no I/O.
+            try:
+                self._participation_store().flush()
+            except Exception as exc:
+                logger.warning(f"Derivative observations could not be archived: {exc}")
             with self._index_volume_refresh_guard:
                 self._index_volume_refresh_inflight.discard(index_name)
+
+    def _participation_store(self):
+        from data.derivative_participation import DerivativeParticipation
+        # Workers are serialized per index; use a class lock for first publication.
+        with self._option_oi_snapshot_file_lock:
+            store = getattr(self, "_derivative_participation", None)
+            if store is None:
+                store = self._derivative_participation = DerivativeParticipation(
+                    archive_dir=(Path(os.environ["UTBOT_TEST_DB_PATH"]).parent / "derivative_observations"
+                                 if os.environ.get("UTBOT_TEST_DB_PATH") else "data_store/derivative_observations"))
+            return store
+
+    def get_derivative_participation(self, instrument, timeframe, as_of):
+        return self._participation_store().features(instrument, timeframe, as_of)
+
+    def get_recorded_option_chain(self, instrument, as_of, expiry=""):
+        return self._participation_store().recorded_option_chain(instrument, as_of, expiry=expiry)
+
+    def _archive_option_chain(self, instrument, chain, timestamp, quality):
+        try:
+            self._subscribe_derivative_pairs(instrument, chain)
+        except Exception as exc:
+            logger.warning(f"Derivative paired stream could not be subscribed for {instrument}: {exc}")
+        try:
+            timestamp = max(float(timestamp), float(chain.attrs.get("observed_at") or timestamp))
+            self._participation_store().record_option_chain(instrument, chain, timestamp, quality)
+            self._participation_store().flush()
+        except Exception as exc:
+            logger.warning(f"Option chain could not be archived for replay: {exc}")
+
+    def _subscribe_derivative_pairs(self, instrument, chain):
+        """Warm both exact CE/PE legs from the existing background chain refresh."""
+        if not getattr(self, "start_streams", False) or chain is None or chain.empty:
+            return
+        kite = getattr(self, "kite", None)
+        resolver = getattr(kite, "resolve_option", None)
+        from intelligence.derivative_context import _expiry
+        expiry = _expiry(chain.attrs.get("expiry"))
+        if not callable(resolver) or expiry is None:
+            return
+        cached = (getattr(self, "_ltp_cache", {}) or {}).get(instrument, {})
+        spot = float(cached.get("ltp", cached.get("price", 0)) or 0) if isinstance(cached, dict) else 0.0
+        if spot <= 0:
+            # The observed paired chain supplies an explicit ATM marker when available.
+            atm_rows = chain.loc[chain["is_atm"].eq(True)] if "is_atm" in chain else pd.DataFrame()
+            if not atm_rows.empty:
+                spot = float(atm_rows.iloc[0]["strike"])
+            elif "call_ltp" in chain and "put_ltp" in chain:
+                distance = (pd.to_numeric(chain.call_ltp, errors="coerce")-
+                            pd.to_numeric(chain.put_ltp, errors="coerce")).abs()
+                if distance.notna().any():
+                    spot = float(chain.loc[distance.idxmin(), "strike"])
+        if spot <= 0:
+            return
+        strikes = sorted(pd.to_numeric(chain["strike"], errors="coerce").dropna().unique(),
+                         key=lambda strike: abs(strike-spot))[:11]
+        tokens = []
+        for strike in strikes:
+            pair = [resolver(instrument, float(strike), side, expiry=expiry) for side in ("CE", "PE")]
+            if not all(isinstance(row, dict) and row.get("instrument_token")
+                       and _expiry(row.get("expiry")) == expiry for row in pair):
+                continue
+            for side, contract in zip(("CE", "PE"), pair):
+                self._register_derivative_contract(instrument, dict(contract, option_type=side))
+                tokens.append(str(contract["instrument_token"]))
+        if tokens:
+            self.subscribe_tokens(tokens)
+
+    def _register_derivative_contract(self, instrument, contract):
+        """Keep exact execution identities available to the non-blocking tick path."""
+        if isinstance(contract, dict):
+            token = str(contract.get("token") or contract.get("instrument_token") or "")
+            symbol = str(contract.get("symbol") or contract.get("tradingsymbol") or "")
+            expiry = str(contract.get("expiry") or "")
+            from intelligence.derivative_context import _expiry
+            parsed_expiry = _expiry(expiry)
+            if parsed_expiry is not None:
+                expiry = parsed_expiry.strftime("%d%b%Y").upper()
+            if token and symbol and expiry:
+                with self._option_oi_snapshot_file_lock:
+                    identities = getattr(self, "_derivative_token_identity", None)
+                    if identities is None:
+                        identities = self._derivative_token_identity = {}
+                    option_type = str(contract.get("option_type") or symbol[-2:]).upper()
+                    strike = float(contract.get("strike_val") or contract.get("strike") or 0)
+                    if not contract.get("strike_val") and contract.get("instrumenttype") == "OPTIDX":
+                        strike /= 100.0  # Execution master stores Angel paise-style strikes.
+                    identities[token] = (instrument, f"{symbol}|{expiry}|{token}",
+                                         expiry, option_type, strike)
+        return contract
+
+    def _record_option_participation_tick(self, token, tick, received_at):
+        identity = (getattr(self, "_derivative_token_identity", {}) or {}).get(str(token))
+        if not identity or "oi" not in tick:
+            return
+        quantity = tick.get("volume_traded", tick.get("volume"))
+        stamp = self._exchange_timestamp_from_payload(tick)
+        if quantity is None or stamp is None or not 0 <= received_at-stamp <= 90:
+            return
+        instrument, contract, expiry, option_type, strike = identity
+        self._participation_store().observe(instrument, "options", "kite", contract,
+            stamp, quantity, oi=tick["oi"], price=tick.get("last_price", 0), clock="exchange",
+            expiry=expiry, option_type=option_type, strike=strike)
 
     def _record_index_futures_volume_snapshot(
         self,
@@ -3193,6 +3528,9 @@ class MarketDataProvider:
                     "minute": minute,
                     "current_volume": 0.0,
                     "completed": deque(maxlen=20),
+                    "completed_rates": deque(maxlen=20),
+                    "current_seconds": 0.0,
+                    "unallocated_volume": 0.0,
                     "last_cumulative": cumulative,
                     "last_at": observed_at,
                 }
@@ -3201,17 +3539,35 @@ class MarketDataProvider:
             last_minute = int(state.get("minute") or minute)
             last_cumulative = float(state.get("last_cumulative") or cumulative)
             delta = max(0.0, cumulative - last_cumulative)
+            elapsed = max(0.0, observed_at - float(state.get("last_at") or observed_at))
             if minute != last_minute:
-                # A sampling gap makes the crossed-minute allocation unknowable. Reset
-                # the baseline rather than manufacture a surge from a multi-minute delta.
+                # The cumulative delta straddles two buckets.  It is unknowable how much
+                # belongs to each, even when only one minute was crossed, so never book it
+                # into the new minute.  Doing so made the first post-boundary poll look
+                # like a genuine one-minute burst.  Keep the completed *known* bucket and
+                # rebase the cumulative counter; subsequent same-minute observations are
+                # again an exact increment.
                 if minute - last_minute == 1:
                     state["completed"].append(
                         max(0.0, float(state.get("current_volume") or 0.0))
                     )
+                    seconds = float(state.get("current_seconds") or 0)
+                    if seconds >= 30:
+                        state.setdefault("completed_rates", deque(maxlen=20)).append(
+                            float(state.get("current_volume") or 0) / seconds)
                 else:
                     state["completed"].clear()
+                    state.setdefault("completed_rates", deque(maxlen=20)).clear()
                 state["minute"] = minute
                 state["current_volume"] = 0.0
+                state["current_seconds"] = 0.0
+                state["unallocated_volume"] = float(state.get("unallocated_volume") or 0) + delta
+                delta = 0.0
+            elif elapsed <= 30:
+                state["current_seconds"] = float(state.get("current_seconds") or 0) + elapsed
+            else:
+                state["unallocated_volume"] = float(state.get("unallocated_volume") or 0) + delta
+                delta = 0.0
             state["current_volume"] = float(state.get("current_volume") or 0.0) + delta
             state["last_cumulative"] = cumulative
             state["last_at"] = observed_at
@@ -3226,7 +3582,7 @@ class MarketDataProvider:
             "available": False,
             "reliable": False,
             "source": "kite_index_futures_minute",
-            "unit": "contracts",
+            "unit": "broker_reported_quantity",
             "tradingsymbol": "",
             "current_volume": 0.0,
             "baseline_volume": 0.0,
@@ -3251,22 +3607,32 @@ class MarketDataProvider:
             current = max(0.0, float(state.get("current_volume") or 0.0))
             last_at = float(state.get("last_at") or 0.0)
             symbol = str(state.get("tradingsymbol") or "")
+            bucket_minute = int(state.get("minute") or -1)
+            rates = list(state.get("completed_rates") or [])
+            seconds = float(state.get("current_seconds") or 0)
+            unallocated = float(state.get("unallocated_volume") or 0)
         age = max(0.0, observed_at - last_at) if last_at > 0 else None
+        current_minute = int(observed_at // 60)
+        # A receipt from the previous minute is not a live observation for the new
+        # bucket.  This prevents the clock alone from changing projected participation.
+        bucket_current = bucket_minute == current_minute
         positive = [value for value in completed if value > 0]
-        baseline = float(np.median(positive)) if positive else 0.0
-        progress = max(0.25, min(1.0, (observed_at % 60.0) / 60.0))
+        baseline_rate = float(np.median(rates)) if rates else 0.0
+        baseline = baseline_rate * 60
         ratio = current / baseline if baseline > 0 else 0.0
-        projected = ratio / progress if ratio > 0 else 0.0
+        projected = (current / seconds) / baseline_rate if seconds > 0 and baseline_rate > 0 else 0.0
         reliable = bool(
             symbol
             and age is not None
             and age <= 30.0
-            and len(positive) >= 5
+            and bucket_current
+            and len(rates) >= 5
+            and seconds >= 15
             and baseline > 0
         )
         return {
             **empty,
-            "available": bool(symbol and age is not None and age <= 30.0),
+            "available": bool(symbol and age is not None and age <= 30.0 and bucket_current),
             "reliable": reliable,
             "tradingsymbol": symbol,
             "current_volume": round(current, 4),
@@ -3274,6 +3640,10 @@ class MarketDataProvider:
             "ratio": round(ratio, 4),
             "projected_ratio": round(min(projected, 10.0), 4),
             "completed_samples": len(positive),
+            "measurement_basis": "sampled_volume_rate",
+            "coverage_seconds": seconds,
+            "volume_complete": False,
+            "unallocated_volume": unallocated,
             "age_seconds": round(age, 2) if age is not None else None,
         }
 
@@ -3336,6 +3706,12 @@ class MarketDataProvider:
                 futures = source.index_futures_activity(symbol) or {}
             except Exception as exc:
                 logger.debug(f"Futures activity lookup failed for {symbol}: {exc}")
+        if futures.get("available"):
+            exchange_at = self._exchange_timestamp_from_payload(futures)
+            # The exchange may update while the REST request is in flight.
+            received_at = time.time()
+            if exchange_at is None or not 0 <= received_at - exchange_at <= 90:
+                futures = {**futures, "available": False, "reason": "stale_or_missing_exchange_timestamp"}
         result["futures"] = futures
 
         if fyers_online:
@@ -3366,13 +3742,13 @@ class MarketDataProvider:
             result.update({
                 "volume": float(futures.get("volume") or 0.0),
                 "oi": float(futures.get("oi") or 0.0),
-                "source": "kite_index_futures", "unit": "contracts",
+                "source": "kite_index_futures", "unit": str(futures.get("unit") or "broker_reported_quantity"),
                 "comparable_to_thresholds": False,
                 "confirmation": "fallback_only",
                 "volume_available": True,
                 "volume_source": "kite_index_futures",
                 "volume_basis": "near_month_futures_confirmation",
-                "volume_unit": "contracts",
+                "volume_unit": str(futures.get("unit") or "broker_reported_quantity"),
                 "volume_comparable": False,
                 "volume_unavailable_reason": (
                     "cash_index_volume_unavailable; futures_confirmation_only"
@@ -3392,6 +3768,12 @@ class MarketDataProvider:
         happens to reconnect at — the fallback is a different quantity, so every extra
         second on it is another bar the volume series cannot use.
         """
+        if self._replacement_enabled():
+            # In this route FYERS cash-share volume comes from completed history,
+            # not index quotes. Four futile quote probes every 3s consume 80/min,
+            # exceeding the Standard 50/min budget and starving real cash history.
+            # Existing positive WebSocket volume and price fallback remain usable.
+            return 0.0
         if not hasattr(self, "_fyers_probe_at"):
             self._fyers_probe_at = {}
         if now - float(self._fyers_probe_at.get(symbol, 0.0) or 0.0) < self.FYERS_RECOVERY_PROBE_SECONDS:
@@ -3485,12 +3867,14 @@ class MarketDataProvider:
         if now - float(self._volume_fallback_alerted.get(symbol, 0.0) or 0.0) < 600.0:
             return
         self._volume_fallback_alerted[symbol] = now
+        unit = str(futures.get("unit") or "broker_reported_quantity")
+        unit_label = "broker-reported units" if unit == "broker_reported_quantity" else unit
         logger.warning(
-            f"INDEX VOLUME FALLBACK: {symbol} cash volume unavailable from Fyers; using "
+            f"INDEX VOLUME FALLBACK: {symbol} live cumulative cash volume unavailable; using "
             f"{futures.get('tradingsymbol')} futures volume "
-            f"({futures.get('volume'):,.0f} contracts, OI {futures.get('oi'):,.0f}) "
-            "for confirmation only. Cash-volume ratio thresholds abstain; the separate "
-            "futures-minute proxy uses its own contracts-only baseline."
+            f"({futures.get('volume'):,.0f} {unit_label}, OI {futures.get('oi'):,.0f}) "
+            "for confirmation only. Cash-volume gates require independently verified cash bars; the separate "
+            "futures-minute proxy uses its own same-unit baseline."
         )
 
     def _kite_token_for_index(self, symbol: str) -> str:
@@ -3541,7 +3925,12 @@ class MarketDataProvider:
                 sequences = {}
                 self._contract_tick_sequences = sequences
 
-            size = max(16, int(getattr(self, "_contract_tick_history_size", 2048) or 2048))
+            active = getattr(self, "_active_contract_tick_tokens", set())
+            size = max(16, int(
+                getattr(self, "_active_contract_tick_history_size", 32768)
+                if token in active
+                else getattr(self, "_contract_tick_history_size", 2048)
+            ))
             token_limit = max(
                 8,
                 int(getattr(self, "_contract_tick_history_token_limit", 128) or 128),
@@ -3552,8 +3941,9 @@ class MarketDataProvider:
                     # Evict least-recently-ticked contract. Frequently ticking active
                     # positions stay resident; stale candidate subscriptions do not grow
                     # memory for the full session.
+                    eviction_pool = [key for key in history if key not in active] or list(history)
                     oldest_token = min(
-                        history,
+                        eviction_pool,
                         key=lambda key: float(history[key][-1][2]) if history[key] else 0.0,
                     )
                     history.pop(oldest_token, None)
@@ -3571,6 +3961,24 @@ class MarketDataProvider:
                 exchange_epoch = 0.0
             queue.append((sequence, price, received_at, exchange_epoch))
             return sequence
+
+    def set_active_contract_tick_tokens(self, tokens) -> None:
+        """Reserve a longer tick tail for live positions without enlarging all symbols."""
+        active = {str(token).strip() for token in tokens if str(token).strip()}
+        lock = getattr(self, "_contract_tick_history_lock", None)
+        if lock is None:
+            self._contract_tick_history_lock = lock = threading.Lock()
+        with lock:
+            self._active_contract_tick_tokens = active
+            history = getattr(self, "_contract_tick_history", {})
+            for token, queue in list(history.items()):
+                size = (
+                    getattr(self, "_active_contract_tick_history_size", 32768)
+                    if token in active else getattr(self, "_contract_tick_history_size", 2048)
+                )
+                size = max(16, int(size))
+                if queue.maxlen != size:
+                    history[token] = deque(queue, maxlen=size)
 
     def get_contract_ticks_since(
         self,
@@ -3600,14 +4008,25 @@ class MarketDataProvider:
                 return [], after_sequence, False
             first_sequence = int(queue[0][0])
             newest_sequence = int(queue[-1][0])
+            if newest_sequence <= after_sequence:
+                # The 100ms monitor usually already consumed this contract's tail.
+                # Avoid scanning up to 32768 retained ticks while holding the socket
+                # writer's lock when there is no new observation to evaluate.
+                return [], newest_sequence, False
             overflowed = bool(
                 after_sequence > 0 and first_sequence > after_sequence + 1
             )
-            ticks = [
-                tick
-                for tick in queue
-                if int(tick[0]) > after_sequence and float(tick[2]) >= not_before
-            ]
+            # The writer allocates each sequence and appends under this same lock.
+            # Walk only the unread suffix, then restore its original arrival order.
+            # Receipt timestamps can arrive out of order, so only sequence can end
+            # the walk; not_before still filters every unread observation.
+            ticks = []
+            for tick in reversed(queue):
+                if int(tick[0]) <= after_sequence:
+                    break
+                if float(tick[2]) >= not_before:
+                    ticks.append(tick)
+            ticks.reverse()
             return ticks, newest_sequence, overflowed
 
     def get_cached_contract_ltp(
@@ -3651,6 +4070,17 @@ class MarketDataProvider:
             self._last_ltp_time = time.time()
             return val
 
+        if self._replacement_enabled() and symbol == "INDIAVIX":
+            auxiliary = self._freshest_cached_index_quote(("angel:INDIAVIX",),
+                20.0 if self.is_market_open() else 86400.0, time.time())
+            if auxiliary is not None:
+                return _remember_ltp_time(auxiliary[1])
+            auxiliary_quote = self._replacement_auxiliary_quote()
+            if auxiliary_quote is not None:
+                with self._index_quote_guard():
+                    self._ws_cache["angel:INDIAVIX"] = auxiliary_quote
+                return _remember_ltp_time(auxiliary_quote)
+
         if symbol in INDEX_SPOT_TOKENS:
             now_ts = time.time()
             cached, _age = self._select_index_ws_quote(symbol, token, now_ts)
@@ -3675,7 +4105,7 @@ class MarketDataProvider:
             if short_token in self._ws_cache and _is_valid_cache(self._ws_cache[short_token]):
                 return _remember_ltp_time(self._ws_cache[short_token])
 
-            fyers_symbol = FYERS_INDEX_SYMBOLS.get(symbol, symbol)
+            fyers_symbol = fyers_quote_symbol(symbol) or symbol
             if fyers_symbol in self._ws_cache and _is_valid_cache(self._ws_cache[fyers_symbol]):
                 return _remember_ltp_time(self._ws_cache[fyers_symbol])
             
@@ -3696,15 +4126,20 @@ class MarketDataProvider:
             except Exception as exc:
                 logger.debug(f"Kite REST quote failed for {symbol}: {exc}")
 
+        if self._fyers_backup_enabled() and kite_ltp <= 0:
+            angel_quote = self._angel_supplementary_quote(symbol)
+            if angel_quote is not None:
+                return _remember_ltp_time(angel_quote)
+
         # 3. TIER 2 — FYERS, used as a cross-check when the broker answered, and as a
         # fallback when it did not.
         fyers_ltp = 0.0
         fyers_values: Dict[str, Any] = {}
         fyers_received_at = 0.0
         fyers_exchange_at = None
-        if getattr(self, 'fyers', None):
+        if getattr(self, 'fyers', None) and (not self._fyers_backup_enabled() or kite_ltp <= 0):
             try:
-                f_sym = FYERS_INDEX_SYMBOLS.get(symbol)
+                f_sym = fyers_quote_symbol(symbol)
                 if f_sym:
                     ok, f_resp = self._call_fyers_bounded(
                         "quotes",
@@ -4063,6 +4498,7 @@ class MarketDataProvider:
         token = INDEX_SPOT_TOKENS.get(name, ("", ""))[0]
         broker_keys = self._index_broker_cache_keys(name, token)
         fyers_keys = (FYERS_INDEX_SYMBOLS.get(name, ""),)
+        angel_keys = ("angel:" + name,) if self._replacement_enabled() else ()
         broker_window = (
             self.INDEX_KITE_PRICE_FRESH_SECONDS
             if session_label == "LIVE"
@@ -4070,6 +4506,7 @@ class MarketDataProvider:
         )
 
         with self._index_quote_guard():
+            angel = self._freshest_cached_index_quote(angel_keys, self.INDEX_FYERS_PRICE_FRESH_SECONDS, now)
             broker = self._freshest_cached_index_quote(broker_keys, broker_window, now)
             if broker is not None and not str(
                 broker[1].get("source") or ""
@@ -4132,6 +4569,8 @@ class MarketDataProvider:
             selected = dict(broker[1])
         elif primary_rest_is_live:
             selected = rest_cached
+        elif angel is not None:
+            selected = dict(angel[1])
         elif fyers is not None:
             selected = dict(fyers[1])
         elif fyers_rest_is_live:
@@ -4182,8 +4621,10 @@ class MarketDataProvider:
 
         if source_lower.startswith("kite"):
             source_role = "primary"
+        elif source_lower.startswith("angel") and self._fyers_backup_enabled():
+            source_role = "supplementary"
         elif source_lower.startswith("fyers"):
-            source_role = "failover"
+            source_role = "backup" if self._fyers_backup_enabled() else "failover"
         elif source_lower.startswith("yahoo"):
             source_role = "delayed"
         else:
@@ -4241,7 +4682,7 @@ class MarketDataProvider:
         )
         quote["preopen_settlement"] = preopen_rest_allowed
 
-        if preopen_rest_allowed and fyers_symbol:
+        if preopen_rest_allowed and fyers_symbol and not self._replacement_enabled():
             preopen_quote = self._get_preopen_fyers_index_quote(symbol, fyers_symbol, now_ts)
             if preopen_quote:
                 quote.update(preopen_quote)
@@ -4286,6 +4727,12 @@ class MarketDataProvider:
                 if not quote["change_pct"]:
                     quote["change_pct"] = quote["change"] / previous_close * 100.0
             return quote
+
+        if preopen_rest_allowed and fyers_symbol and self._replacement_enabled():
+            preopen_quote = self._get_preopen_fyers_index_quote(symbol, fyers_symbol, now_ts)
+            if preopen_quote:
+                quote.update(preopen_quote)
+                return quote
 
         # No websocket quote passed freshness checks. Resolve REST through the one
         # Kite-first bridge above; the old direct Fyers call here silently bypassed the
@@ -4597,6 +5044,15 @@ class MarketDataProvider:
             except Exception as exc:
                 logger.debug(f"Kite touch quote fetch failed for {symbol}: {exc}")
 
+        if self._replacement_enabled():
+            try:
+                quote = self._replacement_touch(exchange, symbol, now_ts, max_age_seconds)
+            except Exception:
+                quote = None
+            if quote is not None and (quote.get("usable") or not self._fyers_backup_enabled()):
+                self._touch_quote_cache[cache_key] = {"time": now_ts, "quote": quote}
+                return quote
+
         if getattr(self, "fyers", None):
             # Current instrument master is Angel-token based; option Fyers symbols
             # are used only when the caller/cache already provides one.
@@ -4845,6 +5301,20 @@ class MarketDataProvider:
 
     def get_previous_close(self, symbol: str) -> float:
         """Fetch official closing price with persistent session caching"""
+        if self._fyers_backup_enabled():
+            existing_source = (getattr(self, "_prev_close_cache_source", {}) or {}).get(symbol, "")
+            existing_age = time.time() - (getattr(self, "_prev_close_cache_time", {}) or {}).get(symbol, 0)
+            if existing_source.startswith(("kite", "angel")) and 0 <= existing_age < 300:
+                return float((getattr(self, "_prev_close_global_cache", {}) or {}).get(symbol) or 0)
+            primary = self._freshest_cached_index_quote(self._index_broker_cache_keys(symbol),
+                self.INDEX_KITE_PRICE_FRESH_SECONDS if self.is_market_open() else 86400.0, time.time())
+            if primary is not None and str(primary[1].get("source", "")).startswith("kite"):
+                close = float(primary[1].get("previous_close") or 0)
+                if close > 0:
+                    return self._remember_previous_close(symbol, close, "kite_ws")
+            supplementary = self._angel_supplementary_quote(symbol)
+            if supplementary is not None and float(supplementary.get("previous_close") or 0) > 0:
+                return float(supplementary["previous_close"])
         if not hasattr(self, "_prev_close_global_cache"):
             self._prev_close_global_cache = {}
             self._prev_close_cache_time = {}
@@ -5030,6 +5500,16 @@ class MarketDataProvider:
         stamp = received_at or datetime.now()
         out["volume_basis"] = "fyers_index"
         out["source"] = "fyers_history"
+        # Completed History API bars replace price-only live ticks. Without an
+        # explicit flag, telemetry restoration carries the tick's False into the
+        # backfill, so every resampled bar stays incomplete despite measured volume.
+        quantities = pd.to_numeric(
+            out.get("volume", pd.Series(index=out.index, dtype=float)), errors="coerce"
+        )
+        complete = quantities.notna() & np.isfinite(quantities) & quantities.ge(0)
+        if "volume_complete" in out:
+            complete &= ~out["volume_complete"].eq(False).fillna(False)
+        out["volume_complete"] = complete
         # Fyers' candle timestamp is exchange/provider time; receipt_at is local
         # transport time and must remain a separate clock for freshness decisions.
         out["provider_time"] = out.index
@@ -5051,6 +5531,94 @@ class MarketDataProvider:
         out["receipt_at"] = received_at or datetime.now()
         out["tick_count"] = 0
         return out
+
+    def _preferred_history_complete(self, frame, interval, days_back, to_date=None):
+        """Skip backup requests only for certified, contiguous requested intervals.
+
+        Constituent-share certification can never cover the index's 15:15-15:29
+        tail (constituent candles stop at 15:14) or a day with no dated membership
+        snapshot. Demanding either one pinned this gate to False, so every index
+        request fell through to the FYERS backup even when the certifiable window
+        was complete. Only intervals a constituent can certify at all are required.
+        """
+        from data.market_calendar import load_nse_holidays, load_nse_special_trading_days
+        from data.constituent_volume import CONSTITUENT_SESSION_CLOSE, ConstituentVolumeService
+        if frame is None or frame.empty or interval not in {"1min", "5min", "15min"}:
+            return False
+        frame = ConstituentVolumeService.local_frame(frame)
+        verified = self._merge_preferred_index_history(frame, pd.DataFrame())
+        if verified.empty:
+            return False
+        target = pd.Timestamp(to_date) if to_date is not None else pd.Timestamp.now(tz="Asia/Kolkata")
+        if target.tzinfo is not None:
+            target = target.tz_convert("Asia/Kolkata").tz_localize(None)
+        period = pd.Timedelta(minutes={"1min": 1, "5min": 5, "15min": 15}[interval])
+        holidays, special = set(load_nse_holidays()), set(load_nse_special_trading_days())
+        close = pd.Timedelta(hours=CONSTITUENT_SESSION_CLOSE[0], minutes=CONSTITUENT_SESSION_CLOSE[1])
+        expected = []
+        lower = target-pd.Timedelta(days=max(1, int(days_back)))
+        for day in pd.date_range(lower.normalize(), target.normalize(), freq="D"):
+            label = day.date().isoformat()
+            if label not in special and (day.weekday() >= 5 or label in holidays):
+                continue
+            opening, closing = day+pd.Timedelta(hours=9, minutes=15), day+close
+            expected.extend(stamp for stamp in pd.date_range(opening, closing, freq=period, inclusive="left")
+                            if lower <= stamp and stamp+period <= target)
+        if not expected:
+            return False
+        expected = pd.DatetimeIndex(sorted(set(expected)))
+        # The newest day is built only up to its last completed minute, so require
+        # it just as far as the frame reaches. Every earlier day stays exact, and a
+        # day the frame does not reach at all is still required.
+        newest = verified.index.max()
+        if newest is not None:
+            # A background reconciliation may trail by one refresh pass. Never
+            # extend that allowance indefinitely or across a missing session.
+            refresh = float(getattr(getattr(self, "_replacement_settings", None),
+                                    "constituent_history_refresh_seconds", 60.0))
+            # A single missing minute can withhold an entire resampled bar. Use
+            # the same minute allowance at every timeframe, plus rounding to its
+            # last complete slot; do not fabricate that unfinished higher bar.
+            grace = pd.Timedelta(seconds=max(90.0, 2 * refresh)) + period - pd.Timedelta(minutes=1)
+            if expected.max() - newest > grace:
+                return False
+            expected = expected[(expected.normalize() != newest.normalize()) | (expected <= newest)]
+        if not len(expected) or not expected.isin(verified.index).all():
+            return False
+        complete = verified.get("volume_complete", pd.Series(False, index=verified.index))
+        complete = complete.reindex(expected).fillna(False).eq(True)
+        # Invalid certificates must not erase known membership and turn a real
+        # coverage failure into an exempt, undated historical interval.
+        dated = frame.get("membership_version", pd.Series("", index=frame.index))
+        dated = dated.fillna("").astype(str).ne("")
+        dated = dated.groupby(dated.index.normalize()).transform("any")
+        dated = dated.reindex(expected, fill_value=False)
+        return bool(dated.any()) and bool(complete[dated].all())
+
+    def _call_fyers_history_with_backoff(self, data, *, timeout, label):
+        """Share history cooldown across indices; never repeat a rejected request."""
+        if time.time() < float(getattr(self, "_fyers_history_retry_at", 0.0)):
+            return False, None
+        ok, response = self._call_fyers_bounded("history", data=data, timeout_seconds=timeout, label=label)
+        text = self._angel_rest_error_text(response).lower()
+        limited = isinstance(response, dict) and response.get("code") in {-360, 429}
+        limited = limited or "requests/minute" in text or "requests/day" in text or "too many requests" in text
+        if limited or not ok:
+            delay = 60.0 if limited else 30.0
+            if "requests/day" in text:
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                delay = max(delay, (now.normalize()+pd.Timedelta(days=1)-now).total_seconds())
+            self._fyers_history_retry_at = time.time()+delay
+            if limited:
+                # Said once, when the refusal happens. Callers re-enter this path every
+                # few seconds, so logging there instead produced a stream of identical
+                # "returned no data" lines for requests the cooldown never even made.
+                logger.warning(
+                    f"FYERS history rate-limited ({text[:160] or 'no detail'}) — "
+                    f"backing off {delay:.0f}s; certified constituent-share volume and "
+                    "Yahoo remain in force meanwhile"
+                )
+        return ok, response
 
     def get_historical_candles(
         self, token, exchange, interval, days_back=15, instrument_name="",
@@ -5103,6 +5671,7 @@ class MarketDataProvider:
             # cache made the newest complete bar predictably 3–5 minutes late.
             history_ttl = min(
                 history_ttl,
+                45.0,
                 float(
                     getattr(
                         runtime_settings,
@@ -5202,16 +5771,55 @@ class MarketDataProvider:
                     )
                     return df
 
-        # 1. PRIMARY SOURCE FOR INDICES: FYERS (To get Volume which AngelOne lacks)
-        if getattr(self, 'fyers', None) and instrument_name in FYERS_INDEX_SYMBOLS:
+        preferred_index_history = pd.DataFrame()
+        if self._replacement_enabled() and instrument_name in FYERS_INDEX_SYMBOLS:
+            # Candidate history stays separate from preserved FYERS archives.
+            preferred_index_history = self._request_replacement_history(instrument_name, interval, days_back, to_date,
+                persist_cache=persist_cache, force_refresh=force_refresh)
+            if not self._fyers_backup_enabled():
+                return preferred_index_history
+            if self._preferred_history_complete(preferred_index_history, interval, days_back, to_date):
+                preferred_index_history = self._merge_preferred_index_history(preferred_index_history, pd.DataFrame())
+                if persist_cache:
+                    self._save_and_merge_candles(preferred_index_history, cache_file)
+                self._api_hist_cache[cache_key] = preferred_index_history
+                self._last_api_hist_fetch[cache_key] = now
+                return preferred_index_history
+
+        fyers_history_attempted = False
+        # FYERS supplies missing backup history/volume after preferred brokers.
+        #
+        # A refusal already armed the shared cooldown in _call_fyers_history_with_backoff,
+        # and re-entering here per index, per timeframe, on every scan tick bought
+        # nothing: the call was suppressed anyway, but four INFO/WARNING pairs a second
+        # were formatted onto the scanner's own loop and the log read "returned no data"
+        # for requests that were never made. A refused request is not a dead source, so
+        # this stays a *timing* gate — the cooldown expires, the branch runs again.
+        fyers_ready = (bool(getattr(self, 'fyers', None)) and not bool(getattr(self, "_fyers_auth_required", False))
+                       and time.time() >= float(getattr(self, "_fyers_history_retry_at", 0.0)))
+        if (not fyers_ready and getattr(self, 'fyers', None)
+                and instrument_name in FYERS_INDEX_SYMBOLS):
+            logger.debug(f"FYERS history for {instrument_name} still in cooldown; "
+                         "preferred brokers and Yahoo remain available")
+        if fyers_ready and instrument_name in FYERS_INDEX_SYMBOLS:
             try:
                 fyers_symbol = FYERS_INDEX_SYMBOLS.get(instrument_name)
                 
                 if fyers_symbol:
-                    logger.info(f"Prioritizing Fyers history for {fyers_symbol} to get volume...")
+                    preferred_end = (preferred_index_history.index.max()
+                                     if not preferred_index_history.empty else None)
+                    logger.info(
+                        "Fetching FYERS history fallback for {}: interval={}, preferred_rows={}, "
+                        "preferred_end={}, force_refresh={}, recovery={}",
+                        fyers_symbol, interval, len(preferred_index_history), preferred_end,
+                        force_refresh, getattr(self, "_replacement_history_errors", {}).get(instrument_name, "unknown"),
+                    )
                     res = "1" if interval == "1min" else ("5" if interval == "5min" else "15")
-                    range_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-                    range_to = datetime.now().strftime("%Y-%m-%d")
+                    history_target = pd.Timestamp(to_date) if to_date is not None else pd.Timestamp.now(tz="Asia/Kolkata")
+                    if history_target.tzinfo is not None:
+                        history_target = history_target.tz_convert("Asia/Kolkata").tz_localize(None)
+                    range_from = (history_target - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                    range_to = history_target.strftime("%Y-%m-%d")
                     
                     data = {
                         "symbol": fyers_symbol,
@@ -5226,9 +5834,9 @@ class MarketDataProvider:
                     _hist_timeout = float(
                         getattr(get_settings(), "fyers_history_timeout_seconds", 8.0) or 8.0
                     )
-                    _ok, response = self._call_bounded(
-                        self.fyers.history,
-                        data=data,
+                    fyers_history_attempted = True
+                    _ok, response = self._call_fyers_history_with_backoff(
+                        data,
                         timeout=_hist_timeout,
                         label=f"fyers.history({fyers_symbol} {res})",
                     )
@@ -5245,8 +5853,8 @@ class MarketDataProvider:
                             f"({res}m, {range_from}..{range_to}): "
                             f"s={(response or {}).get('s')!r} code={(response or {}).get('code')!r} "
                             f"message={(response or {}).get('message')!r}. "
-                            "Index VOLUME is unavailable from any other source; volume-gated "
-                            "entries cannot fire until this is restored."
+                            "Completed cash-volume gates abstain unless independently certified "
+                            "constituent intervals are available."
                         )
                     else:
                         candles = response.get('candles', [])
@@ -5307,7 +5915,7 @@ class MarketDataProvider:
                 logger.warning(f"⚠️ AngelOne fetch failed for {instrument_name}: {e}")
 
         # 3. FALLBACK FOR OTHERS: FYERS (If AngelOne fails)
-        if df.empty and getattr(self, 'fyers', None):
+        if df.empty and fyers_ready and not fyers_history_attempted:
             fyers_symbol = FYERS_INDEX_SYMBOLS.get(instrument_name)
             
             if fyers_symbol:
@@ -5329,9 +5937,8 @@ class MarketDataProvider:
                     }
                     # Bounded for the same reason as the index-history call above: this
                     # also runs on the scanner's loop and the SDK takes no timeout.
-                    _ok, response = self._call_bounded(
-                        self.fyers.history,
-                        data=data,
+                    _ok, response = self._call_fyers_history_with_backoff(
+                        data,
                         timeout=float(
                             getattr(get_settings(), "fyers_history_timeout_seconds", 8.0) or 8.0
                         ),
@@ -5358,6 +5965,11 @@ class MarketDataProvider:
                 except Exception as e:
                     logger.warning(f"⚠️ Fyers history fetch failed for {instrument_name}: {e}")
 
+        if self._fyers_backup_enabled() and not preferred_index_history.empty:
+            df = self._merge_preferred_index_history(preferred_index_history, df)
+            if persist_cache:
+                df = self._save_and_merge_candles(df, cache_file)
+
         # 2. SECONDARY: LOCAL CACHE (If Broker fails or Market is closed)
         if df.empty and cache_file.exists() and not force_refresh:
             # NOT on a forced refresh. This branch is the second way the same stale frame
@@ -5383,7 +5995,11 @@ class MarketDataProvider:
         if not df.empty:
             last_timestamp = df.index[-1]
             last_date = last_timestamp.date()
-            if last_date < today and self.is_market_open():
+            # Before today's first interval closes, the previous session's final
+            # candle is the newest possible completed bar. Yahoo cannot repair it.
+            interval_minutes = {"1min": 1, "5min": 5, "15min": 15}.get(interval, 5)
+            first_close = datetime.combine(today, datetime.min.time()) + timedelta(hours=9, minutes=15+interval_minutes)
+            if last_date < today and self.is_market_open() and datetime.now() >= first_close:
                 is_stale = True
                 logger.info(f"📆 Cache data for {instrument_name} is stale (Last: {last_date}). Triggering Yahoo fallback.")
             elif self.is_market_open() and last_date == today:
@@ -5403,7 +6019,8 @@ class MarketDataProvider:
                 try:
                     self._yahoo_request_count += 1
                     logger.info(f"📡 Falling back to Yahoo for {instrument_name}...")
-                    yahoo_df = yf.Ticker(ticker).history(period=f"{days_back}d", interval=YAHOO_INTERVALS.get(interval, "5m"))
+                    yahoo_days = min(int(days_back), 7 if interval == "1min" else 60)
+                    yahoo_df = yf.Ticker(ticker).history(period=f"{yahoo_days}d", interval=YAHOO_INTERVALS.get(interval, "5m"))
                     if not yahoo_df.empty:
                         self._yahoo_last_used_at = time.time()
                         # Yahoo reports volume=0 for index tickers. This used to be a blind
@@ -5415,6 +6032,11 @@ class MarketDataProvider:
                         df = self._merge_yahoo_preserving_volume(df, yahoo_df, instrument_name)
                 except Exception as e:
                     logger.error(f"❌ Yahoo Fetch Error for {instrument_name}: {e}")
+
+        # Yahoo is delayed last-resort coverage. It may fill absent intervals but
+        # cannot overwrite prices already supplied by Kite/Angel for the same bar.
+        if not preferred_index_history.empty:
+            df = self._merge_preferred_index_history(preferred_index_history, df)
 
         if df.empty:
             empty_df = pd.DataFrame()
@@ -5439,7 +6061,8 @@ class MarketDataProvider:
         base_columns = ['open', 'high', 'low', 'close', 'volume']
         telemetry_columns = [
             name
-            for name in ('tick_count', 'volume_basis', 'source', 'provider_time', 'receipt_at')
+            for name in ('tick_count', 'volume_basis', 'source', 'provider_time', 'receipt_at',
+                         'price_provider', 'volume_provider', 'volume_complete', 'membership_version')
             if name in df.columns
         ]
         final_df = df[base_columns + telemetry_columns].copy()
@@ -5550,7 +6173,16 @@ class MarketDataProvider:
                     merged_df = pd.concat([existing_df, df])
                     merged_df = merged_df[~merged_df.index.duplicated(keep='last')]
                     merged_df.sort_index(inplace=True)
-                    merged_df = merged_df.tail(5000)
+                    # The disk cache is the replay archive. A 5,000-row cap kept
+                    # only ~13 sessions of minute data and deleted a 30-session
+                    # download on its next refresh. Keep 60 dated sessions, with
+                    # the existing 5,000-row floor for less frequent candles.
+                    session_dates = merged_df.index.normalize()
+                    sessions = session_dates.unique()
+                    if len(merged_df) > 5000 and len(sessions) > 60:
+                        session_start = int(session_dates.searchsorted(sessions[-60]))
+                        start = min(len(merged_df) - 5000, session_start)
+                        merged_df = merged_df.iloc[start:]
                     material_cols = [
                         'open', 'high', 'low', 'close', 'volume', 'tick_count',
                         'volume_basis', 'source', 'provider_time',
@@ -5592,6 +6224,18 @@ class MarketDataProvider:
                 logger.warning(f"Fallback candle save failed for {cache_file.name}: {fallback_exc}")
         return df
 
+    def chain_matches_execution_expiry(self, index_symbol, chain):
+        """Revalidate contract identity even while the transport cache is young."""
+        from engine.expiry_manager import expiry_manager
+        actual = str(chain.attrs.get("expiry") or "") if chain is not None else ""
+        key = "active_monthly" if index_symbol in {"BANKNIFTY", "MIDCPNIFTY"} else "active_weekly"
+        expected = expiry_manager.effective_expiry(index_symbol, key)
+        if not actual or not expected:
+            return True  # Legacy callers; live provider results always carry expiry.
+        actual_date = pd.to_datetime(actual, errors="coerce")
+        expected_date = pd.to_datetime(expected, errors="coerce")
+        return bool(pd.notna(actual_date) and pd.notna(expected_date) and actual_date.date() == expected_date.date())
+
     def get_cached_option_chain(
         self,
         index_symbol: str,
@@ -5603,12 +6247,20 @@ class MarketDataProvider:
         meta = (getattr(self, "_option_chain_meta", {}) or {}).get(index_symbol, {})
         if cached is None or not isinstance(meta, dict):
             return None
-        if str(meta.get("source") or "").lower() != "fyers" or not bool(meta.get("expiry_aligned", False)):
+        if not self.chain_matches_execution_expiry(index_symbol, cached):
+            return None
+        allowed = {"fyers", "kite", "angelone"} if self._replacement_enabled() else {"fyers"}
+        if str(meta.get("source") or "").lower() not in allowed or not bool(meta.get("expiry_aligned", False)):
             return None
         fetched_at = float(meta.get("fetched_at") or 0.0)
         age = time.time() - fetched_at if fetched_at > 0 else float("inf")
         if not (0.0 <= age <= max(0.0, float(max_age_seconds or 0.0))):
             return None
+        if self._replacement_enabled() and str(meta.get("source")) != "fyers":
+            clocks = [self._replacement_epoch(value) for column in ("call_quote_at", "put_quote_at")
+                      for value in cached.get(column, pd.Series([None] * len(cached))).tolist()]
+            if not clocks or any(stamp is None or not 0 <= time.time()-stamp <= max_age_seconds for stamp in clocks):
+                return None
         return cached
 
     # Only fire the Kite overlay when Fyers genuinely failed to supply OI. Load stays
@@ -5616,6 +6268,23 @@ class MarketDataProvider:
     # execution and the tick stream — so neither broker is hammered while the other
     # idles. The overlay is demand-driven, not a second unconditional chain fetch.
     _KITE_OI_OVERLAY_MIN_INTERVAL = 60.0
+
+    @staticmethod
+    def _chain_volume_is_usable(chain: "pd.DataFrame") -> bool:
+        """Every option leg must retain a measured, finite, nonnegative volume."""
+        if chain is None or chain.empty:
+            return False
+        for side in ("call", "put"):
+            column = side + "_volume"
+            if column not in chain:
+                return False
+            values = pd.to_numeric(chain[column], errors="coerce")
+            if not (np.isfinite(values) & values.ge(0)).fillna(False).all():
+                return False
+            available = column + "_available"
+            if available in chain and not chain[available].eq(True).fillna(False).all():
+                return False
+        return True
 
     def _chain_oi_is_usable(self, chain: "pd.DataFrame") -> bool:
         if chain is None or chain.empty:
@@ -5627,7 +6296,9 @@ class MarketDataProvider:
             return False
         return bool(calls > 0 and puts > 0)
 
-    def _augment_chain_oi_from_kite(self, index_symbol: str, chain: "pd.DataFrame") -> "pd.DataFrame":
+    def _augment_chain_oi_from_kite(
+        self, index_symbol: str, chain: "pd.DataFrame", *, expiry: str = ""
+    ) -> "pd.DataFrame":
         """Fill open interest from Kite when the Fyers chain has none.
 
         The 2026-08-01 startup logged `PCR=0, Call Delta=0` against a 123-row Fyers
@@ -5651,12 +6322,43 @@ class MarketDataProvider:
         self._last_kite_oi_overlay[index] = now
         try:
             spot = float(self._ltp_cache.get(index, {}).get("ltp", 0.0) or 0.0)
-            kite_chain = source.get_option_chain(index, spot=spot, strikes_each_side=20)
+            # OI belongs to a contract, not merely a strike.  Resolve the same expiry
+            # Fyers selected and pass it through to Kite; an absent/unparseable expiry
+            # is safer than a default-nearest overlay during rollover.
+            kite_expiry = None
+            if expiry:
+                for fmt in ("%d%b%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                    try:
+                        kite_expiry = datetime.strptime(str(expiry), fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            if kite_expiry is None:
+                return chain
+            try:
+                kite_chain = source.get_option_chain(
+                    index, spot=spot, strikes_each_side=20, expiry=kite_expiry
+                )
+            except TypeError as exc:
+                # An adapter without expiry pinning cannot certify the overlay.
+                # Preserve the primary chain without mixing another contract's OI.
+                if "expiry" not in str(exc).lower():
+                    raise
+                return chain
             if kite_chain.empty:
+                return chain
+            returned_expiry = pd.to_datetime(kite_chain.attrs.get("expiry"), errors="coerce")
+            if pd.isna(returned_expiry) or returned_expiry.date() != kite_expiry:
                 return chain
             by_strike = {
                 float(row["strike"]): row for _, row in kite_chain.iterrows()
             }
+            # Use one OI provider for this observation, including uncovered strikes.
+            # Mixing a few remaining primary values would corrupt PCR and deltas.
+            chain = chain.copy()
+            for side in ("call", "put"):
+                chain[f"{side}_oi"] = 0.0
+                chain[f"{side}_oi_change"] = 0.0
             filled = 0
             for position, strike in chain["strike"].items():
                 row = by_strike.get(float(strike))
@@ -5664,6 +6366,8 @@ class MarketDataProvider:
                     continue
                 chain.at[position, "call_oi"] = float(row["call_oi"])
                 chain.at[position, "put_oi"] = float(row["put_oi"])
+                for side in ("call", "put"):
+                    chain.at[position, f"{side}_oi_change"] = 0.0
                 # Carry the live mid so implied volatility is solved from a current
                 # two-way price rather than a possibly-stale last trade.
                 for side in ("call", "put"):
@@ -5672,6 +6376,7 @@ class MarketDataProvider:
                         chain.at[position, f"{side}_mid"] = mid
                 filled += 1
             if filled:
+                chain.attrs["oi_provider"] = "kite"
                 logger.info(
                     f"Filled OI for {filled}/{len(chain)} {index} strikes from Kite "
                     "(Fyers chain returned none) — PCR is live again."
@@ -5681,16 +6386,70 @@ class MarketDataProvider:
         return chain
 
     def get_option_chain(self, index_symbol: str, exchange: str = "NFO") -> Optional[pd.DataFrame]:
-        """Fetch real options data using Fyers (Primary) or AngelOne (Fallback)"""
+        """Fetch preferred Kite/Angel chains, retaining FYERS backup and legacy routes."""
         now = time.time()
         cache_key = f"opt_chain_{index_symbol}"
         if not hasattr(self, "_opt_chain_cache"): self._opt_chain_cache = {}
         if not hasattr(self, "_last_opt_chain_fetch"): self._last_opt_chain_fetch = {}
         if not hasattr(self, "_last_opt_chain_error"): self._last_opt_chain_error = {}
+
+        cached_chain = self._opt_chain_cache.get(cache_key)
+        if cached_chain is not None and not self.chain_matches_execution_expiry(index_symbol, cached_chain):
+            self._opt_chain_cache.pop(cache_key, None)
+            self._last_opt_chain_fetch.pop(cache_key, None)
+            self._last_opt_chain_error.pop(cache_key, None)
         
         from config.settings import get_settings
         chain_ttl = max(90.0, float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 90.0)))
         error_cooldown = max(chain_ttl, 180.0)
+
+        def preferred_probe():
+            # Probe preferred brokers independently of a FYERS cache/cooldown.
+            # One in-flight call and a short retry interval prevent scan storms.
+            with self._replacement_lock:
+                attempts = self.__dict__.setdefault("_preferred_chain_attempts", {})
+                pending = self.__dict__.setdefault("_preferred_chain_pending", set())
+                if cache_key in pending or now-attempts.get(cache_key, 0.0) < 5.0:
+                    return None, {}, False
+                attempts[cache_key] = now
+                pending.add(cache_key)
+            try:
+                try:
+                    chain = self._get_replacement_option_chain(index_symbol, now)
+                except Exception:
+                    chain = pd.DataFrame()
+                return chain, dict(self._option_chain_meta.get(index_symbol, {})), True
+            finally:
+                with self._replacement_lock:
+                    pending.discard(cache_key)
+
+        last_fetch = self._last_opt_chain_fetch.get(cache_key, 0)
+        last_error = self._last_opt_chain_error.get(cache_key, 0)
+        cached_meta = dict((getattr(self, "_option_chain_meta", {}) or {}).get(index_symbol, {}))
+        preferred_cached = bool(cached_meta.get("auto_certified")
+                                and cached_meta.get("source") in {"kite", "angelone"})
+        gated = now-last_fetch < chain_ttl or now-last_error < error_cooldown
+        if self._fyers_backup_enabled() and gated and not preferred_cached:
+            preferred, meta, attempted = preferred_probe()
+            if (preferred is not None and not preferred.empty and meta.get("auto_certified")
+                    and meta.get("source") in {"kite", "angelone"}):
+                return preferred
+            if attempted:
+                # A failed preferred probe must neither extend the backup's
+                # cooldown nor replace a usable backup with a partial chain.
+                if cached_chain is None:
+                    self._opt_chain_cache.pop(cache_key, None)
+                else:
+                    self._opt_chain_cache[cache_key] = cached_chain
+                self._option_chain_meta[index_symbol] = cached_meta
+                if last_fetch:
+                    self._last_opt_chain_fetch[cache_key] = last_fetch
+                else:
+                    self._last_opt_chain_fetch.pop(cache_key, None)
+                if last_error:
+                    self._last_opt_chain_error[cache_key] = last_error
+                else:
+                    self._last_opt_chain_error.pop(cache_key, None)
 
         # Cache option chain aggressively during live scans to prevent API spam.
         last_fetch = self._last_opt_chain_fetch.get(cache_key, 0)
@@ -5714,13 +6473,38 @@ class MarketDataProvider:
         # Mark as in-flight immediately to prevent concurrent threads from piling up
         self._last_opt_chain_fetch[cache_key] = now
 
-        # ══ TRY FYERS FIRST ══
+        replacement_chain = None
+        replacement_meta = {}
+        if self._replacement_enabled():
+            if self._fyers_backup_enabled():
+                replacement_chain, meta, _ = preferred_probe()
+                if replacement_chain is None:
+                    replacement_chain = pd.DataFrame()
+            else:
+                try:
+                    replacement_chain = self._get_replacement_option_chain(index_symbol, now)
+                except Exception:
+                    replacement_chain = pd.DataFrame()
+                meta = self._option_chain_meta.get(index_symbol, {})
+            replacement_meta = dict(meta)
+            if not self._fyers_backup_enabled() or (replacement_chain is not None and not replacement_chain.empty
+                    and meta.get("auto_certified") and meta.get("source") in {"kite", "angelone"}):
+                return replacement_chain
+
+        # FYERS backs up the preferred route, or owns the explicit legacy route.
         if self.fyers:
             fyers_symbol = FYERS_INDEX_SYMBOLS.get(index_symbol)
             
             if fyers_symbol:
                 try:
-                    logger.info(f"Fetching Fyers option chain for {fyers_symbol}...")
+                    logger.info(
+                        "Fetching Fyers option chain for {}: preferred_source={}, strikes={}/{}, "
+                        "coverage_complete={}, exchange_clocks_fresh={}, volume_complete={}, certified={}",
+                        fyers_symbol, replacement_meta.get("source", "unavailable"),
+                        replacement_meta.get("strike_count", 0), replacement_meta.get("requested_strike_count", 0),
+                        replacement_meta.get("coverage_complete", False), replacement_meta.get("exchange_clocks_fresh", False),
+                        replacement_meta.get("volume_complete", False), replacement_meta.get("auto_certified", False),
+                    )
                     
                     # Try to center around ATM strike if we have spot price
                     spot = self.get_latest_price(index_symbol)
@@ -5754,9 +6538,7 @@ class MarketDataProvider:
                             if index_symbol in {"BANKNIFTY", "MIDCPNIFTY"}
                             else "active_weekly"
                         )
-                        active_label = (
-                            expiry_manager.expiries.get(index_symbol, {}).get(expiry_key)
-                        )
+                        active_label = expiry_manager.effective_expiry(index_symbol, expiry_key)
                         expiry_rows = response.get("data", {}).get("expiryData", []) or []
                         active_date = ""
                         if active_label:
@@ -5879,14 +6661,46 @@ class MarketDataProvider:
                             ) if col in pe_df.columns
                         ]
                         chain = pd.merge(ce_df[ce_cols], pe_df[pe_cols], on='strike', how='outer')
+                        # Other legacy fields use zero defaults. Volume must preserve
+                        # missing legs/values as unavailable rather than inactivity.
+                        volumes = {}
+                        for side in ("call", "put"):
+                            column = side + "_volume"
+                            values = pd.to_numeric(chain.get(column, pd.Series(float("nan"), index=chain.index)), errors="coerce")
+                            volumes[column] = values.where(np.isfinite(values) & values.ge(0))
                         chain = chain.fillna(0)
-                        chain = self._augment_chain_oi_from_kite(index_symbol, chain)
+                        for column, values in volumes.items():
+                            chain[column] = values
+                            chain[column + "_available"] = values.notna()
+                        if self._fyers_backup_enabled():
+                            for prefix in ("call", "put"):
+                                chain[prefix+"_day_oi_change"] = chain.get(prefix+"_oi_change", float("nan"))
+                            chain["day_oi_change_provider"] = "fyers"
+                            chain["day_oi_change_received_at"] = now
+                        try:
+                            chain = self._augment_chain_oi_from_kite(
+                                index_symbol, chain, expiry=str(active_label or "")
+                            )
+                        except TypeError as exc:
+                            # Legacy overlay adapters cannot prove contract identity.
+                            if "expiry" not in str(exc).lower():
+                                raise
+                            pass  # No unpinned legacy overlay; preserve primary data.
+                        chain.attrs["provider"] = "fyers"
                         chain = self._apply_option_oi_snapshot_deltas(
                             index_symbol,
                             chain,
-                            provider="fyers",
+                            provider=str(chain.attrs.get("oi_provider") or "fyers"),
                             expiry=str(active_label or "") if "active_label" in locals() else "",
                         )
+                        chain.attrs["expiry"] = str(active_label or "")
+                        chain.attrs["provider"] = "fyers"
+                        chain.attrs["observation_id"] = (
+                            f"fyers|{str(active_label or 'ACTIVE')}|{int(now * 1000)}"
+                        )
+                        chain.attrs.setdefault("observed_at", now)
+                        volume_complete = self._chain_volume_is_usable(chain)
+                        chain.attrs["volume_complete"] = volume_complete
                         self._option_chain_meta[index_symbol] = {
                             "source": "fyers",
                             "fetched_at": now,
@@ -5894,12 +6708,23 @@ class MarketDataProvider:
                             "fallback": False,
                             "active_expiry": active_label,
                             "expiry_aligned": expiry_aligned,
+                            "volume_complete": volume_complete,
                             "oi_change_source": str(chain["oi_change_source"].iloc[0]) if not chain.empty else "none",
                         }
+                        if self._fyers_backup_enabled():
+                            self._option_chain_meta[index_symbol].update(
+                                role="backup", fallback=True,
+                                auto_certified=bool(len(chain) >= 3 and expiry_aligned and self._chain_oi_is_usable(chain) and volume_complete),
+                                reported_day_oi_available=bool(chain[["call_day_oi_change", "put_day_oi_change"]].notna().all().all()),
+                                backup_reason="preferred_chain_unavailable_or_incomplete")
+                        self._archive_option_chain(index_symbol, chain, now, self._option_chain_meta[index_symbol])
                         
                         logger.info(f"✅ Fyers Option Chain fetched successfully for {index_symbol}")
                         self._opt_chain_cache[cache_key] = chain
                         self._last_opt_chain_fetch[cache_key] = now
+                        # A successful backup satisfies this request. A failed preferred
+                        # provider must not delay the next healthy backup refresh.
+                        self._last_opt_chain_error.pop(cache_key, None)
                         self._fyers_chain_failure_streak = 0
                         return chain
                     self._last_opt_chain_fetch[cache_key] = now
@@ -5910,6 +6735,19 @@ class MarketDataProvider:
                     self._last_opt_chain_error[cache_key] = now
                     self._maybe_self_heal_fyers(f"optionchain exception for {index_symbol}")
                     logger.warning(f"⚠️ Fyers Option Chain fetch failed: {e}. Falling back to AngelOne...")
+
+        if self._fyers_backup_enabled():
+            # Preserve the broad result and its refusal metadata; never replace it
+            # with a second, narrower five-pair request after all three routes fail.
+            if replacement_chain is not None and not replacement_chain.empty:
+                self._option_chain_meta[index_symbol] = replacement_meta
+                self._opt_chain_cache[cache_key] = replacement_chain
+                return replacement_chain
+            self._option_chain_meta[index_symbol] = {
+                "source": "unavailable", "fetched_at": now, "strike_count": 0,
+                "fallback": True, "auto_certified": False, "expiry_aligned": False,
+                "unavailable_reason": "kite_angelone_fyers_chain_unavailable"}
+            return pd.DataFrame()
 
         # ══ FALLBACK TO ANGELONE (five nearest complete real CE/PE pairs) ══
         spot = self.get_latest_price(index_symbol)
@@ -5974,10 +6812,12 @@ class MarketDataProvider:
                 'call_oi': ce_data['oi'],
                 'call_oi_change': 0,
                 'call_volume': ce_data['volume'],
+                'call_volume_available': ce_data.get('volume_available', pd.notna(ce_data['volume'])),
                 'call_ltp': ce_data['ltp'],
                 'put_oi': pe_data['oi'],
                 'put_oi_change': 0,
                 'put_volume': pe_data['volume'],
+                'put_volume_available': pe_data.get('volume_available', pd.notna(pe_data['volume'])),
                 'put_ltp': pe_data['ltp'],
                 'call_symbol': ce_data['symbol'], 'put_symbol': pe_data['symbol'],
                 'call_token': ce_data['token'], 'put_token': pe_data['token'],
@@ -6006,13 +6846,16 @@ class MarketDataProvider:
                 & (pd.to_numeric(df['put_oi'], errors='coerce').fillna(0) > 0)
             ).sum()
         )
-        auto_certified = bool(len(df) >= 3 and paired_oi_rows >= 3 and expiry_aligned)
+        volume_complete = self._chain_volume_is_usable(df)
+        df.attrs["volume_complete"] = volume_complete
+        auto_certified = bool(len(df) >= 3 and paired_oi_rows >= 3 and expiry_aligned and volume_complete)
         self._option_chain_meta[index_symbol] = {
             "source": "angelone_near_atm_realtime",
             "fetched_at": now,
             "strike_count": int(len(df)),
             "fallback": True,
             "auto_certified": auto_certified,
+            "volume_complete": volume_complete,
             "active_expiry": active_expiry,
             "expiry_aligned": expiry_aligned,
             "usable_pair_rows": paired_oi_rows,
@@ -6020,6 +6863,7 @@ class MarketDataProvider:
             "resolved_strikes": [float(value) for value in df['strike'].tolist()],
             "oi_change_source": str(df["oi_change_source"].iloc[0]) if not df.empty else "none",
         }
+        self._archive_option_chain(index_symbol, df, now, self._option_chain_meta[index_symbol])
         
         # Cache the result so we don't REST-fetch again within 60s
         self._opt_chain_cache[cache_key] = df
@@ -6132,16 +6976,19 @@ class MarketDataProvider:
         snapshots = self._load_option_oi_snapshots()
         previous = snapshots.get(snapshot_key, {})
         previous_rows = previous.get("rows", {}) if isinstance(previous, dict) else {}
+        previous_provider = str(previous.get("provider", "")) if isinstance(previous, dict) else ""
         previous_session = str(previous.get("session", "")) if isinstance(previous, dict) else ""
         previous_captured = (
             float(previous.get("captured_at", 0.0) or 0.0) if isinstance(previous, dict) else 0.0
         )
         max_age = float(getattr(self, "_oi_snapshot_max_age_seconds", 4 * 86400))
         snapshot_fresh = bool(previous_rows) and (captured_now - previous_captured) <= max_age
+        provider_matches = bool(previous_provider and previous_provider == str(provider))
+        snapshot_horizon = max(0.0, captured_now - previous_captured) if previous_captured else None
 
         if reported_abs > 0:
             source = f"{provider}_reported"
-        elif snapshot_fresh:
+        elif snapshot_fresh and provider_matches:
             call_changes = []
             put_changes = []
             for _, row in normalized.iterrows():
@@ -6158,9 +7005,16 @@ class MarketDataProvider:
         else:
             normalized["call_oi_change"] = 0
             normalized["put_oi_change"] = 0
-            source = f"{provider}_snapshot_warmup"
+            source = (
+                f"{provider}_provider_switch_warmup"
+                if snapshot_fresh and previous_provider and not provider_matches
+                else f"{provider}_snapshot_warmup"
+            )
 
         normalized["oi_change_source"] = source
+        normalized["oi_change_horizon_seconds"] = (
+            86400.0 if source.endswith("_reported") else (snapshot_horizon or 0.0)
+        )
         snapshots[snapshot_key] = {
             "provider": provider,
             "expiry": expiry,
@@ -6177,6 +7031,22 @@ class MarketDataProvider:
         self._option_oi_snapshots = snapshots
         self._save_option_oi_snapshots()
         normalized.attrs["oi_change_source"] = source
+        quote_provider = str(chain.attrs.get("provider") or provider)
+        normalized.attrs.update(instrument=index_symbol, expiry=str(expiry), provider=quote_provider, oi_provider=str(provider),
+                                observation_id=f"{provider}|{expiry}|{captured_now}",
+                                observed_at=captured_now)
+        for _, row in normalized.iterrows():
+            for side in ("call", "put"):
+                contract = str(row.get(f"{side}_symbol") or f"{index_symbol}|{expiry}|{row['strike']}|{side}")
+                participation_provider = quote_provider if quote_provider == provider else f"{quote_provider}|oi:{provider}"
+                self._participation_store().observe(index_symbol, "options", participation_provider, contract,
+                    captured_now, float(row.get(f"{side}_volume") or 0),
+                    oi=float(row.get(f"{side}_oi") or 0), price=float(row.get(f"{side}_ltp") or 0),
+                    clock="receipt", expiry=str(expiry), option_type="CE" if side == "call" else "PE",
+                    strike=float(row["strike"]))
+        normalized.attrs["oi_change_horizon_seconds"] = float(
+            normalized["oi_change_horizon_seconds"].iloc[0]
+        )
         return normalized
 
     def fetch_instruments(self):
@@ -6198,6 +7068,7 @@ class MarketDataProvider:
             # now_dt (full timestamp) lets expiry-day gamma mode apply its intraday cutoff.
             dated = expiry_manager.get_token_for_date(name, strike, option_type, trade_date, expiry_type, now_dt=now_dt)
             if dated:
-                return dated
+                return self._register_derivative_contract(name, dated)
 
-        return expiry_manager.get_token(name, strike, option_type, expiry_type)
+        return self._register_derivative_contract(
+            name, expiry_manager.get_token(name, strike, option_type, expiry_type))

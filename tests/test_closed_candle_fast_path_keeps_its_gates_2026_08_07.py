@@ -39,6 +39,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 IST_NAIVE = datetime(2026, 8, 7, 15, 10, 0)
 
@@ -116,7 +117,7 @@ def test_no_buffer_is_a_no_op():
 
 def _fast_path_branch():
     """The `if not bool(getattr(c, 'entered_intracandle', True)):` body, as an AST."""
-    src = textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute))
+    src = textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute))
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
@@ -191,7 +192,21 @@ def test_the_fast_path_still_skips_the_stabilization_wait():
     branch = _fast_path_branch()
     calls = _calls_in(branch)
     assert "_live_signal_stabilization_requirements" not in calls
-    src = ast.dump(branch)
-    assert "_pending_live_signals" not in src, (
+    # Reading/removing an existing forming buffer prevents a duplicate at close.
+    # The fast path must never assign a new pending candidate or wait on it.
+    pending_writes = [
+        target for node in ast.walk(branch)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if "_pending_live_signals" in ast.dump(target)
+    ]
+    assert not pending_writes, (
         "the closed-candle path put the candidate back into the anti-repaint buffer"
     )
+
+
+@pytest.fixture(autouse=True)
+def _native_scanner_mode(monkeypatch):
+    """Buffer keys here carry no lane suffix; combined modes scope eviction per owner lane."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")

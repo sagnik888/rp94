@@ -1,0 +1,410 @@
+{
+  "engine_sha256": "3dc2c14044238e9706a8d748bc7d0f26309b6e91d72a156214305339950e2adf",
+  "notes": [
+    "Local FYERS data differs from TradingView screenshots.",
+    "Replay includes all supplied candles, distinct from confirmed mode which excludes the last candle.",
+    "This checks local consistency, not TradingView parity or execution returns."
+  ],
+  "frames": [
+    {
+      "symbol": "NIFTY",
+      "timeframe": "5min",
+      "last": "2026-09-23 15:25:00",
+      "source_sha256": "2f09376b6223405e40132683825419aa0b9331b2add5640b082b2ba77f072620",
+      "settings": {
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "screenshot": {
+        "close": 23424.9,
+        "rsi": 43.1,
+        "adx": 22.1,
+        "di_plus": 14.9,
+        "di_minus": 18.8,
+        "bull_score": 13.0,
+        "bear_score": 38.2
+      },
+      "runs": [
+        {
+          "size": "full",
+          "final_position": 0,
+          "features": {
+            "close": 23446.8,
+            "rsi": 57.09478856901986,
+            "rsi5m": 48.741090847599295,
+            "adx": 17.185999822711032,
+            "di_plus": 26.33893121809348,
+            "di_minus": 20.669298868659126,
+            "bull_score": 44.547394284509934,
+            "bear_score": 11.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 12:00:00",
+              "direction": 1,
+              "chart_entry": 23431.2,
+              "signal_close": 23448.05,
+              "exit_time": "2026-09-23 13:30:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        },
+        {
+          "size": "900",
+          "final_position": 0,
+          "features": {
+            "close": 23446.8,
+            "rsi": 57.09478856901986,
+            "rsi5m": 48.741090847599295,
+            "adx": 17.185999822711032,
+            "di_plus": 26.33893121809348,
+            "di_minus": 20.669298868659126,
+            "bull_score": 44.547394284509934,
+            "bear_score": 11.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 12:00:00",
+              "direction": 1,
+              "chart_entry": 23431.2,
+              "signal_close": 23448.05,
+              "exit_time": "2026-09-23 13:30:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        }
+      ],
+      "same_today_trades_full_vs_900": true
+    },
+    {
+      "symbol": "NIFTY",
+      "timeframe": "15min",
+      "last": "2026-09-23 15:15:00",
+      "source_sha256": "8be88480d860e7d6c3c0a4a3f22c15731ddf9af23351b233b97560eb79e9fe40",
+      "settings": {
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "screenshot": {
+        "close": 23424.55,
+        "rsi": 51.1,
+        "adx": 25.1,
+        "di_plus": 17.4,
+        "di_minus": 16.3,
+        "bull_score": 61.4,
+        "bear_score": 22.0
+      },
+      "runs": [
+        {
+          "size": "full",
+          "final_position": 0,
+          "features": {
+            "close": 23446.8,
+            "rsi": 57.028381322016386,
+            "rsi5m": 48.900497113353495,
+            "adx": 21.955076932239425,
+            "di_plus": 25.06238216044208,
+            "di_minus": 19.70076260146948,
+            "bull_score": 38.424344525487044,
+            "bear_score": 14.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 12:00:00",
+              "direction": 1,
+              "chart_entry": 23431.2,
+              "signal_close": 23458.1,
+              "exit_time": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        },
+        {
+          "size": "900",
+          "final_position": 0,
+          "features": {
+            "close": 23446.8,
+            "rsi": 57.028381322016386,
+            "rsi5m": 48.900497113353495,
+            "adx": 21.955076932239425,
+            "di_plus": 25.06238216044208,
+            "di_minus": 19.70076260146948,
+            "bull_score": 38.424344525487044,
+            "bear_score": 14.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 12:00:00",
+              "direction": 1,
+              "chart_entry": 23431.2,
+              "signal_close": 23458.1,
+              "exit_time": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        }
+      ],
+      "same_today_trades_full_vs_900": true
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "timeframe": "15min",
+      "last": "2026-09-23 15:15:00",
+      "source_sha256": "adb2abca1f5a3ef83eaecd108e96a9d4deff3f7c374eaae4150ca0137dc1b83c",
+      "settings": {
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "screenshot": {
+        "close": 56545.6,
+        "rsi": 55.1,
+        "adx": 26.1,
+        "di_plus": 16.5,
+        "di_minus": 17.3,
+        "bull_score": 23.5,
+        "bear_score": 42.0
+      },
+      "runs": [
+        {
+          "size": "full",
+          "final_position": 0,
+          "features": {
+            "close": 56548.9,
+            "rsi": 54.05893315083889,
+            "rsi5m": 48.58794282766617,
+            "adx": 21.259237796935455,
+            "di_plus": 19.331417461478523,
+            "di_minus": 21.51155661163645,
+            "bull_score": 23.029466575419445,
+            "bear_score": 34.51847559387091
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 10:00:00",
+              "direction": 1,
+              "chart_entry": 56454.95,
+              "signal_close": 56475.3,
+              "exit_time": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        },
+        {
+          "size": "900",
+          "final_position": 0,
+          "features": {
+            "close": 56548.9,
+            "rsi": 54.05893315083889,
+            "rsi5m": 48.58794282766617,
+            "adx": 21.259237796935455,
+            "di_plus": 19.331417461478523,
+            "di_minus": 21.51155661163645,
+            "bull_score": 23.029466575419445,
+            "bear_score": 34.51847559387091
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 10:00:00",
+              "direction": 1,
+              "chart_entry": 56454.95,
+              "signal_close": 56475.3,
+              "exit_time": "2026-09-23 15:00:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        }
+      ],
+      "same_today_trades_full_vs_900": true
+    },
+    {
+      "symbol": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "last": "2026-09-23 15:25:00",
+      "source_sha256": "dd299d63839b0135d73513a7648da371e9b811d378016a4412c5723ae125a62a",
+      "settings": {
+        "min_score": 60.0,
+        "conflict_margin": 20.0,
+        "min_adx": 20.0,
+        "use_htf": true,
+        "signal_cooldown": 0,
+        "sl_mode": "fixed",
+        "sl1_pct": 0.2,
+        "sl_min_pct": 0.1,
+        "sl_max_pct": 0.25,
+        "sl_atr_mult": 1.0,
+        "use_sl2": false,
+        "sl2_pct": 0.4,
+        "t1_r": 2.0,
+        "t2_r": 3.0,
+        "t3_r": 4.0,
+        "use_trail": true,
+        "trail_start_r": 1.5,
+        "trail_mult": 1.8,
+        "lock_at_t1": true,
+        "exit_conf_bars": 3,
+        "max_consec_loss": 3,
+        "circuit_pause": 5,
+        "use_pattern_score": true,
+        "entry_mode": "pine",
+        "session_rules": false,
+        "warmup_bars": 200,
+        "entry_cutoff": "15:00",
+        "session_exit": "15:15"
+      },
+      "screenshot": {
+        "close": 14572.25,
+        "rsi": 64.1,
+        "adx": 28.1,
+        "di_plus": 21.3,
+        "di_minus": 13.7,
+        "bull_score": 60.1,
+        "bear_score": 10.0
+      },
+      "runs": [
+        {
+          "size": "full",
+          "final_position": 0,
+          "features": {
+            "close": 14572.25,
+            "rsi": 61.86959435376231,
+            "rsi5m": 54.581937327370895,
+            "adx": 23.49771079350611,
+            "di_plus": 29.413167244028823,
+            "di_minus": 17.684971479187297,
+            "bull_score": 59.93021876389337,
+            "bear_score": 10.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 09:20:00",
+              "direction": 1,
+              "chart_entry": 14557.85,
+              "signal_close": 14563.0,
+              "exit_time": "2026-09-23 09:45:00",
+              "exit_reason": "Hard SL1"
+            },
+            {
+              "entry_time": "2026-09-23 13:40:00",
+              "direction": 1,
+              "chart_entry": 14553.45,
+              "signal_close": 14556.45,
+              "exit_time": "2026-09-23 15:05:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        },
+        {
+          "size": "900",
+          "final_position": 0,
+          "features": {
+            "close": 14572.25,
+            "rsi": 61.86959435376231,
+            "rsi5m": 54.581937327370895,
+            "adx": 23.49771079350611,
+            "di_plus": 29.413167244028823,
+            "di_minus": 17.684971479187297,
+            "bull_score": 59.93021876389337,
+            "bear_score": 10.0
+          },
+          "today_trades": [
+            {
+              "entry_time": "2026-09-23 09:20:00",
+              "direction": 1,
+              "chart_entry": 14557.85,
+              "signal_close": 14563.0,
+              "exit_time": "2026-09-23 09:45:00",
+              "exit_reason": "Hard SL1"
+            },
+            {
+              "entry_time": "2026-09-23 13:40:00",
+              "direction": 1,
+              "chart_entry": 14553.45,
+              "signal_close": 14556.45,
+              "exit_time": "2026-09-23 15:05:00",
+              "exit_reason": "Momentum Exit"
+            }
+          ]
+        }
+      ],
+      "same_today_trades_full_vs_900": true
+    }
+  ]
+}

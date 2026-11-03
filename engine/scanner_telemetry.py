@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ctypes
 import os
 import shutil
@@ -213,6 +214,10 @@ from trading.trade_manager import IST
 
 
 class ScannerTelemetryMixin:
+    def _runtime_build_status(self):
+        from engine.runtime_build import build_status
+        return build_status(getattr(self, 'runtime_source_build', {}), Path(__file__).resolve().parents[1])
+
     """Runtime diagnostics kept separate from the trading pipeline."""
 
     def _diag_inc(self, category: str, key: str, amount: int = 1) -> None:
@@ -593,15 +598,29 @@ class ScannerTelemetryMixin:
             # service: system commit exhaustion.
             valid = valid and commit_total > 0.0
 
+        # Percentages WARN; only exhausted commit headroom (or no fresh sample) BLOCKS.
+        # 2026-09-11: 26 entries were refused, among them every LONG in a 0.5-0.8%
+        # four-index rally, at 92-95.8% commit with 1.2-2.3 GB of headroom left, and in
+        # all 67 guard blocks on record the headroom trigger never fired once. What kills
+        # the process (2026-08-24) is commit EXHAUSTION, requests denied while Windows
+        # grows the pagefile; remaining headroom measures that directly, a percentage of
+        # an auto-growing limit does not. auto_resource_pct_blocks_entries restores the
+        # old percentage block.
+        pct_blocks = bool(getattr(settings, "auto_resource_pct_blocks_entries", False))
+        pct_reasons: List[str] = []
+        if valid and ram_pct >= ram_limit:
+            pct_reasons.append(f"system RAM {ram_pct:.1f}% >= {ram_limit:.1f}%")
+        if valid and commit_total > 0.0 and commit_pct >= commit_limit:
+            pct_reasons.append(f"Windows commit {commit_pct:.1f}% >= {commit_limit:.1f}%")
+        self._auto_resource_pressure_warnings = [] if pct_blocks else list(pct_reasons)
+
         reasons: List[str] = []
         if not valid:
             reasons.append(
                 "fresh host RAM/commit sample unavailable or stale; fail-closed for new exposure"
             )
-        if valid and ram_pct >= ram_limit:
-            reasons.append(f"system RAM {ram_pct:.1f}% >= {ram_limit:.1f}%")
-        if valid and commit_total > 0.0 and commit_pct >= commit_limit:
-            reasons.append(f"Windows commit {commit_pct:.1f}% >= {commit_limit:.1f}%")
+        if pct_blocks:
+            reasons.extend(pct_reasons)
         if (
             valid
             and
@@ -618,11 +637,15 @@ class ScannerTelemetryMixin:
             self._auto_resource_pressure_reasons = list(reasons)
             self._auto_resource_clear_samples = 0
         elif bool(getattr(self, "_auto_resource_pressure_latched", False)):
-            ram_clear = valid and ram_pct < max(0.0, ram_limit - hysteresis)
+            # A percentage that no longer blocks must not hold the latch either.
+            ram_clear = valid and (
+                not pct_blocks or ram_pct < max(0.0, ram_limit - hysteresis)
+            )
             commit_pct_clear = (
                 valid
                 and (
-                    commit_total <= 0.0
+                    not pct_blocks
+                    or commit_total <= 0.0
                     or commit_pct < max(0.0, commit_limit - hysteresis)
                 )
             )
@@ -727,14 +750,10 @@ class ScannerTelemetryMixin:
         }
 
     def _default_executor_queue_depth(self) -> Optional[int]:
-        """Work waiting for a default-executor thread, not just how many threads exist.
+        """Background work waiting in the loop's shared default executor.
 
-        `max_workers` alone cannot distinguish "the pool is idle" from "the pool is full
-        and four index tasks are queued behind a state save" — and the scan cycle submits
-        _process_instrument for every index through this pool. On 2026-08-14 the four
-        indices blew their 9s budget together on 2.2% of cycles with no I/O path
-        correlating above 1.0x, which is the shape of contention rather than slow work.
-        A depth of 0 through such a spike rules this pool out and points at the GIL.
+        Live index analysis owns a separate ScannerLive executor. An empty default
+        queue says nothing about pending work in that dedicated analysis pool.
         """
         try:
             try:
@@ -752,8 +771,28 @@ class ScannerTelemetryMixin:
         estimated_executor_workers = self._estimated_default_executor_max_workers()
         default_executor_workers = self._default_executor_max_workers()
         live_inflight = len(getattr(self, "_live_processing_futures", {}) or {})
+        live_executor = getattr(self, "_scanner_live_executor", None)
+        live_executor_workers = None
+        live_executor_queued = None
+        try:
+            workers = getattr(live_executor, "_max_workers", None)
+            live_executor_workers = int(workers) if workers is not None else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            work_queue = getattr(live_executor, "_work_queue", None)
+            live_executor_queued = int(work_queue.qsize()) if work_queue is not None else None
+        except Exception:
+            pass
+        capacity_workers = (
+            live_executor_workers
+            if live_executor_workers is not None
+            else estimated_executor_workers
+        )
         return {
             "default_executor_queued_tasks": self._default_executor_queue_depth(),
+            "live_executor_max_workers": live_executor_workers,
+            "live_executor_queued_tasks": live_executor_queued,
             "logical_cpu_count": int(os.cpu_count() or 1),
             "active_threads": threading.active_count(),
             "active_indices": active_indices,
@@ -763,7 +802,7 @@ class ScannerTelemetryMixin:
             "default_executor_max_workers": default_executor_workers,
             "live_index_parallelism_needed": active_indices,
             "live_processing_capacity_ratio": round(
-                estimated_executor_workers / max(1, active_indices),
+                capacity_workers / max(1, active_indices),
                 2,
             ),
             "async_execution_queue": self._async_execution_queue_payload(),
@@ -773,9 +812,47 @@ class ScannerTelemetryMixin:
             ),
         }
 
+    def _timeframe_intel_diagnostics(self) -> Dict[str, Any]:
+        """Expose exact-timeframe cache clocks without computing or refreshing data."""
+        now = time.time()
+        if not callable(getattr(self, "_intel_analysis_ttl_seconds", None)):
+            return {"available": False, "bundles": {}, "worker": {}}
+        ttl = self._intel_analysis_ttl_seconds()
+        cache = getattr(self, "_intel_cache", {}) or {}
+        clocks = getattr(self, "_intel_cache_time", {}) or {}
+        bars = getattr(self, "_intel_bar_starts", {}) or {}
+        bundles = {}
+        for name in tuple(getattr(self, "active_indices", ()) or ()):
+            for tf in ("1min", "5min", "15min"):
+                key = self._timeframe_intel_key(name, tf)
+                captured = clocks.get(key)
+                age = now - float(captured) if captured is not None else None
+                bundles[key] = {
+                    "present": isinstance(cache.get(key), dict),
+                    "captured_at": captured,
+                    "age_seconds": round(age, 3) if age is not None else None,
+                    "fresh": isinstance(cache.get(key), dict) and age is not None and 0 <= age <= ttl,
+                    "bar_start": bars.get(key),
+                }
+        progress = dict(getattr(self, "_background_intel_progress", {}) or {})
+        if progress.get("phase_started_at") is not None:
+            progress["phase_age_seconds"] = round(now - progress["phase_started_at"], 3)
+        workers = {}
+        for name, item in tuple((getattr(self, "_background_intel_progress_by_index", {}) or {}).items()):
+            workers[name] = dict(item)
+            if item.get("phase_started_at") is not None:
+                workers[name]["phase_age_seconds"] = round(now - item["phase_started_at"], 3)
+        return {"ttl_seconds": ttl, "bundles": bundles, "worker": progress,
+                "workers": workers,
+                "chain_inflight": [name for name, task in tuple(
+                    (getattr(self, "_background_intel_chain_tasks", {}) or {}).items()) if not task.done()],
+                "analysis_inflight": [name for name, task in tuple(
+                    (getattr(self, "_background_intel_analysis_tasks", {}) or {}).items()) if not task.done()]}
+
     def _get_diagnostics_payload(self) -> Dict[str, Any]:
         diagnostics = getattr(self, "_diagnostics", {}) or {}
         rejects = diagnostics.get("rejects", {}) or {}
+        waiting = diagnostics.get("waiting", {}) or {}
         # Shadow-coverage gaps. A counter nobody can read is not instrumentation, and
         # this one was written but never surfaced until 2026-09-01.
         entry_shadow_skipped = diagnostics.get("entry_shadow_skipped", {}) or {}
@@ -912,6 +989,18 @@ class ScannerTelemetryMixin:
 
         return {
             "rejects": dict(sorted(rejects.items(), key=lambda item: item[1], reverse=True)[:12]),
+            "reject_summary": {
+                "total": sum(max(0, int(count or 0)) for count in rejects.values()),
+                "reason_count": sum(1 for count in rejects.values() if int(count or 0) > 0),
+                "scope": "session" if getattr(self, "mode", "") != "HISTORICAL" else "backtest",
+            },
+            "waiting": dict(sorted(waiting.items(), key=lambda item: item[1], reverse=True)[:12]),
+            "waiting_summary": {
+                "total": sum(max(0, int(count or 0)) for count in waiting.values()),
+                "reason_count": sum(1 for count in waiting.values() if int(count or 0) > 0),
+            },
+            "runtime_build": ScannerTelemetryMixin._runtime_build_status(self),
+            "historical_intelligence_coverage": dict(getattr(self, "_historical_intel_coverage", {}) or {}),
             "entry_shadow_skipped": entry_shadow_skipped,
             "risk_configuration": get_settings().risk_configuration_summary(),
             "option_history": option_history,
@@ -920,6 +1009,7 @@ class ScannerTelemetryMixin:
                 getattr(self, "_option_history_bundle_status", {}) or {}
             ),
             "scanner_freshness": self._scanner_freshness_payload(),
+            "timeframe_intelligence": self._timeframe_intel_diagnostics(),
             "recalculation": self._recalculation_status_payload(),
             "settings_persistence": settings_persistence_status(),
             "latency": {
@@ -944,7 +1034,18 @@ class ScannerTelemetryMixin:
                 "ttl_minutes": int(getattr(getattr(self, "warm_memory", None), "ttl", timedelta()).total_seconds() // 60),
             },
             "timeouts": diagnostics.get("timeouts", {}),
+            "external_call_bulkheads": (
+                self._market_data_gateway.snapshot()
+                if hasattr(getattr(self, "_market_data_gateway", None), "snapshot")
+                else {}
+            ),
+            "live_session_measurement": (
+                self._live_session_metrics.snapshot()
+                if hasattr(getattr(self, "_live_session_metrics", None), "snapshot")
+                else {}
+            ),
             "index_processing_ms": diagnostics.get("index_processing_ms", {}),
+            "phase_processing_ms": diagnostics.get("phase_processing_ms", {}),
             "worker_resources": self._worker_resources_payload(),
             "sources": source_health,
             "mode": self.mode,
@@ -1213,6 +1314,7 @@ class ScannerTelemetryMixin:
             "is_calculating": bool(getattr(self, "is_calculating", False)),
             "calculation_lock": bool(getattr(self, "_calculation_lock", False)),
             "cache_age_ms": cache_age_ms,
+            "session_protection_faults": copy.deepcopy(getattr(self, "_session_protection_faults", {}) or {}),
         }
 
     def _recalculation_status_payload(self) -> Dict[str, Any]:

@@ -67,7 +67,7 @@ def test_execution_rebases_levels_on_verified_live_option_quote():
     entry, stop, target = scanner._execution_levels(_option_candidate())
 
     assert entry == 160.50
-    assert round(stop, 3) == 136.425
+    assert round(stop, 3) == 144.45  # 10% ceiling in ordinary/unknown regimes
     assert target > entry
 
 
@@ -83,7 +83,7 @@ def test_execution_uses_scanner_option_sl_cap_over_stale_trade_manager():
     entry, stop, target = scanner._execution_levels(_option_candidate(option_type="CE"))
 
     assert entry == 208.50
-    assert round(stop, 3) == 177.225
+    assert round(stop, 3) == 187.65  # 10% trend ceiling still bounds the operator cap
     assert target > entry
 
 
@@ -256,7 +256,7 @@ def test_legacy_synthetic_signal_is_rebased_to_verified_quote():
     assert repaired is True
     assert candidate.price == 160.80
     assert candidate.current_price == 160.80
-    assert round(candidate.stop, 2) == 136.68
+    assert round(candidate.stop, 2) == 144.72
     assert candidate.target > candidate.price
     assert candidate.quote_verified is True
 

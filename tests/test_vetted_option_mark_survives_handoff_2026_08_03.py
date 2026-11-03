@@ -21,10 +21,11 @@ TradeManager receives, which is exactly why this survived.
 import inspect
 
 from scanner import Scanner
+from engine.exit_cycle import ExitCycleService
 
 
 def _update_active_trades_source():
-    return inspect.getsource(Scanner._update_active_trades)
+    return inspect.getsource(ExitCycleService.update_active_trades)
 
 
 def test_the_vetted_mark_is_what_reaches_trade_manager():

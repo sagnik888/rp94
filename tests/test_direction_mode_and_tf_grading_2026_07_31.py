@@ -16,6 +16,7 @@ import pytest
 
 from config.settings import Settings
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 
 
 # ── 1. direction mode ────────────────────────────────────────────────────────
@@ -53,7 +54,7 @@ def test_blocked_direction_gives_a_reason():
 
 def test_direction_mode_is_enforced_in_the_entry_loop():
     import inspect
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
     assert "_direction_mode_allows" in src, "declared-but-unenforced was the whole defect"
 
 
@@ -141,7 +142,7 @@ def test_missing_scanner_cache_is_tolerated():
 
 def test_grading_call_uses_the_timeframe_context():
     import inspect
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
     assert "_candidate_timeframe_context" in src
     assert "_tf_intel_score" in src and "_tf_regime" in src
 

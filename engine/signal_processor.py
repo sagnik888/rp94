@@ -1,22 +1,34 @@
 import pandas as pd
 import time
 import copy
+import math
 import re
+import hashlib
+import json
 from datetime import date, datetime, time as dtime, timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Optional
 from loguru import logger
 from dataclasses import dataclass, field
+from engine.scanner_modes import scanner_mode, configured_mode, COMBINED_MODES, scope_suffix, same_owner, native_result, native_policy
 from config.settings import (
     get_settings,
     normalize_timeframe_entry_policy,
     timeframe_entry_timeframes,
 )
 from engine.intelligence_score import (
+    aligned_intelligence_score,
     LEGACY_SCORE_SCALE,
     aggregate_intelligence_score,
     normalize_intelligence_score,
 )
+from engine.candidate_selection import rank_entry_candidates
+from engine.candidate_pipeline import (
+    candidate_size_multipliers,
+    normalized_direction,
+    select_contract_strikes,
+)
+from engine.build_identity import build_identity
 from engine.option_history_store import get_option_history_store
 from engine.signal_quality_policy import (
     choppy_confidence_gate,
@@ -37,9 +49,15 @@ from engine.signal_quality_policy import (
 from engine.market_regime import (
     futures_stop_tolerance_pct,
     is_trending_regime,
+    option_stop_tolerance_pct,
     regime_aligns,
 )
 from engine.entry_policy import effective_underlying_stop_cap_pct
+from engine import s1_lane as s1_lane_policy
+from engine import profit_lock_hold as profit_lock_hold_policy
+from engine import uts_lane as uts_lane_policy
+from engine import s12_lane as s12_lane_policy
+from engine import entry_window
 from engine.position_sizing import resolve_trade_lots, size_lots_for_trade
 from engine.trade_accounting import estimate_trade_charges
 from engine.signal_manager import GradedSignal
@@ -67,6 +85,21 @@ def _setting_enabled(value, default: bool = True) -> bool:
     return bool(value)
 
 
+def _market_naive(value) -> pd.Timestamp:
+    """Normalize an instant to the repository's naive IST candle clock."""
+    ts = pd.Timestamp(value)
+    return ts.tz_convert(IST).tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def _closed_candles_at(frame, as_of, timeframe):
+    if frame is None or getattr(frame, "empty", True):
+        return frame
+    work = frame.copy()
+    work.index = pd.DatetimeIndex([_market_naive(ts) for ts in work.index])
+    duration = pd.Timedelta(str(timeframe or "1min"))
+    return work.loc[work.index + duration <= _market_naive(as_of)]
+
+
 class _PointInTimeCandles:
     """Read-only candle view that never exposes rows after replay clock."""
 
@@ -91,7 +124,7 @@ class _PointInTimeCandles:
             cutoff = cutoff.tz_convert(IST).tz_localize(None)
         if frame.index.tz is not None:
             frame.index = frame.index.tz_convert(IST).tz_localize(None)
-        frame = frame[frame.index <= cutoff]
+        frame = frame[frame.index + pd.Timedelta(minutes=1) <= cutoff]
         timeframe = str(timeframe or "1min").lower()
         if frame.empty or timeframe == "1min":
             return frame
@@ -107,9 +140,10 @@ class _PointInTimeCandles:
         }
         if not all(key in aggregations for key in ("open", "high", "low", "close")):
             return None
-        return frame.resample(
+        resampled = frame.resample(
             timeframe, label="left", closed="left"
         ).agg(aggregations).dropna(subset=["open", "high", "low", "close"])
+        return resampled.loc[resampled.index + pd.Timedelta(timeframe) <= cutoff]
 
     def get_latest_price(self, name):
         frame = self.get_candles(name, "1min")
@@ -366,6 +400,9 @@ def price_action_context(scanner, instrument: str, timeframe: str, sig, settings
                 getattr(settings, "price_action_liquidity_enabled", True), True
             ),
             premium_trend_scale=premium_trend_scale,
+            adverse_threshold=float(
+                getattr(settings, "price_action_entry_adverse_threshold", -0.40) or -0.40
+            ),
         )
     except Exception:
         return None
@@ -405,7 +442,7 @@ def _eod_protect_entry_cutoff(settings):
         return None
 
 
-def _entry_cutoff(settings, timeframe: str):
+def _entry_cutoff(settings, timeframe: str, s1: bool = False):
     """Return the effective no-entry label and time for a timeframe.
 
     2026-08-11: ut_5min_no_entry_after ("15:14") sat 22 minutes AFTER EOD protection
@@ -416,8 +453,20 @@ def _entry_cutoff(settings, timeframe: str):
 
     The two settings are now reconciled rather than left to contradict each other: the
     effective cutoff is whichever comes first.
+
+    A lane signal (UT SMART EXIT, S1) uses the system-wide last-entry times (2026-09-26
+    user: 15m 14:50, 5m 15:10, 1m 15:14) without the EOD-protect clamp: EOD protection is
+    another engine's exit guard and never manages a lane trade; the 15:15 force exit still
+    closes it. Lane callers test the ENTRY time (entry_window.entry_allowed); the returned
+    time is the label's.
     """
-    if str(timeframe) in {"1min", "5min"}:
+    if s1:
+        # `s1` is the lane tag ("S1"/"UTS") or a bool (True = S1).
+        label = s1_lane_policy.lane_entry_cutoff(s1 if isinstance(s1, str) else "S1", timeframe, settings)
+        return label, _parse_clock(label, "15:10")
+    if str(timeframe) == "1min":
+        label = str(getattr(settings, "ut_1min_no_entry_after", "15:14") or "15:14")
+    elif str(timeframe) == "5min":
         label = str(getattr(settings, "ut_5min_no_entry_after", "15:15") or "15:15")
     else:
         label = str(getattr(settings, "ut_no_entry_after", "15:00") or "15:00")
@@ -428,28 +477,35 @@ def _entry_cutoff(settings, timeframe: str):
     return label, cutoff
 
 
-#: Grading telemetry lives on the graded UTBotSignal, but TradeCandidate is built fresh
-#: field-by-field and rtracker reads these off the CANDIDATE — so without an explicit hop
-#: every `grading` block logged empty. Keep this list in sync with rtracker's grading block.
+#: Grading evidence lives on the UTBotSignal, but TradeCandidate is built field-by-field.
+#: Carry the decision-tape fields and the frozen inputs needed for consistent regrading.
 GRADING_TELEMETRY_ATTRS = (
     "graded_timeframe",
     "graded_intel_score",
     "graded_regime",
     "grade_pillars",
+    "confidence_calibrated",
+    "setup_score",
+    "calibrated_win_probability",
+    "expected_net_r",
+    "grading_inputs",
+    "grading_inputs",
 )
+
+UTS_SETUP_ATTRS = ("uts_setup", "uts_multi_index_alignment")
 
 
 def carry_grading_telemetry(candidate, signal) -> None:
-    """Copy grading telemetry from the graded signal onto the candidate that is recorded.
+    """Copy grading evidence from the graded signal onto its candidate.
 
     `_grade_signal` attaches the pillar breakdown to the signal, and the per-timeframe
     grading context is set on that same object. TradeCandidate does not inherit from it,
-    so this hop is what makes either visible in the decision tape. Telemetry only — it
-    must never raise into the signal path.
+    so this hop makes the breakdown visible and preserves inputs for buffer regrading.
+    It must never raise into the signal path.
     """
-    for name in GRADING_TELEMETRY_ATTRS:
+    for name in GRADING_TELEMETRY_ATTRS + UTS_SETUP_ATTRS:
         value = getattr(signal, name, None)
-        if value is None:
+        if value is None and name not in {"setup_score", "calibrated_win_probability", "expected_net_r"}:
             continue
         try:
             setattr(candidate, name, value)
@@ -457,11 +513,18 @@ def carry_grading_telemetry(candidate, signal) -> None:
             pass
 
 
-def _intelligence_stop_pct(base_pct: float, intel_score: float, settings) -> float:
+def _intelligence_stop_pct(
+    base_pct: float,
+    intel_score: float,
+    settings,
+    direction: str = "",
+    score_unit: str = "legacy_0_100",
+) -> float:
     """Nudge the option stop percentage by how strong the corroborating evidence is.
 
-    intel_score runs 0-100 with 50 as neutral. Above neutral the stop may widen slightly
-    (conviction earns room), below it the stop tightens. The adjustment is capped by
+    New signal-path callers pass canonical signed -1..+1 scores and a direction. Legacy
+    direct callers may still pass 0..100 with 50 neutral during the compatibility window.
+    Corroborating evidence widens slightly; contradictory evidence tightens. Adjustment is capped by
     dynamic_stop_intel_max_shift_pct so a stop chosen by ATR and the per-timeframe rules
     is only ever nudged, never redefined, and the result is clamped to a sane band.
 
@@ -481,8 +544,15 @@ def _intelligence_stop_pct(base_pct: float, intel_score: float, settings) -> flo
         score = float(intel_score or 0.0)
     except (TypeError, ValueError):
         return base
-    if score <= 0:
-        return base                      # no reading is not a reason to move the stop
+    unit = str(score_unit or "").strip().lower()
+    if unit == "canonical_signed":
+        if score == 0.0:
+            return base                  # no directional evidence must not move risk
+        lean = aligned_intelligence_score(score, direction)
+    else:
+        if score <= 0:
+            return base                  # legacy zero means no reading
+        lean = max(-1.0, min(1.0, (score - 50.0) / 50.0))
     try:
         max_shift = float(getattr(settings, "dynamic_stop_intel_max_shift_pct", 20.0) or 0.0)
     except (TypeError, ValueError):
@@ -490,7 +560,6 @@ def _intelligence_stop_pct(base_pct: float, intel_score: float, settings) -> flo
     max_shift = max(0.0, min(50.0, max_shift)) / 100.0
     if max_shift <= 0:
         return base
-    lean = max(-1.0, min(1.0, (score - 50.0) / 50.0))
     return max(0.5, min(base * 2.0, base * (1.0 + lean * max_shift)))
 
 
@@ -534,10 +603,16 @@ class TradeCandidate:
     geometry_schema: str = "dual_price_geometry.v1"
     expected_move_forecast: dict[str, Any] = field(default_factory=dict)
     entry_policy_verdict: dict[str, Any] = field(default_factory=dict)
+    # Shared live-data verdict for forecasts and exceptional-entry admission.
+    entry_data_quality: dict[str, Any] = field(default_factory=dict)
     # Versioned quality decision made before raw/override routing.  Unlike a dynamic
     # attribute, this survives the session ledger and can be joined to rtracker exits.
     quality_verdict: dict[str, Any] = field(default_factory=dict)
+    decision_record: dict[str, Any] = field(default_factory=dict)
     signal_timestamp: Optional[datetime] = None
+    # Wall-clock snapshot when the candidate was constructed. The signal timestamp is
+    # the source candle's left edge and is not a valid cutoff for live location checks.
+    decision_timestamp: Optional[datetime] = None
     current_price: float = 0.0
     pnl: float = 0.0
     status: str = "TRADE SIGNAL"
@@ -548,6 +623,9 @@ class TradeCandidate:
     impulse_confirmed: bool = False
     power_move: bool = False
     volume_spike_entry: bool = False
+    # Whether `volume_ratio` represents traded/constituent quantity or a separately
+    # calibrated activity proxy.  Consumers must not treat the latter as traded volume.
+    volume_basis: str = ""
     market_ltp_shock_entry: bool = False
     late_session_reclaim_entry: bool = False
     one_way_cascade_entry: bool = False
@@ -579,6 +657,7 @@ class TradeCandidate:
     source_lane: str = ""
     quad_union_entry: bool = False
     raw_union_entry: bool = False
+    watch_only: bool = False
 
 
 def _sig_date(signal) -> Optional[date]:
@@ -625,16 +704,14 @@ def _estimate_opt_premium(spot_price: float, scanner=None, instrument: str = "",
     """
     base_pct = 0.012
     vix_val = 15.0
-    if scanner and trade_date is not None and hasattr(scanner, "_vix_data"):
+    if scanner and trade_date is not None:
         try:
-            day = str(trade_date)[:10]
-            day_values = [
-                float(v)
-                for k, v in getattr(scanner, "_vix_data", {}).items()
-                if str(k).startswith(day) and float(v or 0.0) > 0
-            ]
-            if day_values:
-                vix_val = sum(day_values) / len(day_values)
+            # A date-only request has no intraday knowledge. Use midnight as its
+            # cutoff, never the mean of the eventual day's VIX observations.
+            resolver = getattr(scanner, "_get_historical_vix", None)
+            measured = float(resolver(pd.Timestamp(trade_date)) or 0.0) if callable(resolver) else 0.0
+            if measured > 0:
+                vix_val = measured
         except Exception:
             pass
     elif scanner and hasattr(scanner, "data"):
@@ -648,7 +725,7 @@ def _estimate_opt_premium(spot_price: float, scanner=None, instrument: str = "",
     dte_boost = 1.0
     if scanner and instrument and trade_date is not None and hasattr(scanner, "expiry"):
         try:
-            dte = max(0.0, float(scanner.expiry.get_dte(instrument, trade_date)))
+            dte = max(0.0, float(_scanner_days_to_expiry(scanner, instrument, trade_date)))
             dte_boost = max(0.75, min(1.35, (max(dte, 1.0) / 3.0) ** 0.25))
         except Exception:
             pass
@@ -656,6 +733,17 @@ def _estimate_opt_premium(spot_price: float, scanner=None, instrument: str = "",
     # Premium roughly scales with VIX. At VIX 15, pct is 1.2%
     scaler = max(10.0, vix_val) / 15.0
     return spot_price * base_pct * scaler * dte_boost
+
+def _scanner_days_to_expiry(scanner, instrument, as_of):
+    # Import at call time: Scanner owns mode routing, including replay probes.
+    from scanner import Scanner
+    return Scanner._days_to_expiry_for(scanner, instrument, as_of)
+
+
+def _scanner_is_expiry_day(scanner, instrument, as_of):
+    from scanner import Scanner
+    return Scanner._is_expiry_day_for(scanner, instrument, as_of)
+
 
 class SignalProcessor:
     """
@@ -668,6 +756,208 @@ class SignalProcessor:
         self._option_symbol_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self._option_history_fetch_attempted = set()
         self._option_history_store = get_option_history_store()
+
+    @staticmethod
+    def _record_directional_census(scanner, signal, instrument, timeframe,
+                                   direction, identity_stamp, settings):
+        """Count native selection arrows without mixing in independent own lanes.
+
+        S1 and UTS skip this selection gate. Their arrows must not change the
+        census that can reject the companion engine's otherwise eligible setup.
+        Live and replay callers retain their existing timestamp identity format.
+        """
+        if s1_lane_policy.is_lane(signal, settings):
+            return
+        try:
+            day = signal.timestamp.date().isoformat()
+            if getattr(scanner, "_dir_census_date", None) != day:
+                scanner._dir_census_date = day
+                scanner._dir_census = {"LONG": 0, "SHORT": 0}
+                scanner._dir_census_seen = set()
+            identity = f"{instrument}|{timeframe}|{identity_stamp}|{direction}"
+            if identity not in scanner._dir_census_seen:
+                scanner._dir_census_seen.add(identity)
+                scanner._dir_census[direction] = scanner._dir_census.get(direction, 0) + 1
+        except Exception:
+            pass
+
+    @staticmethod
+    def _historical_signal_for_replay(signal, timeframe):
+        """Keep the arrow's bar identity while acting only after its close.
+
+        Raw MTF signals and all live paths retain their original timestamps.
+        This copy is used exclusively by the historical reconstruction loop.
+        """
+        result = copy.copy(signal)
+        source = getattr(signal, "source_signal_timestamp", None) or signal.timestamp
+        result.source_signal_timestamp = source
+        result.signal_available_at = (
+            _market_naive(source) + pd.Timedelta(str(timeframe))
+        ).to_pydatetime()
+        result.timestamp = result.signal_available_at
+        return result
+
+    @staticmethod
+    def _historical_entry_cutoff_allows(signal, timeframe: str, lane_tag: str, settings) -> bool:
+        """Replay entry cutoff.
+
+        Historical signals are shifted to the bar close before execution. A lane signal
+        (UT SMART EXIT, S1) enters at its bar's close, which must land by the system-wide
+        last entry (entry_window). Other engines retain their established
+        availability-time comparison.
+        """
+        if lane_tag:
+            start = getattr(signal, "source_signal_timestamp", None) or getattr(signal, "timestamp", None)
+            if start is None:
+                return False
+            return entry_window.entry_allowed(_market_naive(start), timeframe, settings)
+        _, cutoff = _entry_cutoff(settings, timeframe, s1=lane_tag)
+        value = getattr(signal, "timestamp", None)
+        if value is None:
+            return False
+        return _market_naive(value).time() < cutoff
+
+    @staticmethod
+    def _historical_uts_premium_stop_distance(
+        premium: float,
+        index_stop_distance: float,
+        delta: float,
+        settings,
+        *,
+        regime: str = "UNKNOWN",
+        confidence=None,
+        grade: str = "",
+        setup=None,
+        timeframe="",
+    ) -> float:
+        """UTS replay premium guard, identical to live premium-space geometry."""
+        return uts_lane_policy.premium_stop_distance(
+            premium,
+            index_stop_distance,
+            delta,
+            settings,
+            regime=regime,
+            confidence=confidence,
+            grade=grade,
+            setup=setup,
+            timeframe=timeframe,
+        )
+
+    @staticmethod
+    def _historical_index_price_window(scanner, instrument, start, end):
+        """Covered one-minute index proxy prices; not actual futures history."""
+        frame = _closed_candles_at(scanner.candles.get_candles(instrument, "1min"), end, "1min")
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        frame = frame.loc[frame.index >= _market_naive(start)].sort_index()
+        if frame.empty or frame.index[0] - _market_naive(start) >= pd.Timedelta(minutes=1):
+            return pd.DataFrame()
+        if (frame.index.to_series().diff().dropna() > pd.Timedelta(minutes=1)).any():
+            return pd.DataFrame()
+        return frame
+
+    @staticmethod
+    def _historical_price_evidence(inst_type, actual_option=None, *, signal=None, entry_time=None, shadow=False):
+        """Describe replay price origin without changing accounting or outcomes.
+
+        BACKTEST remains the compatibility replay-family tag. This trace carries
+        the finer price basis so modeled derivatives cannot pass as observations.
+        """
+        if str(inst_type).upper() == "OPT" and actual_option:
+            trace = copy.deepcopy(actual_option.get("exit_trace") or [])
+            input_row = next((item for item in trace if item.get("guard") == "replay_input"), None)
+            if input_row is None:
+                input_row = {"guard": "replay_input", "state": "OBSERVED_OPTION_OHLC"}
+                trace.insert(0, input_row)
+            input_row.update({"price_basis": "OBSERVED_OPTION_OHLC", "observed_option_prices": True, "actual_futures_prices": False, "synthetic_option_prices": False})
+            return trace
+        basis = "SYNTHETIC_OPTION_ESTIMATE" if str(inst_type).upper() == "OPT" else "INDEX_PRICE_PROXY"
+        source_time = getattr(signal, "source_signal_timestamp", None) or getattr(signal, "timestamp", None)
+        return [{
+            "guard": "replay_input", "state": basis, "price_basis": basis,
+            "time": pd.Timestamp(entry_time).isoformat() if entry_time is not None else "",
+            "source_signal_timestamp": pd.Timestamp(source_time).isoformat() if source_time is not None else "",
+            "observed_option_prices": False, "actual_futures_prices": False,
+            "synthetic_option_prices": basis == "SYNTHETIC_OPTION_ESTIMATE",
+            "shadow": bool(shadow), "contract_verified": False,
+            "fill_model": "modeled_option_premium_from_index" if basis == "SYNTHETIC_OPTION_ESTIMATE" else "index_ohlc_proxy_not_futures_contract",
+        }]
+
+    @staticmethod
+    def _historical_futures_fill_evidence(window, *, signal, entry_time, exit_time,
+                                         entry_price, exit_price, exit_reason):
+        """Bind completed causal index-proxy fills to their accounting record.
+
+        These are modeled futures outcomes, never observed futures contracts. Only
+        a continuous, valid path through the selected fill can bypass legacy display
+        repairs; malformed or incomplete paths retain ordinary proxy evidence.
+        """
+        import numpy as np
+
+        trace = SignalProcessor._historical_price_evidence(
+            "FUT", signal=signal, entry_time=entry_time,
+        )
+        if window is None or window.empty:
+            return trace
+        try:
+            start, end = _market_naive(entry_time), _market_naive(exit_time)
+            if end < start or not all(math.isfinite(float(value)) and float(value) > 0
+                                      for value in (entry_price, exit_price)):
+                return trace
+            frame = window.copy()
+            frame.index = pd.DatetimeIndex([_market_naive(ts) for ts in frame.index])
+            # A gap fills at its open; retain that opening row as evidence. A fill
+            # at a minute close needs only rows closed by that boundary.
+            at_open = end in frame.index and math.isclose(
+                float(frame.loc[end, "open"]), float(exit_price), rel_tol=0., abs_tol=1e-8,
+            )
+            frame = frame.loc[(frame.index >= start) &
+                              ((frame.index <= end) if at_open else
+                               (frame.index + pd.Timedelta(minutes=1) <= end))]
+            if (frame.empty or not frame.index.is_unique or not frame.index.is_monotonic_increasing
+                    or frame.index[0] - start >= pd.Timedelta(minutes=1)
+                    or (frame.index.to_series().diff().dropna() != pd.Timedelta(minutes=1)).any()
+                    or (not at_open and frame.index[-1] + pd.Timedelta(minutes=1) < end)):
+                return trace
+            values = frame[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+            if (not np.isfinite(values.to_numpy()).all() or (values <= 0).any().any()
+                    or (values["low"] > values[["open", "close"]].min(axis=1)).any()
+                    or (values["high"] < values[["open", "close"]].max(axis=1)).any()):
+                return trace
+            trace[0].update({
+                "fill_accounting": "CAUSAL_INDEX_PROXY_V1", "complete_path": True,
+                "input_sha256": hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes()).hexdigest(),
+                "rows": len(frame), "entry_time": start.isoformat(), "exit_time": end.isoformat(),
+                "entry_price": float(entry_price), "exit_price": float(exit_price),
+                "exit_reason": str(exit_reason),
+                "fill_model": "confirmed_entry_closed_1m_stop_first_gap_at_open_index_proxy",
+            })
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass
+        return trace
+
+    @staticmethod
+    def _bind_historical_intelligence(probe, source, candle_view):
+        """Give production exit readers an exact snapshot at the replay clock.
+
+        Some guards call the exact-intelligence method directly rather than the
+        attached trade-context fallback. Their live cache and wall-clock access
+        must be replaced at this replay adapter boundary, never on the live class.
+        """
+        def exact(trade_like, *, evaluation_time=None, allow_blocking=True):
+            reader = getattr(source, "_get_historical_intel_context_at", None)
+            if candle_view.as_of is None or not callable(reader):
+                return None
+            instrument = str(getattr(trade_like, "instrument", "") or "").split()[0].upper()
+            timeframe = str(getattr(trade_like, "timeframe", "5min") or "5min").lower()
+            context = reader(instrument, _market_naive(candle_view.as_of).to_pydatetime(), timeframe)
+            if not isinstance(context, dict) or not context:
+                return None
+            result = copy.deepcopy(context)
+            result.setdefault("as_of", _market_naive(candle_view.as_of).isoformat())
+            result.setdefault("timeframe", timeframe)
+            return result
+        probe._fresh_exact_trade_intel = exact
 
     def _historical_audit_log(self, message: str) -> None:
         """Keep bulk backtest reject details out of INFO unless explicitly enabled."""
@@ -1033,7 +1323,34 @@ class SignalProcessor:
         """
         identity = f"{signal_ts.isoformat()}|{signal_type}"
         identities = SignalProcessor._live_signal_identities(last_identity)
-        return signal_ts > last_ts or (signal_ts == last_ts and identity not in identities)
+        identity_seen = any(
+            known == identity or known.startswith(f"{identity}|")
+            for known in identities
+        )
+        return signal_ts > last_ts or (signal_ts == last_ts and not identity_seen)
+
+    @staticmethod
+    def _native_entry_has_exit(signal, stream) -> bool:
+        """True when this exact scanner-native entry is already terminal."""
+        if bool(getattr(signal, "native_exit_only", False)):
+            return False
+        source = str(getattr(signal, "source_engine", "") or "").lower()
+        entry_ts = getattr(signal, "timestamp", None)
+        if source not in {"apex_v57", "stock_master_v732"} or entry_ts is None:
+            return False
+        entry_check = entry_ts.replace(tzinfo=None) if getattr(entry_ts, "tzinfo", None) else entry_ts
+        for event in stream or []:
+            if not bool(getattr(event, "native_exit_only", False)):
+                continue
+            if str(getattr(event, "source_engine", "") or "").lower() != source:
+                continue
+            owner_ts = getattr(event, "native_entry_timestamp", None)
+            if owner_ts is None:
+                continue
+            owner_check = owner_ts.replace(tzinfo=None) if getattr(owner_ts, "tzinfo", None) else owner_ts
+            if owner_check == entry_check:
+                return True
+        return False
 
     @staticmethod
     def _live_signal_identities(value) -> set[str]:
@@ -1217,6 +1534,8 @@ class SignalProcessor:
     def _option_signed_delta(spot, strike, option_type, intel_result, dte, fallback):
         """Black-Scholes signed delta for the ACTUAL strike (fixes ITM/OTM options
         being assigned the flat ATM ~0.5 delta). Falls back to the ATM/±0.5 estimate."""
+        if dte is None:
+            return fallback
         try:
             from intelligence.greeks_engine import GreeksEngine
             greeks = (intel_result or {}).get("greeks", {}) or {}
@@ -1237,8 +1556,29 @@ class SignalProcessor:
             return fallback
 
     @staticmethod
-    def _power_move_confirmed(*, volume_ratio, range_atr_ratio, close_location, adx_value, intel_score, trend_15m_agrees, settings) -> bool:
+    def _observed_option_stop_context(option_df, signal_time, spot, strike, option_type, underlying_stop_distance):
+        """Map a spot stop using the expiry of the observed option, not today's master."""
+        from engine.expiry_manager import ArchivedExpiryContext
+        attrs = dict(getattr(option_df, "attrs", {}) or {})
+        expiry = attrs.get("contract_expiry")
+        if not expiry or not attrs.get("contract_verified"):
+            return None
+        context = ArchivedExpiryContext().resolve(
+            "", signal_time, contract_expiry=expiry, contract_verified=True)
+        if not context["available"]:
+            return None
+        delta = SignalProcessor._option_signed_delta(
+            spot, strike, option_type, {}, context["days_to_expiry"],
+            0.5 if str(option_type).upper() == "CE" else -0.5)
+        distance = abs(float(underlying_stop_distance))
+        return {"expiry_context": context, "natural_stop_delta": delta,
+                "natural_stop_delta_source": "estimated_black_scholes_iv_15pct", "natural_stop_iv": 0.15,
+                "underlying_stop_distance": distance, "natural_sl_distance": abs(distance * delta)}
+
+    @staticmethod
+    def _power_move_confirmed(*, volume_ratio, range_atr_ratio, close_location, adx_value, intel_score, trend_15m_agrees, settings, signal_type="") -> bool:
         return power_move_confirmed(
+            signal_type=signal_type,
             volume_ratio=volume_ratio,
             range_atr_ratio=range_atr_ratio,
             close_location=close_location,
@@ -1397,12 +1737,30 @@ class SignalProcessor:
         return True
 
     @staticmethod
-    def _suppress_1min_no_spike_tape(tf, volume_spike_entry, settings) -> bool:
+    def _is_s12_native_burst(signal) -> bool:
+        """True only for a native D2 burst; it must not impersonate the host spike stop."""
+        return bool(
+            s12_lane_policy.lane_of(signal) == "D2"
+            and getattr(signal, "s12_burst", False)
+        )
+
+    @staticmethod
+    def _has_1min_burst_or_spike(signal) -> bool:
+        """The host's measured spike or S1+S2's own confirmed D2 burst."""
+        return bool(
+            getattr(signal, "volume_spike_entry", False)
+            or SignalProcessor._is_s12_native_burst(signal)
+        )
+
+    @staticmethod
+    def _suppress_1min_no_spike_tape(tf, volume_spike_entry, settings, *, native_burst=False) -> bool:
         """Whether to keep a 1min signal off the live tape because it never cleared
-        its configured traded-volume or tick-percentile first filter."""
+        its configured traded-volume or tick-percentile first filter. S1+S2's native D2
+        burst is an equivalent explicit fast-entry route, but keeps its own stop policy."""
         return bool(
             str(tf or "") == "1min"
             and not bool(volume_spike_entry)
+            and not bool(native_burst)
             and _setting_enabled(getattr(settings, "live_1min_log_only_volume_spike", True), True)
         )
 
@@ -1413,7 +1771,7 @@ class SignalProcessor:
             return True
         if str(best_tf or "") != "1min":
             return len(scored or []) > 1 or str(best_tf or "") == "15min"
-        if bool(getattr(best_sig, "volume_spike_entry", False)):
+        if SignalProcessor._has_1min_burst_or_spike(best_sig):
             return True
         if bool(getattr(best_sig, "power_move", False)):
             return True
@@ -1424,30 +1782,69 @@ class SignalProcessor:
         candidates_raw,
         *,
         reversion_window_open: bool = False,
+        plain_one_min: bool = False,
     ):
         """Keep 1min rows from competing unless an exceptional route exists.
 
+        - ``plain_one_min``: the TF toggle is 1M alone (2026-09-26 user), so a plain
+          1m UT flip is an entry path. The 1m combinations take fast 1m rows only.
         - Continuous 1M SPIKE path: requires volume_spike_entry.
         - POST-WIN / distress SNAPBACK path: may admit 1min without spike while the
           reversion window is open (REV-SCLP ON, 1M-SCALP may be OFF).
-        - Confirmed shock, reversal, pullback and cascade flags may enter their own
+        - Confirmed shock, reversal, reclaim and cascade flags may enter their own
           downstream state-specific checks.
-
-        Selecting a 1m timeframe enables monitoring and confirmed bursts; it never
-        turns a raw UT flip into an entry path.
         """
         allow_reversion_1min = bool(reversion_window_open)
         return [
             c
             for c in list(candidates_raw or [])
             if str(c.get("tf", "")) != "1min"
-            or bool(getattr(c.get("sig"), "volume_spike_entry", False))
+            or bool(plain_one_min)
+            or SignalProcessor._has_1min_burst_or_spike(c.get("sig"))
             or allow_reversion_1min
             or bool(getattr(c.get("sig"), "market_ltp_shock_entry", False))
             or bool(getattr(c.get("sig"), "market_wide_reversal_entry", False))
             or bool(getattr(c.get("sig"), "late_session_reclaim_entry", False))
             or bool(getattr(c.get("sig"), "one_way_cascade_entry", False))
         ]
+
+    @staticmethod
+    def _tag_one_min_fast_contexts(scanner, instrument, candidates_raw) -> None:
+        """Give an untagged 1m row its reclaim / cascade evidence before admission.
+
+        Unless the TF toggle is 1M alone, a 1m row is admitted only with a burst,
+        snapback or reversal tag; the reclaim and cascade tags, though, were computed after
+        selection and on the winner only, so a 1m reclaim or cascade could never be
+        selected (2026-09-26). The detectors carry their own switches and windows.
+        """
+        for c in list(candidates_raw or []):
+            sig = c.get("sig")
+            if str(c.get("tf") or "") != "1min" or sig is None:
+                continue
+            if bool(getattr(sig, "late_session_reclaim_entry", False)) or bool(
+                getattr(sig, "one_way_cascade_entry", False)
+            ):
+                continue
+            side = str(getattr(sig, "signal_type", "") or "").upper()
+            for flag, fn_name in (
+                ("late_session_reclaim", "_late_session_reclaim_context"),
+                ("one_way_cascade", "_one_way_cascade_context"),
+            ):
+                fn = getattr(scanner, fn_name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    ctx = fn(instrument, "1min", side, getattr(sig, "timestamp", None))
+                except Exception as exc:
+                    logger.debug(f"1m {flag} check skipped for {instrument}: {exc}")
+                    ctx = None
+                if isinstance(ctx, dict) and ctx:
+                    try:
+                        setattr(sig, f"{flag}_entry", True)
+                        setattr(sig, f"{flag}_context", dict(ctx))
+                    except Exception:
+                        pass
+                    break
 
     @staticmethod
     def _evaluate_reversion_scalp(
@@ -1776,6 +2173,9 @@ class SignalProcessor:
         sibling.confidence = float(confidence or 0.0)
         sibling.score = float(confidence or 0.0)
         sibling.signal_timestamp = getattr(sig, "timestamp", None) or winner.signal_timestamp
+        # The sibling is a different setup. A shallow copy must not regrade it from
+        # the winner's raw candle/ADX/timeframe; absent own inputs mean no regrade.
+        sibling.grading_inputs = copy.deepcopy(getattr(sig, "grading_inputs", None))
         sibling.reasons = list(reasons or []) + [
             f"Cascade multi-TF stack sibling ({sibling.timeframe})"
         ]
@@ -2012,8 +2412,15 @@ class SignalProcessor:
         return choppy_confidence_gate(settings)
 
     @staticmethod
-    def _dynamic_rr(grade: str, confidence: float, intel_score: float = 0.0, max_rr: Optional[float] = None, timeframe: str = "") -> float:
-        return dynamic_rr(grade, confidence, intel_score, max_rr, timeframe)
+    def _dynamic_rr(
+        grade: str,
+        confidence: float,
+        intel_score: float = 0.0,
+        max_rr: Optional[float] = None,
+        timeframe: str = "",
+        direction: str = "",
+    ) -> float:
+        return dynamic_rr(grade, confidence, intel_score, max_rr, timeframe, direction)
 
     @staticmethod
     def _option_index_stop_distance(
@@ -2040,11 +2447,14 @@ class SignalProcessor:
         atr_premium_stop: float = 0.0,
         settings=None,
         intel_score: float = 0.0,
+        direction: str = "",
+        score_unit: str = "legacy_0_100",
     ) -> float:
         try:
             opt_sl_pct = float(getattr(scanner, "options_sl_pct", getattr(get_settings(), "options_sl_pct", 15.0)) or 15.0)
         except Exception:
             opt_sl_pct = 15.0
+        hard_cap_pct = option_stop_tolerance_pct(opt_sl_pct, regime)
         # `options_sl_pct` is an operator risk cap, not a minimum.  Choppy and
         # unknown regimes may tighten a stop through the ATR/expiry rules below,
         # but must never widen a configured premium loss limit.
@@ -2056,9 +2466,12 @@ class SignalProcessor:
         #
         # Default OFF: this changes the risk on every option entry, which is the
         # operator's decision and not a defect being repaired.
-        opt_sl_pct = _intelligence_stop_pct(opt_sl_pct, intel_score, settings)
+        opt_sl_pct = _intelligence_stop_pct(
+            opt_sl_pct, intel_score, settings, direction=direction, score_unit=score_unit,
+        )
+        opt_sl_pct = min(opt_sl_pct, hard_cap_pct)
         price = float(live_trade_price or 0.0)
-        pct_stop = max(0.5, price * (opt_sl_pct / 100.0))
+        pct_stop = price * (opt_sl_pct / 100.0)
 
         # Timeframe- and ATR-aware stop: derive the premium stop from the signal's ATR
         # natural stop (already converted to premium points by the caller) bounded by
@@ -2086,7 +2499,7 @@ class SignalProcessor:
                 floor = price * (min_pct / 100.0)
                 ceil = price * (max_pct / 100.0)
                 stop = min(max(atr_stop, floor), ceil)
-                return max(0.5, stop)
+                return min(pct_stop, max(0.5, stop))
         return pct_stop
 
     def _option_grade_allowed(
@@ -2131,6 +2544,7 @@ class SignalProcessor:
         power_move: bool = False,
         volume_ratio: float = 0.0,
         return_verdict: bool = False,
+        confidence_calibrated: bool = False,
     ):
         return passes_quality_gate(
             tf,
@@ -2151,6 +2565,7 @@ class SignalProcessor:
             power_move=power_move,
             volume_ratio=volume_ratio,
             return_verdict=return_verdict,
+            confidence_calibrated=confidence_calibrated,
         )
 
     @staticmethod
@@ -2176,6 +2591,31 @@ class SignalProcessor:
         power = bool(structural_power or getattr(signal, "power_move", False))
         return impulse, power
 
+    def _replay_candle_volume_evidence(self, signal, tf: str, lookback: int = 20) -> dict:
+        """Signal-bar volume against the prior bars' mean, from the replay candle store.
+
+        Replay has no live intel volume context. This measures the same question from
+        recorded candles (index candle volume, not the live cash/futures basis) and only
+        uses bars up to the signal bar. Returns {} when it cannot be measured.
+        """
+        try:
+            frame = self.scanner.candles.get_candles(str(getattr(signal, "instrument", "") or ""), tf)
+            if frame is None or "volume" not in frame:
+                return {}
+            stamp = pd.Timestamp(getattr(signal, "timestamp")).tz_localize(None)
+            index = frame.index.tz_localize(None) if getattr(frame.index, "tz", None) else frame.index
+            pos = int(index.searchsorted(stamp, side="right")) - 1
+            if pos < lookback or index[pos] != stamp:
+                return {}
+            volumes = frame["volume"].astype(float)
+            base = float(volumes.iloc[pos - lookback:pos].mean())
+            if not base > 0:
+                return {}
+            return dict(volume_ratio=float(volumes.iloc[pos]) / base, volume_available=True,
+                        volume_basis="CANDLE_REPLAY")
+        except Exception:
+            return {}
+
     def _quality_verdict_for_signal(
         self,
         signal,
@@ -2192,6 +2632,40 @@ class SignalProcessor:
         structural_power: bool = False,
     ):
         """Build the canonical call-site inputs shared by replay/recovery/EOD."""
+        if s12_lane_policy.is_lane(signal):
+            native_signal = copy.copy(signal)
+            native_signal.timeframe = tf
+            try:
+                signal_time = pd.Timestamp(getattr(native_signal, "timestamp", None))
+                minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(tf), 5)
+                entry_available_at = signal_time + pd.Timedelta(minutes=minutes)
+            except Exception:
+                entry_available_at = None
+            replay = str(getattr(getattr(self, "scanner", None), "mode", "")).upper() == "HISTORICAL"
+            verdict = s12_lane_policy.entry_verdict(
+                native_signal,
+                settings,
+                regime=regime,
+                lane="REPLAY" if replay else "LIVE",
+                now=entry_available_at,
+            )
+            signal.quality_verdict = verdict.to_dict()
+            return verdict
+        if uts_lane_policy.is_uts(signal, settings):
+            # Historical/recovery/EOD callers must use the same native admission
+            # policy as live. The caller's timeframe is authoritative even when
+            # an older signal record omitted its timeframe. Keep measured volume
+            # provenance and native RSI/ADX; never turn a bare ratio into volume.
+            native_signal = copy.copy(signal)
+            native_signal.timeframe = tf
+            replay = str(getattr(getattr(self, "scanner", None), "mode", "")).upper() == "HISTORICAL"
+            volume = self._replay_candle_volume_evidence(native_signal, tf) if replay else {}
+            verdict = uts_lane_policy.entry_verdict(
+                native_signal, settings, regime=regime,
+                lane=("REPLAY" if replay else "RECOVERY"), **volume,
+            )
+            signal.quality_verdict = verdict.to_dict()
+            return verdict
         impulse_confirmed, power_move = self._explicit_signal_quality_evidence(
             signal,
             structural_impulse=structural_impulse,
@@ -2219,22 +2693,27 @@ class SignalProcessor:
             power_move=power_move,
             volume_ratio=volume_ratio,
             return_verdict=True,
+            confidence_calibrated=bool(getattr(signal, "confidence_calibrated", False)),
         )
 
     @staticmethod
-    def _trend_15m_agrees_at(mtf_result, signal_ts, signal_type: str) -> bool:
+    def _trend_15m_agrees_at(mtf_result, signal_ts, signal_type: str, *, closed_only=False) -> bool:
         result = getattr(mtf_result, "results_15min", None) or {}
         signals = result.get("signals", []) or []
         if not signals:
+            if closed_only:
+                return False
             state = result.get("state", {}) or {}
             position = int(state.get("position") or 0)
             expected = 1 if str(signal_type or "").upper() == "BUY" else -1
             return position == expected
 
-        target_ts = signal_ts.replace(tzinfo=None) if getattr(signal_ts, "tzinfo", None) else signal_ts
+        target_ts = _market_naive(signal_ts) if signal_ts is not None else None
         prior = []
         for signal in signals:
-            ts = signal.timestamp.replace(tzinfo=None) if getattr(signal.timestamp, "tzinfo", None) else signal.timestamp
+            ts = _market_naive(signal.timestamp)
+            if closed_only:
+                ts += pd.Timedelta(minutes=15)
             if target_ts is None or ts <= target_ts:
                 prior.append(signal)
         if not prior:
@@ -2314,6 +2793,8 @@ class SignalProcessor:
         option_type: str,
         interval: str,
         trade_day,
+        now_dt=None,
+        expiry_preference: str = "",
     ) -> Tuple[pd.DataFrame, str]:
         """Use an archived contract only when it contains the requested trade day.
 
@@ -2328,25 +2809,106 @@ class SignalProcessor:
             from pathlib import Path
 
             desired = int(round(float(strike)))
-            desired_width = len(str(abs(desired)))
             suffix = f"{str(option_type or '').upper()}_{interval}.csv"
             candidates = []
-            for path in Path("data_store/candles").glob(f"{instrument}*{suffix}"):
+            # Expiry is part of identity. Monthly Kite symbols encode only the
+            # month; resolve those against a local master rather than guessing
+            # the exchange calendar. Explicit dated symbols are self-describing.
+            from engine.expiry_manager import expiry_policy_signature
+            master_paths = (Path("data_store/kite_instruments.json"), Path("data_store/instruments.json"))
+            def file_signature(path):
+                if not path.exists():
+                    return str(path.resolve()), None, None
+                stat = path.stat()
+                return str(path.resolve()), stat.st_mtime_ns, stat.st_size
+            master_signature = tuple(file_signature(path) for path in master_paths)
+            snapshot = getattr(self, "_archived_master_snapshot", None)
+            if snapshot is None or snapshot[0] != master_signature:
+                master = {}
+                parsed_dates = {}
+                for master_path in master_paths:
+                    if not master_path.exists():
+                        continue
+                    for item in json.loads(master_path.read_text(encoding="utf-8")):
+                        symbol_name = str(item.get("symbol") or item.get("tradingsymbol") or "").upper()
+                        value = str(item.get("expiry") or "")
+                        if value not in parsed_dates:
+                            expiry = pd.to_datetime(value, format="%d%b%Y", errors="coerce")
+                            if pd.isna(expiry):
+                                expiry = pd.to_datetime(value, errors="coerce")
+                            parsed_dates[value] = expiry
+                        expiry = parsed_dates[value]
+                        if symbol_name and not pd.isna(expiry):
+                            master[symbol_name] = expiry.date()
+                by_index = {name: set() for name in ("NIFTY", "BANKNIFTY", "MIDCPNIFTY", "SENSEX")}
+                for symbol, expiry in master.items():
+                    if symbol.endswith(("CE", "PE")):
+                        for name, values in by_index.items():
+                            if symbol.startswith(name):
+                                values.add(expiry)
+                snapshot = (master_signature, master, by_index)
+                self._archived_master_snapshot = snapshot
+            _, master, by_index = snapshot
+            pattern = re.compile(re.escape(str(instrument).upper()) + r"(.+?)" + str(desired) + re.escape(str(option_type).upper()))
+            paths = [path for path in Path("data_store/candles").glob(f"{instrument}*{suffix}")
+                     if pattern.fullmatch(path.name[:-len(f"_{interval}.csv")].upper())]
+            source_signature = (master_signature, tuple(file_signature(path) for path in paths))
+            lookup_key = (str(instrument).upper(), desired, str(option_type).upper(), interval,
+                          trade_day, pd.Timestamp(now_dt) if now_dt is not None else None,
+                          expiry_preference, expiry_policy_signature(), source_signature)
+            cache = self.__dict__.setdefault("_archived_contract_lookup_cache", {})
+            cached = cache.get(lookup_key)
+            if cached is not None:
+                return cached[0].copy(), cached[1]
+            for path in paths:
                 symbol = path.name[: -len(f"_{interval}.csv")]
-                match = re.search(r"(\d+)(CE|PE)$", symbol.upper())
+                match = re.fullmatch(
+                    re.escape(str(instrument).upper()) + r"(.+?)" + str(desired) + re.escape(str(option_type).upper()),
+                    symbol.upper(),
+                )
                 if not match:
                     continue
-                digit_text = match.group(1)
-                if len(digit_text) < desired_width:
+                expiry = master.get(symbol.upper())
+                code = match.group(1)
+                if expiry is None and re.fullmatch(r"\d{2}[A-Z]{3}\d{2}", code):
+                    expiry = datetime.strptime(code, "%d%b%y").date()
+                if expiry is None and re.fullmatch(r"\d{2}[1-9OND]\d{2}", code):
+                    month = {"O": 10, "N": 11, "D": 12}.get(code[2], int(code[2]) if code[2].isdigit() else 0)
+                    expiry = date(2000 + int(code[:2]), month, int(code[3:]))
+                if expiry is None or expiry < trade_day:
                     continue
-                contract_strike = int(digit_text[-desired_width:])
                 day_frame = self._filter_option_history_date(
                     self._option_history_store.load(path), trade_day
                 )
                 if not day_frame.empty:
-                    candidates.append((abs(contract_strike - desired), symbol, day_frame))
+                    candidates.append((expiry, symbol, day_frame))
             if candidates:
-                _, symbol, frame = min(candidates, key=lambda row: (row[0], row[1]))
+                # Resolve the configured rollover from the known local expiry set.
+                # Never silently relabel a different strike as the requested one.
+                from engine.expiry_manager import ExpiryManager
+                expiries = {row[0] for row in candidates}
+                expiries.update(exp for exp in by_index.get(str(instrument).upper(), ()) if exp >= trade_day)
+                resolver = ExpiryManager.__new__(ExpiryManager)
+                resolver.df = pd.DataFrame({"name": [instrument] * len(expiries), "instrumenttype": ["OPTIDX"] * len(expiries), "expiry_dt": pd.to_datetime(sorted(expiries))})
+                native_monthly = str(expiry_preference or "").upper() == "MONTHLY"
+                expected = resolver._select_option_expiry_for_date(
+                    instrument, trade_day,
+                    (
+                        "active_monthly"
+                        if native_monthly or instrument in {"BANKNIFTY", "MIDCPNIFTY"}
+                        else "active_weekly"
+                    ),
+                    now_dt=now_dt,
+                )
+                candidates = [row for row in candidates if expected is not None and row[0] == pd.Timestamp(expected).date()]
+                if not candidates:
+                    return pd.DataFrame(), ""
+                expiry, symbol, frame = min(candidates, key=lambda row: row[1])
+                frame = frame.copy()
+                frame.attrs.update({"contract_symbol": symbol, "contract_expiry": expiry.isoformat(), "contract_strike": desired, "contract_option_type": str(option_type).upper(), "contract_verified": True})
+                if len(cache) >= 128:
+                    cache.clear()
+                cache[lookup_key] = (frame.copy(), symbol)
                 return frame, symbol
         except Exception as exc:
             logger.debug(
@@ -2355,21 +2917,71 @@ class SignalProcessor:
             )
         return pd.DataFrame(), ""
 
-    def _load_option_candles(self, scanner, instrument: str, strike: float, option_type: str, interval: str, trade_date, now_dt=None) -> Tuple[pd.DataFrame, str, str]:
+    def _load_option_candles(
+        self,
+        scanner,
+        instrument: str,
+        strike: float,
+        option_type: str,
+        interval: str,
+        trade_date,
+        now_dt=None,
+        expiry_preference: str = "",
+    ) -> Tuple[pd.DataFrame, str, str]:
         trade_day = pd.Timestamp(trade_date).date() if trade_date is not None else None
         archived_frame, archived_symbol = self._load_cached_historical_option_contract(
-            instrument, strike, option_type, interval, trade_day
+            instrument,
+            strike,
+            option_type,
+            interval,
+            trade_day,
+            now_dt=now_dt,
+            expiry_preference=expiry_preference,
         )
         if not archived_frame.empty:
             diag = getattr(scanner, "_diag_inc", None)
             if diag:
                 diag("option_history", "archived_hits")
             return archived_frame, archived_symbol, ""
-        opt_info = scanner.data.get_option_token(instrument, strike, option_type, trade_date=trade_date, now_dt=now_dt)
+        option_token_kwargs = {"trade_date": trade_date, "now_dt": now_dt}
+        if expiry_preference:
+            option_token_kwargs["expiry_preference"] = expiry_preference
+        opt_info = scanner.data.get_option_token(
+            instrument,
+            strike,
+            option_type,
+            **option_token_kwargs,
+        )
         if not opt_info:
             return pd.DataFrame(), "", ""
         symbol = str(opt_info.get("symbol", ""))
         token = str(opt_info.get("token", ""))
+        # The live resolver may snap a missing strike. A historical row must not
+        # keep the requested strike while replaying that other contract's prices.
+        resolved_strike = opt_info.get("strike_val")
+        if resolved_strike is None and opt_info.get("strike") is not None:
+            resolved_strike = float(opt_info["strike"]) / 100.0
+        if resolved_strike is not None and abs(float(resolved_strike) - float(strike)) > 1e-6:
+            return pd.DataFrame(), "", ""
+        expiry_value = opt_info.get("date_aware_expiry") or opt_info.get("expiry")
+        contract_expiry = pd.to_datetime(expiry_value, errors="coerce") if expiry_value else pd.NaT
+        if not pd.isna(contract_expiry) and trade_day and contract_expiry.date() < trade_day:
+            return pd.DataFrame(), "", ""
+        if str(getattr(scanner, "mode", "")).upper() == "HISTORICAL" and (resolved_strike is None or pd.isna(contract_expiry)):
+            return pd.DataFrame(), "", ""
+
+        def with_contract(frame):
+            if frame is not None and not frame.empty:
+                frame = frame.copy()
+                frame.attrs.update({
+                    "contract_symbol": symbol,
+                    "contract_token": token,
+                    "contract_expiry": contract_expiry.date().isoformat() if not pd.isna(contract_expiry) else "",
+                    "contract_strike": float(resolved_strike) if resolved_strike is not None else float(strike),
+                    "contract_option_type": str(option_type).upper(),
+                    "contract_verified": resolved_strike is not None and not pd.isna(contract_expiry),
+                })
+            return frame
         exchange = str(
             opt_info.get("exch_seg")
             or ("BFO" if _is_bfo_instrument(instrument) else "NFO")
@@ -2381,7 +2993,7 @@ class SignalProcessor:
         if cache_key in self._option_history_cache:
             if diag:
                 diag("option_history", "hits" if not self._option_history_cache[cache_key].empty else "misses")
-            return self._option_history_cache[cache_key], symbol, token
+            return with_contract(self._option_history_cache[cache_key]), symbol, token
         if symbol_cache_key in self._option_symbol_history_cache:
             day_df = self._filter_option_history_date(
                 self._option_symbol_history_cache[symbol_cache_key],
@@ -2391,7 +3003,7 @@ class SignalProcessor:
                 self._option_history_cache[cache_key] = day_df
                 if diag:
                     diag("option_history", "hits" if not day_df.empty else "misses")
-                return day_df, symbol, token
+                return with_contract(day_df), symbol, token
         from pathlib import Path
         cache_path = Path("data_store/candles") / f"{symbol}_{interval}.csv"
         if cache_path.exists():
@@ -2403,7 +3015,7 @@ class SignalProcessor:
                     self._option_history_cache[cache_key] = day_df
                     if diag:
                         diag("option_history", "hits")
-                    return day_df, symbol, token
+                    return with_contract(day_df), symbol, token
                 self._historical_audit_log(f"Option history cache for {symbol} has no rows for {trade_day}; fetching/using configured fallback.")
                 local_cache_missing_day = True
             except Exception:
@@ -2467,7 +3079,7 @@ class SignalProcessor:
             if diag:
                 diag("option_history", "misses")
         self._option_history_cache[cache_key] = day_df
-        return day_df, symbol, token
+        return with_contract(day_df), symbol, token
 
     def _historical_live_management_probe(
         self,
@@ -2511,6 +3123,7 @@ class SignalProcessor:
         probe._rupee_loss_band_states = {}
         probe._loss_threat_confirmation = {}
         probe._setting_enabled = _setting_enabled
+        self._bind_historical_intelligence(probe, scanner, candle_view)
         regime_detector = RegimeDetector()
 
         base = str(instrument or "").upper().split()[0]
@@ -2605,7 +3218,7 @@ class SignalProcessor:
             bar_start = pd.Timestamp(ts)
             if bar_start.tzinfo is not None:
                 bar_start = bar_start.tz_convert(IST).tz_localize(None)
-            candle_view.as_of = bar_start
+            candle_view.as_of = bar_start + pd.Timedelta(minutes=1)
             now = bar_start.to_pydatetime() + timedelta(minutes=1)
             trade.current_price = float(close_px)
             trade.peak_pnl = max(float(trade.peak_pnl or 0.0), float(peak_pnl_rs or 0.0))
@@ -2635,7 +3248,7 @@ class SignalProcessor:
             # Historical intelligence is itself timestamp-sliced. Chain-only fields
             # remain absent, so helpers correctly abstain where they require them.
             try:
-                intel_score, intel_regime = scanner._compute_historical_intel_at(base, bar_start, tf)
+                intel_score, intel_regime = scanner._compute_historical_intel_at(base, now, tf)
                 if str(intel_regime or "UNKNOWN").upper() != "UNKNOWN":
                     regime = str(intel_regime).upper()
                     trade.market_regime = regime
@@ -2647,9 +3260,15 @@ class SignalProcessor:
                         "score_norm": float(intel_score or 0.0),
                     },
                     "regime": {"regime": regime},
-                    "as_of": bar_start.isoformat(),
+                    "as_of": pd.Timestamp(now).isoformat(),
                     "historical_missing": ["option_chain", "order_flow_depth"],
                 }
+                historical_context = getattr(scanner, "_get_historical_intel_context_at", None)
+                if callable(historical_context):
+                    context = historical_context(base, now, tf)
+                    if isinstance(context, dict) and context:
+                        trade.market_intelligence_context = copy.deepcopy(context)
+                        trade.decision_intel = copy.deepcopy(context)
             except Exception as exc:
                 _record_error("historical_intelligence", exc, now)
 
@@ -2690,16 +3309,48 @@ class SignalProcessor:
 
             lock_ratio = 0.0
             lock_stop = 0.0
+            lock_breathing_clamped = False
+            lock_trend_deferred = False
             try:
                 lock_stop, lock_reason, lock_ratio = probe._profit_lock_floor(
                     float(entry_price), "LONG", max(1, int(qty)), peak,
                     bool(trade.scalp_lock_mode), inst_mult=1.0,
                     initial_risk_rs=risk_rs, timeframe=tf, now=now, trade_like=trade,
                 )
-                if lock_stop > 0:
-                    trade.current_stop = max(float(trade.current_stop or stop_price), float(lock_stop))
-                if lock_reason and float(close_px) <= float(trade.current_stop):
-                    return lock_reason, f"production profit-lock floor {trade.current_stop:.2f}", trade.current_stop, regime, trace, evaluated_guards
+                # Same HOLD contract as the live and manual paths (engine/
+                # profit_lock_hold.py): option breathing room, a lock hit only when the
+                # close is at or below the (possibly clamped) lock floor, and a trend
+                # deferral that restores the stop this bar started from. Replay used to
+                # apply the floor with neither (guard audit 2026-10-06). A structural
+                # trail above the floor keeps its own authority through next_stop.
+                pre_lock_stop = float(trade.current_stop or stop_price)
+                proposed_lock_stop = max(pre_lock_stop, float(lock_stop)) if lock_stop > 0 else pre_lock_stop
+                lock_hold = profit_lock_hold_policy.resolve(
+                    probe,
+                    trade,
+                    lock_reason=lock_reason,
+                    lock_stop=lock_stop,
+                    proposed_stop=proposed_lock_stop,
+                    pre_lock_stop=pre_lock_stop,
+                    mark=float(close_px),
+                    option_space=True,
+                    current_pnl_rs=current_pnl,
+                    peak_pnl_rs=peak,
+                    latest_time=now,
+                    regime=regime,
+                    apply_breathing=lock_stop > 0,
+                )
+                trace.extend(dict(item) for item in lock_hold.trace if item.get("state") != "PROPOSED")
+                lock_breathing_clamped = lock_hold.breathing_clamped
+                lock_trend_deferred = lock_hold.trend_deferred
+                lock_stop = lock_hold.lock_stop
+                trade.current_stop = float(lock_hold.stop or pre_lock_stop)
+                if lock_hold.lock_reason and lock_hold.hit:
+                    return (
+                        lock_hold.lock_reason,
+                        f"production profit-lock floor {lock_hold.effective_lock_stop:.2f}",
+                        lock_hold.effective_lock_stop, regime, trace, evaluated_guards,
+                    )
             except Exception as exc:
                 _record_error("profit_lock", exc, now)
 
@@ -2761,7 +3412,13 @@ class SignalProcessor:
                 collapse = probe._smart_lock_floor_collapse(
                     peak, current_pnl, backstop, floor_rs=probe._profit_lock_floor_rs(trade)
                 )
-                if smart_min <= peak and ladder_peak < 3000.0 and (
+                if probe._smart_profit_retention_eligible(
+                    peak_pnl=peak,
+                    minimum_peak=smart_min,
+                    ladder_peak=ladder_peak,
+                    breathing_clamped=lock_breathing_clamped,
+                    trend_deferred=lock_trend_deferred,
+                ) and (
                     current_pnl < peak * backstop or collapse
                 ):
                     reason, detail = _recover_or_exit("SMART_PROFIT_LOCK", "production retention backstop", close_px, current_pnl, peak, risk_rs, now, regime)
@@ -2795,7 +3452,7 @@ class SignalProcessor:
                 return "LOW_GAIN_PROTECT", f"peak {peak_pct:.1f}% -> {current_pct:.1f}%", close_px, regime, trace, evaluated_guards
 
             try:
-                if _Scanner._profit_ladder_pnl(probe, trade, peak, max(1, int(qty))) >= probe._major_win_guard_arm_rs(trade) and current_pnl < peak * 0.75:
+                if _Scanner._profit_ladder_pnl(probe, trade, peak, max(1, int(qty))) >= probe._major_win_guard_ladder_arm_rs(trade, max(1, int(qty))) and current_pnl < peak * 0.75:
                     return "MAJOR_WIN_GUARD", f"peak Rs.{peak:.0f} -> Rs.{current_pnl:.0f}", close_px, regime, trace, evaluated_guards
             except Exception as exc:
                 _record_error("major_win_guard", exc, now)
@@ -2812,6 +3469,117 @@ class SignalProcessor:
             return "", "", float(trade.current_stop or stop_price), regime, trace, evaluated_guards
 
         return evaluate
+
+    def _replay_entry_context(self, scanner, instrument, timeframe, signal, direction, regime, lane):
+        """The live market-context gate evaluated on replay data (PCR/OI unavailable).
+
+        Uses only bars closed by the signal candle's close; never raises.
+        """
+        try:
+            from engine import entry_context_gate as ctx_gate
+
+            minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(timeframe), 5)
+            closes_at = _market_naive(signal.timestamp) + pd.Timedelta(minutes=minutes)
+            volume = self._replay_candle_volume_evidence(signal, timeframe)
+            measures = ctx_gate.market_measures(scanner.candles.get_candles, instrument, timeframe,
+                                                closes_at, direction)
+            rsi = getattr(signal, "rsi_value", None)
+            adx = getattr(signal, "adx_value", None)
+            return ctx_gate.evaluate(ctx_gate.ContextInputs(
+                lane=str(lane or "QP"), instrument=str(instrument), timeframe=str(timeframe),
+                direction=str(direction), regime=str(regime or "UNKNOWN"),
+                adx=float(adx) if adx not in (None, "") else None,
+                rsi=float(rsi) if rsi not in (None, "") else None,
+                volume_ratio=volume.get("volume_ratio"), volume_measured=bool(volume.get("volume_available")),
+                **measures,
+            ), get_settings())
+        except Exception as exc:
+            logger.debug(f"Replay entry context unavailable for {instrument} {timeframe}: {exc}")
+            return None
+
+    @staticmethod
+    def _with_entry_context(verdict: Dict, context) -> Dict:
+        if context is not None and isinstance(verdict, dict):
+            verdict = dict(verdict)
+            verdict["checks"] = {**dict(verdict.get("checks") or {}), "entry_context": context.to_dict()}
+        return verdict
+
+    def _s1_replay_bar_states(self, scanner, instrument: str, timeframe: str):
+        """Per-bar S1 scores keyed by bar CLOSE time, for replaying native S1 exits.
+
+        Computed once per instrument/timeframe from the replay candle store with the
+        live S1 parameters. Indicators are causal, so a bar's row uses only bars up to
+        its own close. Returns None when the frame or engine is unavailable.
+        """
+        cache = self.__dict__.setdefault("_s1_replay_state_cache", {})
+        try:
+            frame = scanner.candles.get_candles(instrument, timeframe)
+            if frame is None or frame.empty:
+                return None
+            key = (instrument, timeframe, len(frame), frame.index[-1])
+            if key in cache:
+                return cache[key]
+            from engine import s1_engine
+
+            params = s1_engine.params_from_settings(get_settings(), instrument)
+
+            def prepared(tf):
+                return s1_engine.drop_off_session_bars(scanner.candles.get_candles(instrument, tf), params.session_end)
+
+            df = prepared(timeframe)
+            feats = s1_engine.compute_features(df, timeframe, params, df_5min=prepared("5min"),
+                                               df_15min=prepared("15min"))
+            minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(timeframe), 5)
+            closes = pd.DatetimeIndex([_market_naive(ts) for ts in df.index]) + pd.Timedelta(minutes=minutes)
+            states = pd.DataFrame({
+                "bull": feats["bull_score"], "bear": feats["bear_score"], "adx": feats["adx"],
+                "rel_vol": feats["rel_vol"], "atr_exp": feats["atr_exp"],
+            }, index=closes)
+            if len(cache) > 24:
+                cache.clear()
+            cache[key] = states
+            return states
+        except Exception as exc:
+            logger.debug(f"S1 replay bar states unavailable for {instrument} {timeframe}: {exc}")
+            return None
+
+    @staticmethod
+    def _closed_candle_replay_window(entry_ts, timeframe, exit_ts, session_exit_ts, crosses_session):
+        """Shift a non-UTS replay to when its signal candle (and the next one) has closed.
+
+        ``replay_closed_candle_entries=False`` restores the old open-stamp timing for
+        comparison runs only; it books one candle of look-ahead.
+        """
+        minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(timeframe or ""), 0)
+        if not minutes or not _setting_enabled(
+            getattr(get_settings(), "replay_closed_candle_entries", True), True
+        ):
+            return entry_ts, exit_ts
+        step = timedelta(minutes=minutes)
+        start = entry_ts + step
+        end = exit_ts if crosses_session else min(session_exit_ts, exit_ts + step)
+        return start, end
+
+    @staticmethod
+    def _uts_replay_window(signal, timeframe, fallback_end, *, next_signal=None):
+        """Price a confirmed UTS entry and chart exit only after their bars close."""
+        minutes = {"1min": 1, "5min": 5, "15min": 15}[timeframe]
+        source = getattr(signal, "source_signal_timestamp", None) or signal.timestamp
+        start = _market_naive(source).to_pydatetime() + timedelta(minutes=minutes)
+        end = _market_naive(fallback_end).to_pydatetime()
+        if next_signal is not None:
+            # Native arrows are stamped at their candle opens. An opposite
+            # arrow can close this replay only once that candle has closed.
+            next_source = getattr(next_signal, "source_signal_timestamp", None) or next_signal.timestamp
+            next_available = _market_naive(next_source).to_pydatetime() + timedelta(minutes=minutes)
+            end = min(end, next_available)
+        exit_bar = getattr(signal, "uts_exit_time", None)
+        reason = ""
+        if exit_bar is not None:
+            chart_end = _market_naive(exit_bar).to_pydatetime() + timedelta(minutes=minutes)
+            if start < chart_end <= end:
+                end, reason = chart_end, str(getattr(signal, "uts_exit_reason", "") or "")
+        return start, end, reason
 
     def _simulate_actual_option_exit(
         self,
@@ -2835,25 +3603,67 @@ class SignalProcessor:
         replay_grade: str = "",
         replay_confidence: float = 0.0,
         replay_regime: str = "UNKNOWN",
+        replay_stop_context: Optional[Dict] = None,
+        live_exits: bool = True,
+        replay_source_lane: str = "",
+        required_stop_distance: float = 0.0,
+        chart_exit_reason: str = "",
+        replay_setup=None,
     ) -> Optional[Dict]:
+        """``live_exits=False`` keeps the other engines' live guards out of this replay
+        (the S1 lane) while ``qty`` still prices the recorded path in rupees."""
         if option_df is None or option_df.empty:
             return None
-        start = start_ts.replace(tzinfo=None) if start_ts.tzinfo else start_ts
-        end = end_ts.replace(tzinfo=None) if end_ts.tzinfo else end_ts
+        start = _market_naive(start_ts).to_pydatetime()
+        end = _market_naive(end_ts).to_pydatetime()
         force_exit_time = datetime.strptime(
             str(getattr(get_settings(), "ut_force_exit_time", "15:25") or "15:25"),
             "%H:%M",
         ).time()
+        if str(replay_source_lane or "").upper() in {"D1", "D2"} and _setting_enabled(
+            getattr(get_settings(), "replay_s12_native_exits", True), True
+        ):
+            from engine.s12_lane import square_off as s12_square_off
+
+            force_exit_time = datetime.strptime(s12_square_off(get_settings()), "%H:%M").time()
         session_end = datetime.combine(start.date(), force_exit_time)
         end = min(end, session_end)
-        window = option_df.loc[(option_df.index >= start) & (option_df.index <= end)]
-        if window.empty:
+        frame = option_df.copy()
+        if not isinstance(frame.index, pd.DatetimeIndex):
             return None
-        entry_premium = float(window.iloc[0]["close"])
+        frame.index = pd.DatetimeIndex([_market_naive(ts) for ts in frame.index])
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        window = frame.loc[(frame.index >= start) & (frame.index + pd.Timedelta(minutes=1) <= end)]
+        if window.empty or window.index[0] - pd.Timestamp(start) >= pd.Timedelta(minutes=1):
+            return None
+        required = ["open", "high", "low", "close"]
+        if not all(key in window.columns for key in required):
+            return None
+        entry_time = window.index[0].to_pydatetime()
+        entry_premium = float(window.iloc[0]["open"])
         if entry_premium <= 0:
             return None
         risk_from_price = entry_premium - float(sl_price)
-        max_sl_dist = max(0.5, entry_premium * float(max_sl_pct or 0.15))
+        uts_replay = str(replay_source_lane).upper() == "UTS"
+        replay_holder = replay_setup
+        if uts_replay:
+            # The explicit replay lane is authoritative. Legacy setup objects
+            # may lack lane/timeframe metadata, so retain their evidence while
+            # filling those identities on a copy rather than changing signals.
+            replay_holder = copy.copy(replay_setup) if replay_setup is not None else SimpleNamespace()
+            replay_holder.source_lane = "UTS"
+            if not str(getattr(replay_holder, 'instrument', '') or '').strip():
+                replay_holder.instrument = tf15_instrument
+            if not str(getattr(replay_holder, "timeframe", "") or "").strip():
+                replay_holder.timeframe = tf15_timeframe or "15min"
+        replay_cap_pct = option_stop_tolerance_pct(
+            float(max_sl_pct or 0.15) * 100.0,
+            replay_regime,
+            confidence=replay_confidence if replay_grade else None,
+            grade=replay_grade,
+            setup=replay_holder,
+        )
+        max_sl_dist = entry_premium * replay_cap_pct / 100.0
         if natural_sl_distance is not None and float(natural_sl_distance or 0) > 0:
             risk = min(float(natural_sl_distance), max_sl_dist)
         elif risk_from_price >= max(0.5, entry_premium * 0.01):
@@ -2862,13 +3672,164 @@ class SignalProcessor:
             # The pre-estimated stop can be stale once real option candles supply the entry.
             # Re-anchor to a meaningful premium risk before checking SL/target hits.
             risk = max_sl_dist
-        risk = max(0.5, risk)
+        risk = min(max_sl_dist, max(0.5, risk))
+        uts_replay = str(replay_source_lane).upper() == "UTS"
+        if uts_replay:
+            # Re-anchor the UTS guard to the observed option fill, not the
+            # provisional premium used before this price path was available.
+            risk = min(max_sl_dist, uts_lane_policy.premium_stop_distance(
+                entry_premium, required_stop_distance, 1.0, get_settings(),
+                regime=replay_regime, confidence=replay_confidence if replay_grade else None,
+                grade=replay_grade,
+                setup=replay_holder,
+            ))
+        # Native S1 management (2026-10-08 audit): the replay used to run S1 trades
+        # through the other engines' generic guards with a 2.5-3.8R target, so S1
+        # replay results said nothing about live S1. Use the lane's own premium risk,
+        # target and per-bar exit_decision instead.
+        s1_replay = (
+            not uts_replay
+            and str(replay_source_lane).upper() == "S1"
+            and _setting_enabled(getattr(get_settings(), "replay_s1_native_exits", True), True)
+        )
+        s1_trade = None
+        if s1_replay:
+            s1_settings = get_settings()
+            s1_score = float(getattr(replay_setup, "s1_score", 0.0) or 0.0)
+            s1_guard = s1_lane_policy.premium_guard_pct(
+                tf15_timeframe or "5min", entry_time, s1_score, s1_settings, regime=replay_regime)
+            s1_index_dist = abs(float(getattr(replay_setup, "stop_distance", 0.0) or 0.0))
+            mapped = float(natural_sl_distance or 0.0)
+            risk = max(0.05, min(entry_premium * s1_guard / 100.0, mapped) if mapped > 0
+                       else entry_premium * s1_guard / 100.0)
+            weak = s1_lane_policy.entry_is_weak(replay_setup, replay_regime, tf15_direction, s1_settings)
+            rr = s1_lane_policy.target_rr(s1_settings, weak=weak)
+            s1_dir = 1 if str(tf15_direction or "LONG").upper() in {"LONG", "BUY"} else -1
+            s1_spot_entry = float(getattr(replay_setup, "price", 0.0) or 0.0)
+            s1_trade = SimpleNamespace(
+                direction="LONG" if s1_dir == 1 else "SHORT", inst_type="OPT",
+                entry_price=entry_premium, initial_stop=max(0.05, entry_premium - risk),
+                timeframe=tf15_timeframe, source_lane="S1", exit_policy_owner="S1",
+                underlying_entry=s1_spot_entry,
+                underlying_stop=(s1_spot_entry - s1_dir * s1_index_dist) if s1_index_dist > 0 else 0.0,
+                s1_score=s1_score, s1_peak_premium=entry_premium, lots=1, lot_size=max(1, int(qty or 1)),
+                signal_time=getattr(replay_setup, "timestamp", None),
+            )
+            s1_states = self._s1_replay_bar_states(tf15_exit_scanner, tf15_instrument, tf15_timeframe)
+            s1_spots = None
+            try:
+                s1_spots = tf15_exit_scanner.candles.get_candles(tf15_instrument, "1min")
+                if s1_spots is not None and not s1_spots.empty:
+                    s1_spots = s1_spots.copy()
+                    s1_spots.index = pd.DatetimeIndex([_market_naive(ts) for ts in s1_spots.index])
+                    s1_spots = s1_spots[~s1_spots.index.duplicated(keep="last")].sort_index()
+            except Exception:
+                s1_spots = None
+            s1_tf_min = {"1min": 1, "5min": 5, "15min": 15}.get(str(tf15_timeframe or ""), 5)
+            s1_signal_ts = getattr(replay_setup, "timestamp", None)
+            s1_signal_close = (_market_naive(s1_signal_ts) + pd.Timedelta(minutes=s1_tf_min)) if s1_signal_ts is not None else None
+            s1_exit_bar = getattr(replay_setup, "s1_exit_time", None)
+            s1_engine_exit_at = (_market_naive(s1_exit_bar) + pd.Timedelta(minutes=s1_tf_min)) if s1_exit_bar is not None else None
+            s1_margin = float(getattr(s1_settings, "s1_lane_trend_margin", 20.0) or 20.0)
+        s12_replay = (
+            str(replay_source_lane or "").upper() in {"D1", "D2"}
+            and _setting_enabled(getattr(get_settings(), "replay_s12_native_exits", True), True)
+        )
+        s12_trade = None
+        s12_spots = None
+        s12_market = None
+        s12_direction = 1 if str(tf15_direction or "LONG").upper() in {"LONG", "BUY"} else -1
+        s12_tf_min = {"1min": 1, "5min": 5, "15min": 15}.get(str(tf15_timeframe or ""), 5)
+        if s12_replay:
+            from engine import s12_lane as s12_policy
+
+            s12_settings = get_settings()
+            replay_holder = copy.copy(replay_setup) if replay_setup is not None else SimpleNamespace()
+            replay_holder.source_lane = str(replay_source_lane).upper()
+            replay_holder.s12_lane = str(replay_source_lane).upper()
+            replay_holder.direction = "LONG" if s12_direction == 1 else "SHORT"
+            replay_holder.timeframe = tf15_timeframe or "5min"
+            replay_holder.instrument = tf15_instrument
+            if tf15_exit_scanner is None:
+                return None
+            try:
+                s12_spots = tf15_exit_scanner.candles.get_candles(tf15_instrument, "1min")
+                if s12_spots is not None and not s12_spots.empty:
+                    s12_spots = s12_spots.copy()
+                    s12_spots.index = pd.DatetimeIndex([_market_naive(ts) for ts in s12_spots.index])
+                    s12_spots = s12_spots[~s12_spots.index.duplicated(keep="last")].sort_index()
+            except Exception:
+                s12_spots = None
+            if s12_spots is None or s12_spots.empty or entry_time not in s12_spots.index:
+                return None
+            entry_spot = float(s12_spots.loc[entry_time].get("open", 0.0) or 0.0)
+            if entry_spot <= 0:
+                return None
+            s12_levels = s12_policy.admission_levels(replay_holder, entry_spot, s12_settings)
+            replay_holder.s12_entry_spot = entry_spot
+            for key, value in s12_levels.items():
+                setattr(replay_holder, key, value)
+            replay_cap_pct = s12_policy.premium_cap_pct(
+                replay_holder,
+                s12_settings,
+                operator_cap=float(getattr(s12_settings, "options_sl_pct", max_sl_pct * 100.0) or max_sl_pct * 100.0),
+                timeframe=tf15_timeframe,
+            )
+            max_sl_dist = entry_premium * replay_cap_pct / 100.0
+            risk = max(0.05, max_sl_dist)
+            stop_updates = []
+            for update in getattr(replay_holder, "s12_stop_updates", []) or []:
+                try:
+                    when, level = update
+                    stop_updates.append({"effective_from": _market_naive(when), "stop": float(level)})
+                except (TypeError, ValueError):
+                    continue
+            milestones = {}
+            for name, when in (getattr(replay_holder, "s12_milestones", {}) or {}).items():
+                try:
+                    milestones[str(name)] = {"time": _market_naive(when)}
+                except Exception:
+                    continue
+            s12_trade = SimpleNamespace(
+                instrument=tf15_instrument,
+                timeframe=tf15_timeframe or "5min",
+                direction="LONG" if s12_direction == 1 else "SHORT",
+                source_lane=str(replay_source_lane).upper(),
+                s12_lane=str(replay_source_lane).upper(),
+                s12_trade_id=str(getattr(replay_holder, "s12_trade_id", "") or ""),
+                signal_time=getattr(replay_holder, "timestamp", None),
+                inst_type="OPT",
+                entry_price=entry_premium,
+                initial_stop=max(0.05, entry_premium - risk),
+                s12_premium_cap_pct=replay_cap_pct,
+                **s12_levels,
+            )
+            for name in ("s12_t1_hit", "s12_t2_hit", "s12_t3_hit"):
+                setattr(s12_trade, name, bool(getattr(replay_holder, name, False)))
+            s12_market = {
+                "lane": str(replay_source_lane).upper(),
+                "trade_id": s12_trade.s12_trade_id,
+                "stop_updates": stop_updates,
+                "milestones": milestones,
+            }
+            live_exits = False  # S12 uses the engine stop/EXIT and its own premium cap.
+            live_qty = fast_exit_qty = 0
         sl_price = max(0.05, entry_premium - risk)
-        target_price = entry_premium + (risk * rr)
+        target_price = 0.0 if s12_trade is not None else entry_premium + (risk * rr)
         exit_price = float(window.iloc[-1]["close"])
-        exit_time = window.index[-1]
+        exit_time = window.index[-1] + pd.Timedelta(minutes=1)
         exit_reason = "HISTORICAL"
         exit_detail = ""
+        uts_trade = None
+        if s1_trade is not None:
+            live_exits = False  # S1 has its own lane policy, not the generic guards.
+            s1_active_stop = sl_price
+            s1_active_target = target_price
+        if uts_replay:
+            live_exits = False  # UTS has its own lane policy, not the generic guards.
+            uts_trade = SimpleNamespace(inst_type="OPT", entry_price=entry_premium,
+                                       initial_stop=sl_price, s1_peak_premium=entry_premium)
+            uts_active_stop = sl_price
 
         # Optionally let the replay see the LIVE trade-management guards. Without this
         # the only reachable outcomes are SL HIT / TARGET_HIT / HISTORICAL, so a
@@ -2877,8 +3838,9 @@ class SignalProcessor:
         # drift. Imported here because scanner imports this module.
         live_qty = 0
         fast_exit_qty = 0
+        path_qty = 0 if live_exits else max(0, int(qty or 0))
         try:
-            if _setting_enabled(
+            if live_exits and _setting_enabled(
                 getattr(get_settings(), "backtest_live_exits_enabled", False), False
             ):
                 live_qty = max(0, int(qty or 0))
@@ -2887,7 +3849,20 @@ class SignalProcessor:
             live_qty = 0
         peak_rs = 0.0
         price_path = []
-        exit_trace = []
+        input_hash = hashlib.sha256(pd.util.hash_pandas_object(window, index=True).values.tobytes()).hexdigest()
+        input_meta = {"time": pd.Timestamp(entry_time).isoformat(), "guard": "replay_input", "state": "VERIFIED_PRICE_PATH", "input_sha256": input_hash,
+                      "eligible_at": pd.Timestamp(start).isoformat(), "entry_time": pd.Timestamp(entry_time).isoformat(), "entry_price": entry_premium,
+                      "fill_model": "first_available_1m_open;stop_first_when_ohlc_order_unknown;gap_stop_at_open;close_guard_at_close",
+                      "contract": dict(option_df.attrs), "rows": len(window), "last_closed_at": pd.Timestamp(exit_time).isoformat()}
+        if uts_replay:
+            input_meta["fill_model"] += (
+                ";uts_peak_uses_observed_high;new_uts_lock_cross_at_observed_close"
+                ";raised_uts_lock_applies_next_bar"
+            )
+        if replay_stop_context:
+            input_meta.update(copy.deepcopy(replay_stop_context))
+        input_meta["option_stop_cap_pct"] = replay_cap_pct
+        exit_trace = [input_meta]
         evaluated_guards = []
         live_probe = None
         # Unit-level/premium-only callers have no historical index candle store.
@@ -2906,7 +3881,7 @@ class SignalProcessor:
             entry_price=entry_premium, price=entry_premium,
             initial_stop=sl_price, trailing_stop=sl_price,
             quantity=live_qty, pnl_quantity=live_qty, lots=1,
-            lot_size=max(1, live_qty), entry_time=start,
+            lot_size=max(1, live_qty), entry_time=entry_time,
         )
         if live_qty > 0 and tf15_exit_scanner is not None:
             try:
@@ -2916,7 +3891,7 @@ class SignalProcessor:
                     direction=tf15_direction,
                     option_type=tf15_option_type,
                     timeframe=tf15_timeframe,
-                    entry_time=start,
+                    entry_time=entry_time,
                     entry_price=entry_premium,
                     stop_price=sl_price,
                     target_price=target_price,
@@ -2952,7 +3927,7 @@ class SignalProcessor:
                     instrument=tf15_instrument,
                     direction=tf15_direction,
                     option_type=tf15_option_type,
-                    entry_time=start,
+                    entry_time=entry_time,
                     entry_price=entry_premium,
                     stop_price=sl_price,
                     qty=fast_exit_qty,
@@ -2960,17 +3935,30 @@ class SignalProcessor:
             except Exception:
                 tf15_probe = None
 
-        for ts, row in window.iloc[1:].iterrows():
+        previous_bar = None
+        for ts, row in window.iterrows():
+            # Validate only the path actually reached. A missing or malformed
+            # future bar after an already executed exit cannot change admission.
+            if previous_bar is not None and ts - previous_bar > pd.Timedelta(minutes=1):
+                return None
+            previous_bar = ts
+            values = pd.to_numeric(row[required], errors="coerce")
+            if not all(math.isfinite(float(value)) for value in values) or (values <= 0).any() or values["low"] > min(values["open"], values["close"]) or values["high"] < max(values["open"], values["close"]):
+                return None
             low = float(row.get("low", row.get("close", 0.0)) or 0.0)
             high = float(row.get("high", row.get("close", 0.0)) or 0.0)
             op = float(row.get("open", row.get("close", 0.0)) or 0.0)
 
             close_px = float(row.get("close", op) or op)
-            peak_qty = live_qty or fast_exit_qty
+            peak_qty = live_qty or fast_exit_qty or path_qty
             if peak_qty > 0:
                 peak_rs = max(peak_rs, (high - entry_premium) * peak_qty)
             active_stop = float(sl_price)
-            active_target = float(target_price)
+            active_target = 0.0 if uts_trade is not None or s12_trade is not None else float(target_price)
+            if uts_trade is not None:
+                active_stop = uts_active_stop
+            if s1_trade is not None:
+                active_stop, active_target = s1_active_stop, s1_active_target
             if live_probe is not None:
                 # Stop updates returned by the prior closed candle apply now. Newly
                 # computed stops below apply only to the next candle.
@@ -2985,6 +3973,135 @@ class SignalProcessor:
                 "active_target": active_target,
             })
 
+            # Resting stop/target orders exist before the candle. A close-only
+            # guard cannot override an earlier hit, and OHLC does not identify
+            # which level came first if both traded: choose the adverse stop.
+            if low <= active_stop:
+                exit_price = min(op, active_stop)
+                exit_time = ts if op <= active_stop else ts + pd.Timedelta(minutes=1)
+                exit_reason = "S12_PREMIUM_CAP" if s12_trade is not None else "SL HIT"
+                break
+            elif active_target > 0 and high >= active_target:
+                exit_price = active_target
+                exit_time = ts if op >= active_target else ts + pd.Timedelta(minutes=1)
+                exit_reason = "TARGET_HIT"
+                break
+
+            if uts_trade is not None:
+                # The prior resting stop has already survived this whole bar.
+                # Its observed high is therefore eligible to arm or tighten the
+                # premium lock. OHLC does not locate the low relative to that
+                # high: only a subsequent close below the new floor proves a
+                # same-bar crossing, and that observed close prices the exit.
+                # Otherwise the raised stop takes effect in the following bar.
+                uts_lane_policy.exit_decision(
+                    uts_trade, 0.0, high, now=(ts + pd.Timedelta(minutes=1)).to_pydatetime(),
+                )
+                decision = uts_lane_policy.exit_decision(
+                    uts_trade, 0.0, close_px, now=(ts + pd.Timedelta(minutes=1)).to_pydatetime(),
+                )
+                uts_active_stop = max(active_stop, float(decision.premium_stop or active_stop))
+                price_path[-1]["next_stop"] = uts_active_stop
+                evaluated_guards = ["UTS_PREMIUM_STOP", "UTS_PROFIT_LOCK", "UTS_CHART_EXIT"]
+                if decision.exit:
+                    exit_price, exit_time = close_px, ts + pd.Timedelta(minutes=1)
+                    exit_reason, exit_detail = decision.reason, decision.detail
+                    break
+
+            if s1_trade is not None:
+                # Same fill model as UTS: the resting stop survived this bar, so its
+                # favourable extremes may arm the T1/premium lock; only the observed
+                # close can prove a same-bar crossing; a raised stop applies next bar.
+                # Trend/market come from the latest S1 bar CLOSED after the signal bar.
+                bar_end = ts + pd.Timedelta(minutes=1)
+                spot_fav = spot_adv = 0.0
+                if s1_spots is not None:
+                    try:
+                        spot_row = s1_spots.loc[ts]
+                        spot_fav = float(spot_row["high"] if s1_dir == 1 else spot_row["low"])
+                        spot_adv = float(spot_row["low"] if s1_dir == 1 else spot_row["high"])
+                    except Exception:
+                        spot_fav = spot_adv = 0.0
+                s1_trend, s1_market = 0, None
+                if s1_states is not None and s1_signal_close is not None:
+                    closed = s1_states.loc[(s1_states.index <= bar_end) & (s1_states.index > s1_signal_close)]
+                    if not closed.empty:
+                        last = closed.iloc[-1]
+                        gap = (float(last["bull"]) - float(last["bear"])) * s1_dir
+                        s1_trend = 1 if gap >= s1_margin else -1 if -gap >= s1_margin else 0
+                        s1_market = {"adx_value": float(last["adx"]), "s1_rel_volume": float(last["rel_vol"]),
+                                     "s1_atr_expansion": float(last["atr_exp"])}
+                s1_engine_exit = ({"reason": str(getattr(replay_setup, "s1_exit_reason", "") or "S1 exit")}
+                                  if s1_engine_exit_at is not None and bar_end >= s1_engine_exit_at else None)
+                s1_lane_policy.exit_decision(
+                    s1_trade, spot_fav, high, now=bar_end.to_pydatetime(), settings=s1_settings,
+                    trend=s1_trend, regime=replay_regime, market=s1_market,
+                )
+                decision = s1_lane_policy.exit_decision(
+                    s1_trade, spot_adv, close_px, now=bar_end.to_pydatetime(), engine_exit=s1_engine_exit,
+                    settings=s1_settings, trend=s1_trend, regime=replay_regime, market=s1_market,
+                )
+                if decision.premium_stop and float(decision.premium_stop) > s1_active_stop:
+                    s1_active_stop = float(decision.premium_stop)
+                if decision.target_premium and float(decision.target_premium) > 0:
+                    s1_base_target = float(decision.target_premium)
+                    s1_active_target = min(s1_active_target or s1_base_target, s1_base_target)
+                if decision.runner:
+                    s1_active_target = 0.0
+                elif s1_active_target <= 0:
+                    s1_active_target = float(target_price)
+                price_path[-1]["next_stop"] = s1_active_stop
+                if decision.exit:
+                    exit_price, exit_time = close_px, bar_end
+                    exit_reason, exit_detail = decision.reason, decision.detail
+                    break
+
+            if s12_trade is not None:
+                # Engine STOP_UPDATED values become resting index protection only at
+                # their effective time. Evaluate the bar's adverse extreme against the
+                # stop that was already active at its open; a newly raised stop applies
+                # to the following minute.
+                s12_policy.apply_engine_view(s12_trade, s12_market, now=ts.to_pydatetime())
+                try:
+                    spot_row = s12_spots.loc[ts]
+                    spot_adverse = float(spot_row["low"] if s12_direction == 1 else spot_row["high"])
+                    spot_close = float(spot_row["close"])
+                except Exception:
+                    return None
+                bar_end = ts + pd.Timedelta(minutes=1)
+                exit_bar = getattr(replay_holder, "s12_exit_time", None)
+                engine_exit = None
+                if exit_bar is not None and getattr(replay_holder, "s12_exit_reason", ""):
+                    engine_exit_at = _market_naive(exit_bar) + pd.Timedelta(minutes=s12_tf_min)
+                    if bar_end >= engine_exit_at:
+                        engine_exit = {
+                            "reason": str(getattr(replay_holder, "s12_exit_reason", "") or ""),
+                            "time": exit_bar,
+                            "price": getattr(replay_holder, "s12_exit_price", None),
+                            "trade_id": s12_trade.s12_trade_id,
+                        }
+                decision = s12_policy.exit_decision(
+                    s12_trade,
+                    spot_adverse,
+                    close_px,
+                    now=bar_end.to_pydatetime(),
+                    engine_exit=engine_exit,
+                    settings=s12_settings,
+                )
+                price_path[-1]["s12_stop"] = float(decision.index_stop or 0.0)
+                price_path[-1]["s12_spot_close"] = spot_close
+                if decision.exit:
+                    exit_price, exit_time = close_px, bar_end
+                    exit_reason, exit_detail = decision.reason, decision.detail
+                    break
+                # Closed-bar stop and milestone changes are effective from the next
+                # minute, after this bar's adverse excursion has been evaluated.
+                s12_policy.apply_engine_view(s12_trade, s12_market, now=bar_end.to_pydatetime())
+                price_path[-1]["next_s12_stop"] = float(s12_policy.current_stop(s12_trade) or 0.0)
+                price_path[-1]["s12_t1_hit"] = bool(getattr(s12_trade, "s12_t1_hit", False))
+                price_path[-1]["s12_t2_hit"] = bool(getattr(s12_trade, "s12_t2_hit", False))
+                price_path[-1]["s12_t3_hit"] = bool(getattr(s12_trade, "s12_t3_hit", False))
+
             if live_guard is not None:
                 try:
                     verdict = live_guard(
@@ -2996,7 +4113,7 @@ class SignalProcessor:
                     fired, detail = verdict
                     if fired:
                         exit_price = close_px
-                        exit_time = ts
+                        exit_time = ts + pd.Timedelta(minutes=1)
                         exit_reason = getattr(verdict, "rule", "") or "PROFIT_FLOOR_EXIT"
                         exit_detail = str(detail or "")
                         exit_trace.append({
@@ -3009,28 +4126,6 @@ class SignalProcessor:
                         "time": pd.Timestamp(ts).isoformat(), "guard": "peak_giveback_cap",
                         "state": "ERROR_ABSTAIN", "detail": f"{type(exc).__name__}: {exc}",
                     })
-
-            if low <= active_stop and active_target > 0 and high >= active_target:
-                dist_to_sl = abs(op - active_stop)
-                dist_to_tgt = abs(op - active_target)
-                if dist_to_sl < dist_to_tgt:
-                    exit_price = active_stop
-                    exit_reason = "SL HIT"
-                else:
-                    exit_price = active_target
-                    exit_reason = "TARGET_HIT"
-                exit_time = ts
-                break
-            elif low <= active_stop:
-                exit_price = active_stop
-                exit_time = ts
-                exit_reason = "SL HIT"
-                break
-            elif active_target > 0 and high >= active_target:
-                exit_price = active_target
-                exit_time = ts
-                exit_reason = "TARGET_HIT"
-                break
 
             if live_probe is not None:
                 try:
@@ -3048,11 +4143,11 @@ class SignalProcessor:
                         live_probe.active_target = active_target
                     price_path[-1]["regime"] = regime
                     price_path[-1]["next_stop"] = live_probe.active_stop
-                    exit_trace = list(probe_trace)
+                    exit_trace = [input_meta] + list(probe_trace)
                     evaluated_guards = list(guards)
                     if reason:
-                        exit_price = float(next_stop if reason in {"SMART_PROFIT_LOCK", "MAJOR_WIN_GUARD"} and next_stop > 0 else close_px)
-                        exit_time = ts
+                        exit_price = close_px
+                        exit_time = ts + pd.Timedelta(minutes=1)
                         exit_reason = reason
                         exit_detail = str(detail or "")
                         exit_trace.append({
@@ -3079,12 +4174,19 @@ class SignalProcessor:
                     fired = False
                 if fired:
                     exit_price = close_px
-                    exit_time = ts
+                    exit_time = ts + pd.Timedelta(minutes=1)
                     exit_reason = "TF15_FAST_REVERSAL"
                     exit_detail = str(_why or "")
                     break
 
+        if exit_reason == "HISTORICAL" and pd.Timestamp(exit_time) < pd.Timestamp(end):
+            return None
+        if uts_replay and exit_reason == "HISTORICAL" and chart_exit_reason:
+            exit_reason = uts_lane_policy.EXIT_REASONS.get(chart_exit_reason, "UTS_EXIT")
+        exit_trace.append({"time": pd.Timestamp(exit_time).isoformat(), "guard": exit_reason, "state": "FILL", "price": float(exit_price), "detail": exit_detail})
         return {
+            "entry_time": entry_time,
+            "input_sha256": input_hash,
             "entry": entry_premium,
             "exit": max(0.05, exit_price),
             "stop": sl_price,
@@ -3095,6 +4197,11 @@ class SignalProcessor:
             "price_path": price_path,
             "exit_trace": exit_trace,
             "evaluated_guards": evaluated_guards,
+            "s12_state": (
+                {key: copy.deepcopy(getattr(s12_trade, key)) for key in s12_lane_policy.SESSION_STATE_FIELDS
+                 if hasattr(s12_trade, key)}
+                if s12_trade is not None else {}
+            ),
         }
 
     def _historical_tf15_exit_probe(
@@ -3127,6 +4234,7 @@ class SignalProcessor:
         probe._diagnostics = {}
         probe._timeframe_intel_cache = {}
         regime_detector = RegimeDetector()
+        self._bind_historical_intelligence(probe, scanner, candle_view)
 
         trade = SimpleNamespace(
             instrument=str(instrument or "").upper(),
@@ -3148,7 +4256,7 @@ class SignalProcessor:
             bar_start = pd.Timestamp(ts)
             if bar_start.tzinfo is not None:
                 bar_start = bar_start.tz_convert(IST).tz_localize(None)
-            candle_view.as_of = bar_start
+            candle_view.as_of = bar_start + pd.Timedelta(minutes=1)
             evaluation_time = bar_start.to_pydatetime() + timedelta(minutes=1)
             current_spot = candle_view.get_latest_price(trade.instrument) or 0.0
             # Rebuild the trade's rolling own-timeframe regime from only the candles
@@ -3289,15 +4397,99 @@ class SignalProcessor:
                 sl_hit, tgt_hit = low <= stop, high >= target
             else:
                 sl_hit, tgt_hit = high >= stop, low <= target
-            if sl_hit and tgt_hit:
-                if abs(op - stop) < abs(op - target):
-                    return float(stop), "SL HIT", ts
-                return float(target), "TARGET_HIT", ts
             if sl_hit:
-                return float(stop), "SL HIT", ts
+                fill = min(op, stop) if is_long else max(op, stop)
+                filled_at = ts if fill == op else ts + pd.Timedelta(minutes=1)
+                return float(fill), "SL HIT", filled_at
             if tgt_hit:
-                return float(target), "TARGET_HIT", ts
+                at_open = op >= target if is_long else op <= target
+                return float(target), "TARGET_HIT", ts if at_open else ts + pd.Timedelta(minutes=1)
         return None, "", None
+
+    @staticmethod
+    def _simulate_s12_futures_exit_path(
+        window,
+        *,
+        signal,
+        levels: Dict,
+        market: Dict,
+        instrument: str,
+        timeframe: str,
+        direction: str,
+        entry_price: float,
+        settings,
+    ) -> Optional[Dict]:
+        """Walk closed 1m index bars using D1/D2 stops, engine exits and square-off."""
+        if window is None or window.empty:
+            return None
+        trade = SimpleNamespace(
+            instrument=instrument,
+            timeframe=timeframe,
+            direction=direction,
+            source_lane=str(getattr(signal, "source_lane", "") or getattr(signal, "s12_lane", "")),
+            s12_lane=str(getattr(signal, "s12_lane", "") or getattr(signal, "source_lane", "")),
+            s12_trade_id=str(getattr(signal, "s12_trade_id", "") or ""),
+            signal_time=getattr(signal, "timestamp", None),
+            inst_type="FUT",
+            entry_price=float(entry_price or 0.0),
+            initial_stop=float(levels.get("s12_stop") or 0.0),
+            **levels,
+        )
+        for name in ("s12_t1_hit", "s12_t2_hit", "s12_t3_hit"):
+            setattr(trade, name, bool(getattr(signal, name, False)))
+        for bar_ts, bar in window.iterrows():
+            bar_ts = _market_naive(bar_ts)
+            bar_end = bar_ts + pd.Timedelta(minutes=1)
+            s12_lane_policy.apply_engine_view(trade, market, now=bar_ts.to_pydatetime())
+            op = float(bar.get("open", bar.get("close", 0.0)) or 0.0)
+            low = float(bar.get("low", bar.get("close", 0.0)) or 0.0)
+            high = float(bar.get("high", bar.get("close", 0.0)) or 0.0)
+            close = float(bar.get("close", op) or op)
+            stop = s12_lane_policy.current_stop(trade)
+            crossed = stop > 0 and (
+                (direction == "LONG" and low <= stop)
+                or (direction != "LONG" and high >= stop)
+            )
+            adverse = low if direction == "LONG" else high
+            engine_exit = None
+            exit_bar = getattr(signal, "s12_exit_time", None)
+            exit_reason = str(getattr(signal, "s12_exit_reason", "") or "")
+            if exit_bar is not None and exit_reason:
+                minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(timeframe), 5)
+                if bar_end >= _market_naive(exit_bar) + pd.Timedelta(minutes=minutes):
+                    engine_exit = {
+                        "reason": exit_reason,
+                        "time": exit_bar,
+                        "price": getattr(signal, "s12_exit_price", None),
+                        "trade_id": trade.s12_trade_id,
+                    }
+            decision = s12_lane_policy.exit_decision(
+                trade,
+                adverse if crossed else close,
+                0.0,
+                now=bar_end.to_pydatetime(),
+                engine_exit=engine_exit,
+                settings=settings,
+            )
+            if decision.exit:
+                if crossed:
+                    fill = min(op, stop) if direction == "LONG" else max(op, stop)
+                    return {
+                        "trade": trade, "price": float(fill),
+                        "time": bar_ts if fill == op else bar_end,
+                        "reason": decision.reason, "stop_hit": True,
+                    }
+                return {"trade": trade, "price": close, "time": bar_end,
+                        "reason": decision.reason, "stop_hit": False}
+            s12_lane_policy.apply_engine_view(trade, market, now=bar_end.to_pydatetime())
+        last_ts = _market_naive(window.index[-1])
+        return {
+            "trade": trade,
+            "price": float(window.iloc[-1].get("close", entry_price) or entry_price),
+            "time": last_ts + pd.Timedelta(minutes=1),
+            "reason": "",
+            "stop_hit": False,
+        }
 
     @staticmethod
     def _hybrid_backtest_dual_futures_enabled(scanner) -> bool:
@@ -3452,16 +4644,26 @@ class SignalProcessor:
             source_engines=list(getattr(signal, "source_engines", []) or []),
             source_lane=SignalProcessor._signal_source_lane(signal, get_settings().scanner_engine),
             data_provenance="BACKTEST",
+            replay_exit_trace=self._historical_price_evidence("FUT", signal=signal, entry_time=entry_time, shadow=True),
         )
 
     @staticmethod
     def _signal_source_lane(signal, scanner_engine_mode: str = "") -> str:
         lane = str(getattr(signal, "source_lane", "") or "").upper()
+        if lane in {"D1", "D2"}:
+            return lane
         if lane in {"A", "B"}:
             return lane
         source = str(getattr(signal, "source_engine", "") or "").lower()
         if source in {"flow_burst", "apex_hybrid"}:
             return "B"
+        if configured_mode() in COMBINED_MODES and not source in {"s1", "ut_smart"}:
+            return "QP"
+        if source == "s1":
+            # Persisted on the trade (source_engine is not), so a restart keeps the S1 lane.
+            return "S1"
+        if source == "ut_smart":
+            return "UTS"
         if str(scanner_engine_mode or "").lower() == "adaptive_dual":
             return "A"
         return ""
@@ -3474,6 +4676,8 @@ class SignalProcessor:
         keep one managed lifecycle even when they carry source_engines for context.
         """
         mode = str(scanner_engine_mode or "").lower()
+        if mode == "s1s2_dual":
+            return [SignalProcessor._signal_source_lane(signal, mode) or "D1"]
         if mode == "adaptive_dual":
             return [SignalProcessor._signal_source_lane(signal, mode) or "A"]
         if mode == "quality_hybrid":
@@ -3628,6 +4832,7 @@ class SignalProcessor:
     @staticmethod
     def _historical_same_replay_stream(left, right, scanner_engine_mode: str = "") -> bool:
         if str(scanner_engine_mode or "").lower() not in {
+            "s1s2_dual",
             "adaptive_dual",
             "quad_union",
             "quad_prime",
@@ -3643,14 +4848,14 @@ class SignalProcessor:
 
     @staticmethod
     def _historical_trade_id(prefix: str, instrument: str, timeframe: str, signal, scanner_engine_mode: str = "", fmt: str = "%Y%m%d%H%M%S") -> str:
-        ts = getattr(signal, "timestamp", None)
+        ts = getattr(signal, "source_signal_timestamp", None) or getattr(signal, "timestamp", None)
         ts_part = ts.strftime(fmt) if hasattr(ts, "strftime") else str(ts or "")
         mode = str(scanner_engine_mode or "").lower()
         stream_key = SignalProcessor._historical_replay_stream_key(signal, mode)
         stream_part = ""
-        if mode in {"adaptive_dual", "quad_union", "quad_prime", "utbot_ema", "utbot_consensus", "quality_hybrid"} and stream_key:
+        if mode in {"adaptive_dual", "quad_union", "quad_prime", "utbot_ema", "utbot_consensus", "quality_hybrid", "s1s2_dual"} and stream_key:
             stream_part = "_" + re.sub(r"[^A-Za-z0-9]+", "_", str(stream_key)).strip("_").upper()
-        return f"{prefix}_{instrument}_{timeframe}{stream_part}_{ts_part}"
+        return f"{prefix}_{instrument}_{timeframe}{stream_part}_{ts_part}" + scope_suffix(signal)
 
     @staticmethod
     def _latest_candle_timestamp(df) -> Optional[datetime]:
@@ -3690,7 +4895,7 @@ class SignalProcessor:
                 idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
                 frame = frame.copy()
                 frame.index = idx
-            frame = frame[(frame.index.date == ts.date()) & (frame.index <= ts)]
+            frame = frame[(frame.index.date == ts.date()) & (frame.index + pd.Timedelta(minutes=5) <= ts)]
             if len(frame) < 3:
                 return "FORMING"
             first = frame.iloc[:3]
@@ -3724,7 +4929,7 @@ class SignalProcessor:
         settings,
         candidates_raw: List[Dict],
     ) -> None:
-        mode = str(getattr(settings, "scanner_engine", "") or "").lower()
+        mode = scanner_mode(settings)
         if mode != "adaptive_dual":
             return
         if not _setting_enabled(getattr(settings, "dual_lane_enabled", True), True):
@@ -3771,12 +4976,20 @@ class SignalProcessor:
                     continue
                 seen[seen_key] = identity
 
-                no_entry_label, no_entry_after = _entry_cutoff(settings, tf)
+                no_entry_label, no_entry_after = _entry_cutoff(
+                    settings, tf, s1=s1_lane_policy.lane_tag(signal, settings)
+                )
                 is_after_no_entry = tf in ["1min", "5min", "15min"] and signal_time.time() >= no_entry_after
                 ts_str = signal_time.strftime("%Y-%m-%d %H:%M:00")
                 vix_value = scanner._vix_data.get(ts_str)
                 if vix_value is None:
-                    vix_value = scanner.data.get_ltp("NSE", "INDIAVIX", "99926017") or 15.0
+                    # 0.0 is this codebase's absent-VIX sentinel (see _get_historical_vix, which
+                    # returns 0 rather than 15 for exactly this reason). "or 15.0" defeated the
+                    # working abstain branch in SignalManager._grade_signal: 15.0 sits between
+                    # the 12.0 low and 20.0 high thresholds, so vix_penalty was always 0.0 and
+                    # "VIX unavailable: no volatility adjustment" never printed once across
+                    # 41,420 archived graded rows.
+                    vix_value = scanner.data.get_ltp("NSE", "INDIAVIX", "99926017") or 0.0
                 session_ctx = (
                     intel_result.get("session_context", {})
                     if isinstance(intel_result, dict)
@@ -3788,8 +5001,17 @@ class SignalProcessor:
                     intel_score,
                     regime,
                     vix_value=vix_value,
-                    day_type=str(session_ctx.get("day_type") or ""),
-                    day_type_confidence=float(session_ctx.get("confidence") or 0.0),
+                    day_type=str(
+                        session_ctx.get("effective_day_type")
+                        or session_ctx.get("day_type")
+                        or ""
+                    ),
+                    day_type_confidence=float(
+                        session_ctx.get("effective_confidence")
+                        or session_ctx.get("phase_confidence")
+                        or session_ctx.get("confidence")
+                        or 0.0
+                    ),
                 )
                 candidates_raw.append({
                     "sig": signal,
@@ -3807,68 +5029,188 @@ class SignalProcessor:
                     "trade",
                 )
 
-    def process_best_signal(
-        self, instrument, mtf_result, intel_result, intel_score, regime,
-        lots, lot_size, cfg, spot, atm_strike,
+    def _record_signal_pipeline_evidence(self, candidates, *, instrument: str, phase: str):
+        """Evidence phase: stamp decision provenance before candidates leave processor."""
+        from engine.decision_record import ensure_decision_record
+
+        now = datetime.now(IST)
+        items = list(candidates or [])
+        for rank, candidate in enumerate(items, start=1):
+            record = ensure_decision_record(
+                candidate,
+                rank=rank,
+                decided_at=now,
+                alternatives=[item for item in items if item is not candidate],
+            )
+            record["processor_phase"] = str(phase)
+            record["instrument"] = str(instrument)
+            candidate.decision_record = record
+        return items
+
+    def _finalize_signal_candidates(
+        self,
+        *,
+        instrument,
+        best_tf,
+        results_list,
+        scored,
+        settings,
+        scanner_engine_mode,
     ) -> List[TradeCandidate]:
-        
-        # Access Scanner properties via self.scanner
+        """Evidence/output phase: select strike winner and emit optional siblings."""
+        if not results_list:
+            return []
         scanner = self.scanner
-        settings = get_settings()
+        results_list.sort(key=lambda item: item.score, reverse=True)
+        winner = self._prefer_liquid_strike(results_list, settings) or results_list[0]
+        if winner is not results_list[0]:
+            logger.info(
+                f"Strike liquidity tie-break for {instrument}: "
+                f"{getattr(winner, 'trading_symbol', '')} "
+                f"(OI {getattr(winner, 'strike_oi', 0.0):,.0f} / "
+                f"vol {getattr(winner, 'strike_volume', 0.0):,.0f}) preferred over "
+                f"{getattr(results_list[0], 'trading_symbol', '')} "
+                f"(OI {getattr(results_list[0], 'strike_oi', 0.0):,.0f} / "
+                f"vol {getattr(results_list[0], 'strike_volume', 0.0):,.0f})"
+            )
+        getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
+            f"{instrument}_{best_tf}", None
+        )
+        scanner.log_event(
+            f"🎯 Potential {winner.direction} Signal for {winner.instrument} ({winner.timeframe})",
+            "trade",
+        )
+        output = [winner]
+        try:
+            siblings = self._emit_cascade_tf_siblings(
+                winner, scored, settings, scanner_engine_mode
+            )
+            if siblings:
+                output.extend(siblings)
+                stack_desc = [
+                    f"{item.timeframe}:{getattr(item, 'source_lane', '') or 'A'}"
+                    for item in output
+                ]
+                logger.info(f"Cascade multi-TF stack for {instrument}: {stack_desc}")
+                scanner.log_event(
+                    f"Cascade multi-TF stack {instrument}: "
+                    f"{len(output)} entries ({', '.join(item.timeframe for item in output)})",
+                    "trade",
+                )
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.debug(f"Cascade multi-TF siblings abstained for {instrument}: {exc}")
+        if len(output) == 1:
+            try:
+                rare = self._emit_rare_dual_tf_siblings(
+                    winner, scored, settings, scanner_engine_mode
+                )
+                if rare:
+                    output.extend(rare)
+                    scanner.log_event(
+                        f"Rare dual-TF {instrument}: "
+                        f"{', '.join(item.timeframe for item in output)}",
+                        "trade",
+                    )
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.debug(f"Rare dual-TF abstained for {instrument}: {exc}")
+        return self._record_signal_pipeline_evidence(
+            output, instrument=instrument, phase="candidate_output"
+        )
+
+    def _prepare_signal_pipeline_inputs(self, instrument, settings):
+        """Data-preparation phase: resolve eligible frames and immutable mode inputs."""
+        scanner = self.scanner
+        if not scanner.risk_manager.can_trade("ANY"):
+            return None
+        timeframe_contexts = self._build_timeframe_contexts(scanner, instrument, settings)
+        scanner_engine_mode = scanner_mode(settings)
+        policy = normalize_timeframe_entry_policy(
+            getattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
+        )
+        policy_timeframes = timeframe_entry_timeframes(policy)
+        candidate_timeframes = [
+            tf for tf in ("5min", "15min") if tf in policy_timeframes
+        ]
+        if scanner_engine_mode == "one_plus_one":
+            # Two scanner cores execute once. Other intraday frames remain feature
+            # inputs and must never become duplicate portfolio state machines.
+            # This was previously an undeclared getattr and therefore could only
+            # ever use its fallback. Keep that real behaviour explicit.
+            execution_tf = "5min"
+            candidate_timeframes = [
+                execution_tf if execution_tf in {"1min", "5min", "15min"} else "5min"
+            ]
+        live = str(getattr(scanner, "mode", "") or "").upper() != "HISTORICAL"
+        volume_spike = _setting_enabled(
+            getattr(settings, "volume_spike_entry_enabled", True), True
+        )
+        one_min_scalp = _setting_enabled(
+            getattr(settings, "one_min_scalping_enabled", True), True
+        )
+        reversion_enabled = _setting_enabled(
+            getattr(settings, "post_exit_reversion_enabled", False), False
+        )
+        reversion_window = False
+        if live and reversion_enabled:
+            try:
+                probe = getattr(scanner, "_reversion_window_active", None)
+                reversion_window = bool(probe(instrument)) if callable(probe) else False
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.debug(f"Reversion-window input unavailable for {instrument}: {exc}")
+        policy_one_min = "1min" in policy_timeframes and one_min_scalp
+        legacy_one_min = live and (
+            (volume_spike and one_min_scalp) or reversion_window
+        )
+        if policy_one_min or legacy_one_min or (
+            live and "1min" in policy_timeframes and reversion_window
+        ):
+            candidate_timeframes.insert(0, "1min")
+        return {
+            "timeframe_policy": policy,
+            "timeframe_contexts": timeframe_contexts,
+            "scanner_engine_mode": scanner_engine_mode,
+            "policy_timeframes": policy_timeframes,
+            "candidate_timeframes": candidate_timeframes,
+            "live": live,
+            "volume_spike": volume_spike,
+            "one_min_scalp": one_min_scalp,
+            "reversion_enabled": reversion_enabled,
+            "reversion_window": reversion_window,
+        }
+
+    def _collect_signal_candidates(
+        self,
+        instrument,
+        mtf_result,
+        intel_result,
+        intel_score,
+        regime,
+        lots,
+        lot_size,
+        cfg,
+        spot,
+        atm_strike,
+        settings,
+        prepared,
+        one_plus_one_source="",
+    ):
+        """Replay/collection phase: produce raw candidates without final admission."""
+        scanner = self.scanner
+        scanner_engine_mode = prepared["scanner_engine_mode"]
+        candidate_timeframes = prepared["candidate_timeframes"]
+        _timeframe_contexts = prepared["timeframe_contexts"]
+        _live = prepared["live"]
+        is_live = _live
+        tf_policy = prepared["timeframe_policy"]
+        _one_plus_one_source = one_plus_one_source
+        inst_pref = str(getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
+        candidates_raw = []
 
         def naive_ts(value):
             if value is None:
                 return datetime.min
             return value.replace(tzinfo=None) if getattr(value, "tzinfo", None) else value
 
-        if not scanner.risk_manager.can_trade("ANY"):
-            return []
-
-        # None unless per_timeframe_grading_enabled is set, in which case each candidate
-        # is graded with its own timeframe's cached intelligence instead of the 5-minute one.
-        _timeframe_contexts = self._build_timeframe_contexts(scanner, instrument, settings)
-
-        # Collect NEW signals from the normal entry TFs. Live mode also watches
-        # 1min when: (a) 1M spike scalping is ON, or (b) post-exit reversion is
-        # ON and this index has an open reversion window (decoupled toggles).
-        scanner_engine_mode = str(getattr(settings, "scanner_engine", "utbot") or "utbot").lower()
-        candidates_raw = []
-        tf_policy = normalize_timeframe_entry_policy(
-            getattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
-        )
-        policy_timeframes = timeframe_entry_timeframes(tf_policy)
-        candidate_timeframes = [
-            tf for tf in ("5min", "15min") if tf in policy_timeframes
-        ]
-        _live = getattr(scanner, "mode", "").upper() != "HISTORICAL"
-        _vol_spike_on = _setting_enabled(getattr(settings, "volume_spike_entry_enabled", True), True)
-        _one_min_scalp_on = _setting_enabled(getattr(settings, "one_min_scalping_enabled", True), True)
-        _reversion_on = _setting_enabled(getattr(settings, "post_exit_reversion_enabled", False), False)
-        _reversion_window = False
-        if _live and _reversion_on:
-            try:
-                _rw = getattr(scanner, "_reversion_window_active", None)
-                _reversion_window = bool(_rw(instrument)) if callable(_rw) else False
-            except Exception:
-                _reversion_window = False
-        # Explicit 1m policy enables monitoring and confirmed bursts while 1MSCALP
-        # is ON. It never admits a raw 1m UT flip. Legacy policies retain their
-        # established spike/snapback path.
-        # 1M SPIKE path: volume_spike_entry + one_min_scalping both ON.
-        # POST-WIN SNAPBACK path: reversion window alone is enough (decoupled —
-        # must not require volume_spike_entry_enabled, or pure snapback dies).
-        policy_allows_one_min_burst = (
-            "1min" in policy_timeframes and _one_min_scalp_on
-        )
-        legacy_fast_one_min = (
-            _live
-            and tf_policy in {"PRIMARY_15", "INCLUDE_5MIN"}
-            and ((_vol_spike_on and _one_min_scalp_on) or bool(_reversion_window))
-        )
-        if policy_allows_one_min_burst or legacy_fast_one_min or (
-            _live and "1min" in policy_timeframes and bool(_reversion_window)
-        ):
-            candidate_timeframes.insert(0, "1min")
         for tf in candidate_timeframes:
             sigs = [] # Master Fix: Clear sigs to prevent stale leak from previous iterations
             result = getattr(mtf_result, f"results_{tf}", None)
@@ -3876,10 +5218,18 @@ class SignalProcessor:
                 if tf == "15min": logger.debug(f"⚠️ No 15min results for {instrument} yet.")
                 continue
             sigs = [s for s in result.get("signals", []) if s.instrument == instrument]
+            if sigs and str(getattr(scanner, "mode", "") or "").upper() == "HISTORICAL":
+                sigs = [signal for signal in sigs if not getattr(signal, "uts_forming", False)]
             logger.debug(f"🔍 [AUDIT-SIGS] {instrument} {tf}: found {len(sigs)} signals")
             if not sigs:
                 continue
-            dedup_key = f"{instrument}_{tf}"
+            source_key = str(_one_plus_one_source or "").lower()
+            dedup_key = (
+                f"{instrument}_{tf}_{source_key}"
+                if scanner_engine_mode == "one_plus_one" and source_key
+                else f"{instrument}_{tf}"
+            )
+            dedup_key += scope_suffix(sigs[-1], settings)
             is_live = scanner.mode.upper() != "HISTORICAL"
             if tf == "1min" and is_live and dedup_key not in scanner._last_signal_time:
                 scanner._last_signal_time[dedup_key] = (
@@ -3977,10 +5327,21 @@ class SignalProcessor:
                     )
                     
                     # Process signals for this TF
-                    for i in range(len(sigs) - 1):
-                        s1, s2 = sigs[i], sigs[i+1]
-                        if not self._historical_same_replay_stream(s1, s2, scanner_engine_mode):
+                    for i in range(len(sigs)):
+                        s1 = sigs[i]
+                        s2 = sigs[i + 1] if i + 1 < len(sigs) else None
+                        hist_s1 = s1_lane_policy.is_lane(s1, settings)
+                        hist_lane_tag = s1_lane_policy.lane_tag(s1, settings)
+                        hist_s12 = hist_lane_tag in {"D1", "D2"}
+                        if hist_s12:
+                            # D1/D2 trades carry their own engine EXIT and may be the
+                            # final event in the replay window. They are not paired to
+                            # an opposite arrow from another lane or another trade.
+                            if s2 is None or not self._historical_same_replay_stream(s1, s2, scanner_engine_mode):
+                                s2 = s1
+                        elif s2 is None or not self._historical_same_replay_stream(s1, s2, scanner_engine_mode):
                             continue
+                        hist_uts = hist_lane_tag == "UTS"
                         # Earlier rows are indicator warm-up only. They must not inflate
                         # diagnostics for the selected backtest window.
                         if s1.timestamp.date() < trade_cutoff:
@@ -3995,9 +5356,9 @@ class SignalProcessor:
                         hist_regime = hist_intel_regime if hist_intel_regime and hist_intel_regime != "UNKNOWN" else "UNKNOWN"
                         if hist_regime == "UNKNOWN":
                             try:
-                                sub_df = candles_df.loc[:s1.timestamp] if getattr(candles_df.index, "is_monotonic_increasing", False) else candles_df[candles_df.index <= s1.timestamp]
+                                sub_df = _closed_candles_at(tf_candles_df, s1.timestamp, tf)
                             except Exception:
-                                sub_df = candles_df[candles_df.index <= s1.timestamp]
+                                sub_df = _closed_candles_at(tf_candles_df, s1.timestamp, tf)
                             hist_regime_res = scanner.intel.regime.detect(sub_df, instrument, tf)
                             hist_regime = hist_regime_res.get("regime", "UNKNOWN")
                         hist_confluence = scanner._compute_historical_confluence_at(
@@ -4058,6 +5419,7 @@ class SignalProcessor:
                             mtf_result,
                             s1.timestamp,
                             s1.signal_type,
+                            closed_only=True,
                         )
                         hist_structural_impulse = bool(
                             tf == "5min"
@@ -4105,7 +5467,7 @@ class SignalProcessor:
                         # actual OPT/FUT lane instead of reading an unbound sim_inst.
                         # Historical L1 depth is unavailable, so never leak current
                         # depth into a past decision.
-                        if tf == "1min":
+                        if tf == "1min" and not hist_s1:
                             hist_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
                             hist_volume_spike_metrics = (
                                 hist_burst_detector(
@@ -4122,7 +5484,7 @@ class SignalProcessor:
                             )
                             setattr(s1, "volume_spike_entry", bool(hist_volume_spike_metrics))
                             setattr(s1, "volume_spike_metrics", dict(hist_volume_spike_metrics or {}))
-                            if not hist_volume_spike_metrics:
+                            if not hist_volume_spike_metrics and tf_policy != "PRIMARY_1":
                                 record_reject("1min requires confirmed directional burst", sim_inst)
                                 continue
                         diag_inc_unique = getattr(scanner, "_diag_inc_unique", None)
@@ -4151,18 +5513,10 @@ class SignalProcessor:
                         # ── R2: regime veto + directional census (replay parity) ──
                         # Same gates as the live path so 22-Jun-style replays reflect them.
                         _hist_dir = "LONG" if s1.signal_type == "BUY" else "SHORT"
-                        try:
-                            _hist_day = s1.timestamp.date().isoformat()
-                            if getattr(scanner, "_dir_census_date", None) != _hist_day:
-                                scanner._dir_census_date = _hist_day
-                                scanner._dir_census = {"LONG": 0, "SHORT": 0}
-                                scanner._dir_census_seen = set()
-                            _cid = f"{instrument}|{tf}|{str(s1.timestamp)}|{_hist_dir}"
-                            if _cid not in scanner._dir_census_seen:
-                                scanner._dir_census_seen.add(_cid)
-                                scanner._dir_census[_hist_dir] = scanner._dir_census.get(_hist_dir, 0) + 1
-                        except Exception:
-                            pass
+                        self._record_directional_census(
+                            scanner, s1, instrument, tf, _hist_dir,
+                            str(s1.timestamp), settings,
+                        )
                         _hv = directional_fut_veto(
                             settings,
                             inst_type=sim_inst,
@@ -4219,7 +5573,12 @@ class SignalProcessor:
                             no_entry_after, gate_time = _entry_cutoff(settings, tf)
                             s1_time = s1.timestamp.replace(tzinfo=None).time() if s1.timestamp.tzinfo else s1.timestamp.time()
                             power_move_cutoff_ok = bool(power_move_hist and scanner._power_move_late_cutoff_ok(s1.timestamp))
-                            if s1_time >= gate_time and not power_move_cutoff_ok:
+                            if (
+                                not self._historical_entry_cutoff_allows(
+                                    s1, tf, hist_lane_tag, settings
+                                )
+                                and not power_move_cutoff_ok
+                            ):
                                 record_reject(f"After no-entry gate {no_entry_after}", sim_inst)
                                 self._historical_audit_log(f"🚫 [AUDIT] Skipping backfill entry at {s1.timestamp} due to ut_no_entry_after ({no_entry_after})")
                                 continue
@@ -4229,11 +5588,21 @@ class SignalProcessor:
                         # partially built shared trade list makes replay results depend
                         # on task completion order. TradeManager applies the configured
                         # concurrency policy deterministically after generation.
-                        if s1.timestamp.date() >= trade_cutoff and s2.timestamp.date() >= trade_cutoff and s1.signal_type != s2.signal_type:
+                        replay_pair_ready = (
+                            hist_s12
+                            or (s2.timestamp.date() >= trade_cutoff and s1.signal_type != s2.signal_type)
+                        )
+                        if s1.timestamp.date() >= trade_cutoff and replay_pair_ready:
                             force_exit_time = datetime.strptime(
                                 str(getattr(settings, "ut_force_exit_time", "15:25") or "15:25"),
                                 "%H:%M",
                             ).time()
+                            if hist_s12 and _setting_enabled(
+                                getattr(settings, "replay_s12_native_exits", True), True
+                            ):
+                                force_exit_time = datetime.strptime(
+                                    s12_lane_policy.square_off(settings), "%H:%M"
+                                ).time()
                             entry_ts = s1.timestamp.replace(tzinfo=None) if s1.timestamp.tzinfo else s1.timestamp
                             next_signal_ts = s2.timestamp.replace(tzinfo=None) if s2.timestamp.tzinfo else s2.timestamp
                             session_exit_ts = datetime.combine(entry_ts.date(), force_exit_time)
@@ -4241,7 +5610,35 @@ class SignalProcessor:
                                 next_signal_ts.date() != entry_ts.date()
                                 or next_signal_ts > session_exit_ts
                             )
-                            effective_exit_ts = session_exit_ts if crosses_session else next_signal_ts
+                            effective_exit_ts = session_exit_ts if crosses_session or hist_s12 else next_signal_ts
+                            hist_chart_reason = ""
+                            if hist_s12 and _setting_enabled(
+                                getattr(settings, "replay_s12_native_exits", True), True
+                            ):
+                                s12_minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(tf), 5)
+                                # D1 SETUP is filled at the next candle open; D2's
+                                # close-based ENTRY is executable at that same close
+                                # boundary. Both begin at signal-open + one bar.
+                                entry_ts = entry_ts + timedelta(minutes=s12_minutes)
+                                native_exit_time = getattr(s1, "s12_exit_time", None)
+                                native_exit_reason = str(getattr(s1, "s12_exit_reason", "") or "")
+                                if native_exit_time is not None and native_exit_reason:
+                                    native_exit_close = _market_naive(native_exit_time).to_pydatetime() + timedelta(minutes=s12_minutes)
+                                    if entry_ts < native_exit_close < effective_exit_ts:
+                                        effective_exit_ts = native_exit_close
+                                    hist_chart_reason = native_exit_reason
+                            elif hist_uts:
+                                entry_ts, effective_exit_ts, hist_chart_reason = self._uts_replay_window(
+                                    s1, tf, session_exit_ts, next_signal=s2,
+                                )
+                            elif not hist_s12:
+                                # Signals are stamped at their candle OPEN but only exist once that
+                                # candle closes. Entering (and taking the next opposite signal) at the
+                                # stamp booked a move the system could not have traded: the 2026-10-08
+                                # payoff audit found every QP replay profit inside that one-bar window.
+                                entry_ts, effective_exit_ts = self._closed_candle_replay_window(
+                                    entry_ts, tf, effective_exit_ts, session_exit_ts, crosses_session,
+                                )
 
                             if sim_inst == "FUT":
                                 sim_option_type = ""
@@ -4264,17 +5661,62 @@ class SignalProcessor:
                                     0.5 if sim_option_type == "CE" else -0.5,
                                 )
 
-                            index_stop_distance = s1.stop_distance
+                            hist_s12_levels = {}
+                            hist_s12_entry_spot = float(
+                                getattr(s1, "s12_engine_entry", 0.0) or getattr(s1, "price", 0.0) or 0.0
+                            ) if hist_s12 else 0.0
+                            if hist_s12:
+                                try:
+                                    entry_spot_frame = scanner.candles.get_candles(instrument, "1min")
+                                    if entry_spot_frame is not None and not entry_spot_frame.empty:
+                                        normalized_index = pd.DatetimeIndex([
+                                            _market_naive(ts) for ts in entry_spot_frame.index
+                                        ])
+                                        positions = normalized_index.get_indexer([_market_naive(entry_ts)])
+                                        if len(positions) and positions[0] >= 0:
+                                            hist_s12_entry_spot = float(
+                                                entry_spot_frame.iloc[int(positions[0])].get("open", hist_s12_entry_spot)
+                                                or hist_s12_entry_spot
+                                            )
+                                except Exception:
+                                    pass
+                                hist_s12_levels = s12_lane_policy.admission_levels(
+                                    s1, hist_s12_entry_spot, settings
+                                )
+                                index_stop_distance = abs(
+                                    hist_s12_entry_spot - float(hist_s12_levels.get("s12_stop") or 0.0)
+                                )
+                            else:
+                                index_stop_distance = s1.stop_distance
+                            hist_s12_market = {"lane": hist_lane_tag, "trade_id": str(
+                                getattr(s1, "s12_trade_id", "") or ""
+                            ), "stop_updates": [], "milestones": {}}
+                            if hist_s12:
+                                for update in getattr(s1, "s12_stop_updates", []) or []:
+                                    try:
+                                        when, level = update
+                                        hist_s12_market["stop_updates"].append({
+                                            "effective_from": _market_naive(when), "stop": float(level),
+                                        })
+                                    except (TypeError, ValueError):
+                                        continue
+                                for name, when in (getattr(s1, "s12_milestones", {}) or {}).items():
+                                    try:
+                                        hist_s12_market["milestones"][str(name)] = {"time": _market_naive(when)}
+                                    except Exception:
+                                        continue
                             # Provisional entry/stop for risk sizing (FUT uses index; OPT uses abs delta).
                             if sim_inst == "FUT":
-                                hist_entry_px = float(s1.price or 0.0)
-                                hist_stop_px = float(s1.trailing_stop or 0.0)
-                                if direction == "LONG":
+                                hist_entry_px = float(hist_s12_entry_spot or s1.price or 0.0)
+                                hist_stop_px = float(
+                                    hist_s12_levels.get("s12_stop") or s1.trailing_stop or 0.0
+                                )
+                                if direction == "LONG" and not hist_s12:
                                     hist_stop_px = max(
                                         hist_stop_px,
                                         hist_entry_px * (1.0 - float(scanner.futures_sl_pct or 0.0) / 100.0),
                                     )
-                                else:
+                                elif direction != "LONG" and not hist_s12:
                                     hist_stop_px = min(
                                         hist_stop_px if hist_stop_px > 0 else hist_entry_px * 1.01,
                                         hist_entry_px * (1.0 + float(scanner.futures_sl_pct or 0.0) / 100.0),
@@ -4292,22 +5734,27 @@ class SignalProcessor:
                                 s1.timestamp,
                                 s1.signal_type,
                             )
-                            size_result = resolve_trade_lots(
-                                settings=settings,
-                                inst_type=sim_inst,
-                                requested_lots=requested,
-                                lot_size=lot_size,
-                                entry_price=hist_entry_px,
-                                stop_price=hist_stop_px,
-                                compression_state=hist_compression_state,
-                                intel_score=float(hist_intel_score or 0.0),
-                            )
-                            hist_lots = int(size_result.lots or 0)
-                            if hist_lots < 1:
-                                self._historical_audit_log(
-                                    f"Skipping {instrument} {tf} {sim_inst}: {size_result.reason}"
+                            if hist_uts and sim_inst == "OPT":
+                                # UTS admission requires the observed contract fill and
+                                # premium cap. A provisional delta estimate cannot size it.
+                                hist_lots = max(1, requested)
+                            else:
+                                size_result = resolve_trade_lots(
+                                    settings=settings,
+                                    inst_type=sim_inst,
+                                    requested_lots=requested,
+                                    lot_size=lot_size,
+                                    entry_price=hist_entry_px,
+                                    stop_price=hist_stop_px,
+                                    compression_state=hist_compression_state,
+                                    intel_score=float(hist_intel_score or 0.0),
                                 )
-                                continue
+                                hist_lots = int(size_result.lots or 0)
+                                if hist_lots < 1:
+                                    self._historical_audit_log(
+                                        f"Skipping {instrument} {tf} {sim_inst}: {size_result.reason}"
+                                    )
+                                    continue
 
                             qty = hist_lots * lot_size
                             
@@ -4318,6 +5765,9 @@ class SignalProcessor:
                                 option_df, trading_symbol, symbol_token = self._load_option_candles(
                                     scanner, instrument, hist_strike, sim_option_type, "1min", s1.timestamp.date(), now_dt=s1.timestamp
                                 )
+                                if hist_uts and option_df.empty:
+                                    record_reject("UTS replay requires observed option prices", "OPT")
+                                    continue
                                 if option_df.empty and getattr(settings, "ut_option_history_mode", "fetch_or_skip") == "fetch_or_skip":
                                     option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
                                     if option_pref == "OPT":
@@ -4335,7 +5785,9 @@ class SignalProcessor:
                                     sim_multiplier = 1.0
                                     hist_strike = 0.0
                                     entry_premium = s1.price
-                                    fut_stop = float(s1.trailing_stop or 0.0)
+                                    fut_stop = float(
+                                        hist_s12_levels.get("s12_stop") or s1.trailing_stop or 0.0
+                                    )
                                     size_result = resolve_trade_lots(
                                         settings=settings,
                                         inst_type="FUT",
@@ -4358,27 +5810,55 @@ class SignalProcessor:
                                 entry_premium = s1.price
                             
                             if sim_inst == "FUT":
-                                sl_price = s1.trailing_stop
-                                hist_fut_sl_pct = futures_stop_tolerance_pct(
-                                    scanner.futures_sl_pct,
-                                    hist_regime,
+                                sl_price = float(
+                                    hist_s12_levels.get("s12_stop") or s1.trailing_stop or 0.0
                                 )
-                                max_sl_dist = entry_premium * (hist_fut_sl_pct / 100.0)
-                                if direction == "LONG":
-                                    sl_price = max(sl_price, entry_premium - max_sl_dist)
-                                else:
-                                    sl_price = min(sl_price, entry_premium + max_sl_dist)
+                                if not hist_s12:
+                                    hist_fut_sl_pct = futures_stop_tolerance_pct(
+                                        scanner.futures_sl_pct,
+                                        hist_regime,
+                                    )
+                                    max_sl_dist = entry_premium * (hist_fut_sl_pct / 100.0)
+                                    if direction == "LONG":
+                                        sl_price = max(sl_price, entry_premium - max_sl_dist)
+                                    else:
+                                        sl_price = min(sl_price, entry_premium + max_sl_dist)
                                 index_stop_distance = max(1.0, abs(entry_premium - sl_price))
                             else:
                                 # Options are always long-premium instruments (CE/PE buy). Keep SL below entry.
                                 # Use absolute spot stop distance mapped by multiplier, capped by option SL%.
                                 spot_stop_dist = abs(float(s1.price) - float(s1.trailing_stop))
-                                natural_sl_dist = abs(spot_stop_dist * sim_multiplier)
-                                max_sl_dist = entry_premium * (scanner.options_sl_pct / 100.0)
-                                effective_sl_dist = max(0.05, min(natural_sl_dist, max_sl_dist))
+                                hist_option_cap = (
+                                    s12_lane_policy.premium_cap_pct(s1, settings, timeframe=tf)
+                                    if hist_s12 else option_stop_tolerance_pct(
+                                        scanner.options_sl_pct, hist_regime,
+                                        confidence=hist_conf, grade=hist_grade,
+                                        setup=s1,
+                                    )
+                                )
+                                if hist_uts:
+                                    effective_sl_dist = self._historical_uts_premium_stop_distance(
+                                        entry_premium,
+                                        spot_stop_dist,
+                                        sim_multiplier,
+                                        settings,
+                                        regime=hist_regime,
+                                        confidence=hist_conf,
+                                        grade=hist_grade,
+                                        setup=s1, timeframe=tf,
+                                    )
+                                elif hist_s12:
+                                    effective_sl_dist = entry_premium * hist_option_cap / 100.0
+                                else:
+                                    natural_sl_dist = abs(spot_stop_dist * sim_multiplier)
+                                    max_sl_dist = entry_premium * (hist_option_cap / 100.0)
+                                    effective_sl_dist = max(0.05, min(natural_sl_dist, max_sl_dist))
                                 sl_price = max(0.05, entry_premium - effective_sl_dist)
                             
-                            raw_exit_spot = s2.price
+                            raw_exit_spot = (
+                                float(getattr(s1, "s12_exit_price", 0.0) or s1.price or 0.0)
+                                if hist_s12 else s2.price
+                            )
                             if crosses_session:
                                 raw_exit_spot = s1.price
                                 day_candles = candles_df[
@@ -4393,12 +5873,12 @@ class SignalProcessor:
                                 hist_rr = self._dynamic_rr(hist_grade, hist_conf, timeframe=tf)
                                 actual_option = self._simulate_actual_option_exit(
                                     option_df if "option_df" in locals() else pd.DataFrame(),
-                                    s1.timestamp,
+                                    entry_ts,
                                     effective_exit_ts,
                                     sl_price,
-                                    hist_rr,
-                                    natural_sl_distance=natural_sl_distance,
-                                    max_sl_pct=scanner.options_sl_pct / 100.0,
+                                    uts_lane_policy.target_rr(settings) if hist_uts else hist_rr,
+                                    natural_sl_distance=effective_sl_dist if hist_uts else natural_sl_distance,
+                                    max_sl_pct=hist_option_cap / 100.0,
                                     qty=qty,
                                     tf15_qty=qty,
                                     tf15_exit_scanner=scanner,
@@ -4409,6 +5889,10 @@ class SignalProcessor:
                                     replay_grade=hist_grade,
                                     replay_confidence=hist_conf,
                                     replay_regime=hist_regime,
+                                    replay_source_lane=hist_lane_tag,
+                                    replay_setup=s1,
+                                    required_stop_distance=natural_sl_distance if hist_uts else 0.0,
+                                    chart_exit_reason=hist_chart_reason,
                                 )
                                 if actual_option:
                                     entry_premium = actual_option["entry"]
@@ -4417,7 +5901,29 @@ class SignalProcessor:
                                     exit_premium = raw_exit_premium
                                     exit_time = actual_option["exit_time"]
                                     is_sl_hit = actual_option["reason"] == "SL HIT"
+                                    if hist_uts:
+                                        size_result = resolve_trade_lots(
+                                            settings=settings, inst_type="OPT",
+                                            requested_lots=requested, lot_size=lot_size,
+                                            entry_price=entry_premium, stop_price=sl_price,
+                                            compression_state=hist_compression_state,
+                                            intel_score=float(hist_intel_score or 0.0),
+                                        )
+                                        hist_lots = int(size_result.lots or 0)
+                                        if hist_lots < 1:
+                                            record_reject(size_result.reason, "OPT")
+                                            continue
+                                        observed_qty = hist_lots * lot_size
+                                        if observed_qty != qty:
+                                            for sample in actual_option.get("price_path") or []:
+                                                for value in ("pnl", "peak_pnl"):
+                                                    if value in sample:
+                                                        sample[value] *= observed_qty / qty
+                                        qty = observed_qty
                                 else:
+                                    if hist_uts:
+                                        record_reject("UTS replay lacks a complete observed option path or compatible stop", "OPT")
+                                        continue
                                     spot_diff = raw_exit_spot - s1.price if direction == "LONG" else s1.price - raw_exit_spot
                                     raw_exit_premium = entry_premium + (spot_diff * sim_multiplier)
                                     
@@ -4444,41 +5950,79 @@ class SignalProcessor:
                             
                             is_sl_hit = bool(actual_option and actual_option["reason"] == "SL HIT")
                             fut_target_hit = False
+                            s12_exit_reason = ""
+                            hist_s12_trade = None
                             exit_premium = raw_exit_premium
                             exit_time = actual_option["exit_time"] if actual_option else effective_exit_ts
                             
                             candles_1min = scanner.candles.get_candles(instrument, "1min")
+                            futures_replay_window = None
                             
                             if actual_option is None and candles_1min is not None and not candles_1min.empty:
                                 try:
-                                    s1_ts = s1.timestamp.replace(tzinfo=None) if s1.timestamp.tzinfo else s1.timestamp
+                                    # Closed-candle start for every lane (entry_ts is already
+                                    # shifted past the signal candle; see _closed_candle_replay_window).
+                                    s1_ts = entry_ts
                                     between_candles = candles_1min.loc[s1_ts:effective_exit_ts]
+                                    if (hist_uts or (hist_s12 and sim_inst == "FUT")) and sim_inst == "FUT":
+                                        # Only bars traded after confirmation and fully
+                                        # known by the exit decision may hit a resting stop.
+                                        between_candles = candles_1min.loc[
+                                            (candles_1min.index >= entry_ts)
+                                            & (candles_1min.index + pd.Timedelta(minutes=1) <= effective_exit_ts)
+                                        ]
+                                        futures_replay_window = between_candles
+                                        if not between_candles.empty:
+                                            raw_exit_spot = float(between_candles.iloc[-1]["close"])
+                                            raw_exit_premium = exit_premium = raw_exit_spot
                                     
                                     if not between_candles.empty:
                                         if sim_inst == "FUT":
+                                            if hist_s12 and _setting_enabled(
+                                                getattr(settings, "replay_s12_native_exits", True), True
+                                            ):
+                                                replay = self._simulate_s12_futures_exit_path(
+                                                    between_candles,
+                                                    signal=s1,
+                                                    levels=hist_s12_levels,
+                                                    market=hist_s12_market,
+                                                    instrument=instrument,
+                                                    timeframe=tf,
+                                                    direction=direction,
+                                                    entry_price=entry_premium,
+                                                    settings=settings,
+                                                )
+                                                if replay is not None:
+                                                    hist_s12_trade = replay["trade"]
+                                                    s12_exit_reason = str(replay.get("reason") or "")
+                                                    exit_premium = float(replay["price"])
+                                                    exit_time = replay["time"]
+                                                    raw_exit_spot = exit_premium
+                                                    is_sl_hit = bool(replay.get("stop_hit"))
+                                            else:
                                             # Exit parity (2026-07-09 audit): FUT replay
                                             # previously scanned ONLY the stop and rode
                                             # winners to the next flip/day end (zero
                                             # TARGET_HIT among 334 FUT rows) — the same
                                             # intrabar SL/target walk the OPTION replay
                                             # gets applies here now.
-                                            fut_rr = self._dynamic_rr(hist_grade, hist_conf, timeframe=tf)
-                                            fut_target = (
-                                                entry_premium + (index_stop_distance * fut_rr)
-                                                if direction == "LONG"
-                                                else entry_premium - (index_stop_distance * fut_rr)
-                                            )
-                                            sim_price, sim_reason, sim_ts = self._simulate_futures_exit_path(
-                                                between_candles, entry_premium, sl_price, fut_target, direction
-                                            )
-                                            if sim_reason == "SL HIT":
-                                                is_sl_hit = True
-                                                exit_premium = sl_price
-                                                exit_time = sim_ts
-                                            elif sim_reason == "TARGET_HIT":
-                                                fut_target_hit = True
-                                                exit_premium = float(sim_price)
-                                                exit_time = sim_ts
+                                                fut_rr = self._dynamic_rr(hist_grade, hist_conf, timeframe=tf)
+                                                fut_target = (
+                                                    entry_premium + (index_stop_distance * fut_rr)
+                                                    if direction == "LONG"
+                                                    else entry_premium - (index_stop_distance * fut_rr)
+                                                )
+                                                sim_price, sim_reason, sim_ts = self._simulate_futures_exit_path(
+                                                    between_candles, entry_premium, sl_price, fut_target, direction
+                                                )
+                                                if sim_reason == "SL HIT":
+                                                    is_sl_hit = True
+                                                    exit_premium = float(sim_price) if hist_uts else sl_price
+                                                    exit_time = sim_ts
+                                                elif sim_reason == "TARGET_HIT":
+                                                    fut_target_hit = True
+                                                    exit_premium = float(sim_price)
+                                                    exit_time = sim_ts
                                         else:
                                             if direction == "LONG":
                                                 all_premiums = entry_premium + ((between_candles['low'] - s1.price) * sim_multiplier)
@@ -4532,11 +6076,18 @@ class SignalProcessor:
                                 if crosses_session and hist_exit_reason == "HISTORICAL":
                                     hist_exit_reason = "SESSION_END"
                             else:
-                                hist_exit_reason = "SL HIT" if is_sl_hit else (
-                                    "TARGET_HIT" if fut_target_hit
-                                    else ("SESSION_END" if crosses_session else "HISTORICAL")
+                                hist_exit_reason = s12_exit_reason if hist_s12 and s12_exit_reason else (
+                                    "SL HIT" if is_sl_hit else (
+                                        "TARGET_HIT" if fut_target_hit
+                                        else ("SESSION_END" if crosses_session else "HISTORICAL")
+                                    )
                                 )
-                            hist_rr = self._dynamic_rr(hist_grade, hist_conf, timeframe=tf)
+                                if hist_s12 and not s12_exit_reason and hist_chart_reason:
+                                    hist_exit_reason = s12_lane_policy.exit_reason_for(hist_chart_reason)
+                                if hist_uts and sim_inst == "FUT" and not is_sl_hit and not fut_target_hit and hist_chart_reason:
+                                    hist_exit_reason = uts_lane_policy.EXIT_REASONS.get(hist_chart_reason, "UTS_EXIT")
+                            hist_rr = (uts_lane_policy.target_rr(settings) if hist_uts and sim_inst == "OPT"
+                                       else self._dynamic_rr(hist_grade, hist_conf, timeframe=tf))
                             hist_lane = self._signal_source_lane(s1, scanner_engine_mode)
                             hist_source_engine = str(getattr(s1, "source_engine", "") or "")
                             hist_source_engines = list(getattr(s1, "source_engines", []) or [])
@@ -4556,11 +6107,14 @@ class SignalProcessor:
                                 continue
                                 
                             if sim_inst == "OPT":
-                                hist_target = actual_option["target"] if actual_option else entry_premium + ((entry_premium - sl_price) * hist_rr)
+                                hist_target = (
+                                    0.0 if hist_s12 else
+                                    actual_option["target"] if actual_option else entry_premium + ((entry_premium - sl_price) * hist_rr)
+                                )
                             elif direction == "LONG":
-                                hist_target = s1.price + (index_stop_distance * hist_rr)
+                                hist_target = 0.0 if hist_s12 else s1.price + (index_stop_distance * hist_rr)
                             else:
-                                hist_target = s1.price - (index_stop_distance * hist_rr)
+                                hist_target = 0.0 if hist_s12 else s1.price - (index_stop_distance * hist_rr)
 
                             # Evaluate once, after option-history/product fallback has
                             # selected the product that the simulated trade will store.
@@ -4583,8 +6137,19 @@ class SignalProcessor:
                                     f"Skipping {instrument} {tf} signal due to quality gate at {s1.timestamp}"
                                 )
                                 continue
+                            hist_context = self._replay_entry_context(
+                                scanner, instrument, tf, s1, direction, hist_regime, hist_lane_tag)
+                            if hist_context is not None and not hist_context.allowed:
+                                record_reject(f"Context gate {hist_context.rule_id}", sim_inst)
+                                continue
 
-                            e_time = IST.localize(s1.timestamp) if (s1.timestamp and getattr(s1.timestamp, "tzinfo", None) is None) else s1.timestamp
+                            historical_entry_time = (
+                                actual_option["entry_time"] if actual_option
+                                else entry_ts
+                            )
+                            e_time = (IST.localize(historical_entry_time)
+                                      if (historical_entry_time and getattr(historical_entry_time, "tzinfo", None) is None)
+                                      else historical_entry_time)
                             ex_time = IST.localize(exit_time) if (exit_time and getattr(exit_time, "tzinfo", None) is None) else exit_time
                             t = Trade(
                                 id=hist_id, instrument=instrument, timeframe=tf,
@@ -4596,13 +6161,18 @@ class SignalProcessor:
                                 rr_ratio=hist_rr, target=hist_target,
                                 status="CLOSED", exit_price=exit_premium, exit_time=ex_time,
                                 pnl=net_pnl, charges=sim_charges, exit_reason=hist_exit_reason,
-                                instrument_multiplier=sim_multiplier, entry_spot=s1.price,
-                                spot_stop=s1.trailing_stop,
-                                spot_target=(s1.price + (index_stop_distance * hist_rr)) if direction == "LONG" else (s1.price - (index_stop_distance * hist_rr)),
+                                instrument_multiplier=sim_multiplier,
+                                entry_spot=(hist_s12_entry_spot or s1.price),
+                                spot_stop=(hist_s12_levels.get("s12_stop") or s1.trailing_stop),
+                                spot_target=(0.0 if hist_s12 else
+                                    (s1.price + (index_stop_distance * hist_rr)) if direction == "LONG"
+                                    else (s1.price - (index_stop_distance * hist_rr))),
                                 trading_symbol=trading_symbol, symbol_token=symbol_token,
                                 source_engine=hist_source_engine,
                                 source_engines=hist_source_engines,
                                 source_lane=hist_lane,
+                                signal_time=(getattr(s1, "source_signal_timestamp", None)
+                                             or s1.timestamp) if (hist_uts or hist_s12) else None,
                                 data_provenance="BACKTEST",
                                 market_regime=str(hist_regime or "UNKNOWN"),
                                 entry_intelligence_score=float(hist_intel_score or 0.0),
@@ -4614,9 +6184,38 @@ class SignalProcessor:
                                 raw_union_entry=bool(getattr(s1, "raw_union_entry", False)),
                                 initial_stop=float(sl_price or 0.0),
                                 replay_price_path=list((actual_option or {}).get("price_path") or []),
-                                replay_exit_trace=list((actual_option or {}).get("exit_trace") or []),
-                                quality_verdict=hist_quality_verdict.to_dict(),
+                                replay_exit_trace=(self._historical_futures_fill_evidence(
+                                    futures_replay_window, signal=s1, entry_time=historical_entry_time,
+                                    exit_time=exit_time, entry_price=entry_premium,
+                                    exit_price=exit_premium, exit_reason=hist_exit_reason,
+                                ) if hist_uts and sim_inst == "FUT" else
+                                    list((actual_option or {}).get("exit_trace") or [])),
+                                quality_verdict=self._with_entry_context(hist_quality_verdict.to_dict(), hist_context),
                             )
+                            if hist_s12:
+                                for key in s12_lane_policy.SESSION_STATE_FIELDS:
+                                    if hasattr(s1, key):
+                                        setattr(t, key, copy.deepcopy(getattr(s1, key)))
+                                for key, value in ((actual_option or {}).get("s12_state") or {}).items():
+                                    setattr(t, key, copy.deepcopy(value))
+                                for key, value in hist_s12_levels.items():
+                                    if key not in {"s12_stop", "s12_stop_initial"} or not hasattr(t, key):
+                                        setattr(t, key, value)
+                                t.s12_lane = hist_lane_tag
+                                t.s12_trade_id = hist_s12_market["trade_id"]
+                                hist_s12_final_state = (actual_option or {}).get("s12_state") or {}
+                                t.s12_stop = float(
+                                    hist_s12_final_state.get("s12_stop", 0.0)
+                                    or getattr(hist_s12_trade, "s12_stop", 0.0)
+                                    or hist_s12_levels.get("s12_stop") or 0.0
+                                ) if hist_s12_trade is not None else float(
+                                    hist_s12_final_state.get("s12_stop", 0.0)
+                                    or hist_s12_levels.get("s12_stop") or 0.0
+                                )
+                                t.s12_stop_initial = float(
+                                    hist_s12_levels.get("s12_stop_initial") or hist_s12_levels.get("s12_stop") or 0.0
+                                )
+                                t.s12_premium_cap_pct = float(hist_option_cap) if sim_inst == "OPT" else 0.0
                             
                             live_session_day_raw = (
                                 scanner._get_current_session_day()
@@ -4705,7 +6304,12 @@ class SignalProcessor:
                         "_allow_inferred_signal_recovery",
                         lambda: False,
                     )
-                    if is_live and sigs and bool(allow_inferred_recovery()):
+                    historical_final_uts = bool(
+                        not is_live and sigs
+                        and str(getattr(scanner, "mode", "")).upper() == "HISTORICAL"
+                        and uts_lane_policy.is_uts(sigs[-1], settings)
+                    )
+                    if historical_final_uts or (is_live and sigs and bool(allow_inferred_recovery())):
                         logger.info(f"Running live recovery for {instrument} {tf}...")
                         last_s = sigs[-1]
                         session_day_raw = (
@@ -5142,13 +6746,36 @@ class SignalProcessor:
                                 day_type=eod_day_type,
                                 day_type_confidence=eod_day_conf,
                             )
-                            if eod_grade == "C":
+                            if eod_grade == "C" and not historical_final_uts:
                                 continue
+
+                            if historical_final_uts:
+                                # This final arrow has no next arrow to pair with,
+                                # but admission still belongs to the same policy as
+                                # every earlier historical UTS entry. Grade is display
+                                # metadata; direction, cutoff and native evidence bind.
+                                direction_allowed, _ = self._direction_mode_allows(
+                                    last_s.signal_type, settings
+                                )
+                                if not direction_allowed or not self._historical_entry_cutoff_allows(
+                                    last_s, tf, "UTS", settings
+                                ):
+                                    continue
+                                final_native_verdict = self._quality_verdict_for_signal(
+                                    last_s, tf=tf, grade=eod_grade, confidence=eod_conf,
+                                    regime=eod_regime, inst_type="OPT", settings=settings,
+                                    trend_15m_agrees=self._trend_15m_agrees_at(
+                                        mtf_result, last_s.timestamp, last_s.signal_type,
+                                        closed_only=True,
+                                    ),
+                                )
+                                if not final_native_verdict.allowed:
+                                    continue
 
                             # Apply burst-only admission to the unpaired final 1m
                             # signal too. No historical L1 snapshot exists, so depth is
                             # deliberately unavailable rather than read from live book.
-                            if tf == "1min":
+                            if tf == "1min" and not historical_final_uts:
                                 eod_burst_detector = getattr(scanner, "_detect_volume_spike_entry", None)
                                 eod_volume_spike_metrics = (
                                     eod_burst_detector(
@@ -5204,6 +6831,7 @@ class SignalProcessor:
                                     eod_price = day_candles['close'].iloc[-1]
                             
                             eod_lane = self._signal_source_lane(last_s, scanner_engine_mode)
+                            eod_uts = eod_lane == "UTS"
                             eod_source_engine = str(getattr(last_s, "source_engine", "") or "")
                             eod_source_engines = list(getattr(last_s, "source_engines", []) or [])
                             eod_id = self._historical_trade_id("EOD", instrument, tf, last_s, scanner_engine_mode, fmt="%m%d%H%M")
@@ -5214,7 +6842,15 @@ class SignalProcessor:
                                 continue
                             if not any(ct.id == eod_id for ct in scanner.trades.closed_trades):
                                 eod_exit_time = datetime.combine(sig_date, force_exit_time)
-                                e_time = IST.localize(last_s.timestamp) if last_s.timestamp.tzinfo is None else last_s.timestamp
+                                eod_start = last_s.timestamp
+                                eod_chart_reason = ""
+                                if eod_uts:
+                                    eod_start, eod_exit_time, eod_chart_reason = self._uts_replay_window(last_s, tf, eod_exit_time)
+                                else:
+                                    eod_naive = eod_start.replace(tzinfo=None) if getattr(eod_start, "tzinfo", None) else eod_start
+                                    eod_start, _ = self._closed_candle_replay_window(
+                                        eod_naive, tf, eod_exit_time, eod_exit_time, True)
+                                e_time = IST.localize(eod_start) if eod_start.tzinfo is None else eod_start
                                 ex_time = IST.localize(eod_exit_time) if eod_exit_time.tzinfo is None else eod_exit_time
                                 
                                 
@@ -5233,16 +6869,27 @@ class SignalProcessor:
                                     spot_diff = eod_price - last_s.price if direction == "LONG" else last_s.price - eod_price
                                     exit_premium = entry_premium + (spot_diff * sim_multiplier)
                                 else: # AUTO
-                                    eod_option_allowed = self._option_grade_allowed(
-                                        eod_grade,
-                                        eod_conf,
-                                        eod_regime,
-                                        adx_value=getattr(last_s, "adx_value", 0.0),
-                                        intel_score=eod_intel_score,
-                                        signal_score=eod_conf,
-                                        timeframe=tf,
-                                    )
-                                    sim_inst = "OPT" if eod_option_allowed else "FUT"
+                                    if historical_final_uts:
+                                        sim_inst = scanner._resolve_instrument_type(
+                                            instrument=instrument, grade=eod_grade,
+                                            regime=eod_regime, intel_score=eod_intel_score,
+                                            signal_score=eod_conf, confidence=eod_conf,
+                                            adx_value=getattr(last_s, "adx_value", 0.0),
+                                            atr_value=getattr(last_s, "atr_value", 0.0),
+                                            price=last_s.price, signal_time=last_s.timestamp,
+                                            timeframe=tf, five_min_true_impulse=False,
+                                        )
+                                    else:
+                                        eod_option_allowed = self._option_grade_allowed(
+                                            eod_grade,
+                                            eod_conf,
+                                            eod_regime,
+                                            adx_value=getattr(last_s, "adx_value", 0.0),
+                                            intel_score=eod_intel_score,
+                                            signal_score=eod_conf,
+                                            timeframe=tf,
+                                        )
+                                        sim_inst = "OPT" if eod_option_allowed else "FUT"
                                     sim_option_type = ("CE" if direction == "LONG" else "PE") if sim_inst == "OPT" else ""
                                     sim_multiplier = 0.5 if sim_inst == "OPT" else 1.0
                                     if sim_inst == "OPT":
@@ -5280,6 +6927,8 @@ class SignalProcessor:
                                         scanner, instrument, sim_atm_strike, sim_option_type, "1min", sig_date,
                                         now_dt=getattr(last_s, "timestamp", None)
                                     )
+                                    if eod_uts and option_df.empty:
+                                        continue
                                     history_mode = getattr(settings, "ut_option_history_mode", "fetch_or_skip")
                                     if option_df.empty and history_mode == "fetch_or_skip":
                                         option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
@@ -5307,17 +6956,34 @@ class SignalProcessor:
                                             eod_stop = min(last_s.trailing_stop, entry_premium + max_fut_sl_dist)
                                             eod_target = entry_premium - ((eod_stop - entry_premium) * eod_rr)
 
-                                    opt_sl_price = max(
-                                        0.05,
-                                        entry_premium - max(0.05, entry_premium * (scanner.options_sl_pct / 100.0)),
+                                    est_entry = float(entry_premium or 0.0)
+                                    spot_stop_dist = abs(float(last_s.price) - float(last_s.trailing_stop))
+                                    eod_option_cap = option_stop_tolerance_pct(
+                                        scanner.options_sl_pct, eod_regime,
+                                        confidence=eod_conf, grade=eod_grade,
+                                        setup=last_s,
                                     )
-                                    if sim_inst == "OPT" and not option_df.empty:
-                                        est_entry = _estimate_opt_premium(last_s.price, scanner, instrument, _sig_date(last_s))
-                                        spot_stop_dist = abs(float(last_s.price) - float(last_s.trailing_stop))
+                                    if eod_uts:
+                                        natural_sl_premium_dist = self._historical_uts_premium_stop_distance(
+                                            est_entry,
+                                            spot_stop_dist,
+                                            sim_multiplier,
+                                            settings,
+                                            regime=eod_regime,
+                                            confidence=eod_conf,
+                                            grade=eod_grade,
+                                            setup=last_s, timeframe=tf,
+                                        )
+                                        effective_sl_dist = natural_sl_premium_dist
+                                    else:
                                         natural_sl_premium_dist = abs(spot_stop_dist * sim_multiplier)
-                                        max_sl_dist = est_entry * (scanner.options_sl_pct / 100.0)
-                                        effective_sl_dist = max(0.05, min(natural_sl_premium_dist, max_sl_dist))
-                                        opt_sl_price = max(0.05, est_entry - effective_sl_dist)
+                                        max_sl_dist = est_entry * (eod_option_cap / 100.0)
+                                        effective_sl_dist = max(
+                                            0.05,
+                                            min(natural_sl_premium_dist, max_sl_dist),
+                                        )
+                                    opt_sl_price = max(0.05, est_entry - effective_sl_dist)
+                                    if sim_inst == "OPT" and not option_df.empty:
                                         eod_probe_qty = max(
                                             1,
                                             int(
@@ -5327,12 +6993,12 @@ class SignalProcessor:
                                         )
                                         actual_eod = self._simulate_actual_option_exit(
                                             option_df,
-                                            last_s.timestamp,
+                                            eod_start,
                                             eod_exit_time,
                                             opt_sl_price,
-                                            eod_rr,
+                                            uts_lane_policy.target_rr(settings) if eod_uts else eod_rr,
                                             natural_sl_distance=natural_sl_premium_dist,
-                                            max_sl_pct=scanner.options_sl_pct / 100.0,
+                                            max_sl_pct=eod_option_cap / 100.0,
                                             qty=eod_probe_qty,
                                             tf15_qty=eod_probe_qty,
                                             tf15_exit_scanner=scanner,
@@ -5343,9 +7009,18 @@ class SignalProcessor:
                                             replay_grade=eod_grade,
                                             replay_confidence=eod_conf,
                                             replay_regime=eod_regime,
+                                            replay_source_lane=eod_lane,
+                                            replay_setup=last_s,
+                                            required_stop_distance=abs(spot_stop_dist * sim_multiplier) if eod_uts else 0.0,
+                                            chart_exit_reason=eod_chart_reason,
                                         )
                                         if actual_eod:
                                             entry_premium = actual_eod["entry"]
+                                            if eod_uts:
+                                                observed_entry_time = actual_eod["entry_time"]
+                                                e_time = (IST.localize(observed_entry_time)
+                                                          if observed_entry_time.tzinfo is None
+                                                          else observed_entry_time)
                                             opt_sl_price = actual_eod["stop"]
                                             exit_premium = actual_eod["exit"]
                                             eod_target = actual_eod["target"]
@@ -5353,9 +7028,13 @@ class SignalProcessor:
                                             ex_time = IST.localize(eod_exit_time) if (eod_exit_time and getattr(eod_exit_time, "tzinfo", None) is None) else eod_exit_time
                                             eod_exit_reason = actual_eod["reason"] if actual_eod["reason"] != "HISTORICAL" else "SESSION_END"
                                         else:
+                                            if eod_uts:
+                                                continue
                                             fallback_risk = max(0.5, est_entry - opt_sl_price)
                                             eod_target = est_entry + (fallback_risk * eod_rr)
                                     else:
+                                        if eod_uts:
+                                            continue
                                         fallback_risk = max(0.5, entry_premium - opt_sl_price)
                                         eod_target = entry_premium + (fallback_risk * eod_rr)
 
@@ -5389,8 +7068,58 @@ class SignalProcessor:
                                 if not eod_quality_verdict.allowed:
                                     logger.info(f"⭐️ Skipping EOD {instrument} {tf} signal due to quality gate at {last_s.timestamp}")
                                     continue
+                                eod_context = self._replay_entry_context(
+                                    scanner, instrument, tf, last_s,
+                                    "LONG" if str(getattr(last_s, "signal_type", "")).upper() == "BUY" else "SHORT",
+                                    eod_regime, eod_lane)
+                                if eod_context is not None and not eod_context.allowed:
+                                    logger.info(f"Skipping EOD {instrument} {tf} signal: context gate {eod_context.rule_id}")
+                                    continue
 
                                 eod_lots = getattr(scanner, "user_lots_fut", {}).get(instrument, 1) if sim_inst == "FUT" else getattr(scanner, "user_lots", {}).get(instrument, 1)
+                                if historical_final_uts:
+                                    size_result = resolve_trade_lots(
+                                        settings=settings, inst_type=sim_inst,
+                                        requested_lots=int(eod_lots or 0), lot_size=lot_size,
+                                        entry_price=float(entry_premium or 0.0),
+                                        stop_price=float(opt_sl_price if sim_inst == "OPT" else eod_stop),
+                                        compression_state=self._historical_compression_state(
+                                            candles_df, last_s.timestamp, last_s.signal_type
+                                        ),
+                                        intel_score=float(eod_intel_score or 0.0) if sim_inst == "OPT" else 0.0,
+                                    )
+                                    eod_lots = int(size_result.lots or 0)
+                                    if eod_lots < 1:
+                                        continue
+                                    if actual_eod and eod_probe_qty != eod_lots * lot_size:
+                                        # UTS premium exits do not depend on quantity.
+                                        # Keep the observed path's rupee fields aligned
+                                        # with the same sizing rule as paired entries.
+                                        quantity_ratio = eod_lots * lot_size / eod_probe_qty
+                                        for sample in actual_eod.get("price_path") or []:
+                                            for value in ("pnl", "peak_pnl"):
+                                                if value in sample:
+                                                    sample[value] *= quantity_ratio
+                                if historical_final_uts and sim_inst == "FUT":
+                                    minute_candles = scanner.candles.get_candles(instrument, "1min")
+                                    if minute_candles is None or minute_candles.empty:
+                                        continue
+                                    exit_window = minute_candles.loc[
+                                        (minute_candles.index >= eod_start)
+                                        & (minute_candles.index + pd.Timedelta(minutes=1) <= eod_exit_time)
+                                    ]
+                                    if exit_window.empty:
+                                        continue
+                                    exit_premium = float(exit_window.iloc[-1]["close"])
+                                    sim_price, sim_reason, sim_ts = self._simulate_futures_exit_path(
+                                        exit_window, entry_premium, eod_stop, eod_target, direction,
+                                    )
+                                    if sim_reason:
+                                        exit_premium, eod_exit_reason = float(sim_price), sim_reason
+                                        eod_exit_time = sim_ts
+                                        ex_time = IST.localize(sim_ts) if sim_ts.tzinfo is None else sim_ts
+                                    elif eod_chart_reason:
+                                        eod_exit_reason = uts_lane_policy.EXIT_REASONS.get(eod_chart_reason, "UTS_EXIT")
                                 sim_charges = estimate_trade_charges(
                                     last_s.price if sim_inst == "FUT" else entry_premium,
                                     exit_premium,
@@ -5399,10 +7128,10 @@ class SignalProcessor:
                                     settings,
                                 )
                                 if sim_inst == "FUT":
-                                    if direction == "LONG" and eod_price <= eod_stop:
+                                    if not historical_final_uts and direction == "LONG" and eod_price <= eod_stop:
                                         exit_premium = eod_stop
                                         eod_exit_reason = "SL HIT"
-                                    elif direction == "SHORT" and eod_price >= eod_stop:
+                                    elif not historical_final_uts and direction == "SHORT" and eod_price >= eod_stop:
                                         exit_premium = eod_stop
                                         eod_exit_reason = "SL HIT"
                                     if direction == "LONG":
@@ -5420,7 +7149,9 @@ class SignalProcessor:
                                     trailing_stop=(opt_sl_price if sim_inst == "OPT" else eod_stop),
                                     current_stop=(opt_sl_price if sim_inst == "OPT" else eod_stop),
                                     lots=eod_lots, lot_size=lot_size, grade=f"{eod_grade} (EOD, Hist)", confidence=eod_conf,
-                                    inst_type=sim_inst, option_type=sim_option_type, rr_ratio=1.5,
+                                    inst_type=sim_inst, option_type=sim_option_type,
+                                    rr_ratio=(uts_lane_policy.target_rr(settings) if eod_uts and sim_inst == "OPT"
+                                              else eod_rr if eod_uts else 1.5),
                                     target=eod_target,
                                     status="CLOSED", exit_price=exit_premium, exit_time=ex_time,
                                     pnl=eod_pnl, charges=sim_charges, exit_reason=eod_exit_reason,
@@ -5432,7 +7163,7 @@ class SignalProcessor:
                                     source_engine=eod_source_engine,
                                     source_engines=eod_source_engines,
                                     source_lane=eod_lane,
-                                    quality_verdict=eod_quality_verdict.to_dict(),
+                                    quality_verdict=self._with_entry_context(eod_quality_verdict.to_dict(), eod_context),
                                     data_provenance="BACKTEST",
                                     market_regime=str(eod_regime or "UNKNOWN"),
                                     entry_intelligence_score=float(eod_intel_score or 0.0),
@@ -5443,8 +7174,15 @@ class SignalProcessor:
                                     quad_union_entry=bool(getattr(last_s, "quad_union_entry", False)),
                                     raw_union_entry=bool(getattr(last_s, "raw_union_entry", False)),
                                     initial_stop=float((opt_sl_price if sim_inst == "OPT" else eod_stop) or 0.0),
+                                    signal_time=(getattr(last_s, "source_signal_timestamp", None)
+                                                 or last_s.timestamp) if eod_uts else None,
                                     replay_price_path=list((actual_eod or {}).get("price_path") or []),
-                                    replay_exit_trace=list((actual_eod or {}).get("exit_trace") or []),
+                                    replay_exit_trace=(self._historical_futures_fill_evidence(
+                                        exit_window, signal=last_s, entry_time=eod_start,
+                                        exit_time=eod_exit_time, entry_price=entry_premium,
+                                        exit_price=exit_premium, exit_reason=eod_exit_reason,
+                                    ) if historical_final_uts and sim_inst == "FUT" else
+                                        list((actual_eod or {}).get("exit_trace") or [])),
                                 )
                                 live_session_day_raw = (
                                     scanner._get_current_session_day()
@@ -5547,7 +7285,11 @@ class SignalProcessor:
                 # strategy_direction_mode was only ever persisted and displayed, never
                 # enforced, so LONG_ONLY / SHORT_ONLY did not actually restrict trading.
                 # No-op under the default LONG_SHORT.
-                _dir_ok, _dir_reason = self._direction_mode_allows(sig.signal_type, settings)
+                _dir_ok, _dir_reason = (
+                    (True, "1+1 native direction")
+                    if scanner_engine_mode == "one_plus_one"
+                    else self._direction_mode_allows(sig.signal_type, settings)
+                )
                 if not _dir_ok:
                     scanner.log_signal_decision_once(
                         f"{instrument}|{tf}|{sig.signal_type}|direction-mode",
@@ -5557,14 +7299,17 @@ class SignalProcessor:
                     continue
                 s_ts = naive_ts(sig.timestamp)
                 l_ts = last_time
-                signal_identity = f"{s_ts.isoformat()}|{sig.signal_type}"
+                identity_source = str(getattr(sig, "source_engine", "") or "").lower()
+                signal_identity = f"{s_ts.isoformat()}|{sig.signal_type}|{identity_source}"
                 last_identity = getattr(scanner, "_last_signal_identity", {}).get(dedup_key, "")
                 now_naive = naive_ts(datetime.now(IST))
                 tf_minutes = {"1min": 1, "5min": 5, "15min": 15}.get(tf, 5)
                 pending_key = (
                     f"{instrument}_{tf}_"
                     f"{'LONG' if sig.signal_type == 'BUY' else 'SHORT'}"
+                    f"{('_' + identity_source) if scanner_engine_mode == 'one_plus_one' else ''}"
                 )
+                pending_key += scope_suffix(sig, settings)
                 recheck_eligible = (
                     getattr(scanner, "_live_signal_recheck_eligible", {}).get(dedup_key)
                     == signal_identity
@@ -5609,6 +7354,22 @@ class SignalProcessor:
                 )
                 is_new_signal = is_new_signal or recheck_due or post_repaint_recheck_due
                 if is_new_signal:
+                    if (
+                        scanner_engine_mode == "one_plus_one"
+                        and not bool(getattr(sig, "native_exit_only", False))
+                        and self._native_entry_has_exit(sig, sigs)
+                    ):
+                        # The native state machine opened and closed this lifecycle
+                        # before platform admission (including same-bar stop-outs).
+                        # Consuming it here prevents a stale entry from reaching the
+                        # 20-30s buffer after its owning scanner is already flat.
+                        self._remember_live_signal_identity(
+                            scanner, dedup_key, s_ts, signal_identity
+                        )
+                        getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
+                            dedup_key, None
+                        )
+                        continue
                     if not hasattr(scanner, "_live_signal_recheck_at"):
                         scanner._live_signal_recheck_at = {}
                     scanner._live_signal_recheck_at[dedup_key] = now_naive
@@ -5651,6 +7412,7 @@ class SignalProcessor:
                         intrabar_enabled = intrabar_signals_enabled
                         if (
                             not intrabar_enabled
+                            and scanner_engine_mode != "one_plus_one"
                             and not self._live_signal_candle_is_closed(s_ts, tf, now_naive)
                         ):
                             logger.debug(
@@ -5660,16 +7422,31 @@ class SignalProcessor:
                             emit_once = getattr(scanner, "log_signal_decision_once", None)
                             if callable(emit_once):
                                 emit_once(
-                                    f"{instrument}|{tf}|{sig.signal_type}|{s_ts.isoformat(timespec='seconds')}|partial",
-                                    f"Signal waiting: {instrument} {sig.signal_type} {tf} @ {sig.price:.2f} - partial candle deferred until {candle_close_time.strftime('%H:%M:%S')}",
+                                    f"{instrument}|{tf}|{sig.signal_type}|{s_ts.isoformat(timespec='seconds')}|partial{scope_suffix(sig, settings)}",
+                                    f"Signal waiting: {instrument} {sig.signal_type} {tf} @ {sig.price:.2f}"
+                                    f"{(' [' + scope_suffix(sig, settings)[1:] + ']') if scope_suffix(sig, settings) else ''}"
+                                    f" - partial candle deferred until {candle_close_time.strftime('%H:%M:%S')}",
                                     "trade",
                                 )
                             continue
 
-                    no_entry_label, no_entry_after = _entry_cutoff(settings, tf)
-                    is_after_no_entry = tf in ["1min", "5min", "15min"] and sig.timestamp.time() >= no_entry_after
+                    lane_tag = self._signal_source_lane(sig, scanner_engine_mode)
+                    if lane_tag:
+                        no_entry_label = entry_window.last_entry(tf, settings)
+                        is_after_no_entry = not entry_window.entry_allowed(
+                            sig.timestamp,
+                            tf,
+                            settings,
+                            now=datetime.now(IST),
+                        )
+                    else:
+                        no_entry_label, no_entry_after = _entry_cutoff(settings, tf)
+                        is_after_no_entry = (
+                            tf in ["1min", "5min", "15min"]
+                            and sig.timestamp.time() >= no_entry_after
+                        )
                     volume_spike_metrics = None
-                    if is_live and tf in {"1min", "5min"}:
+                    if is_live and tf in {"1min", "5min"} and scanner_engine_mode != "one_plus_one":
                         volume_spike_metrics = scanner._detect_volume_spike_entry(
                             instrument,
                             tf,
@@ -5690,7 +7467,11 @@ class SignalProcessor:
                         vix_value = scanner.data.get_ltp("NSE", "INDIAVIX", "99926017") or 15.0
 
                     if is_live:
-                        raw_key = f"{instrument}|{tf}|{sig.signal_type}|{s_ts.isoformat(timespec='seconds')}"
+                        raw_source = str(getattr(sig, "source_engine", "") or "").lower()
+                        raw_key = (
+                            f"{instrument}|{tf}|{sig.signal_type}|"
+                            f"{s_ts.isoformat(timespec='seconds')}|{raw_source}"
+                        )
                         seen_raw = getattr(scanner, "_raw_utbot_activity_keys", None)
                         if seen_raw is None:
                             scanner._raw_utbot_activity_keys = set()
@@ -5703,7 +7484,10 @@ class SignalProcessor:
                             # cannot enter without its configured surge gate, so logging them only
                             # floods the tape.
                             suppress_1min_raw = self._suppress_1min_no_spike_tape(
-                                tf, getattr(sig, "volume_spike_entry", False), settings
+                                tf,
+                                getattr(sig, "volume_spike_entry", False),
+                                settings,
+                                native_burst=self._is_s12_native_burst(sig),
                             )
                             if not suppress_1min_raw:
                                 scanner.log_event(
@@ -5715,6 +7499,8 @@ class SignalProcessor:
                     # per-timeframe grading is enabled; otherwise these resolve to the
                     # caller's 5-minute values and grading is unchanged.
                     if (
+                        scanner_engine_mode != "one_plus_one"
+                        and
                         _timeframe_contexts is not None
                         and _setting_enabled(
                             getattr(settings, "own_timeframe_intel_fail_closed", True), True
@@ -5776,10 +7562,18 @@ class SignalProcessor:
                         sig,
                         mtf_result.confluence_score,
                         _tf_intel_score,
-                        _tf_regime,
-                        vix_value=vix_value,
-                        day_type=str(_live_session_ctx.get("day_type") or ""),
-                        day_type_confidence=float(_live_session_ctx.get("confidence") or 0.0),
+                    _tf_regime,
+                    vix_value=vix_value,
+                    day_type=str(
+                        _live_session_ctx.get("effective_day_type")
+                        or _live_session_ctx.get("day_type")
+                        or ""
+                    ),
+                    day_type_confidence=float(
+                        _live_session_ctx.get("phase_confidence")
+                        if _live_session_ctx.get("phase_confidence") is not None
+                        else (_live_session_ctx.get("confidence") or 0.0)
+                    ),
                     )
                     candidates_raw.append({
                         "sig": sig, 
@@ -5793,27 +7587,141 @@ class SignalProcessor:
                         "signal_identity": signal_identity,
                     })
                     
-                    # Always update the lock to prevent evaluating the same signal on
-                    # every tick. The identity state is a set because union engines may
-                    # emit a legitimate BUY and SELL at the same timestamp.
-                    self._remember_live_signal_identity(
-                        scanner, dedup_key, s_ts, signal_identity
-                    )
-                    getattr(scanner, "_live_signal_recheck_eligible", {}).pop(dedup_key, None)
+                    # Final selection owns consumption. Consuming alternatives here made
+                    # a rejected/reversing candidate disappear before its recheck pass.
+        return candidates_raw
 
-        self._append_adaptive_dual_apex_candidates(
-            scanner=scanner,
-            instrument=instrument,
-            mtf_result=mtf_result,
-            intel_result=intel_result,
-            intel_score=intel_score,
-            regime=regime,
-            settings=settings,
-            candidates_raw=candidates_raw,
+    def process_best_signal(
+        self, instrument, mtf_result, intel_result, intel_score, regime,
+        lots, lot_size, cfg, spot, atm_strike, _one_plus_one_source="",
+        _retry_state=None,
+    ) -> List[TradeCandidate]:
+
+        # Access Scanner properties via self.scanner
+        scanner = self.scanner
+        settings = get_settings()
+        if configured_mode(settings) == "ut_ema":
+            from engine.ut_ema_lane import build_candidates
+            return build_candidates(self, instrument, mtf_result, cfg, lots, lot_size, settings)
+        original_context = (intel_result, intel_score, regime)
+
+        scanner_engine_mode = scanner_mode(settings)
+        combined_mode = configured_mode(settings)
+        if combined_mode in COMBINED_MODES and not _one_plus_one_source:
+            from engine.combined_scanner import native_mtf_view
+            candidates = []
+            for mode in (COMBINED_MODES[combined_mode], 's1'):
+                partition = native_mtf_view(mtf_result, mode)
+                with native_policy(mode):
+                    candidates.extend(self.process_best_signal(
+                        instrument, partition, intel_result, intel_score, regime,
+                        lots, lot_size, cfg, spot, atm_strike, _one_plus_one_source=mode))
+            return candidates
+        if scanner_engine_mode == "one_plus_one" and not _one_plus_one_source:
+            # Do not make two native cores compete in the platform's best-signal
+            # tournament. Each source gets an independent pass across 1m/5m/15m.
+            sources = []
+            for tf in ("1min", "5min", "15min"):
+                result = getattr(mtf_result, f"results_{tf}", None) or {}
+                for signal in result.get("signals", []) or []:
+                    source = str(getattr(signal, "source_engine", "") or "").lower()
+                    if source in {"apex_v57", "stock_master_v732"} and source not in sources:
+                        sources.append(source)
+            independent = []
+            for source in sources:
+                partition = copy.copy(mtf_result)
+                for tf in ("1min", "5min", "15min"):
+                    original = getattr(mtf_result, f"results_{tf}", None)
+                    if original is None:
+                        continue
+                    filtered = dict(original)
+                    filtered["signals"] = [
+                        signal for signal in (original.get("signals", []) or [])
+                        if str(getattr(signal, "source_engine", "") or "").lower() == source
+                    ]
+                    setattr(partition, f"results_{tf}", filtered)
+                independent.extend(self.process_best_signal(
+                    instrument, partition, intel_result, intel_score, regime,
+                    lots, lot_size, cfg, spot, atm_strike,
+                    _one_plus_one_source=source,
+                ))
+            return independent
+
+        def naive_ts(value):
+            if value is None:
+                return datetime.min
+            return value.replace(tzinfo=None) if getattr(value, "tzinfo", None) else value
+
+        prepared = (_retry_state["prepared"] if _retry_state is not None
+                    else self._prepare_signal_pipeline_inputs(instrument, settings))
+        if prepared is None:
+            return []
+
+        # None unless per_timeframe_grading_enabled is set, in which case each candidate
+        # is graded with its own timeframe's cached intelligence instead of the 5-minute one.
+        _timeframe_contexts = prepared["timeframe_contexts"]
+
+        # Collect NEW signals from the normal entry TFs. Live mode also watches
+        # 1min when: (a) 1M spike scalping is ON, or (b) post-exit reversion is
+        # ON and this index has an open reversion window (decoupled toggles).
+        scanner_engine_mode = prepared["scanner_engine_mode"]
+        candidates_raw = []
+        tf_policy = prepared["timeframe_policy"]
+        policy_timeframes = prepared["policy_timeframes"]
+        candidate_timeframes = prepared["candidate_timeframes"]
+        _live = prepared["live"]
+        _vol_spike_on = prepared["volume_spike"]
+        _one_min_scalp_on = prepared["one_min_scalp"]
+        _reversion_on = prepared["reversion_enabled"]
+        _reversion_window = prepared["reversion_window"]
+        is_live = _live
+        # A 1m-inclusive policy collects 1m rows while 1MSCALP is ON. A plain 1m UT
+        # flip enters only under 1M alone (PRIMARY_1, 2026-09-26 user); every other
+        # policy uses 1m rows for the burst/snapback/cascade/reclaim paths only.
+        # 1M SPIKE path: volume_spike_entry + one_min_scalping both ON.
+        # POST-WIN SNAPBACK path: reversion window alone is enough (decoupled —
+        # must not require volume_spike_entry_enabled, or pure snapback dies).
+        policy_allows_one_min_burst = "1min" in policy_timeframes and _one_min_scalp_on
+        # 1m bursts/snapbacks are collected under EVERY timeframe policy; unless the
+        # toggle is 1M alone they are the only 1m entries (2026-09-26 user).
+        legacy_fast_one_min = _live and (
+            (_vol_spike_on and _one_min_scalp_on) or bool(_reversion_window)
+        )
+        candidates_raw = list(_retry_state["remaining"]) if _retry_state is not None else self._collect_signal_candidates(
+            instrument,
+            mtf_result,
+            intel_result,
+            intel_score,
+            regime,
+            lots,
+            lot_size,
+            cfg,
+            spot,
+            atm_strike,
+            settings,
+            prepared,
+            one_plus_one_source=_one_plus_one_source,
         )
 
+        # ── No-Entry After Gate ──
+        # Replay implementation lives in _collect_signal_candidates and calls:
+        # self._historical_entry_cutoff_allows(s1, tf, hist_lane_tag, settings)
+        # before `continue` on an ineligible historical signal.
+
+        if _retry_state is None:
+            self._append_adaptive_dual_apex_candidates(
+                scanner=scanner,
+                instrument=instrument,
+                mtf_result=mtf_result,
+                intel_result=intel_result,
+                intel_score=intel_score,
+                regime=regime,
+                settings=settings,
+                candidates_raw=candidates_raw,
+            )
+
         # In HISTORICAL mode, we only run the backfill once and do not return live candidates
-        if getattr(scanner, "mode", "").upper() == "HISTORICAL":
+        if scanner.mode == "HISTORICAL":
             return []
 
         if not candidates_raw:
@@ -5822,28 +7730,33 @@ class SignalProcessor:
         def _emit_signal_decision(raw: Dict, reason_msg: str, status_msg: str) -> None:
             sig = raw["sig"]
             tf = raw["tf"]
+            diagnostic_scope = scope_suffix(sig, settings)
+            decision_key = (
+                f"{instrument}|{tf}|{sig.signal_type}|"
+                f"{sig.timestamp.isoformat(timespec='seconds')}|{status_msg}|{reason_msg}{diagnostic_scope}"
+            )
             # Tape hygiene: a 1min signal that never cleared its basis-aware surge
             # first filter can't enter, so its rejections only flood the live tape.
             # Suppress them (debug file log only); reject diagnostics still count.
             if self._suppress_1min_no_spike_tape(
-                tf, getattr(sig, "volume_spike_entry", False), settings
+                tf,
+                getattr(sig, "volume_spike_entry", False),
+                settings,
+                native_burst=self._is_s12_native_burst(sig),
             ):
                 logger.debug(
                     f"Signal decision (1min no-spike, tape-suppressed): {instrument} "
                     f"{tf} {sig.signal_type} -> {status_msg}: {reason_msg}"
                 )
-                diag_inc = getattr(scanner, "_diag_inc", None)
-                if callable(diag_inc):
-                    diag_inc("rejects", reason_msg)
+                diag_inc_unique = getattr(scanner, "_diag_inc_unique", None)
+                if callable(diag_inc_unique):
+                    diag_inc_unique("rejects", reason_msg, f"raw|{decision_key}")
                 return
-            decision_key = (
-                f"{instrument}|{tf}|{sig.signal_type}|"
-                f"{sig.timestamp.isoformat(timespec='seconds')}|{status_msg}|{reason_msg}"
-            )
             logger.info(f"Signal decision: {instrument} {tf} {sig.signal_type} -> {status_msg}: {reason_msg}")
             emit_once = getattr(scanner, "log_signal_decision_once", None)
             message = (
-                f"Signal rejected: {instrument} {sig.signal_type} {tf} @ {sig.price:.2f} - "
+                f"Signal rejected: {instrument} {sig.signal_type} {tf} @ {sig.price:.2f}"
+                f"{(' [' + diagnostic_scope[1:] + ']') if diagnostic_scope else ''} - "
                 f"{reason_msg}"
             )
             if callable(emit_once):
@@ -5851,9 +7764,13 @@ class SignalProcessor:
             else:
                 scanner.log_event(message, "trade")
                 
-            diag_inc = getattr(scanner, "_diag_inc", None)
-            if callable(diag_inc):
-                diag_inc("rejects", reason_msg)
+            # The activity persistence path owns the unique diagnostic count.
+            # Counting again here inflated one refusal on every gate recheck.
+            # Bare scanner adapters with no persistence still get unique counts.
+            if not callable(getattr(scanner, "_persist_rejected_signal_event", None)):
+                diag_inc_unique = getattr(scanner, "_diag_inc_unique", None)
+                if callable(diag_inc_unique):
+                    diag_inc_unique("rejects", reason_msg, f"raw|{decision_key}")
 
         def _build_rejected_from_raw(raw: Dict, reason_msg: str, status_msg: str) -> List[TradeCandidate]:
             _emit_signal_decision(raw, reason_msg, status_msg)
@@ -5915,8 +7832,11 @@ class SignalProcessor:
             setattr(rej, "source_signal_type", sig.signal_type)
             setattr(rej, "source_signal_price", float(getattr(sig, "price", 0.0) or 0.0))
             setattr(rej, "adx_value", float(getattr(sig, "adx_value", 0.0) or 0.0))
-            setattr(rej, "market_regime", str(regime or "UNKNOWN"))
-            setattr(rej, "intelligence_score", float(normalize_intelligence_score(intel_score)))
+            rejected_regime, rejected_intel_norm = self._graded_candidate_context(
+                sig, regime, normalize_intelligence_score(intel_score)
+            )
+            setattr(rej, "market_regime", rejected_regime)
+            setattr(rej, "intelligence_score", float(rejected_intel_norm))
             rejected_intel_result = self._graded_candidate_intel_result(sig, intel_result)
             if isinstance(rejected_intel_result, dict):
                 setattr(
@@ -5936,14 +7856,35 @@ class SignalProcessor:
                         "wavetrend": dict(rejected_intel_result.get("wavetrend", {}) or {}),
                     },
                 )
+            # Every refusal funnels through here, and all 15 early returns above the
+            # accepted-candidate stamp used to reach rtracker with an empty revision and
+            # an empty data_provenance -- 1,057 of 2,295 archived verdict rows, and the
+            # exact set whose ADX also arrived as 0.0. Stamping here rather than at each
+            # return means a new refusal path cannot reintroduce the gap.
+            for _field, _value in build_identity(settings, scanner).items():
+                setattr(rej, _field, _value)
             return [rej]
 
         exit_handled = False
         opposite_signal_raw = None
-        for c in sorted(candidates_raw, key=lambda item: item["sig"].timestamp):
+        for c in sorted(candidates_raw if _retry_state is None else [], key=lambda item: item["sig"].timestamp):
             if scanner._handle_opposite_signal_exit(instrument, c["sig"], c["tf"]):
                 exit_handled = True
                 opposite_signal_raw = c  # the signal whose flip forced the exit
+            if (
+                is_live
+                and scanner_engine_mode == "one_plus_one"
+                and bool(getattr(c.get("sig"), "native_exit_only", False))
+            ):
+                self._remember_live_signal_identity(
+                    scanner,
+                    str(c.get("dedup_key") or f"{instrument}_{c.get('tf', '')}"),
+                    naive_ts(c["sig"].timestamp),
+                    str(c.get("signal_identity") or ""),
+                )
+                getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
+                    str(c.get("dedup_key") or ""), None
+                )
 
         # Live/manual mode must not flip into a fresh opposite entry in the same
         # index/timeframe until the existing signal/trade has been exited. We block
@@ -5955,7 +7896,11 @@ class SignalProcessor:
         # Exception: multi-index market LTP shock / market-wide reverse — force-exit
         # the old side and allow the reverse entry this cycle so late dumps/rallies
         # are not missed while waiting for the next scan.
-        if exit_handled and getattr(scanner, "mode", "") != "HISTORICAL":
+        if (
+            exit_handled
+            and scanner_engine_mode != "one_plus_one"
+            and getattr(scanner, "mode", "") != "HISTORICAL"
+        ):
             blocked_raw = opposite_signal_raw or candidates_raw[-1]
             _shock_relax = False
             try:
@@ -6024,20 +7969,53 @@ class SignalProcessor:
                 )
                 return _build_rejected_from_raw(blocked_raw, "Opposite signal must exit existing signal/trade first", "REJECTED - Opposite Signal Wait")
 
+        if getattr(scanner, "mode", "") != "HISTORICAL":
+            # UT SMART EXIT reverses only on a CLOSED candle (2026-09-26 user). A flip on the
+            # forming candle against an open trade is held as a recheck, not refused: the
+            # refusal ("Already has active ... trade") consumed the arrow, so the close could
+            # neither reverse the trade nor enter the new side.
+            _has_opposite = getattr(scanner, "_has_opposite_exposure", None)
+            for _raw in sorted(candidates_raw, key=lambda item: item["sig"].timestamp, reverse=True):
+                _sig = _raw["sig"]
+                if scanner_engine_mode == "one_plus_one":
+                    index_stop_distance = abs(
+                        float(best_sig.price)
+                        - float(getattr(best_sig, "native_stop", best_sig.trailing_stop) or best_sig.trailing_stop)
+                    )
+                    effective_fut_sl_pct = (
+                        index_stop_distance / max(float(best_sig.price), 1e-9) * 100.0
+                    )
+                elif (
+                    getattr(_sig, "uts_forming", False)
+                    and uts_lane_policy.is_uts(_sig, settings)
+                    and callable(_has_opposite)
+                    and _has_opposite(instrument, _sig, _raw["tf"])
+                ):
+                    return _build_rejected_from_raw(
+                        _raw, "UT SMART EXIT reverses on the candle close", "REJECTED - Opposite Signal Wait"
+                    )
+
+        # 2026-09-26 user: a plain 1m signal enters only when the TF toggle is 1M alone;
+        # every other policy (1M+5M, 1M+15M, 1M+5M+15M included) takes 1m bursts,
+        # snapbacks, cascades and reclaims only.
+        plain_one_min = tf_policy == "PRIMARY_1"
+        if not plain_one_min:
+            self._tag_one_min_fast_contexts(scanner, instrument, candidates_raw)
         entry_candidates_raw = self._entry_admissible_raw_candidates(
             candidates_raw,
             reversion_window_open=bool(_reversion_window),
+            plain_one_min=plain_one_min,
         )
         if not entry_candidates_raw:
             return []
         # All explicit policies apply to every engine and historical replay. Legacy
         # 15M retains Quad Prime's established raw multi-source exception; old 15M /
         # 5M+15M modes also preserve established fast 1m spike/snapback routes.
-        legacy_fast_one_min_policy = tf_policy in {"PRIMARY_15", "INCLUDE_5MIN"}
+        legacy_fast_one_min_policy = True   # 1m burst/snapback under every policy
         legacy_quad_prime_bypass = (
             tf_policy == "PRIMARY_15" and scanner_engine_mode == "quad_prime"
         )
-        if not legacy_quad_prime_bypass:
+        if not legacy_quad_prime_bypass and scanner_engine_mode != "one_plus_one":
             entry_candidates_raw = [
                 c
                 for c in entry_candidates_raw
@@ -6046,7 +8024,9 @@ class SignalProcessor:
                     legacy_fast_one_min_policy
                     and str(c.get("tf") or "") == "1min"
                     and (
-                        bool(getattr(c.get("sig"), "volume_spike_entry", False))
+                        self._has_1min_burst_or_spike(c.get("sig"))
+                        or bool(getattr(c.get("sig"), "late_session_reclaim_entry", False))
+                        or bool(getattr(c.get("sig"), "one_way_cascade_entry", False))
                         or bool(_reversion_window)
                     )
                 )
@@ -6063,31 +8043,39 @@ class SignalProcessor:
                 "REJECTED - Timeframe Policy Blocked",
             )
 
-        scored = []
-        for c in entry_candidates_raw:
-            sig, tf, grade, confidence, reasons = c["sig"], c["tf"], c["grade"], c["confidence"], c["reasons"]
-            score = confidence
-            if tf == "15min":
-                score += 0.0001
-            if bool(getattr(sig, "volume_spike_entry", False)) or bool(
-                getattr(sig, "market_ltp_shock_entry", False)
-            ):
-                # A confirmed fast spike / multi-index LTP shock must outrank a
-                # simultaneous 15min row that may already be inside the 15:00
-                # no-entry window (5min/1min still trade until their later cutoff).
-                score += 1.0
-            if self._signal_source_lane(sig, scanner_engine_mode) == "B":
-                # Engine 11's APEX lane is intentionally confirmation-heavy.
-                # When it competes with the adaptive trend lane in the same
-                # scan, give the fresh APEX candidate a small tiebreak without
-                # bypassing grade, quality, risk, or quote gates.
-                score += 0.75
-            scored.append((score, sig, tf, grade, confidence, reasons, c.get("after_no_entry", False)))
-
-        # Fix: Sort primarily by timestamp to pick the LATEST signal.
-        # If multiple signals have the same timestamp, pick the one with highest score.
-        scored.sort(key=lambda x: (x[1].timestamp, x[0]), reverse=True)
+        scored = rank_entry_candidates(
+            entry_candidates_raw,
+            lambda signal: self._signal_source_lane(signal, scanner_engine_mode),
+        )
         best_score, best_sig, best_tf, best_grade, best_conf, best_reasons, best_after_no_entry = scored[0]
+        # All decisions for the selected setup must consume the evidence that graded
+        # it. Previously only the final candidate stamp used this context, after
+        # routing, FUT veto, stop sizing and scalp classification had read the caller's
+        # 5m bundle. Explicit 15m confirmation and session-wide census remain separate.
+        regime, intel_score = self._graded_candidate_context(
+            best_sig, regime, normalize_intelligence_score(intel_score)
+        )
+        intel_result = self._graded_candidate_intel_result(best_sig, intel_result)
+        selected_raw = next(
+            (
+                raw for raw in entry_candidates_raw
+                if raw.get("sig") is best_sig and str(raw.get("tf") or "") == str(best_tf or "")
+            ),
+            None,
+        )
+        if is_live and selected_raw is not None:
+            selected_dedup_key = str(
+                selected_raw.get("dedup_key") or f"{instrument}_{best_tf}"
+            )
+            self._remember_live_signal_identity(
+                scanner,
+                selected_dedup_key,
+                naive_ts(best_sig.timestamp),
+                str(selected_raw.get("signal_identity") or ""),
+            )
+            getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
+                selected_dedup_key, None
+            )
         best_source_engine = str(getattr(best_sig, "source_engine", "") or "").lower()
         best_source_engines = [
             str(src).lower()
@@ -6104,7 +8092,15 @@ class SignalProcessor:
         best_source_lane = self._signal_source_lane(best_sig, scanner_engine_mode)
         quad_union_entry = scanner_engine_mode in {"quad_union", "quad_prime"}
         quad_prime_entry = scanner_engine_mode == "quad_prime"
-        best_direction = "LONG" if best_sig.signal_type == "BUY" else "SHORT"
+        best_direction = normalized_direction(best_sig.signal_type)
+        # S1 lane: the user's S1 script already selected this signal with its own five
+        # gates, so the other engines' SELECTION filters below are skipped for it. Safety
+        # gates (loss breakers, caps, cutoff, quotes, sizing) still run.
+        # "S1" / "UTS" / "" (truthy exactly for a lane signal); UT SMART EXIT shares the
+        # lane's admission and exits, with its own stop, target, guard and cutoffs.
+        s1_lane = s1_lane_policy.lane_tag(best_sig, settings)
+        uts_lane_on = s1_lane == "UTS"
+        s12_lane_on = s1_lane in {"D1", "D2"}
 
         # ── DIAGNOSTIC: 5min-vs-15min selection (debug TF misdetection) ──
         # Fires live whenever more than one TF competed or 15min won, so the next
@@ -6155,7 +8151,7 @@ class SignalProcessor:
             logger.debug(f"TF-select diagnostic failed for {instrument}: {_dbg_exc}")
 
         def _build_rejected_candidate(reason_msg: str, status_msg: str) -> List[TradeCandidate]:
-            return _build_rejected_from_raw(
+            rejected = _build_rejected_from_raw(
                 {
                     "sig": best_sig,
                     "tf": best_tf,
@@ -6166,12 +8162,54 @@ class SignalProcessor:
                 reason_msg,
                 status_msg,
             )
+            # Only candidate-specific refusal permits trying another setup. Book
+            # capacity, capital, circuit breakers and opposite exits stop the wave.
+            retryable = {
+                "REJECTED - Regime Veto", "REJECTED - Session Trend Guard",
+                "REJECTED - Pre-Candle Flip Veto", "REJECTED - Counter Census",
+                "REJECTED - Price Action", "REJECTED - FUT Stop Distance",
+                "REJECTED - Weak 1min", "REJECTED - Monopoly",
+            }
+            remaining = [row for row in entry_candidates_raw if row["sig"] is not best_sig]
+            if status_msg in retryable and remaining:
+                alternatives = self.process_best_signal(
+                    instrument, mtf_result, *original_context, lots, lot_size,
+                    cfg, spot, atm_strike, _one_plus_one_source=_one_plus_one_source,
+                    _retry_state={"prepared": prepared, "remaining": remaining},
+                )
+                if alternatives:
+                    return rejected + alternatives
+            return rejected
 
         for tid, trade in list(scanner.trades.open_trades.items()):
+            if not same_owner(trade, best_sig, settings):
+                continue
             # Ghost / hist / replay rows never block live opposite/same-side guards.
             if not self._is_live_book_trade(trade):
                 continue
             if trade.instrument == instrument and trade.status == "OPEN":
+                if scanner_engine_mode == "one_plus_one":
+                    # Each native core owns a separate lifecycle.  An APEX position
+                    # cannot absorb, upgrade, or reject a Stock Master entry (and vice
+                    # versa); only a still-open position from the same native source
+                    # suppresses another entry from that source.
+                    trade_source = str(getattr(trade, "source_engine", "") or "").lower()
+                    candidate_source = str(best_source_engine or "").lower()
+                    if trade_source != candidate_source:
+                        continue
+                    _emit_signal_decision(
+                        {
+                            "sig": best_sig,
+                            "tf": best_tf,
+                            "grade": best_grade,
+                            "confidence": best_conf,
+                            "reasons": best_reasons,
+                        },
+                        f"Native source {candidate_source} already has active "
+                        f"{trade.timeframe} {trade.direction} trade {tid}",
+                        "REJECTED - Existing Native Source Trade",
+                    )
+                    return []
                 if scanner_engine_mode == "adaptive_dual" and best_source_lane == "B":
                     probe = SimpleNamespace(
                         instrument=instrument,
@@ -6308,12 +8346,42 @@ class SignalProcessor:
                         return []
                     continue
 
-                if best_tf == "15min" and trade.timeframe == "5min":
+                if best_tf == "15min" and trade.timeframe == "5min" and not s1_lane_policy.is_managed_lane(trade, settings):
                     trade.timeframe = "15min"
                     trade.grade = best_grade
                     trade.confidence = best_conf
                     logger.info(f"🚀 UPGRADED {instrument} trade to 15-min status")
                     return []
+                if s1_lane and str(getattr(trade, "direction", "") or "").upper() != best_direction:
+                    # A lane FLIP (S1 / UT SMART EXIT) meeting the trade it reverses: the exit
+                    # order is out (EXIT_PENDING) but not filled when the next scan builds the
+                    # new side. The bare refusal below consumed the arrow, so a fill slower
+                    # than one scan (2-4s live) lost the reversal entry. Keep it
+                    # recheck-eligible, exactly as the quad_prime flip path above does.
+                    _best_raw = next((c for c in entry_candidates_raw if c.get("sig") is best_sig), {})
+                    _flip_key = str(_best_raw.get("dedup_key") or f"{instrument}_{best_tf}")
+                    _flip_identity = _best_raw.get("signal_identity")
+                    _flip_rejection = _build_rejected_from_raw(
+                        {
+                            "sig": best_sig,
+                            "tf": best_tf,
+                            "grade": best_grade,
+                            "confidence": best_conf,
+                            "reasons": best_reasons,
+                            "dedup_key": _flip_key,
+                            "signal_identity": _flip_identity,
+                        },
+                        f"Opposite {getattr(trade, 'timeframe', '')} {trade.direction} trade {tid} still closing",
+                        "REJECTED - Existing Opposite Trade",
+                    )
+                    if is_live and _flip_identity:
+                        # The recheck above only arms while the candle forms; a CLOSED-candle
+                        # flip (every UT SMART EXIT flip) needs its dedup lock released so the
+                        # next scan sees the arrow again once the old trade has filled out.
+                        self._forget_live_signal_identity(
+                            scanner, _flip_key, naive_ts(best_sig.timestamp), str(_flip_identity)
+                        )
+                    return _flip_rejection
                 _emit_signal_decision(
                     {
                         "sig": best_sig,
@@ -6380,10 +8448,12 @@ class SignalProcessor:
             logger.debug(f"15m availability note skipped for {instrument}: {exc}")
         adx_value = float(getattr(best_sig, "adx_value", 0.0) or 0.0)
         volume_spike_entry = bool(getattr(best_sig, "volume_spike_entry", False))
+        s12_burst_entry = bool(s12_lane_on and self._is_s12_native_burst(best_sig))
+        one_min_burst_or_spike_entry = bool(volume_spike_entry or s12_burst_entry)
         volume_spike_metrics = dict(getattr(best_sig, "volume_spike_metrics", {}) or {})
         market_ltp_shock_entry = bool(getattr(best_sig, "market_ltp_shock_entry", False))
         market_ltp_shock_context = dict(getattr(best_sig, "market_ltp_shock_context", {}) or {})
-        if not market_ltp_shock_entry:
+        if scanner_engine_mode != "one_plus_one" and not market_ltp_shock_entry:
             try:
                 _shock_fn = getattr(scanner, "_evaluate_market_ltp_shock", None)
                 if callable(_shock_fn):
@@ -6413,28 +8483,22 @@ class SignalProcessor:
         # Used by the counter-trend guard below. Keyed identity dedups the many
         # re-evaluations of the same forming candle within a scan cycle.
         signal_direction = best_direction
-        try:
-            census_day = best_sig.timestamp.date().isoformat()
-            if getattr(scanner, "_dir_census_date", None) != census_day:
-                scanner._dir_census_date = census_day
-                scanner._dir_census = {"LONG": 0, "SHORT": 0}
-                scanner._dir_census_seen = set()
-            _census_id = (
-                f"{instrument}|{best_tf}|"
-                f"{naive_ts(best_sig.timestamp).isoformat()}|{signal_direction}"
-            )
-            if _census_id not in scanner._dir_census_seen:
-                scanner._dir_census_seen.add(_census_id)
-                scanner._dir_census[signal_direction] = (
-                    scanner._dir_census.get(signal_direction, 0) + 1
-                )
-        except Exception:
-            pass
+        self._record_directional_census(
+            scanner, best_sig, instrument, best_tf, signal_direction,
+            naive_ts(best_sig.timestamp).isoformat(), settings,
+        )
         momentum_threshold = float(getattr(settings, "momentum_override_threshold", 25.0) or 25.0)
         intel_norm = normalize_intelligence_score(intel_score)
         # Data-confirmed late-session power move (volume + range + close + momentum/align).
         # When confirmed it may bypass the grade floor and (after 15:00) the no-entry
         # cutoff, entering in tight scalp-lock mode.
+        # ``as_of`` matters: without it _detect_power_move takes df.tail(...).iloc[-1],
+        # which live is the FORMING bar, so the volume surge, range expansion and close
+        # location that define a power move were read off an unfinished candle that could
+        # still reverse. The sibling thrust lane already pins its own bar --
+        # _detect_volume_spike_entry is called with as_of=sig.timestamp -- and the
+        # HISTORICAL reconstruction of this very detector passes as_of too. Only the live
+        # power-move call omitted it, so live and replay disagreed about the same bar.
         power_move = scanner._detect_power_move(
             instrument,
             best_tf,
@@ -6442,14 +8506,17 @@ class SignalProcessor:
             adx_value=adx_value,
             intel_score=intel_score,
             trend_15m_agrees=trend_15m_agrees,
-        )
+            as_of=getattr(best_sig, "timestamp", None),
+        ) if scanner_engine_mode != "one_plus_one" else False
         # Market LTP shock is a multi-index fast dump/rally — treat like volume spike
         # for gate bypasses (trend guard, quality floor) on 1min/5min only.
-        fast_thrust_override = bool(power_move or volume_spike_entry or market_ltp_shock_entry)
+        fast_thrust_override = bool(
+            power_move or volume_spike_entry or market_ltp_shock_entry or s12_burst_entry
+        )
         _reversal_relief_context = None
         try:
             _relief_fn = getattr(scanner, "_entry_reversal_relief_context", None)
-            if callable(_relief_fn):
+            if scanner_engine_mode != "one_plus_one" and callable(_relief_fn):
                 _reversal_relief_context = _relief_fn(
                     instrument,
                     best_tf,
@@ -6460,6 +8527,15 @@ class SignalProcessor:
                 )
         except Exception as exc:
             logger.debug(f"Reversal relief check skipped for {instrument} {best_tf}: {exc}")
+        if not isinstance(_reversal_relief_context, dict) and best_tf == "1min":
+            # A 1m row admitted on reclaim / cascade evidence before selection
+            # (_tag_one_min_fast_contexts) keeps that evidence.
+            for _flag in ("late_session_reclaim", "one_way_cascade"):
+                _pre_ctx = getattr(best_sig, f"{_flag}_context", None)
+                if getattr(best_sig, f"{_flag}_entry", False) and isinstance(_pre_ctx, dict):
+                    _reversal_relief_context = dict(_pre_ctx)
+                    _reversal_relief_context.setdefault("type", _flag)
+                    break
         late_session_reclaim_entry = bool(
             isinstance(_reversal_relief_context, dict)
             and _reversal_relief_context.get("type") == "late_session_reclaim"
@@ -6486,6 +8562,48 @@ class SignalProcessor:
             best_reasons = list(best_reasons or []) + [
                 str(_reversal_relief_context.get("reason") or "one-way cascade")
             ]
+        if uts_lane_policy.is_uts(best_sig, settings):
+            count_aligned = getattr(scanner, "_count_uts_aligned_indices", None)
+            if callable(count_aligned):
+                best_sig.uts_multi_index_alignment = count_aligned(
+                    "LONG" if best_sig.signal_type == "BUY" else "SHORT",
+                    best_tf, include_self=instrument) >= 2
+        if s1_lane:
+            # 2026-09-24: an S1 SELL tagged as an LTP shock was refused five times by the
+            # shock lane's 1-minute cash-volume demand while the S1 move ran, so that tag is
+            # dropped. Volume-spike, cascade, reclaim and snapback stay (2026-09-25 user):
+            # they admit 1m S1 bursts and label the trade; S1 keeps its own levels, exits,
+            # cutoffs and sizing.
+            market_ltp_shock_entry = False
+            if getattr(best_sig, "market_ltp_shock_entry", False):
+                setattr(best_sig, "market_ltp_shock_entry", False)
+            fast_thrust_override = bool(power_move or volume_spike_entry or s12_burst_entry)
+        # Kept apart from _reversal_relief_context on purpose: that context also
+        # re-admits repainting arrows and late-session scalps, which the stale-regime
+        # evidence never covered (it was measured on non-repainted signals only).
+        _stale_regime_context = None
+        try:
+            _stale_fn = getattr(scanner, "_stale_regime_reversal_context", None)
+            if scanner_engine_mode != "one_plus_one" and callable(_stale_fn):
+                _stale_regime_context = _stale_fn(
+                    instrument,
+                    best_tf,
+                    best_sig.signal_type,
+                    best_sig.timestamp,
+                    regime=self._graded_candidate_context(best_sig, regime, intel_norm)[0],
+                )
+        except Exception as exc:
+            logger.debug(f"Stale-regime check skipped for {instrument} {best_tf}: {exc}")
+        stale_regime_reversal_entry = bool(
+            isinstance(_stale_regime_context, dict) and _stale_regime_context.get("enabled") is True
+        )
+        if stale_regime_reversal_entry:
+            try:
+                setattr(best_sig, "stale_regime_reversal_entry", True)
+                setattr(best_sig, "stale_regime_reversal_context", dict(_stale_regime_context))
+            except Exception:
+                pass
+            best_reasons = list(best_reasons or []) + [str(_stale_regime_context.get("reason"))]
         extreme_exhaustion = any(
             "extreme" in str(reason).lower() and "exhaustion" in str(reason).lower()
             for reason in (best_reasons or [])
@@ -6561,13 +8679,16 @@ class SignalProcessor:
         # Must run early: pure SNAPBACK has no volume_spike_entry and would die
         # at Weak-1min if tagged only later. SPIKE and SNAPBACK share the 1m
         # chassis but only ONE trade fires (best winner); dual-tag when both true.
-        is_reversion_scalp, _rev_meta = self._evaluate_reversion_scalp(
-            scanner,
-            settings,
-            instrument=instrument,
-            best_tf=best_tf,
-            best_sig=best_sig,
-        )
+        if scanner_engine_mode == "one_plus_one":
+            is_reversion_scalp, _rev_meta = False, {}
+        else:
+            is_reversion_scalp, _rev_meta = self._evaluate_reversion_scalp(
+                scanner,
+                settings,
+                instrument=instrument,
+                best_tf=best_tf,
+                best_sig=best_sig,
+            )
         if is_reversion_scalp:
             logger.info(
                 f"⚡ [REVERSION SCALP] {instrument} 1min {best_sig.signal_type} "
@@ -6576,14 +8697,37 @@ class SignalProcessor:
                 f"move={_rev_meta.get('move_pct', 0):.2f}%)."
             )
 
-        if best_tf == "1min":
-            if not volume_spike_entry:
+        if best_tf == "1min" and scanner_engine_mode != "one_plus_one":
+            # Every engine, S1 included (2026-09-26 user): a plain 1m signal enters only
+            # when the TF toggle is 1M alone; otherwise 1m enters only on a burst, spike,
+            # snapback, cascade or late-session reclaim.
+            if s12_burst_entry and not volume_spike_entry:
+                logger.info(f"🚀 Confirmed 1min S1+S2 D2 native burst entry for {instrument}")
+            elif not one_min_burst_or_spike_entry:
                 if one_way_cascade_entry:
                     logger.info(f"🚀 Confirmed 1min one-way cascade entry for {instrument}")
+                elif late_session_reclaim_entry:
+                    logger.info(f"🚀 Confirmed 1min late-session reclaim entry for {instrument}")
                 elif is_reversion_scalp:
                     logger.info(
                         f"🚀 Confirmed 1min POST-WIN SNAPBACK entry for {instrument} "
                         f"(window open; spike not required)"
+                    )
+                elif tf_policy == "PRIMARY_1" or _setting_enabled(
+                    getattr(settings, "one_min_raw_entry_enabled", False), False
+                ):
+                    # The operator's fast lane. OFF by default: with the burst
+                    # requirement in place only 4 raw 1min signals reached the buffer in
+                    # 52 sessions, so there is no sample to judge the open lane on. When
+                    # it is switched on, the 1min buffer is the short one
+                    # (volume_spike_entry_stabilization_seconds, 3-15s) rather than the
+                    # 30s 5m/15m window, and every other gate still applies.
+                    # A plain 1m entry under 1M alone takes the same fast 1m chassis.
+                    setattr(best_sig, "one_min_raw_entry", True)
+                    logger.info(
+                        f"⚡ 1min raw entry admitted for {instrument} {best_sig.signal_type} ("
+                        + (f"TF policy {tf_policy}" if tf_policy == "PRIMARY_1" else "ONE_MIN_RAW_ENTRY_ENABLED")
+                        + ")"
                     )
                 else:
                     spike_requirement = self._volume_spike_requirement_text(
@@ -6591,7 +8735,8 @@ class SignalProcessor:
                     )
                     return _build_rejected_candidate(
                         f"1min entry requires directional burst: {spike_requirement}; "
-                        "POST-WIN SNAPBACK; or confirmed one-way cascade",
+                        "POST-WIN SNAPBACK; confirmed one-way cascade or late-session reclaim "
+                        "(or select 1M alone in the TF toggle)",
                         "REJECTED - Weak 1min",
                     )
             else:
@@ -6604,7 +8749,7 @@ class SignalProcessor:
                 )
 
         can_open, _ = scanner.trades.can_open_trade()
-        if not can_open:
+        if scanner_engine_mode != "one_plus_one" and not can_open:
             return _build_rejected_candidate("Max overall trades reached or capital depleted", "REJECTED - Max Trades")
 
         iv_percentile_for_routing = float(iv_percentile if iv_percentile is not None else 50.0)
@@ -6612,7 +8757,7 @@ class SignalProcessor:
         strong_momentum = abs(intel_norm) > 0.60 or best_score > 0.4
         
         trade_date = best_sig.timestamp.date()
-        is_0dte = scanner.expiry.is_expiry_day(instrument, trade_date)
+        is_0dte = _scanner_is_expiry_day(scanner, instrument, trade_date)
         is_late_session = best_sig.timestamp.time() >= datetime.strptime("14:00", "%H:%M").time()
         
         inst_type = scanner._resolve_instrument_type(
@@ -6630,7 +8775,7 @@ class SignalProcessor:
             timeframe=best_tf,
             five_min_true_impulse=true_5min_impulse,
         )
-        if not scanner.risk_manager.can_trade(inst_type):
+        if scanner_engine_mode != "one_plus_one" and not scanner.risk_manager.can_trade(inst_type):
             return _build_rejected_candidate(
                 f"{inst_type} circuit breaker is active",
                 f"REJECTED - {inst_type} Risk Halt",
@@ -6643,9 +8788,9 @@ class SignalProcessor:
             signal_type=best_sig.signal_type,
             regime=regime,
             adx_value=adx_value,
-            power_move=fast_thrust_override or is_reversion_scalp,
+            power_move=fast_thrust_override or is_reversion_scalp or s1_lane,
         )
-        if _veto_block and not (
+        if scanner_engine_mode != "one_plus_one" and _veto_block and not (
             is_reversion_scalp or
             (late_session_reclaim_entry
             and isinstance(_reversal_relief_context, dict)
@@ -6673,6 +8818,8 @@ class SignalProcessor:
 
         _session_ctx = intel_result.get("session_context", {}) if isinstance(intel_result, dict) else {}
         if (
+            scanner_engine_mode != "one_plus_one"
+            and
             _setting_enabled(getattr(settings, "session_context_trend_day_guard_enabled", True), True)
             and isinstance(_session_ctx, dict)
             and best_tf in {"1min", "5min"}
@@ -6680,6 +8827,7 @@ class SignalProcessor:
             and not is_reversion_scalp
             and not late_session_reclaim_entry
             and not _reversal_relief_context
+            and not s1_lane
         ):
             # Prefer rolling effective phase so the guard tracks mood flips
             # (minute/hour/session pockets) instead of a sticky full-day label.
@@ -6746,11 +8894,18 @@ class SignalProcessor:
                             ]
                 except Exception:
                     _shock_yield = False
+            if stale_regime_reversal_entry and _expected and str(best_sig.signal_type).upper() != _expected:
+                # The day label is built on the same move whose extreme went stale.
+                best_reasons = list(best_reasons or []) + [
+                    f"Session trend guard yielded: {_day_type} is stale "
+                    f"({_stale_regime_context.get('reason')})"
+                ]
             if (
                 _expected
                 and _day_conf >= _min_day_conf
                 and str(best_sig.signal_type).upper() != _expected
                 and not _shock_yield
+                and not stale_regime_reversal_entry
             ):
                 # Census-contradiction yield: when the session's own directional
                 # census strongly opposes the day-type label, the label is stale
@@ -6796,12 +8951,15 @@ class SignalProcessor:
                 getattr(settings, "pre_candle_flip_veto_min_confidence", 0.70) or 0.70
             )
             if (
+                scanner_engine_mode != "one_plus_one"
+                and
                 _pre_state in {"LIKELY_5M_FLIP", "LIKELY_15M_FLIP"}
                 and _pre_dir in {"LONG", "SHORT"}
                 and _pre_dir != _sig_dir
                 and _pre_conf >= _min_flip_conf
                 and not fast_thrust_override
                 and not is_reversion_scalp
+                and not s1_lane
             ):
                 _flip_msg = (
                     f"Pre-candle flip against entry: {instrument} {best_tf} {_sig_dir} vs "
@@ -6860,7 +9018,14 @@ class SignalProcessor:
             day_type=_cs_day_type,
             day_type_confidence=_cs_day_conf,
         )
-        if _census_block and not is_reversion_scalp:
+        if _census_block and stale_regime_reversal_entry:
+            # The census counts this scanner's own lagging arrows; 22 census-refused
+            # stale-regime reversals averaged +1.29 ATR at 30m (2026-08-18..09-17).
+            best_reasons = list(best_reasons or []) + [
+                f"Counter census yielded to stale regime: {_census_block}"
+            ]
+            _census_block = ""
+        if _census_block and not is_reversion_scalp and not s1_lane:
             return _build_rejected_candidate(_census_block, "REJECTED - Counter Census")
 
         # ── Structural price-action patch (SEPARATE, gated; default OFF) ──
@@ -6876,16 +9041,27 @@ class SignalProcessor:
             except Exception:
                 pass
             if (
+                scanner_engine_mode != "one_plus_one"
+                and
                 _setting_enabled(getattr(settings, "price_action_block_adverse", False), False)
                 and not fast_thrust_override
+                and not s1_lane
                 and _pa_ctx.get("verdict") == "ADVERSE"
             ):
+                # Shadow only: would a holding opening gap make prior-session structure moot?
+                from engine import gap_open_shadow as _gap_open_shadow
+                _gap_open_shadow.record(scanner, instrument, best_tf, best_sig, settings, _pa_ctx)
+                _pa_relief = _reversal_relief_context or (
+                    _stale_regime_context if stale_regime_reversal_entry else None
+                )
                 if _setting_enabled(
                     getattr(settings, "price_action_reversal_relief_enabled", True),
                     True,
-                ) and _reversal_relief_context:
+                ) and _pa_relief:
+                    # "SELL into support" is where a stale uptrend's reversal starts;
+                    # BANKNIFTY 10:25/10:30 on 2026-09-17 were refused there and fell 400.
                     try:
-                        _pa_ctx["relief_reason"] = _reversal_relief_context.get(
+                        _pa_ctx["relief_reason"] = _pa_relief.get(
                             "reason",
                             "confirmed reversal relief",
                         )
@@ -6913,7 +9089,12 @@ class SignalProcessor:
             one_way_cascade_entry
             and _setting_enabled(getattr(settings, "cascade_multi_tf_stack_enabled", True), True)
         )
-        if existing_index_trades and concurrency_guard_on and not quad_prime_entry:
+        if (
+            scanner_engine_mode != "one_plus_one"
+            and existing_index_trades
+            and concurrency_guard_on
+            and not quad_prime_entry
+        ):
             # Cascade multi-TF: allow additional TFs up to cascade cap (no forced FUT/OPT flip).
             if cascade_multi_tf:
                 primary_max = max(1, int(getattr(settings, "cascade_primary_max_tf", 3) or 3))
@@ -7025,20 +9206,15 @@ class SignalProcessor:
                     logger.info(f"🚫 Monopoly Guard: {instrument} {msg}. Skipping {best_tf}.")
                     return _build_rejected_candidate(msg, "REJECTED - Monopoly")
 
-        option_type = "CE" if best_sig.signal_type == "BUY" else "PE"
         strike_interval = cfg.get("strike_interval", 50)
-        
-        atm_strike_val = round(spot / strike_interval) * strike_interval if spot > 0 else 0
-        itm_strike_val = (atm_strike_val - strike_interval) if option_type == "CE" else (atm_strike_val + strike_interval)
-        
         strike_selection = getattr(settings, "option_strike_selection", "ATM")
-        target_strikes = []
-        if inst_type == "FUT":
-            target_strikes = [0.0]
-        else:
-            if strike_selection == "ATM": target_strikes = [atm_strike_val]
-            elif strike_selection == "ITM": target_strikes = [itm_strike_val]
-            else: target_strikes = [atm_strike_val, itm_strike_val]
+        option_type, atm_strike_val, itm_strike_val, target_strikes = select_contract_strikes(
+            inst_type=inst_type,
+            signal_type=best_sig.signal_type,
+            spot=spot,
+            strike_interval=strike_interval,
+            strike_selection=strike_selection,
+        )
 
         # Read ONCE whenever an option needs either strike ranking or absolute
         # liquidity admission. allow_fetch=False means this uses the chain already
@@ -7075,7 +9251,7 @@ class SignalProcessor:
                 strike_local = strike
                 # Per-strike Black-Scholes delta (ITM/OTM aware), not the flat ATM delta.
                 try:
-                    dte_val = scanner.expiry.get_dte(instrument, best_sig.timestamp.date())
+                    dte_val = _scanner_days_to_expiry(scanner, instrument, best_sig.timestamp)
                 except Exception:
                     dte_val = 1
                 instrument_multiplier = self._option_signed_delta(
@@ -7083,7 +9259,13 @@ class SignalProcessor:
                     0.5 if option_type_local == "CE" else -0.5,
                 )
 
-            final_rr = self._dynamic_rr(best_grade, best_conf, intel_score, timeframe=best_tf)
+            final_rr = self._dynamic_rr(
+                best_grade,
+                best_conf,
+                intel_score,
+                timeframe=best_tf,
+                direction=best_direction,
+            )
             if volume_spike_entry or market_ltp_shock_entry:
                 if best_tf == "1min" or market_ltp_shock_entry:
                     # Late shock dumps/rallies are short-horizon scalp/OPT paths.
@@ -7106,27 +9288,93 @@ class SignalProcessor:
                     1.5,
                     float(getattr(settings, "post_exit_reversion_min_rr", 1.5) or 1.5),
                 )
-            direction = "LONG" if best_sig.signal_type == "BUY" else "SHORT"
-            
-            quality_factor = min(1.0, (best_conf + (0.1 if best_grade in ["A", "A+"] else 0.0)))
+            s1_guard = 0.0
+            s1_weak_target = False
+            if uts_lane_on:
+                # UT SMART EXIT: the chart has no target, so this R multiple is nominal (the
+                # lane never closes on it); the guard is set from the premium below.
+                s1_weak_target = False
+                final_rr = uts_lane_policy.target_rr(settings)
+            elif s12_lane_on:
+                final_rr = s12_lane_policy.target_rr(settings)
+                s12_floor = s12_lane_policy.min_entry_rr(settings)
+                if final_rr + 1e-9 < s12_floor:
+                    logger.info(
+                        f"S1+S2 Dual {instrument} {best_tf}: target {final_rr:.2f}R is below "
+                        f"the {s12_floor:.2f}R entry floor; signal not taken"
+                    )
+                    continue
+                s1_guard = s12_lane_policy.premium_cap_pct(
+                    best_sig, settings, regime=regime, timeframe=best_tf
+                )
+            elif s1_lane == "S1":
+                # S1 targets are R multiples of its SL1; T3 is the hard target, T1/T2 and the
+                # profit lock are managed by the S1 lane while the trade is open.
+                # 2026-09-25 user: 1R on a normal trade, 0.7R when the move is weak; the
+                # runner keeps a trade open past it while the S1 trend is with it.
+                s1_weak_target = s1_lane_policy.entry_is_weak(
+                    best_sig, regime, "LONG" if best_sig.signal_type == "BUY" else "SHORT", settings
+                )
+                final_rr = s1_lane_policy.target_rr(settings, weak=s1_weak_target)
+                # 2026-10-08 user (item 7): the RR floor is the base target, so a weak-move
+                # S1 entry (0.7R target, cannot pay after costs) is refused rather than having
+                # its target silently rebuilt to the floor at execution.
+                s1_floor = s1_lane_policy.lane_min_entry_rr(best_sig, settings)
+                if final_rr + 1e-9 < s1_floor:
+                    logger.info(
+                        f"S1 {instrument} {best_tf}: weak-move target {final_rr:.2f}R below the "
+                        f"{s1_floor:.2f}R entry floor; signal not taken"
+                    )
+                    try:
+                        scanner._diag_inc("s1_lane", "weak_target_refused")
+                    except Exception:
+                        pass
+                    continue
+                s1_guard = s1_lane_policy.premium_guard_pct(
+                    best_tf,
+                    datetime.now(IST).replace(tzinfo=None),
+                    float(getattr(best_sig, "s1_score", 0.0) or 0.0),
+                    settings,
+                    regime=regime,
+                )
+                s1_guard = min(
+                    s1_guard,
+                    option_stop_tolerance_pct(
+                        scanner.options_sl_pct, regime,
+                        confidence=best_conf, grade=best_grade,
+                    ),
+                )
+            direction = normalized_direction(best_sig.signal_type)
+
             # RR-scaled sizing. The legacy `1.0 if final_rr >= 1.5 else final_rr/1.5`
             # was dead code — dynamic_rr already floors at 1.5R, so it was always 1.0 and never
             # shrank size. Gate a real implementation behind an explicit setting
             # (default OFF = full size, preserving live behavior); when enabled, size
             # scales down for low-RR setups toward rr_size_floor and reaches full size
             # once final_rr >= rr_size_reference_rr.
-            if _setting_enabled(getattr(settings, "rr_size_scaling_enabled", False), False):
-                ref_rr = max(1e-6, float(getattr(settings, "rr_size_reference_rr", 2.5) or 2.5))
-                rr_floor = float(getattr(settings, "rr_size_floor", 0.5) or 0.5)
-                rr_factor = max(rr_floor, min(1.0, float(final_rr) / ref_rr))
-            else:
-                rr_factor = 1.0
-            total_multiplier = quality_factor * rr_factor
+            quality_factor, rr_factor, total_multiplier = candidate_size_multipliers(
+                confidence=best_conf,
+                grade=best_grade,
+                final_rr=final_rr,
+                rr_scaling_enabled=_setting_enabled(
+                    getattr(settings, "rr_size_scaling_enabled", False), False
+                ),
+                rr_reference=float(
+                    getattr(settings, "rr_size_reference_rr", 2.5) or 2.5
+                ),
+                rr_floor=float(getattr(settings, "rr_size_floor", 0.5) or 0.5),
+            )
             cap_based_lots = None
             effective_fut_sl_pct = None
 
             if inst_type == "FUT":
-                if (
+                if s12_lane_on:
+                    s12_levels = s12_lane_policy.admission_levels(best_sig, spot, settings)
+                    index_stop_distance = abs(float(spot or 0.0) - float(s12_levels.get("s12_stop") or 0.0))
+                    effective_fut_sl_pct = (
+                        index_stop_distance / max(float(spot or 0.0), 1e-9) * 100.0
+                    )
+                elif not s1_lane and (
                     volume_spike_entry
                     or market_ltp_shock_entry
                     or late_session_reclaim_entry
@@ -7196,8 +9444,16 @@ class SignalProcessor:
                 )
                 # No capital hardcap on lots when auto sizing is OFF (default).
                 cap_based_lots = None
-                
-                option_stop_pct = (
+                if s12_lane_on:
+                    s12_levels = s12_lane_policy.admission_levels(best_sig, spot, settings)
+                    index_stop_distance = abs(float(spot or 0.0) - float(s12_levels.get("s12_stop") or 0.0))
+                    option_stop_pct = s1_guard
+                elif scanner_engine_mode == "one_plus_one":
+                    # Native spot geometry is mapped later with the live signed delta;
+                    # no platform premium-percent or regime cap may reshape it.
+                    index_stop_distance = abs(float(spot) - native_stop_spot)
+                else:
+                    option_stop_pct = (
                     float(getattr(settings, "one_way_cascade_options_sl_pct", 5.0) or 5.0)
                     if one_way_cascade_entry
                     else
@@ -7208,6 +9464,26 @@ class SignalProcessor:
                     if (volume_spike_entry or market_ltp_shock_entry or is_reversion_scalp)
                     else float(scanner.options_sl_pct or 0.0)
                 )
+                if uts_lane_on:
+                    s1_guard = uts_lane_policy.premium_guard_pct(
+                        est_premium, float(best_sig.stop_distance or 0.0), abs(instrument_multiplier), settings,
+                        regime=regime, confidence=best_conf, grade=best_grade,
+                        setup=best_sig, timeframe=best_tf,
+                    )
+                option_stop_pct = min(
+                    option_stop_pct,
+                    option_stop_tolerance_pct(
+                        scanner.options_sl_pct, regime,
+                        confidence=best_conf, grade=best_grade,
+                        setup=best_sig,
+                        fast_entry=bool(
+                            one_way_cascade_entry or late_session_reclaim_entry
+                            or volume_spike_entry or market_ltp_shock_entry or is_reversion_scalp
+                        ),
+                    ),
+                )
+                if s1_lane == "S1":
+                    option_stop_pct = s1_guard
                 max_premium_sl_pts = est_premium * (option_stop_pct / 100.0)
                 hard_cap_index_sl = max_premium_sl_pts / max(0.1, abs(instrument_multiplier))
                 # Option premium risk and underlying index risk are separate ceilings.
@@ -7236,6 +9512,10 @@ class SignalProcessor:
                     hard_cap_index_sl,
                     policy_index_sl,
                 )
+                if s1_lane:
+                    # The S1 SL1 (0.10-0.25% of the index) is the index stop; the premium
+                    # guard is applied separately in premium space below.
+                    index_stop_distance = max(0.0, float(best_sig.stop_distance or 0.0))
 
             if direction == "LONG":
                 entry_stop = spot - index_stop_distance
@@ -7243,6 +9523,10 @@ class SignalProcessor:
             else:
                 entry_stop = spot + index_stop_distance
                 target = spot - (index_stop_distance * final_rr)
+            if s12_lane_on:
+                s12_levels = s12_lane_policy.admission_levels(best_sig, spot, settings)
+                entry_stop = float(s12_levels.get("s12_stop") or entry_stop)
+                target = 0.0  # T1-T3 are milestones; native engine exits own the trade.
 
             trading_symbol = ""
             symbol_token = ""
@@ -7251,7 +9535,22 @@ class SignalProcessor:
                 trading_symbol = info.get("current_fut", "")
                 symbol_token = info.get("current_fut_token", "")
             else:
-                opt_info = scanner.data.get_option_token(instrument, strike_local, option_type_local)
+                option_token_kwargs = {}
+                native_expiry_preference = (
+                    str(
+                        getattr(best_sig, "native_option_expiry_preference", "") or ""
+                    )
+                    if scanner_engine_mode == "one_plus_one"
+                    else ""
+                )
+                if native_expiry_preference:
+                    option_token_kwargs["expiry_preference"] = native_expiry_preference
+                opt_info = scanner.data.get_option_token(
+                    instrument,
+                    strike_local,
+                    option_type_local,
+                    **option_token_kwargs,
+                )
                 if opt_info:
                     trading_symbol = opt_info['symbol']
                     symbol_token = opt_info['token']
@@ -7336,7 +9635,35 @@ class SignalProcessor:
                                 )
                                 continue
                             live_trade_price = live_premium
-                            if (
+                            if uts_lane_on:
+                                # Catastrophe stop beyond the chart's close-based UT stop.
+                                s1_guard = uts_lane_policy.premium_guard_pct(
+                                    live_trade_price, index_stop_distance, abs(instrument_multiplier), settings,
+                                    regime=regime, confidence=best_conf, grade=best_grade,
+                                    setup=best_sig, timeframe=best_tf,
+                                )
+                                max_sl_dist = uts_lane_policy.premium_stop_distance(
+                                    live_trade_price, index_stop_distance, abs(instrument_multiplier), settings,
+                                    regime=regime, confidence=best_conf, grade=best_grade,
+                                    setup=best_sig, timeframe=best_tf,
+                                )
+                            elif s12_lane_on:
+                                max_sl_dist = s12_lane_policy.premium_stop_distance(
+                                    live_trade_price,
+                                    index_stop_distance,
+                                    abs(instrument_multiplier),
+                                    settings,
+                                    setup=best_sig,
+                                    timeframe=best_tf,
+                                )
+                            elif s1_lane:
+                                max_sl_dist = s1_lane_policy.premium_stop_distance(
+                                    live_trade_price,
+                                    index_stop_distance,
+                                    instrument_multiplier,
+                                    s1_guard,
+                                )
+                            elif (
                                 volume_spike_entry
                                 or market_ltp_shock_entry
                                 or late_session_reclaim_entry
@@ -7361,22 +9688,49 @@ class SignalProcessor:
                                     atr_premium_stop=float(index_stop_distance) * abs(float(instrument_multiplier or 0.0)),
                                     settings=settings,
                                     intel_score=float(intel_score or 0.0),
+                                    direction=direction,
+                                    score_unit="canonical_signed",
                                 )
-                            candidate_stop = live_trade_price - max_sl_dist
-                            candidate_target = live_trade_price + (max_sl_dist * final_rr)
+                            if not s12_lane_on:
+                                max_sl_dist = min(
+                                    max_sl_dist,
+                                    live_trade_price * option_stop_tolerance_pct(
+                                        scanner.options_sl_pct, regime,
+                                        confidence=best_conf, grade=best_grade,
+                                        setup=best_sig,
+                                        fast_entry=bool(
+                                            volume_spike_entry or market_ltp_shock_entry
+                                            or late_session_reclaim_entry or one_way_cascade_entry
+                                            or is_reversion_scalp
+                                        ),
+                                    ) / 100.0,
+                                )
+                            if scanner_engine_mode != "one_plus_one":
+                                candidate_stop = live_trade_price - max_sl_dist
+                                candidate_target = 0.0 if s12_lane_on else live_trade_price + (max_sl_dist * final_rr)
                         else: # FUT
                             live_fut_ltp = self._contract_ltp(scanner, exchange, trading_symbol, symbol_token)
                             live_trade_price = live_fut_ltp if live_fut_ltp > 0 else spot
-                            max_sl_dist = self._futures_stop_distance(
-                                index_stop_distance,
-                                live_trade_price,
-                                scanner.futures_sl_pct,
-                                regime,
-                            )
-                            if direction == "LONG":
+                            if scanner_engine_mode == "one_plus_one":
+                                basis = live_trade_price - float(spot)
+                                candidate_stop = native_stop_spot + basis
+                                candidate_target = (
+                                    native_target_spot + basis if native_has_hard_target else 0.0
+                                )
+                            elif s12_lane_on:
+                                candidate_stop = live_trade_price + (entry_stop - float(spot or 0.0))
+                                candidate_target = 0.0
+                            else:
+                                max_sl_dist = self._futures_stop_distance(
+                                    index_stop_distance,
+                                    live_trade_price,
+                                    scanner.futures_sl_pct,
+                                    regime,
+                                )
+                            if scanner_engine_mode != "one_plus_one" and not s12_lane_on and direction == "LONG":
                                 candidate_stop = live_trade_price - max_sl_dist
                                 candidate_target = live_trade_price + (max_sl_dist * final_rr)
-                            else:
+                            elif scanner_engine_mode != "one_plus_one" and not s12_lane_on:
                                 candidate_stop = live_trade_price + max_sl_dist
                                 candidate_target = live_trade_price - (max_sl_dist * final_rr)
                     except Exception as e:
@@ -7391,29 +9745,46 @@ class SignalProcessor:
                             continue
                         else:
                             live_trade_price = spot
-                            max_sl_dist = self._futures_stop_distance(
-                                index_stop_distance,
-                                live_trade_price,
-                                scanner.futures_sl_pct,
-                                regime,
-                            )
-                            if direction == "LONG":
+                            if scanner_engine_mode == "one_plus_one":
+                                candidate_stop = native_stop_spot
+                                candidate_target = native_target_spot if native_has_hard_target else 0.0
+                            elif s12_lane_on:
+                                candidate_stop = entry_stop
+                                candidate_target = 0.0
+                            else:
+                                max_sl_dist = self._futures_stop_distance(
+                                    index_stop_distance,
+                                    live_trade_price,
+                                    scanner.futures_sl_pct,
+                                    regime,
+                                )
+                            if scanner_engine_mode != "one_plus_one" and not s12_lane_on and direction == "LONG":
                                 candidate_stop = live_trade_price - max_sl_dist
                                 candidate_target = live_trade_price + (max_sl_dist * final_rr)
-                            else:
+                            elif scanner_engine_mode != "one_plus_one" and not s12_lane_on:
                                 candidate_stop = live_trade_price + max_sl_dist
                                 candidate_target = live_trade_price - (max_sl_dist * final_rr)
                 
-                no_entry_label, _ = _entry_cutoff(settings, best_tf)
+                no_entry_label, _ = _entry_cutoff(settings, best_tf, s1=s1_lane)
                 # A confirmed power-move may enter past the no-entry cutoff, but only
                 # up to the hard late cutoff so there is still time before square-off.
                 power_move_cutoff_ok = bool(
                     best_after_no_entry
                     and fast_thrust_override
+                    and not s1_lane
                     and scanner._power_move_late_cutoff_ok(best_sig.timestamp)
                 )
-                effective_no_entry = best_after_no_entry and not power_move_cutoff_ok
-                candidate_status = f"NO ENTRY - AFTER {no_entry_label}" if effective_no_entry else "TRADE SIGNAL"
+                effective_no_entry = (
+                    False
+                    if scanner_engine_mode == "one_plus_one"
+                    else best_after_no_entry and not power_move_cutoff_ok
+                )
+                s12_signal_only = bool(s12_lane_on and s12_lane_policy.signal_only(settings))
+                candidate_status = (
+                    f"NO ENTRY - AFTER {no_entry_label}" if effective_no_entry
+                    else "SIGNAL ONLY" if s12_signal_only
+                    else "TRADE SIGNAL"
+                )
                 candidate_action = "NO_ENTRY" if effective_no_entry else "ENTRY"
                 candidate_reasons = list(best_reasons or [])
                 if effective_no_entry:
@@ -7477,6 +9848,22 @@ class SignalProcessor:
                     logger.warning(f"Skipping candidate for {instrument} due to invalid live price: {live_trade_price}")
                     continue
 
+                if inst_type == "OPT":
+                    entry_cap_pct = option_stop_tolerance_pct(
+                        scanner.options_sl_pct, regime,
+                        confidence=best_conf, grade=best_grade,
+                        setup=best_sig,
+                        fast_entry=bool(volume_spike_entry or market_ltp_shock_entry
+                                        or late_session_reclaim_entry or one_way_cascade_entry
+                                        or is_reversion_scalp),
+                    )
+                    candidate_stop = max(
+                        float(candidate_stop or 0.0),
+                        live_trade_price * (1.0 - entry_cap_pct / 100.0),
+                    )
+                    if s1_guard > 0:
+                        s1_guard = min(s1_guard, entry_cap_pct)
+
                 requested_lots = (
                     int(getattr(scanner, "user_lots", {}).get(instrument, 1) or 1)
                     if inst_type == "OPT"
@@ -7484,7 +9871,9 @@ class SignalProcessor:
                 )
                 # Lot scale: cascade OPT 2–3×; heavy-trend (2/4 align) OPT 2×; else 1×.
                 # FUT always 1×. A+/power_move alone never multiplies.
-                cascade_scale = bool(one_way_cascade_entry)
+                # 2026-09-25 user, S1: the configured lots per index/timeframe, 1x even
+                # on a cascade; only a heavy trend doubles (OPT).
+                cascade_scale = bool(one_way_cascade_entry) and not s1_lane
                 heavy_trend_scale = False
                 if not cascade_scale and str(inst_type or "").upper() == "OPT":
                     try:
@@ -7525,20 +9914,30 @@ class SignalProcessor:
                     and not _confirmed_breakout_valid
                     else _compression_state
                 )
-                size_result = resolve_trade_lots(
-                    settings=settings,
-                    inst_type=inst_type,
-                    requested_lots=requested_lots,
-                    lot_size=lot_size,
-                    entry_price=float(live_trade_price or 0.0),
-                    stop_price=float(candidate_stop or 0.0),
-                    cap_lots=cap_based_lots if inst_type == "OPT" else None,
-                    cascade_scale=cascade_scale,
-                    heavy_trend_scale=heavy_trend_scale,
-                    high_conviction=False,
-                    compression_state=_effective_compression_state,
-                    intel_score=float(intel_score or 0.0),
-                )
+                if scanner_engine_mode == "one_plus_one":
+                    # Native admission uses the operator's configured lot count exactly.
+                    # No compression, regime, grade, intelligence, or risk-budget sizer
+                    # may resize or veto a scanner-owned entry.
+                    size_result = SimpleNamespace(
+                        lots=max(0, int(requested_lots or 0)),
+                        mode="native_fixed",
+                        reason="1+1 configured fixed lots",
+                    )
+                else:
+                    size_result = resolve_trade_lots(
+                        settings=settings,
+                        inst_type=inst_type,
+                        requested_lots=requested_lots,
+                        lot_size=lot_size,
+                        entry_price=float(live_trade_price or 0.0),
+                        stop_price=float(candidate_stop or 0.0),
+                        cap_lots=cap_based_lots if inst_type == "OPT" else None,
+                        cascade_scale=cascade_scale,
+                        heavy_trend_scale=heavy_trend_scale,
+                        high_conviction=False,
+                        compression_state=_effective_compression_state,
+                        intel_score=float(intel_score or 0.0),
+                    )
                 if size_result.lots < 1:
                     logger.info(
                         "Skipping %s %s %s: %s",
@@ -7574,6 +9973,7 @@ class SignalProcessor:
                     atm_strike=strike_local, multiplier=instrument_multiplier, trading_symbol=trading_symbol,
                     symbol_token=symbol_token, rr=round(final_rr, 2), score=final_strike_score,
                     reasons=candidate_reasons, signal_timestamp=best_sig.timestamp,
+                    decision_timestamp=datetime.now(IST),
                     entry_spot=float(spot or 0.0),
                     spot_stop=float(entry_stop or 0.0),
                     spot_target=float(target or 0.0),
@@ -7592,11 +9992,13 @@ class SignalProcessor:
                     geometry_verified=True,
                     status=candidate_status,
                     action=candidate_action,
+                    watch_only=s12_signal_only,
                     volume_spike_entry=volume_spike_entry,
                     market_ltp_shock_entry=market_ltp_shock_entry,
                     late_session_reclaim_entry=late_session_reclaim_entry,
                     one_way_cascade_entry=one_way_cascade_entry,
                     volume_ratio=float(volume_spike_metrics.get("volume_ratio", 0.0) or 0.0),
+                    volume_basis=str(volume_spike_metrics.get("volume_basis", "") or ""),
                     range_atr_ratio=float(volume_spike_metrics.get("range_atr_ratio", 0.0) or 0.0),
                     close_location=float(volume_spike_metrics.get("close_location", 0.0) or 0.0),
                     initial_stop=float(candidate_stop or 0.0),
@@ -7635,11 +10037,37 @@ class SignalProcessor:
                 )
                 carry_grading_telemetry(candidate, best_sig)
                 setattr(candidate, "source_signal_type", best_sig.signal_type)
+                setattr(candidate, "one_plus_one", scanner_engine_mode == "one_plus_one")
+                setattr(candidate, "native_scanner", str(getattr(best_sig, "native_scanner", "") or ""))
+                for _native_field in (
+                    "native_stop", "native_stop2", "native_target1", "native_target2",
+                    "native_target3", "native_trail_start_r", "native_trail_atr",
+                ):
+                    if hasattr(best_sig, _native_field):
+                        setattr(candidate, _native_field, getattr(best_sig, _native_field))
                 setattr(candidate, "source_signal_price", float(best_sig.price or 0.0))
                 setattr(candidate, "source_signal_bar_index", int(getattr(best_sig, "bar_index", -1) or -1))
                 setattr(candidate, "source_engine", best_source_engine)
                 setattr(candidate, "source_engines", list(best_source_engines))
                 setattr(candidate, "source_lane", best_source_lane)
+                setattr(candidate, "s1_lane", bool(s1_lane))
+                if uts_lane_on:
+                    for _k in ("uts_trail", "uts_atr"):
+                        setattr(candidate, _k, getattr(best_sig, _k, None))
+                if s1_lane:
+                    setattr(candidate, "s1_guard_pct", float(s1_guard))
+                    setattr(candidate, "s1_weak_target", bool(s1_weak_target))
+                    for _k in ("s1_score", "s1_setup", "s1_sl_pct", "s1_sl1", "s1_targets",
+                               "s1_chart_entry", "s1_chart_signal_close", "s1_chart_sl1", "s1_chart_sl2", "s1_chart_targets"):
+                        setattr(candidate, _k, getattr(best_sig, _k, None))
+                if s12_lane_on:
+                    for _k in (*s12_lane_policy.SESSION_STATE_FIELDS, "s12_stop_updates", "s12_engine_entry", "s12_fill_cancel"):
+                        if hasattr(best_sig, _k):
+                            setattr(candidate, _k, copy.deepcopy(getattr(best_sig, _k)))
+                    for _k, _v in s12_lane_policy.admission_levels(best_sig, spot, settings).items():
+                        setattr(candidate, _k, _v)
+                    candidate.s12_lane = s12_lane
+                    candidate.s12_premium_cap_pct = float(s1_guard)
                 setattr(candidate, "quad_union_entry", bool(quad_union_entry))
                 setattr(candidate, "raw_union_entry", bool(quad_union_entry))
                 setattr(candidate, "late_session_reclaim_entry", bool(late_session_reclaim_entry))
@@ -7651,6 +10079,9 @@ class SignalProcessor:
                 setattr(candidate, "market_ltp_shock_entry", bool(market_ltp_shock_entry))
                 if market_ltp_shock_entry and market_ltp_shock_context:
                     setattr(candidate, "market_ltp_shock_context", dict(market_ltp_shock_context))
+                setattr(candidate, "stale_regime_reversal_entry", bool(stale_regime_reversal_entry))
+                if stale_regime_reversal_entry:
+                    setattr(candidate, "stale_regime_reversal_context", dict(_stale_regime_context))
                 setattr(
                     candidate,
                     "market_wide_reversal_entry",
@@ -7663,6 +10094,11 @@ class SignalProcessor:
                         dict(getattr(best_sig, "market_wide_reversal_context") or {}),
                     )
                 setattr(candidate, "is_reversion_scalp", bool(is_reversion_scalp))
+                setattr(
+                    candidate,
+                    "one_min_raw_entry",
+                    bool(getattr(best_sig, "one_min_raw_entry", False)),
+                )
                 if one_way_cascade_entry and isinstance(_reversal_relief_context, dict):
                     setattr(candidate, "one_way_cascade_context", dict(_reversal_relief_context))
                 setattr(candidate, "trend_15m_agrees", bool(trend_15m_agrees))
@@ -7693,16 +10129,24 @@ class SignalProcessor:
                             "wavetrend": dict(candidate_intel_result.get("wavetrend", {}) or {}),
                         },
                     )
-                setattr(candidate, "strategy_revision", str(getattr(settings, "strategy_revision", "") or ""))
-                setattr(candidate, "strategy_direction_mode", str(getattr(settings, "strategy_direction_mode", "") or ""))
-                setattr(candidate, "data_provenance", "LIVE" if getattr(scanner, "mode", "") == "REAL" else "BACKTEST")
+                # One stamp for both outcomes. Rejections are stamped in
+                # _build_rejected_from_raw; without the same call here an ACCEPTED row
+                # would carry revision and provenance but no build_fingerprint, which is
+                # the same unattributable gap the rejections had, only inverted.
+                for _field, _value in build_identity(settings, scanner).items():
+                    setattr(candidate, _field, _value)
                 if iv_percentile is not None:
                     setattr(candidate, "iv_percentile", float(iv_percentile))
                 setattr(candidate, "option_premium_ok", bool(option_premium_ok))
-                setattr(candidate, "chain_quality", dict(chain_quality or {}))
+                setattr(candidate, "chain_quality", {
+                    **dict(chain_quality or {}), "captured_at_epoch": time.time(),
+                })
                 setattr(candidate, "market_regime", _stamp_regime)
-                # Tag with the structural price-action verdict (advisory telemetry).
-                _pa = getattr(scanner, "_last_price_action_ctx", None)
+                # Stamp this worker's decision context. Another instrument can
+                # overwrite the scanner's diagnostic snapshot before construction.
+                _pa = _pa_ctx
+                setattr(candidate, "price_action_verdict", "")
+                setattr(candidate, "price_action_score", 0.0)
                 if isinstance(_pa, dict):
                     setattr(candidate, "price_action_verdict", str(_pa.get("verdict") or ""))
                     setattr(candidate, "price_action_score", float(_pa.get("score") or 0.0))
@@ -7717,19 +10161,19 @@ class SignalProcessor:
                 candidate.is_explosive_bypass = bool(is_explosive_bypass)
                 # Power-move: bypass grade floor / late cutoff downstream, enter tight (scalp-lock).
                 candidate.power_move = bool(power_move)
-                if fast_thrust_override:
+                if fast_thrust_override and not s1_lane:
                     candidate.scalp_lock_mode = True
                     candidate.reasons = list(candidate.reasons or []) + [
                         "⚡ Fast thrust (data-confirmed): tight stop + scalp-lock risk"
                     ]
-                if late_session_reclaim_entry:
+                if late_session_reclaim_entry and not s1_lane:
                     candidate.scalp_lock_mode = True
                 if market_ltp_shock_entry:
                     candidate.scalp_lock_mode = True
                     candidate.reasons = list(candidate.reasons or []) + [
                         "⚡ Market LTP shock (multi-index): tight stop + short stab + scalp-lock"
                     ]
-                if is_reversion_scalp:
+                if is_reversion_scalp and not s1_lane:
                     candidate.scalp_lock_mode = True
                     _rev_rr = max(
                         1.5,
@@ -7752,14 +10196,27 @@ class SignalProcessor:
                         if isinstance(intel_result, dict)
                         else {}
                     )
-                    _wm_day = str(_wm_ctx.get("day_type") or "").upper()
-                    _wm_conf = float(_wm_ctx.get("confidence") or 0.0)
+                    _wm_day = str(
+                        _wm_ctx.get("effective_day_type")
+                        or _wm_ctx.get("market_phase")
+                        or _wm_ctx.get("day_type")
+                        or ""
+                    ).upper()
+                    _wm_conf = float(
+                        _wm_ctx.get("effective_confidence")
+                        or _wm_ctx.get("phase_confidence")
+                        or _wm_ctx.get("confidence")
+                        or 0.0
+                    )
                     if (
+                        scanner_engine_mode != "one_plus_one"
+                        and
                         _setting_enabled(getattr(settings, "weak_market_scalp_mode_enabled", True), True)
                         and _wm_day == "RANGE_DAY"
                         and _wm_conf
                         >= float(getattr(settings, "weak_market_scalp_min_day_confidence", 0.60) or 0.60)
                         and not fast_thrust_override
+                        and not bool(getattr(candidate, "s1_lane", False))
                         and not bool(getattr(candidate, "market_wide_reversal_entry", False))
                         and not bool(getattr(candidate, "one_way_cascade_entry", False))
                         and not candidate.is_explosive_bypass
@@ -7813,60 +10270,11 @@ class SignalProcessor:
                     + (" | one-way-cascade" if one_way_cascade_entry else "")
                 )
 
-        if not results_list:
-            return []
-
-        results_list.sort(key=lambda x: x.score, reverse=True)
-        # Score decides. Liquidity only separates candidates the score cannot.
-        winner = self._prefer_liquid_strike(results_list, settings) or results_list[0]
-        if winner is not results_list[0]:
-            logger.info(
-                f"Strike liquidity tie-break for {instrument}: "
-                f"{getattr(winner, 'trading_symbol', '')} "
-                f"(OI {getattr(winner, 'strike_oi', 0.0):,.0f} / "
-                f"vol {getattr(winner, 'strike_volume', 0.0):,.0f}) preferred over "
-                f"{getattr(results_list[0], 'trading_symbol', '')} "
-                f"(OI {getattr(results_list[0], 'strike_oi', 0.0):,.0f} / "
-                f"vol {getattr(results_list[0], 'strike_volume', 0.0):,.0f})"
-            )
-        getattr(scanner, "_live_signal_recheck_eligible", {}).pop(
-            f"{instrument}_{best_tf}",
-            None,
+        return self._finalize_signal_candidates(
+            instrument=instrument,
+            best_tf=best_tf,
+            results_list=results_list,
+            scored=scored,
+            settings=settings,
+            scanner_engine_mode=scanner_engine_mode,
         )
-        
-        scanner.log_event(f"🎯 Potential {winner.direction} Signal for {winner.instrument} ({winner.timeframe})", "trade")
-        # Cascade multi-TF: emit 1m+5m+15m (+ dual 5/15) siblings in the same wave.
-        # Rare dual-TF: when cascade is not active, allow one excellent 1m+5/15 pair.
-        out = [winner]
-        try:
-            siblings = self._emit_cascade_tf_siblings(
-                winner, scored, settings, scanner_engine_mode
-            )
-            if siblings:
-                out.extend(siblings)
-                stack_desc = [
-                    f"{c.timeframe}:{getattr(c, 'source_lane', '') or 'A'}" for c in out
-                ]
-                logger.info(f"Cascade multi-TF stack for {instrument}: {stack_desc}")
-                scanner.log_event(
-                    f"Cascade multi-TF stack {instrument}: "
-                    f"{len(out)} entries ({', '.join(c.timeframe for c in out)})",
-                    "trade",
-                )
-        except Exception as sib_exc:
-            logger.debug(f"Cascade multi-TF siblings skipped for {instrument}: {sib_exc}")
-        if len(out) == 1:
-            try:
-                rare = self._emit_rare_dual_tf_siblings(
-                    winner, scored, settings, scanner_engine_mode
-                )
-                if rare:
-                    out.extend(rare)
-                    scanner.log_event(
-                        f"Rare dual-TF {instrument}: "
-                        f"{', '.join(c.timeframe for c in out)}",
-                        "trade",
-                    )
-            except Exception as rare_exc:
-                logger.debug(f"Rare dual-TF skipped for {instrument}: {rare_exc}")
-        return out

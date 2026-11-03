@@ -1,0 +1,21 @@
+{
+  "INTEGRATION_CONTRACT.md": "a7c2618a8f5b8b4d2a5cfb5d6e329d5ea953ae4471c6768a2b468a112eb2bebf",
+  "QA_v1_2.md": "377e66fb1617ae41524ab22e464c9c29b9e4bd797c9e7db02257abd3fb111286",
+  "README.md": "dcabe6d6cf19f3a4487c38b46088fb9acac3e9a3e2b8f42eeef4bc93e402c092",
+  "config.defaults.json": "55818502cc447f94fa256d6333ded479b5810d27d8ff95b93ed70f3a76d77772",
+  "examples/demo_1m.csv": "a7c97068e6ee375de74c8fdb14e2b86ad0367b13c5740de7d67cb4f8c4822c3d",
+  "examples/demo_5m.csv": "c2f48624391dd4e3d707331e60be6e43c115b3d89222c7eb2b1fa761727c1266",
+  "examples/generate_demo.py": "8d2704f178150450a637be71943ecd46870947033fc632b5feae99440177cdc2",
+  "pyproject.toml": "797a35ea4584fabc3e8298b89a6d607c55170c6c7434269100770ffec44bcf3f",
+  "scanner/__init__.py": "68e1016b5a66170d6944260a746d84eed8f1c1b108bf2c951138105139522964",
+  "scanner/cli.py": "1572bb3899a611da2f73fc9c0e2cf5d85cd2c97a943985503f7f14f034be4e3c",
+  "scanner/config.py": "9f222124b017638d5bc5d8f686dbf79390786e5672c6a1d3a3ce9841f2faf6c2",
+  "scanner/engine.py": "563cd8f0a2caae37cd47498aca9b39f558e26a4855e422481fe4b77290746a59",
+  "scanner/generated_rules.py": "a629c3b9a2c989562d8bfcb3da6137bee0464e8173c89e1bfbe39a4d4b29ecec",
+  "scanner/indicators.py": "0f079d7e199de9b3ef52fb0ed579a88093c61dc9a633348fb03251d68283df35",
+  "scanner/mtf.py": "a9acb9103fe9002249fea95a46842c5f6e5ac2a5eca997f9ddc97d8ea5247585",
+  "scanner/timing.py": "495783d79cb19e932c55280d918cd038c43d5971feea69ab40962896c275f398",
+  "tests/test_scanner.py": "091b285d88b5f75659f095b0f9a3d3fd926ea5cdd7f328812b69b4a3febd4372",
+  "tests/test_v11_audit_repairs.py": "64398d426a3b48cada4dbe631cc78604d51022de12999d3a82177b0b840b4abf",
+  "tests/test_v12_source_parity.py": "bde2baba633876725ceeff8a1eeb1113ebd0031345f57cc4131a0743b4bac584"
+}

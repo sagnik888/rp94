@@ -6,6 +6,7 @@ Manages signal generation, deduplication, grading, and history.
 """
 
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Deque, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -15,6 +16,105 @@ from engine.intelligence_score import normalize_intelligence_score
 from engine.signal_quality_policy import confidence_to_grade, setting_enabled
 
 from engine.ut_bot_core import UTBotSignal
+
+
+def intelligence_pillar_score(intelligence_score, signal_type: str):
+    """The intelligence pillar of the grade, direction-aligned. Returns (score, reasons).
+
+    Shared with the stabilization re-grade so a signal re-scored on fresh intelligence
+    while it waits in the buffer cannot drift from the birth-time formula.
+    """
+    reasons: List[str] = []
+    intelligence_score = normalize_intelligence_score(intelligence_score)
+    aligned_intel = intelligence_score if str(signal_type).upper() == "BUY" else -intelligence_score
+    score = max(-0.20, min(0.30, aligned_intel * 0.30))
+    if aligned_intel > 0.5:
+        reasons.append("Intelligence: Institutional Volume/OI Confirmed")
+    elif aligned_intel > 0.2:
+        reasons.append("Intelligence: Moderate Data Support")
+    elif aligned_intel < -0.3:
+        reasons.append("Intelligence: Data CONTRADICTS signal")
+    return score, reasons
+
+
+def regime_pillar_score(
+    regime: str,
+    signal_type: str,
+    *,
+    day_type: str = "",
+    day_type_confidence: float = 0.0,
+):
+    """The regime pillar of the grade, including the range-day damp. (score, reasons)."""
+    reasons: List[str] = []
+    regime = str(regime or "UNKNOWN").upper()
+    is_buy = str(signal_type).upper() == "BUY"
+    score = 0.0
+    if regime in {"TRENDING_UP", "BREAKOUT_UP"}:
+        if is_buy:
+            score += 0.30
+            reasons.append("Regime: Trend-Following alignment")
+        else:
+            score -= 0.25
+            reasons.append("Regime: COUNTER-TREND (High Risk)")
+    elif regime in {"TRENDING_DOWN", "BREAKOUT_DOWN"}:
+        if not is_buy:
+            score += 0.30
+            reasons.append("Regime: Trend-Following alignment")
+        else:
+            score -= 0.25
+            reasons.append("Regime: COUNTER-TREND (High Risk)")
+    elif regime in {"RANGING", "SIDEWAYS", "VOLATILE", "MEAN_REVERTING"}:
+        score -= 0.10
+        reasons.append(f"Regime: Range-bound noise ({regime})")
+    elif regime == "UNKNOWN":
+        score -= 0.30
+        reasons.append("Regime: UNKNOWN (High Risk Penalty)")
+
+    # 2026-07-03: the 5min detector read TRENDING 54-60% of a confirmed RANGE_DAY, and
+    # the +0.30 alignment bonus on those phantom trends manufactured A+ labels that went
+    # 0/6. On a confirmed range day the trend-alignment bonus is capped; reversal/thrust
+    # paths are graded elsewhere and unaffected.
+    try:
+        from config.settings import get_settings as _gs_damp
+
+        damp_settings = _gs_damp()
+        if (
+            bool(getattr(damp_settings, "range_day_regime_pillar_damp_enabled", True))
+            and str(day_type or "").upper() == "RANGE_DAY"
+            and float(day_type_confidence or 0.0)
+            >= float(getattr(damp_settings, "range_day_regime_pillar_min_confidence", 0.60) or 0.60)
+        ):
+            cap = float(getattr(damp_settings, "range_day_regime_pillar_bonus_cap", 0.10) or 0.10)
+            if score > cap:
+                score = cap
+                reasons.append(
+                    f"Range-day damp: {regime} alignment bonus capped at +{cap:.2f} "
+                    "(session is a confirmed range day)"
+                )
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        logger.debug(f"Range-day regime damp settings unavailable: {exc}")
+    return score, reasons
+
+
+def confidence_from_total_score(total_score: float) -> float:
+    """Map the summed pillars to confidence exactly as the grading engine does."""
+    use_logistic = True
+    logistic_k = 5.0
+    try:
+        from config.settings import get_settings as _gs
+
+        settings = _gs()
+        use_logistic = setting_enabled(getattr(settings, "ut_confidence_logistic", True), True)
+        logistic_k = float(getattr(settings, "ut_confidence_logistic_k", 5.0) or 5.0)
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        logger.debug(f"Confidence logistic settings unavailable: {exc}")
+    if use_logistic:
+        import math
+
+        confidence = 1.0 / (1.0 + math.exp(-logistic_k * float(total_score)))
+    else:
+        confidence = 0.5 + float(total_score)
+    return max(0.0, min(1.0, confidence))
 
 
 @dataclass
@@ -136,6 +236,8 @@ class SignalManager:
         from config.settings import get_settings
         _s = get_settings()
         tech_score = 0.0
+        adx_score = 0.0
+        mtf_score = 0.0
         
         # ── VIX Patch ──
         vix_penalty = 0.0
@@ -151,7 +253,14 @@ class SignalManager:
         except (ImportError, AttributeError, TypeError, ValueError) as exc:
             logger.debug(f"Signal VIX threshold settings unavailable: {exc}")
             vix_high_threshold, vix_low_threshold = 20.0, 12.0
-        if vix_value > vix_high_threshold:
+        try:
+            vix_value = float(vix_value)
+            vix_available = 0 < vix_value < float("inf")
+        except (TypeError, ValueError):
+            vix_available = False
+        if not vix_available:
+            reasons.append("VIX unavailable: no volatility adjustment")
+        elif vix_value > vix_high_threshold:
             vix_penalty = 0.10
             reasons.append(f"VIX High ({vix_value:.1f})")
         elif vix_value < vix_low_threshold:
@@ -185,6 +294,7 @@ class SignalManager:
         if abs(aligned_conf) > 0.2:
             mtf_score = ((abs(aligned_conf) - 0.2) / 0.8) * 0.20
             tech_score += mtf_score if aligned_conf > 0 else -mtf_score
+            mtf_score = mtf_score if aligned_conf > 0 else -mtf_score
             if aligned_conf > 0.6:
                 reasons.append("Technical: Strong Multi-TF Confluence")
             elif aligned_conf > 0:
@@ -201,66 +311,17 @@ class SignalManager:
                 reasons.append(f"Technical: Tight Risk-Window ({atr_ratio:.1f}x ATR)")
 
         # ── Pillar 2: INTELLIGENCE (30% Weight) ──
-        # Align intelligence score with signal direction
-        intelligence_score = normalize_intelligence_score(intelligence_score)
-        aligned_intel = intelligence_score if signal.signal_type == "BUY" else -intelligence_score
-        
-        intel_score_part = max(-0.20, min(0.30, aligned_intel * 0.30))
-        
-        if aligned_intel > 0.5:
-            reasons.append("Intelligence: Institutional Volume/OI Confirmed")
-        elif aligned_intel > 0.2:
-            reasons.append("Intelligence: Moderate Data Support")
-        elif aligned_intel < -0.3:
-            reasons.append("Intelligence: Data CONTRADICTS signal")
+        intel_score_part, intel_reasons = intelligence_pillar_score(
+            intelligence_score, signal.signal_type
+        )
+        reasons.extend(intel_reasons)
 
-        # ── Pillar 3: REGIME (30% Weight) ──
-        # This is the 'Context' layer requested in Audit
-        if regime in {"TRENDING_UP", "BREAKOUT_UP"}:
-            if signal.signal_type == "BUY":
-                regime_score += 0.30
-                reasons.append("Regime: Trend-Following alignment")
-            else:
-                regime_score -= 0.25
-                reasons.append("Regime: COUNTER-TREND (High Risk)")
-        elif regime in {"TRENDING_DOWN", "BREAKOUT_DOWN"}:
-            if signal.signal_type == "SELL":
-                regime_score += 0.30
-                reasons.append("Regime: Trend-Following alignment")
-            else:
-                regime_score -= 0.25
-                reasons.append("Regime: COUNTER-TREND (High Risk)")
-        elif regime in ["RANGING", "SIDEWAYS", "VOLATILE", "MEAN_REVERTING"]:
-            regime_score -= 0.10
-            reasons.append(f"Regime: Range-bound noise ({regime})")
-        elif regime == "UNKNOWN":
-            regime_score -= 0.30
-            reasons.append(f"Regime: UNKNOWN (High Risk Penalty)")
-
-        # ── Range-day damp on the regime pillar ──
-        # 2026-07-03: the 5min detector read TRENDING 54-60% of a confirmed
-        # RANGE_DAY, and the +0.30 alignment bonus on those phantom trends
-        # manufactured A+ labels that went 0/6. On a confirmed range day the
-        # trend-alignment bonus is capped — reversal/thrust paths are graded
-        # elsewhere and unaffected.
-        try:
-            from config.settings import get_settings as _gs_damp
-            _damp_settings = _gs_damp()
-            if (
-                bool(getattr(_damp_settings, "range_day_regime_pillar_damp_enabled", True))
-                and str(day_type or "").upper() == "RANGE_DAY"
-                and float(day_type_confidence or 0.0)
-                >= float(getattr(_damp_settings, "range_day_regime_pillar_min_confidence", 0.60) or 0.60)
-            ):
-                _cap = float(getattr(_damp_settings, "range_day_regime_pillar_bonus_cap", 0.10) or 0.10)
-                if regime_score > _cap:
-                    regime_score = _cap
-                    reasons.append(
-                        f"Range-day damp: {regime} alignment bonus capped at +{_cap:.2f} "
-                        "(session is a confirmed range day)"
-                    )
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
-            logger.debug(f"Range-day regime damp settings unavailable: {exc}")
+        # ── Pillar 3: REGIME (30% Weight), with the range-day damp ──
+        regime_delta, regime_reasons = regime_pillar_score(
+            regime, signal.signal_type, day_type=day_type, day_type_confidence=day_type_confidence
+        )
+        regime_score += regime_delta
+        reasons.extend(regime_reasons)
 
         # ── Pillar 4: MANIPULATION FILTER (Global Penalty) ──
         c = getattr(signal, "raw_candle", None)
@@ -270,17 +331,68 @@ class SignalManager:
             if total > 0:
                 wick_top = c['high'] - max(c['open'], c['close'])
                 wick_bottom = min(c['open'], c['close']) - c['low']
-                # Penalize BUY if it has a massive TOP wick (rejection of higher prices)
-                if signal.signal_type == "BUY" and wick_top > (body * 2.5):
+                # A small body alone cannot make a tiny contrary wick a trap.
+                # Require substantial, dominant rejection and a close away from
+                # the rejected edge. This is symmetric for BUY and SELL dojis.
+                top_rejection = (
+                    wick_top > body * 2.5 and wick_top >= total * 0.40
+                    and wick_top > wick_bottom and (c['close'] - c['low']) / total <= 0.60
+                )
+                bottom_rejection = (
+                    wick_bottom > body * 2.5 and wick_bottom >= total * 0.40
+                    and wick_bottom > wick_top and (c['high'] - c['close']) / total <= 0.60
+                )
+                if signal.signal_type == "BUY" and top_rejection:
                     tech_score -= 0.4 
                     reasons.append("⚠️ ALERT: Supply-Trap Wick Detected")
                 # Penalize SELL if it has a massive BOTTOM wick (rejection of lower prices)
-                elif signal.signal_type == "SELL" and wick_bottom > (body * 2.5):
+                elif signal.signal_type == "SELL" and bottom_rejection:
                     tech_score -= 0.4
                     reasons.append("⚠️ ALERT: SL-Hunt Wick Detected")
 
-        # Final Mixed Score Calculation
-        total_score = tech_score + intel_score_part + regime_score - vix_penalty
+        # ADX, timeframe trend, regime and partner agreement describe correlated
+        # trend evidence. They share the existing 0.30 regime-pillar budget.
+        from engine.scanner_modes import scanner_mode as native_scanner_mode
+        scanner_mode = native_scanner_mode(_s, signal)
+        agreement = max(0, min(3, int(getattr(signal, "trend_agreement", 0) or 0)))
+        agreement_bonus = 0.0
+        if scanner_mode in {"adaptive_dual", "quad_prime"}:
+            agreement_bonus = min(
+                max(0.0, float(getattr(_s, "utbot_prime_max_confidence_bonus", 0.09) or 0.0)),
+                agreement * max(0.0, float(getattr(_s, "utbot_prime_confidence_per_agreement", 0.03) or 0.0)),
+            )
+        trend_raw = adx_score + mtf_score + regime_score
+        trend_budget = 0.30
+        if (
+            bool(getattr(_s, "range_day_regime_pillar_damp_enabled", True))
+            and str(day_type or "").upper() == "RANGE_DAY"
+            and float(day_type_confidence or 0.0) >= float(getattr(_s, "range_day_regime_pillar_min_confidence", .60) or .60)
+        ):
+            # Correlated votes cannot undo the existing confirmed-range-day damp.
+            trend_budget = min(.30, max(0., float(getattr(_s, "range_day_regime_pillar_bonus_cap", .10) or .10)))
+        trend_group = max(-0.30, min(trend_budget, trend_raw))
+        nontrend_score = tech_score - adx_score - mtf_score
+        agreement_score = 0.0
+        if agreement_bonus:
+            # Existing agreement settings are confidence points. Convert their
+            # requested change to score units before enforcing the shared budget;
+            # this preserves their meaning wherever the trend budget has room.
+            base_confidence = confidence_from_total_score(trend_group + nontrend_score + intel_score_part - vix_penalty)
+            requested_confidence = min(1.0 - 1e-9, base_confidence + agreement_bonus)
+            if setting_enabled(getattr(_s, "ut_confidence_logistic", True), True):
+                import math
+                k = float(getattr(_s, "ut_confidence_logistic_k", 5.0) or 5.0)
+                if k > 0 and 0 < base_confidence < requested_confidence < 1:
+                    agreement_score = (math.log(requested_confidence / (1-requested_confidence)) - math.log(base_confidence / (1-base_confidence))) / k
+            else:
+                agreement_score = max(0.0, requested_confidence - base_confidence)
+            trend_raw += agreement_score
+            trend_group = max(-0.30, min(trend_budget, trend_raw))
+        total_score = trend_group + nontrend_score + intel_score_part - vix_penalty
+        if trend_group != trend_raw:
+            reasons.append(f"Correlated trend evidence shares a -0.30/+{trend_budget:.2f} score budget")
+        if agreement_score:
+            reasons.append(f"Partner agreement {agreement}/3 included in the shared trend budget")
         # ── Confidence de-saturation ──
         # Legacy: clamp(0.5 + total_score, 0, 1) pinned at 1.0 for any setup whose
         # pillars summed past +0.5 — ~45% of signals graded "A+ @ 100%", so the
@@ -304,77 +416,25 @@ class SignalManager:
             confidence = max(0.0, min(1.0, 0.5 + total_score))
         confidence = max(0.0, min(1.0, confidence))
         _confidence_pre_adjust = confidence
-        # R5: optional isotonic calibration to realized win-rate (default OFF;
-        # no-op until the outcome dataset is ready). Makes confidence a probability.
-        try:
-            from config.settings import get_settings as _gs2
-            from intelligence.confidence_calibration import calibrate as _calibrate_conf
-            _settings = _gs2()
-            confidence = max(
-                0.0,
-                min(
-                    1.0,
-                    _calibrate_conf(
-                        confidence,
-                        _settings,
-                        instrument=getattr(signal, "instrument", ""),
-                        timeframe=getattr(signal, "timeframe", ""),
-                        regime=regime,
-                    ),
-                ),
-            )
-        except Exception as exc:
-            logger.debug(f"Confidence calibration unavailable: {exc}")
-            _settings = None
 
+        # Caps constrain the final score, including every agreement bonus.
         try:
-            if _settings is None:
-                from config.settings import get_settings as _gs_cap
-                _settings = _gs_cap()
             raw_adx = float(getattr(signal, "adx_value", 0.0) or 0.0)
-            cap = float(getattr(_settings, "ut_exhaustion_confidence_cap", 0.82) or 0.82)
+            cap = float(getattr(_s, "ut_exhaustion_confidence_cap", 0.82) or 0.82)
             if raw_adx > 40.0 and 0.0 < cap < 1.0 and confidence > cap:
                 confidence = cap
-                reasons.append(
-                    f"Exhaustion cap: ADX {raw_adx:.0f} > 40 caps confidence at {cap:.0%}"
-                )
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+                reasons.append(f"Exhaustion cap: ADX {raw_adx:.0f} > 40 caps confidence at {cap:.0%}")
+        except (AttributeError, TypeError, ValueError) as exc:
             logger.debug(f"Exhaustion confidence cap unavailable: {exc}")
 
-        try:
-            if _settings is None:
-                from config.settings import get_settings as _gs3
-                _settings = _gs3()
-            scanner_mode = str(getattr(_settings, "scanner_engine", "") or "").lower()
-            if scanner_mode in {"adaptive_dual", "quad_prime"}:
-                agreement = max(0, min(3, int(getattr(signal, "trend_agreement", 0) or 0)))
-                per = max(
-                    0.0,
-                    float(getattr(_settings, "utbot_prime_confidence_per_agreement", 0.03) or 0.0),
-                )
-                cap = max(
-                    0.0,
-                    float(getattr(_settings, "utbot_prime_max_confidence_bonus", 0.09) or 0.0),
-                )
-                bonus = min(cap, agreement * per)
-                if bonus > 0:
-                    confidence = max(0.0, min(1.0, confidence + bonus))
-                    sources = [
-                        str(src).lower()
-                        for src in (getattr(signal, "trend_agreement_sources", None) or [])
-                        if str(src or "").strip()
-                    ]
-                    source_text = f" ({'+'.join(sources)})" if sources else ""
-                    label = (
-                        "Adaptive Dual Lane A"
-                        if scanner_mode == "adaptive_dual"
-                        else "Quad Prime"
-                    )
-                    reasons.append(
-                        f"{label} agreement {agreement}/3{source_text}: +{bonus:.0%} confidence"
-                    )
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
-            logger.debug(f"Prime agreement confidence settings unavailable: {exc}")
+        # Compatibility confidence remains the setup score used by existing gates.
+        # Outcome estimates are attached at the frozen decision boundary using a
+        # validated shadow model. The legacy accepted-trade-only curve cannot
+        # calibrate this new scoring version or its different fixed-horizon target.
+        signal.setup_score = confidence
+        signal.calibrated_win_probability = None
+        signal.confidence_calibrated = False
+        signal.expected_net_r = None
 
         # Grade is purely a display bucket of confidence — single source of truth
         # lives in engine.signal_quality_policy.confidence_to_grade.
@@ -389,15 +449,47 @@ class SignalManager:
         # rtracker without changing this function's return arity.
         try:
             setattr(signal, "grade_pillars", {
+                "scoring_version": "bounded_evidence.v2",
+                "trend_group": round(trend_group, 4),
+                "trend_raw": round(trend_raw, 4),
+                "trend_adx": round(adx_score, 4),
+                "trend_mtf": round(mtf_score, 4),
+                "trend_agreement": round(agreement_score, 4),
+                "nontrend": round(nontrend_score, 4),
                 "tech": round(float(tech_score), 4),
                 "intel": round(float(intel_score_part), 4),
                 "regime": round(float(regime_score), 4),
                 "vix_penalty": round(float(vix_penalty), 4),
+                "vix_available": vix_available,
                 "total_score": round(float(total_score), 4),
                 "confidence_pre_adjust": round(float(_confidence_pre_adjust), 4),
                 "confidence_final": round(float(confidence), 4),
                 "adjustments": round(float(confidence - _confidence_pre_adjust), 4),
                 "grade": str(grade),
+                "setup_score": float(confidence),
+                "calibrated_win_probability": signal.calibrated_win_probability,
+                "expected_net_r": None,
+            })
+            # A buffered candidate must replay this complete computation, including
+            # nonlinear calibration/caps. The old aggregate `adjustments` delta is
+            # telemetry, not a reusable arithmetic term. Keep only grading inputs,
+            # detached from the mutable engine signal and safe for warm-memory JSON.
+            raw_inputs = {}
+            for name in (
+                "instrument", "timeframe", "signal_type", "timestamp",
+                "signal_available_at", "price", "trailing_stop", "stop_distance",
+                "atr_value", "adx_value", "position_state", "bar_index", "raw_candle",
+                "trend_agreement", "trend_agreement_sources", "source_engine", "source_lane",
+                "source_engines", "impulse_confirmed", "is_explosive_bypass", "power_move",
+            ):
+                value = getattr(signal, name, None)
+                raw_inputs[name] = value.isoformat() if isinstance(value, datetime) else deepcopy(value)
+            setattr(signal, "grading_inputs", {
+                "schema": "signal_grading_inputs.v1",
+                "signal": raw_inputs,
+                "confluence_score": float(confluence_score or 0.0),
+                "vix_value": vix_value if vix_available else None,
+                "reasons": list(reasons),
             })
         except Exception as exc:  # telemetry must never break grading
             logger.debug(f"Pillar breakdown telemetry unavailable: {exc}")

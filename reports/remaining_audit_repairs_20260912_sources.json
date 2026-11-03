@@ -1,0 +1,29 @@
+{
+  "source_sha256": {
+    "scanner.py": "53f9f69d2a5eecf0ba53a24a910d9c923e4327f7d34fc7144fd74504091bd931",
+    "data/market_data.py": "2aa716f9125d60816fe10bd93cfd5341f852ea96789b0254cf2ae42865b6dfac",
+    "data/kite_market_data.py": "3e7f8c5c4999b068baab8a967cca7e771cf62ce564a0c3abf49ac540dbcd28da",
+    "data/candle_builder.py": "8e22c5bd42230ef4f5d9ff35d6fe9419f31a5745bfc6c69fa6e6e0addcb27750",
+    "data/derivative_participation.py": "79fef07fa08271b84d6a27cff0302c0758e32ef3139f1a4d18de5189b221ea31",
+    "engine/expiry_manager.py": "a0d16e27bcb7dde7dbf30f01249bcb8eac9d28eb1c5228980b9c6460b83af5e6",
+    "engine/multi_timeframe.py": "b026097c408b35b6897c86d5decdebf99726e447d7b322af45cb4f20f3da264c",
+    "engine/quality_verdict.py": "d2a5356985bc9fdf206cdb1aa78216f50ddd14bf3e4deb0d2b84cc84b8fe0201",
+    "intelligence/intelligence_aggregator.py": "0d9414c8f56099871365cf11504fdbc22893c2b80992a4184ebce40510d23055",
+    "intelligence/oi_tracker.py": "e6c4dba6c01ee9424aaab5c38ac0b9091f70969bd3ff98a0364e34f3103db4ec",
+    "intelligence/pcr_engine.py": "7d49ab04e449b9d822756664af0c6f40aea007899b8aa21197bc02eeccc03feb",
+    "intelligence/order_flow.py": "188badc0ed6f874732e788b9e3f67a8fc667a30075b1d147f29ec0e1175f5629",
+    "intelligence/session_context.py": "29b2b5092a4b9d4ae2470caf7f569d8a58a9ba7c3fa6010c47bb00be71d6ffc5",
+    "intelligence/volume_profiler.py": "6cc6c5b15cb9f3803caabbae451e783f0528445bbfa5220d6fc82a5bd17993f9",
+    "intelligence/regime_detector.py": "be6dee9a2cd4d18c4cfd49314a761a96ca861aeacb1562e0730d238eb3e4d8c4",
+    "tests/test_remaining_audit_repairs_2026_09_11.py": "1c360a20f60ab8b2982c01fda7d23bda74692d6b78f73bbf01994dcc138db791"
+  },
+  "new_regression_cases": 86,
+  "full_suite_result": "remaining_fixes_verified_20260912.xml",
+  "verification": {
+    "passed": 6025,
+    "failures": 0,
+    "errors": 0,
+    "deselected": 4,
+    "relevant_source_hashes_match": true
+  }
+}

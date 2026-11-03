@@ -1,8 +1,8 @@
-"""Sanitized AngelOne read-only market-data fallback.
+"""Sanitized AngelOne read-only market-data adapter.
 
 Spot indices are computed values and AngelOne reports zero traded volume for them,
-so index quotes remain price-only. Option market data is accepted only after the
-active Kite contract identity is independently resolved to AngelOne's own token.
+so index quotes remain price-only. Options use AngelOne's own current tokens after
+exact contract resolution or validation of independent master metadata.
 """
 
 from __future__ import annotations
@@ -11,6 +11,9 @@ import logging
 import json
 import threading
 import time
+import math
+import ssl
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -18,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pyotp
 import requests
 from loguru import logger
+from data.angelone_readonly import AngelReadOnlyCapabilities
 
 
 ANGELONE_INDEX_TARGETS = {
@@ -34,8 +38,8 @@ ANGELONE_SCRIP_MASTER_URL = (
 ANGELONE_OPTION_ROOTS = tuple(ANGELONE_INDEX_TARGETS)
 
 
-class AngelOneIndexQuoteSource:
-    """Small, fail-closed SmartAPI REST client for index quote redundancy."""
+class AngelOneIndexQuoteSource(AngelReadOnlyCapabilities):
+    """Fail-closed SmartAPI data client with optional independent streaming."""
 
     def __init__(
         self,
@@ -52,10 +56,13 @@ class AngelOneIndexQuoteSource:
         self._totp_secret = str(totp_secret or "").strip()
         self._timeout_seconds = max(1.0, min(10.0, float(timeout_seconds or 5.0)))
         self._api: Any = None
+        self._index_rest_cache = {}
+        self._init_capabilities()
         self._lock = threading.RLock()
         self.connected = False
         self.last_success_at = 0.0
         self.last_error = ""
+        self._auth_error_code = ""
         self._retry_after = 0.0
         self._option_master_lock = threading.RLock()
         self._option_master_date = ""
@@ -82,9 +89,31 @@ class AngelOneIndexQuoteSource:
         from SmartApi import SmartConnect
 
         smart_module.logger.setLevel(logging.CRITICAL)
+        # SDK constructors replace handlers and reset levels. The disabled flag
+        # survives that reconfiguration, including concurrent reconnects.
+        smart_module.logger.disabled = True
         for handler in list(getattr(smart_module.logger, "handlers", ()) or ()):
             handler.setLevel(logging.CRITICAL)
         return SmartConnect
+
+    @staticmethod
+    def _load_stream_sdk():
+        import websocket
+        import SmartApi.smartWebSocketV2 as module
+
+        module.logger.disabled = True
+        module.logger.setLevel(logging.CRITICAL)
+
+        class VerifiedSocket(module.SmartWebSocketV2):
+            def connect(self):
+                headers = {"Authorization": self.auth_token, "x-api-key": self.api_key,
+                           "x-client-code": self.client_code, "x-feed-token": self.feed_token}
+                self.wsapp = websocket.WebSocketApp(self.ROOT_URI, header=headers, on_open=self._on_open,
+                    on_error=self._on_error, on_close=self._on_close, on_data=self._on_data,
+                    on_ping=self._on_ping, on_pong=self._on_pong)
+                self.wsapp.run_forever(sslopt={"cert_reqs": ssl.CERT_REQUIRED}, ping_interval=10,
+                                      ping_payload=self.HEART_BEAT_MESSAGE)
+        return VerifiedSocket
 
     def connect(self, *, force: bool = False) -> bool:
         if not self.configured:
@@ -107,15 +136,28 @@ class AngelOneIndexQuoteSource:
                     self._password,
                     pyotp.TOTP(self._totp_secret).now(),
                 )
-                if not isinstance(response, dict) or not response.get("status"):
+                if not isinstance(response, dict) or response.get("status") is not True:
+                    code = str(response.get("errorcode") or response.get("errorCode") or "") if isinstance(response, dict) else ""
+                    self._auth_error_code = code if re.fullmatch(r"[A-Za-z0-9_-]{0,32}", code) else ""
                     self._api = None
                     self.connected = False
                     self.last_error = "authentication_rejected"
-                    self._retry_after = time.time() + 30.0
+                    message = str(response.get("message") or "").casefold() if isinstance(response, dict) else ""
+                    limited = "attempt" in message and ("pin" in message or "exceed" in message)
+                    invalid = "invalid" in message and any(word in message for word in ("password", "mpin", "user id", "userid"))
+                    if limited:
+                        self.last_error = "authentication_attempt_limit"
+                    # Repeating a rejected PIN on each stream retry can lock the
+                    # account. Leave transient server failures on the shorter retry.
+                    self._retry_after = time.time() + (300.0 if limited or invalid else 30.0)
                     return False
                 self._api = api
+                session_data = response.get("data") or {}
+                self._jwt_token = str(session_data.get("jwtToken") or "")
+                self._feed_token = str(session_data.get("feedToken") or getattr(api, "feed_token", "") or "")
                 self.connected = True
                 self.last_error = ""
+                self._auth_error_code = ""
                 self._retry_after = 0.0
                 logger.info("AngelOne read-only market-data fallback connected.")
                 return True
@@ -152,12 +194,75 @@ class AngelOneIndexQuoteSource:
                 continue
             if not symbol.endswith(("CE", "PE")) or not symbol.startswith(roots):
                 continue
-            contracts[(exchange, symbol)] = {
+            normalized = {
                 "exchange": exchange,
                 "symbol": symbol,
                 "token": token,
             }
+            # Keep verifiable raw master identity for an independent fallback.
+            # Legacy caches without these fields can still translate a known
+            # execution contract, but cannot define their own option universe.
+            name = str(raw.get("name") or "").upper()
+            kind = str(raw.get("instrumenttype") or "").upper()
+            try:
+                expiry = datetime.strptime(str(raw.get("expiry") or "").upper(), "%d%b%Y").date()
+                strike = float(raw.get("strike"))
+                if (name in ANGELONE_OPTION_ROOTS and kind == "OPTIDX" and math.isfinite(strike)
+                        and strike > 0 and exchange == ("BFO" if name == "SENSEX" else "NFO")):
+                    normalized.update(name=name, instrumenttype=kind, expiry=expiry.strftime("%d%b%Y").upper(),
+                                      strike=strike, strike_val=strike/100.)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            contracts[(exchange, symbol)] = normalized
         return contracts
+
+    def option_contracts(self, index_symbol: str = "", *, expiry=None) -> List[Dict[str, Any]]:
+        """Return independent contracts only from complete current master metadata."""
+        name = str(index_symbol or "").upper()
+        if name and name not in ANGELONE_OPTION_ROOTS:
+            return []
+        try:
+            wanted = (expiry.date() if isinstance(expiry, datetime) else expiry) if expiry is not None else None
+            if isinstance(wanted, str):
+                wanted = datetime.strptime(wanted[:10], "%Y-%m-%d").date()
+            master = self._load_option_master()
+            if master and not any(row.get("instrumenttype") == "OPTIDX" for row in master.values()):
+                # Today's pre-upgrade cache may contain tokens only. Refresh it
+                # once, with a cooldown, rather than guessing missing metadata.
+                with self._option_master_lock:
+                    now = time.monotonic()
+                    if now < getattr(self, "_independent_master_retry_at", 0.):
+                        return []
+                    self._independent_master_retry_at = now+60.
+                master = self._load_option_master(force=True)
+        except (TypeError, ValueError, OSError):
+            return []
+        contracts = []
+        for row in master.values():
+            underlying = str(row.get("name") or "").upper()
+            if (underlying not in ANGELONE_OPTION_ROOTS or (name and underlying != name)
+                    or row.get("instrumenttype") != "OPTIDX"
+                    or not str(row.get("symbol") or "").startswith(underlying)
+                    or row.get("exchange") != ("BFO" if underlying == "SENSEX" else "NFO")):
+                continue
+            try:
+                day = datetime.strptime(row["expiry"], "%d%b%Y").date()
+                strike = float(row["strike"])/100.
+                side = str(row["symbol"])[-2:]
+                if (day < datetime.now().date() or (wanted is not None and day != wanted)
+                        or not math.isfinite(strike) or strike <= 0 or side not in {"CE", "PE"}):
+                    continue
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            contracts.append(dict(name=underlying, exchange=row["exchange"], tradingsymbol=row["symbol"],
+                                  token=row["token"], expiry=day, strike=strike, instrument_type=side,
+                                  _angel_native=True))
+        # Ambiguous same-contract identities are unavailable, never guessed.
+        identities = {}
+        for contract in contracts:
+            key = (contract["name"], contract["expiry"], contract["strike"], contract["instrument_type"])
+            identities.setdefault(key, []).append(contract)
+        return [rows[0] for rows in identities.values() if len(rows) == 1]
 
     def _read_option_master_cache(self, day: str) -> Dict[Tuple[str, str], Dict[str, str]]:
         path = self._option_master_cache_path
@@ -231,9 +336,18 @@ class AngelOneIndexQuoteSource:
     @staticmethod
     def _number(payload: Dict[str, Any], key: str) -> float:
         try:
-            return float(payload.get(key) or 0.0)
+            value = float(payload.get(key) or 0.0)
+            return value if math.isfinite(value) else 0.0
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _option_volume(payload: Dict[str, Any]) -> float:
+        try:
+            value = float(payload["tradeVolume"])
+            return value if math.isfinite(value) and value >= 0 else float("nan")
+        except (KeyError, TypeError, ValueError):
+            return float("nan")
 
     def get_index_quote(self, symbol: str, *, retry_auth: bool = True) -> Optional[Dict[str, Any]]:
         name = str(symbol or "").upper()
@@ -244,45 +358,49 @@ class AngelOneIndexQuoteSource:
             if not self.connect():
                 return None
         exchange, trading_symbol, token = target
+        streamed = self.stream_quote(exchange, trading_symbol)
+        if streamed is not None:
+            return {**streamed, "volume_available": False, "volume": 0.0, "volume_unit": "none"}
         with self._lock:
-            try:
-                response = self._api.ltpData(exchange, trading_symbol, token)
-            except Exception:
-                self.connected = False
-                self.last_error = "quote_failed"
-                self._retry_after = time.time() + 10.0
-                return None
-            if not isinstance(response, dict) or not response.get("status"):
-                code = str(response.get("errorcode") or response.get("errorCode") or "")
-                if retry_auth and code == "AG8001":
-                    self.connected = False
-                    self._api = None
-                    if self.connect(force=True):
-                        return self.get_index_quote(name, retry_auth=False)
-                self.last_error = "quote_rejected"
-                return None
-            row = response.get("data") or {}
-            ltp = self._number(row, "ltp")
-            if ltp <= 0:
-                self.last_error = "non_positive_quote"
-                return None
             now = time.time()
-            self.last_success_at = now
-            self.last_error = ""
-            return {
-                "ltp": ltp,
-                "open": self._number(row, "open"),
-                "high": self._number(row, "high"),
-                "low": self._number(row, "low"),
-                "previous_close": self._number(row, "close"),
-                "received_at": now,
-                "exchange_at": None,
-                "source": "angel_rest",
-                "volume_available": False,
-                "volume": 0.0,
-                "volume_unit": "none",
-                "volume_unavailable_reason": "spot_index_is_not_traded",
-            }
+            cached = self._index_rest_cache.get(name)
+            if cached and 0 <= now-cached["received_at"] <= 2:
+                stamp = cached.get("exchange_at")
+                if stamp is None or -1.0 <= now-stamp <= 6:
+                    return dict(cached)
+            # One bounded request refreshes every index. Per-index requests could
+            # consume the shared budget forever before the last indices got a turn.
+            tokens = {}
+            for venue, _, own_token in ANGELONE_INDEX_TARGETS.values():
+                tokens.setdefault(venue, []).append(own_token)
+            rows = self.get_full_quotes(tokens)
+            if not rows and not self.connected and retry_auth and self.connect(force=True):
+                return self.get_index_quote(name, retry_auth=False)
+            for index, (venue, _, own_token) in ANGELONE_INDEX_TARGETS.items():
+                row = rows.get((venue, own_token))
+                if not isinstance(row, dict) or self._number(row, "ltp") <= 0:
+                    continue
+                received = float(row["received_at"])
+                stamp = row.get("exchange_at")
+                if stamp is not None and not -1.0 <= time.time()-stamp <= 6:
+                    continue
+                self._index_rest_cache[index] = {
+                    "ltp": self._number(row, "ltp"),
+                    "open": self._number(row, "open"), "high": self._number(row, "high"),
+                    "low": self._number(row, "low"), "previous_close": self._number(row, "close"),
+                    "received_at": received, "exchange_at": stamp, "source": "angel_rest",
+                    "volume_available": False, "volume": 0.0, "volume_unit": "none",
+                    "volume_unavailable_reason": "spot_index_is_not_traded",
+                }
+                self.last_success_at = received
+            selected = self._index_rest_cache.get(name)
+            stamp = selected.get("exchange_at") if selected else None
+            now = time.time()
+            if (selected and 0 <= now-selected["received_at"] <= 2
+                    and (stamp is None or -1.0 <= now-stamp <= 6)):
+                self.last_error = ""
+                return dict(selected)
+            return None
 
     @staticmethod
     def _option_identity(
@@ -297,6 +415,13 @@ class AngelOneIndexQuoteSource:
         kite_symbol = str(contract.get("symbol") or "").upper()
         if option_type not in {"CE", "PE"} or exchange not in {"NFO", "BFO"}:
             return None
+        if contract.get("_angel_native"):
+            if (str(contract.get("name") or "").upper() != name
+                    or exchange != ("BFO" if name == "SENSEX" else "NFO")
+                    or not kite_symbol.endswith(option_type)):
+                return None
+            return {"exchange": exchange, "symbol": kite_symbol,
+                    "query": kite_symbol[:-2], "option_type": option_type}
         if exchange == "BFO" and kite_symbol.endswith(option_type):
             angel_symbol = kite_symbol
         else:
@@ -337,7 +462,7 @@ class AngelOneIndexQuoteSource:
         *,
         retry_auth: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Resolve exact Angel tokens from daily master, then quote all pairs in one call."""
+        """Resolve exact Angel tokens, then quote pairs in budgeted batches."""
         if not self.connected or self._api is None:
             if not self.connect():
                 return []
@@ -382,48 +507,18 @@ class AngelOneIndexQuoteSource:
             exchange: list(dict.fromkeys(tokens))
             for exchange, tokens in exchange_tokens.items()
         }
+        quotes = self.get_full_quotes(exchange_tokens, wait=1.1)
+        if not quotes and not self.connected and retry_auth:
+            if self.connect(force=True):
+                return self.get_option_pairs(index_symbol, contract_pairs, retry_auth=False)
         with self._lock:
-            try:
-                response = None
-                for attempt in range(2):
-                    try:
-                        response = self._api.getMarketData(
-                            mode="FULL", exchangeTokens=exchange_tokens
-                        )
-                    except Exception:
-                        response = None
-                    if isinstance(response, dict) and response.get("status"):
-                        break
-                    if attempt == 0:
-                        time.sleep(1.1)
-            except Exception:
-                self.last_error = "option_market_data_failed"
-                return []
-
-            if not isinstance(response, dict) or not response.get("status"):
-                code = str(response.get("errorcode") or response.get("errorCode") or "")
-                if retry_auth and code == "AG8001":
-                    self.connected = False
-                    self._api = None
-                    if self.connect(force=True):
-                        return self.get_option_pairs(
-                            index_symbol, contract_pairs, retry_auth=False
-                        )
-                self.last_error = "option_market_data_rejected"
-                return []
-
-            fetched = (response.get("data") or {}).get("fetched") or []
-            by_token = {
-                str(row.get("symbolToken") or row.get("symboltoken") or row.get("token") or ""): row
-                for row in fetched if isinstance(row, dict)
-            }
             result: List[Dict[str, Any]] = []
             for item in prepared:
                 quoted = {"strike": item["strike"], "expiry": item["expiry"]}
                 complete = True
                 for side in ("CE", "PE"):
                     identity = item[side]
-                    row = by_token.get(identity["token"])
+                    row = quotes.get((identity["exchange"], identity["token"]))
                     ltp = self._number(row, "ltp") if isinstance(row, dict) else 0.0
                     if ltp <= 0:
                         complete = False
@@ -432,7 +527,10 @@ class AngelOneIndexQuoteSource:
                         **identity,
                         "ltp": ltp,
                         "oi": max(0.0, self._number(row, "opnInterest")),
-                        "volume": max(0.0, self._number(row, "totTrdQty")),
+                        "volume": self._option_volume(row),
+                        "volume_available": math.isfinite(self._option_volume(row)),
+                        "received_at": row.get("received_at"),
+                        "exchange_at": row.get("exchange_at"),
                     }
                 if complete:
                     result.append(quoted)
@@ -466,10 +564,15 @@ class AngelOneIndexQuoteSource:
             "connected": bool(self.connected),
             "last_success_age_seconds": round(age, 2) if age is not None else None,
             "last_error": self.last_error,
+            "auth_error_code": self._auth_error_code,
             "price_only": False,
             "index_price_only": True,
             "option_market_data": True,
             "index_volume_available": False,
+            "stream_connected": self._stream_connected,
+            "stream_last_tick": self._stream_last_tick,
+            "history_last_success": self._history_last_success,
+            "history_error": self._history_error,
             "option_master_date": self._option_master_date,
             "option_master_contracts": len(self._option_master_by_symbol),
         }

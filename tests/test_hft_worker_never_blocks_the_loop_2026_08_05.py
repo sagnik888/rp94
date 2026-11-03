@@ -152,7 +152,7 @@ def test_the_hft_worker_asks_for_the_non_blocking_variant():
     import inspect
 
     src = inspect.getsource(Scanner._background_hft_worker)
-    assert "_update_active_trades(allow_blocking=False)" in src, (
+    assert "_run_exit_tick()" in src, (
         "the 100ms worker is back to the blocking call"
     )
 
@@ -184,17 +184,12 @@ def test_the_scan_cycle_does_not_block_the_loop_either():
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "_update_active_trades"
+        and n.func.attr == "_run_exit_tick"
     ]
     assert calls, "_scan_cycle no longer updates active trades at all"
-    for call in calls:
-        kw = {k.arg: k.value for k in call.keywords}
-        assert "allow_blocking" in kw, (
-            "_scan_cycle calls _update_active_trades() with the default allow_blocking="
-            "True, so a blocking option-chain fetch runs on the scanner event loop"
-        )
-        assert isinstance(kw["allow_blocking"], ast.Constant)
-        assert kw["allow_blocking"].value is False
+    from engine.exit_cycle import ExitCycleService
+    tick = inspect.getsource(ExitCycleService.run_tick)
+    assert "update_active_trades(allow_blocking=False)" in tick
 
 
 def test_the_background_refresher_still_does_the_blocking_fetch():

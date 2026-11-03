@@ -24,6 +24,14 @@ from engine.position_sizing import resolve_trade_lots
 from engine.signal_processor import SignalProcessor, TradeCandidate
 
 
+@pytest.fixture(autouse=True)
+def _native_scanner_mode(monkeypatch):
+    """These cases cover native cascade policy, regardless of the live mode."""
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
+    # Fixed-lot semantics; equal-risk lots (2026-10-08) are tested separately.
+    monkeypatch.setattr(get_settings(), "risk_based_lots_enabled", False, raising=False)
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 def _cand(
@@ -143,7 +151,7 @@ def _full_cascade_wave(base_conf=0.80):
 
 class TestLotScalePolicy:
     def test_matrix_cascade_heavy_fixed(self):
-        s = Settings(
+        s = Settings(risk_based_lots_enabled=False, 
             auto_risk_sizing_enabled=False,
             cascade_lot_scale_enabled=True,
             cascade_lot_multiplier_opt=3.0,
@@ -155,7 +163,7 @@ class TestLotScalePolicy:
         )
         # Operator default (2026-07-10): FUT hard-capped at 1 lot out of the box.
         r_default = resolve_trade_lots(
-            settings=Settings(auto_risk_sizing_enabled=False),
+            settings=Settings(risk_based_lots_enabled=False, auto_risk_sizing_enabled=False),
             inst_type="FUT",
             requested_lots=3,
             lot_size=25,
@@ -192,20 +200,20 @@ class TestLotScalePolicy:
 
     def test_opt_cascade_clamped_2_to_3(self):
         assert cascade_multiplier_for_inst(
-            Settings(cascade_lot_multiplier_opt=5.0, cascade_lot_multiplier_opt_min=2.0),
+            Settings(risk_based_lots_enabled=False, cascade_lot_multiplier_opt=5.0, cascade_lot_multiplier_opt_min=2.0),
             "OPT",
         ) == pytest.approx(3.0)
         assert cascade_multiplier_for_inst(
-            Settings(cascade_lot_multiplier_opt=2.0, cascade_lot_multiplier_opt_min=2.0),
+            Settings(risk_based_lots_enabled=False, cascade_lot_multiplier_opt=2.0, cascade_lot_multiplier_opt_min=2.0),
             "OPT",
         ) == pytest.approx(2.0)
         assert heavy_trend_multiplier_for_inst(
-            Settings(heavy_trend_lot_multiplier_opt=5.0), "OPT"
+            Settings(risk_based_lots_enabled=False, heavy_trend_lot_multiplier_opt=5.0), "OPT"
         ) == pytest.approx(2.0)
-        assert heavy_trend_multiplier_for_inst(Settings(), "FUT") == pytest.approx(1.0)
+        assert heavy_trend_multiplier_for_inst(Settings(risk_based_lots_enabled=False), "FUT") == pytest.approx(1.0)
 
     def test_base_1_lot_cascade_opt_still_scales(self):
-        s = Settings(
+        s = Settings(risk_based_lots_enabled=False, 
             auto_risk_sizing_enabled=False,
             cascade_lot_multiplier_opt=3.0,
             cascade_lot_multiplier_opt_min=2.0,
@@ -375,7 +383,7 @@ class TestMidcapCascadeStack:
         assert "cascade" in basis.lower()
 
     def test_lot_base1_cascade_is_2_to_3_not_six(self):
-        s = Settings(
+        s = Settings(risk_based_lots_enabled=False, 
             auto_risk_sizing_enabled=False,
             cascade_lot_multiplier_opt=3.0,
             cascade_lot_multiplier_opt_min=2.0,
@@ -387,7 +395,7 @@ class TestMidcapCascadeStack:
         )
         assert r3.lots == 3
         assert r3.mode == "cascade"
-        s2 = Settings(
+        s2 = Settings(risk_based_lots_enabled=False, 
             auto_risk_sizing_enabled=False,
             cascade_lot_multiplier_opt=2.0,
             cascade_lot_multiplier_opt_min=2.0,
@@ -473,11 +481,14 @@ class TestConcurrencyCaps:
 # ── HEAVY TREND ALIGNMENT ────────────────────────────────────────────
 
 class TestHeavyTrendAlign:
-    def test_two_of_four_eligible(self):
+    def test_three_of_four_eligible(self):
+        """2026-09-26 user: 3 of 4 indices (2 of 4 no longer doubles)."""
         sc = _scanner()
         sc._cached_results = {
             "BANKNIFTY_15min": {"signals": [SimpleNamespace(signal_type="BUY")]}
         }
+        assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is False
+        sc._cached_results["SENSEX_15min"] = {"signals": [SimpleNamespace(signal_type="BUY")]}
         assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is True
 
     def test_solo_not_eligible(self):

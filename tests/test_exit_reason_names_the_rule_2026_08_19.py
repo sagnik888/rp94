@@ -35,6 +35,7 @@ import pytest
 
 from config.settings import get_settings
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 def _sc():
@@ -132,8 +133,9 @@ def test_neither_live_call_site_hardcodes_the_exit_name():
     create_exit / _close_and_record regardless of which rule fired."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     sites = [i for i in range(len(src)) if src.startswith("self._peak_giveback_cap_exit(", i)]
+    sites += [i for i in range(len(src)) if src.startswith("scanner._peak_giveback_cap_exit(", i)]
     assert len(sites) == 2, f"expected 2 call sites, found {len(sites)}"
 
     for start in sites:

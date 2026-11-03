@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from tests.source_views import scanner_runtime_source
 
 import pytz
 
@@ -84,8 +85,8 @@ def test_helpers_not_nifty_only():
 
 
 def test_manual_mode_path_intact_when_auto_off():
-    src = Path("scanner.py").read_text(encoding="utf-8")
-    assert "if not self.auto_mode and not is_warmup:" in src
+    src = scanner_runtime_source()
+    assert "if not scanner.auto_mode and not is_warmup:" in src
     assert "accepted_by_gate" in src
     assert "async def execute_manual_signal" in src
     assert 'exec_type="M"' in src or "exec_type='M'" in src

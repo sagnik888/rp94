@@ -7,7 +7,13 @@ const SCANNER_ENGINE_LABELS = {
     utbot_consensus: 'UT1 + Consensus',
     quad_union: 'Quad Union',
     quad_prime: 'Quad Prime',
+    quad_prime_s1: 'Quad Prime + S1',
+    ut_smart_s1: 'UT Smart Exit + S1',
     adaptive_dual: 'Adaptive Dual',
+    s1: 'S1 Confluence',
+    ut_smart: 'UT Smart Exit',
+    s1s2_dual: 'S1+S2 Dual (Pine v5.4)',
+    ut_ema: 'ut/ema',
 };
 
 const SCANNER_ENGINE_OPTIONS = [
@@ -17,7 +23,192 @@ const SCANNER_ENGINE_OPTIONS = [
     ['utbot_consensus', 'UT1 + Consensus'],
     ['quad_union', 'Quad Union'],
     ['quad_prime', 'Quad Prime'],
-    ['adaptive_dual', 'Adaptive Dual'],
+    ['quad_prime_s1', 'Quad Prime + S1'],
+    ['ut_smart_s1', 'UT Smart Exit + S1'],
+    ['ut_smart', 'UT Smart Exit'],
+    ['s1', 'S1 Confluence'],
+    ['s1s2_dual', 'S1+S2 Dual (Pine v5.4)'],
+    ['ut_ema', 'ut/ema'],
+];
+
+let S12_SETTINGS_FIELDS = [];
+
+function refreshS12SettingsCard(config = state.latestData?.config || {}) {
+    const schema = config?.s12_settings_schema;
+    const grid = document.querySelector('#settings-s12-engine .settings-grid');
+    if (!schema || !grid) return;
+    const fields = Object.entries(schema).map(([key, meta]) => {
+        const label = key.slice(4).replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const id = `sett${key.slice(4).split('_').map(part => part[0].toUpperCase() + part.slice(1)).join('')}`;
+        const kind = String(meta?.kind || 'float');
+        const fallback = meta?.default ?? config[key];
+        const extra = kind === 'enum'
+            ? (meta.choices || []).map(value => [value, String(value)])
+            : ['int', 'float'].includes(kind)
+                ? { min: meta.min, max: meta.max, step: meta.step || (kind === 'int' ? '1' : '0.01') }
+                : undefined;
+        return [key, id, label, kind, fallback, extra];
+    });
+    if (fields.length === S12_SETTINGS_FIELDS.length && fields.every((field, i) => field[0] === S12_SETTINGS_FIELDS[i]?.[0])) return;
+    S12_SETTINGS_FIELDS = fields;
+    grid.replaceChildren();
+    for (const [, id, label, kind, , extra] of fields) {
+        let control;
+        if (kind === 'bool') {
+            control = document.createElement('label');
+            control.className = 'settings-switch-card';
+            const title = document.createElement('span');
+            const strong = document.createElement('strong');
+            strong.textContent = label;
+            title.appendChild(strong);
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.id = id;
+            control.append(title, input);
+        } else {
+            control = document.createElement('div');
+            control.className = 'setting-group';
+            const title = document.createElement('label');
+            title.textContent = label;
+            const input = document.createElement(kind === 'enum' ? 'select' : 'input');
+            input.id = id;
+            if (kind === 'time') input.type = 'time';
+            else if (kind !== 'enum') {
+                input.type = 'number';
+                if (extra?.min !== undefined) input.min = String(extra.min);
+                if (extra?.max !== undefined) input.max = String(extra.max);
+                if (extra?.step !== undefined) input.step = String(extra.step);
+            }
+            if (kind === 'enum') for (const [value, text] of extra || []) {
+                const option = document.createElement('option');
+                option.value = value;
+                option.textContent = text;
+                input.appendChild(option);
+            }
+            control.append(title, input);
+        }
+        grid.appendChild(control);
+    }
+}
+
+// S1 engine / lane settings. Mirrors engine/s1_lane.py S1_SETTING_SPEC (a test keeps the
+// two key sets equal). [key, element id, label, kind, fallback, attrs-or-choices]
+const S1_SETTINGS_FIELDS = [
+    ['s1_candle_type', 'settS1CandleType', 'S1 Candle Source', 'enum', 'heikin_ashi', [['heikin_ashi', 'Heikin Ashi (manual reference)'], ['standard', 'Standard OHLC']]],
+    ['s1_min_score', 'settS1MinScore', 'Min Confluence Score', 'float', 60, { step: '1', min: '0', max: '100' }],
+    ['s1_conflict_margin', 'settS1ConflictMargin', 'Min Bull-Bear Gap', 'float', 20, { step: '1', min: '0', max: '100' }],
+    ['s1_min_adx', 'settS1MinAdx', 'Min ADX', 'float', 20, { step: '0.5', min: '0', max: '60' }],
+    ['s1_use_htf', 'settS1UseHtf', '15m EMA Alignment Gate', 'bool', true],
+    ['s1_signal_cooldown', 'settS1Cooldown', 'Min Bars Between Signals', 'int', 0, { step: '1', min: '0', max: '50' }],
+    ['s1_chart_sl1_pct', 'settS1ChartSl1', 'Chart SL1 % (your TradingView input)', 'float', 0.20, { step: '0.05', min: '0.01', max: '10' }],
+    ['s1_chart_sl2_pct', 'settS1ChartSl2', 'Chart SL2 % (your TradingView input)', 'float', 0.40, { step: '0.05', min: '0.05', max: '15' }],
+    ['s1_session_end', 'settS1SessionEnd', 'Chart Session Ends (drop bars from)', 'time', '15:15'],
+    ['s1_sl_mode', 'settS1SlMode', 'SL1 Mode', 'enum', 'fixed', [['anchor', 'Dynamic: 3-bar extreme'], ['atr', 'Dynamic: k x ATR'], ['fixed', 'Fixed %']]],
+    ['s1_sl_min_pct', 'settS1SlMinPct', 'Dynamic SL1 Min % of LTP', 'float', 0.10, { step: '0.01', min: '0.01', max: '2' }],
+    ['s1_sl_max_pct', 'settS1SlMaxPct', 'Dynamic SL1 Max % of LTP', 'float', 0.25, { step: '0.01', min: '0.01', max: '2' }],
+    ['s1_sl1_pct', 'settS1Sl1Pct', 'Fixed SL1 % of LTP', 'float', 0.10, { step: '0.01', min: '0.01', max: '2' }],
+    ['s1_sl_atr_mult', 'settS1SlAtrMult', 'ATR SL Multiple', 'float', 1.0, { step: '0.1', min: '0.1', max: '5' }],
+    ['s1_use_sl2', 'settS1UseSl2', 'SL2 Gap Stop', 'bool', false],
+    ['s1_sl2_pct', 'settS1Sl2Pct', 'SL2 % of LTP', 'float', 0.40, { step: '0.05', min: '0.05', max: '5' }],
+    ['s1_t1_r', 'settS1T1R', 'T1 (R)', 'float', 2, { step: '0.5', min: '0.5', max: '10' }],
+    ['s1_t2_r', 'settS1T2R', 'T2 (R)', 'float', 3, { step: '0.5', min: '0.5', max: '10' }],
+    ['s1_t3_r', 'settS1T3R', 'T3 (R)', 'float', 4, { step: '0.5', min: '0.5', max: '20' }],
+    ['s1_trail_start_r', 'settS1TrailStartR', 'Trail Starts At (R)', 'float', 1.5, { step: '0.25', min: '0.25', max: '10' }],
+    ['s1_trail_mult', 'settS1TrailMult', 'Trail ATR Offset', 'float', 1.8, { step: '0.1', min: '0.1', max: '10' }],
+    ['s1_exit_conf_bars', 'settS1ExitConfBars', 'Momentum Exit Confirm Bars', 'int', 3, { step: '1', min: '1', max: '10' }],
+    ['s1_circuit_pause', 'settS1CircuitPause', 'Circuit Breaker Pause Bars', 'int', 5, { step: '1', min: '0', max: '100' }],
+    ['s1_max_consec_loss_nifty', 'settS1ConsecNifty', 'Loss Streak Stop: NIFTY (0 = system setting)', 'int', 0, { step: '1', min: '0', max: '50' }],
+    ['s1_max_consec_loss_banknifty', 'settS1ConsecBankNifty', 'Loss Streak Stop: BANKNIFTY (0 = system setting)', 'int', 0, { step: '1', min: '0', max: '50' }],
+    ['s1_max_consec_loss_sensex', 'settS1ConsecSensex', 'Loss Streak Stop: SENSEX (0 = system setting)', 'int', 0, { step: '1', min: '0', max: '50' }],
+    ['s1_max_consec_loss_midcpnifty', 'settS1ConsecMidcp', 'Loss Streak Stop: MIDCPNIFTY (0 = system setting)', 'int', 0, { step: '1', min: '0', max: '50' }],
+    ['s1_entry_mode', 'settS1EntryMode', 'Signal State Machine', 'enum', 'pine', [['pine', 'Pine indicator state rules'], ['close', 'Close-entry replay']]],
+    ['s1_lane_enabled', 'settS1LaneEnabled', 'S1 Own Lane (skip other gates/guards)', 'bool', true],
+    ['s1_lane_guard_pct_1min', 'settS1Guard1m', 'Premium Guard % 1m', 'float', 5, { step: '1', min: '1', max: '50' }],
+    ['s1_lane_guard_pct_5min', 'settS1Guard5m', 'Premium Guard % 5m', 'float', 10, { step: '1', min: '1', max: '50' }],
+    ['s1_lane_guard_pct_15min', 'settS1Guard15m', 'Premium Guard % 15m', 'float', 15, { step: '1', min: '1', max: '50' }],
+    ['s1_lane_guard_late_after', 'settS1GuardLateAfter', 'Guard One Step Tighter After', 'time', '14:30'],
+    ['s1_lane_guard_strong_score', 'settS1GuardStrongScore', 'Guard One Step Wider At Score', 'float', 80, { step: '1', min: '0', max: '100' }],
+    ['s1_lane_t1_lock_r', 'settS1T1LockR', 'Index Stop Lock At T1 (R)', 'float', 0.7, { step: '0.1', min: '0', max: '5' }],
+    ['s1_lane_lock_arm_r', 'settS1LockArmR', 'Profit Lock Arms At (R)', 'float', 1.0, { step: '0.25', min: '0.1', max: '10' }],
+    ['s1_lane_rr_floor_at_target', 'settS1RrFloorAtTarget', 'Entry RR Floor = Target (no sub-target entries)', 'bool', true],
+    ['s1_lane_signal_only', 'settS1SignalOnly', 'S1 Signals Only (no Auto orders)', 'bool', true],
+    ['s1_lane_breakeven_enabled', 'settS1BreakevenEnabled', 'Breakeven Stop After Small Gain', 'bool', true],
+    ['s1_lane_breakeven_arm_r', 'settS1BreakevenArmR', 'Breakeven Arms At (R)', 'float', 1.0, { step: '0.05', min: '0.05', max: '5' }],
+    ['s1_lane_breakeven_cost_rs', 'settS1BreakevenCost', 'Breakeven Covers Round-Trip Cost (Rs)', 'float', 140, { step: '10', min: '0', max: '2000' }],
+    ['s1_sl1_pct_5min', 'settS1Sl1Pct5m', '5m Fixed Index Stop % (0 = use SL mode)', 'float', 0.1, { step: '0.01', min: '0', max: '2' }],
+    ['s1_sl1_pct_15min', 'settS1Sl1Pct15m', '15m Fixed Index Stop % (0 = use SL mode)', 'float', 0.15, { step: '0.01', min: '0', max: '2' }],
+    ['s1_lane_giveback_with_trend', 'settS1GivebackWith', 'Giveback % (trend with trade)', 'float', 25, { step: '1', min: '0', max: '95' }],
+    ['s1_lane_giveback_neutral', 'settS1GivebackNeutral', 'Giveback % (no clear trend)', 'float', 10, { step: '1', min: '0', max: '95' }],
+    ['s1_lane_giveback_unknown', 'settS1GivebackUnknown', 'Giveback % (trend unknown: no closed bar yet / data missing)', 'float', 25, { step: '1', min: '0', max: '95' }],
+    ['s1_lane_giveback_against', 'settS1GivebackAgainst', 'Giveback % (trend against)', 'float', 0, { step: '1', min: '0', max: '95' }],
+    ['s1_lane_trend_margin', 'settS1TrendMargin', 'Clear Trend = Score Gap >=', 'float', 20, { step: '1', min: '1', max: '100' }],
+    ['s1_lane_intrabar_wait_seconds', 'settS1IntrabarWait', 'Intrabar Signal Buffer Sec', 'float', 15, { step: '1', min: '0', max: '120' }],
+    ['s1_lane_intrabar_wait_seconds_1min', 'settS1IntrabarWait1m', 'Intrabar Signal Buffer Sec (1min)', 'float', 5, { step: '1', min: '0', max: '60' }],
+    ['s1_lane_forming_recompute_seconds', 'settS1FormingRecompute', 'Forming-Bar Recompute Every (sec, 0 = every scan)', 'float', 15, { step: '1', min: '0', max: '120' }],
+    ['s1_lane_base_rr', 'settS1BaseRr', 'Target: Normal Trade (R)', 'float', 1.0, { step: '0.1', min: '0.3', max: '10' }],
+    ['s1_lane_weak_rr', 'settS1WeakRr', 'Target: Weak Move (R)', 'float', 0.7, { step: '0.1', min: '0.3', max: '10' }],
+    ['s1_lane_runner_max_r', 'settS1RunnerMaxR', 'Runner Max In Special Trend (R, else T3)', 'float', 30, { step: '1', min: '1', max: '100' }],
+    ['s1_lane_special_trend_margin', 'settS1SpecialTrend', 'Special Trend = Score Gap >=', 'float', 40, { step: '1', min: '1', max: '100' }],
+    ['s1_lane_weak_adx', 'settS1WeakAdx', 'Weak Move: ADX Below', 'float', 20, { step: '1', min: '0', max: '100' }],
+    ['s1_lane_weak_rel_volume', 'settS1WeakVol', 'Weak Move: Volume Below x Avg', 'float', 1.2, { step: '0.1', min: '0', max: '10' }],
+    ['s1_lane_min_entry_rr', 'settS1MinEntryRr', 'Final Entry Check Min RR (S1)', 'float', 0.5, { step: '0.1', min: '0.1', max: '5' }],
+    ['s1_lane_reentry_enabled', 'settS1Reentry', 'Missed-Signal Re-entry (same or stronger score)', 'bool', true],
+    ['s1_lane_reentry_bars_1min', 'settS1ReentryBars1', 'Re-entry Window 1m (bars after close)', 'int', 3, { step: '1', min: '1', max: '20' }],
+    ['s1_lane_reentry_bars_5min', 'settS1ReentryBars5', 'Re-entry Window 5m (bars after close)', 'int', 1, { step: '1', min: '1', max: '20' }],
+    ['s1_lane_reentry_bars_15min', 'settS1ReentryBars15', 'Re-entry Window 15m (bars after close)', 'int', 1, { step: '1', min: '1', max: '20' }],
+];
+
+// Morning HISTORICAL -> REAL switch (editable any time; the worker re-reads it). It
+// changes the trading mode only: the Auto Mode toggle stays exactly as the operator left it.
+// UT SMART EXIT engine / lane settings. Mirrors engine/uts_lane.py UTS_SETTING_SPEC
+// (a test keeps the two key sets equal). Defaults match the uploaded Pine script.
+const UTS_SETTINGS_FIELDS = [
+    ['uts_key_value', 'settUtsKeyValue', 'UT Sensitivity / Key Value', 'float', 1.0, { step: '0.1', min: '0.1', max: '10' }],
+    ['uts_atr_period', 'settUtsAtrPeriod', 'UT ATR Period', 'int', 10, { step: '1', min: '1', max: '100' }],
+    ['uts_key_value_5min', 'settUtsKeyValue5', '5m Key Value', 'float', 1.0, { step: '0.1', min: '0.1', max: '30' }],
+    ['uts_atr_period_5min', 'settUtsAtrPeriod5', '5m ATR Period', 'int', 10, { step: '1', min: '1', max: '100' }],
+    ['uts_key_value_1min', 'settUtsKeyValue1', '1m Key Value', 'float', 1.0, { step: '0.1', min: '0.1', max: '30' }],
+    ['uts_atr_period_1min', 'settUtsAtrPeriod1', '1m ATR Period', 'int', 10, { step: '1', min: '1', max: '100' }],
+    ['uts_use_heikin_ashi', 'settUtsUseHa', 'Use Heikin Ashi Source', 'bool', false],
+    ['uts_smart_exit', 'settUtsSmartExit', 'Enable Smart Exit', 'bool', true],
+    ['uts_arm_atr', 'settUtsArmAtr', 'Arm Exit After Profit (ATR)', 'float', 0.8, { step: '0.05', min: '0.1', max: '10' }],
+    ['uts_retrace_atr', 'settUtsRetraceAtr', 'Peak Retracement Trigger (ATR)', 'float', 0.45, { step: '0.05', min: '0.05', max: '10' }],
+    ['uts_hard_retrace_atr', 'settUtsHardRetraceAtr', 'Emergency Peak Retracement (ATR)', 'float', 1.1, { step: '0.05', min: '0.2', max: '10' }],
+    ['uts_min_bars', 'settUtsMinBars', 'Minimum Bars Before Smart Exit', 'int', 2, { step: '1', min: '0', max: '50' }],
+    ['uts_confirmations', 'settUtsConfirmations', 'Momentum Confirmations Required', 'int', 2, { step: '1', min: '1', max: '4' }],
+    ['uts_rsi_length', 'settUtsRsiLength', 'RSI Length', 'int', 14, { step: '1', min: '2', max: '100' }],
+    ['uts_rsi_ob', 'settUtsRsiOb', 'RSI Overbought', 'float', 70, { step: '1', min: '50', max: '100' }],
+    ['uts_rsi_os', 'settUtsRsiOs', 'RSI Oversold', 'float', 30, { step: '1', min: '0', max: '50' }],
+    ['uts_rsi_lookback', 'settUtsRsiLookback', 'RSI Peak Lookback', 'int', 5, { step: '1', min: '2', max: '50' }],
+    ['uts_exit_ema', 'settUtsExitEma', 'Exit EMA Length', 'int', 5, { step: '1', min: '1', max: '100' }],
+    ['uts_wick_ratio', 'settUtsWickRatio', 'Rejection Wick Ratio', 'float', 0.35, { step: '0.05', min: '0.1', max: '0.9' }],
+    ['uts_session_end', 'settUtsSessionEnd', 'Session End (bars from here dropped)', 'time', '15:15'],
+    ['uts_lane_enabled', 'settUtsLaneEnabled', 'UT Smart Exit Lane (own entries + exits)', 'bool', true],
+    ['uts_lane_allow_intrabar_entries', 'settUtsAllowIntrabar', 'Allow UTS forming candle entries', 'bool', true],
+    ['uts_lane_result_max_age_seconds', 'settUtsResultAge', 'Repaint Evidence Max Age (seconds)', 'float', 30, { step: '1', min: '1', max: '120' }],
+    ['uts_lane_reclaim_start', 'settUtsReclaimStart', 'Late Big-Move Check From', 'time', '13:00'],
+    ['uts_lane_sl_max_pct', 'settUtsSlMaxPct', 'Max UT Stop (% of index)', 'float', 1.0, { step: '0.05', min: '0.05', max: '5' }],
+    ['uts_lane_min_entry_rr', 'settUtsMinRr', 'Min Entry RR (nominal)', 'float', 0.5, { step: '0.1', min: '0.1', max: '5' }],
+    ['uts_lane_target_r', 'settUtsTargetR', 'Nominal Target (R, never closes)', 'float', 3.0, { step: '0.5', min: '0.5', max: '50' }],
+    ['uts_lane_guard_mult', 'settUtsGuardMult', 'Premium Guard (x UT stop)', 'float', 2.0, { step: '0.1', min: '1', max: '10' }],
+    ['uts_lane_guard_min_pct', 'settUtsGuardMin', 'Premium Guard Min %', 'float', 10, { step: '1', min: '1', max: '80' }],
+    ['uts_lane_guard_max_pct', 'settUtsGuardMax', 'Premium Guard Max %', 'float', 15, { step: '1', min: '1', max: '90' }],
+    ['uts_lane_lock_arm_r', 'settUtsLockArm', 'Premium Profit Lock Arm (R)', 'float', 1, { step: '0.1', min: '0.5', max: '10' }],
+    ['uts_lane_lock_giveback_pct', 'settUtsLockGiveback', 'Premium Peak Gain Giveback %', 'float', 30, { step: '1', min: '0', max: '100' }],
+    ['uts_lane_5m_intel_gate_enabled', 'settUts5mIntelGate', '5m Entries Need Intel Support (vol + ADX + RSI + PCR)', 'bool', true],
+    ['uts_lane_5m_min_volume_ratio', 'settUts5mMinVol', '5m Min Volume (x average)', 'float', 1.0, { step: '0.1', min: '0', max: '5' }],
+    ['uts_lane_5m_min_adx', 'settUts5mMinAdx', '5m Min ADX', 'float', 20, { step: '1', min: '0', max: '60' }],
+    ['uts_lane_5m_require_directional_rsi', 'settUts5mDirRsi', '5m Require RSI On Trade Side (55/45)', 'bool', true],
+    ['uts_lane_5m_pcr_veto_enabled', 'settUts5mPcrVeto', '5m Block On Opposing PCR Intel', 'bool', true],
+    ['uts_lane_intrabar_wait_seconds', 'settUtsWait', '5m / 15m Intra-candle Entry Wait (s)', 'float', 15, { step: '1', min: '0', max: '120' }],
+    ['uts_lane_intrabar_wait_seconds_1min', 'settUtsWait1min', '1m Intra-candle Entry Wait (s)', 'float', 5, { step: '1', min: '5', max: '7' }],
+    ['uts_lane_repaint_check_seconds', 'settUtsRepaintCheck', 'Intra-candle Repaint Check (s)', 'float', 10, { step: '1', min: '1', max: '120' }],
+    ['uts_lane_repaint_reentry_grace_seconds', 'settUtsRepaintReentry', 'Re-entry Grace After Repaint Exit (s)', 'float', 90, { step: '5', min: '0', max: '600' }],
+];
+
+const AUTO_START_FIELDS = [
+    ['auto_real_mode_premarket_enabled', 'settAutoRealPremarket', 'Switch HISTORICAL to REAL at the time below (Auto toggle unchanged)', 'bool', false],
+    ['auto_real_mode_premarket_switch_time', 'settAutoRealSwitchTime', 'REAL Switch Time (IST)', 'time', '09:00:00'],
 ];
 
 const UT_PRESET_HELP = {
@@ -50,6 +241,19 @@ function getActiveScannerEngine() {
     ).toLowerCase();
 }
 
+function syncUtsSignalTiming(changedId) {
+    if (!['ut_smart', 'ut_smart_s1'].includes(document.getElementById('settScannerEngine')?.value)) return;
+    const main = document.getElementById('settIntrabarSignals');
+    const uts = document.getElementById('settUtsAllowIntrabar');
+    if (!main || !uts) return;
+    if (changedId === 'settUtsAllowIntrabar') main.checked = uts.checked;
+    else uts.checked = main.checked;
+    const help = document.getElementById('settSignalModeHelp');
+    if (help) help.textContent = main.checked
+        ? 'ON: closed signals plus buffered forming entries; UTS 5m/15m 20s, 1m 5-7s; repaint checks every 10s after entry'
+        : 'OFF: confirmed entries only after candle close';
+}
+
 function syncSettingsScannerEngine(mode) {
     const normalized = String(mode || 'quad_prime').toLowerCase();
     const settingsEl = document.getElementById('settScannerEngine');
@@ -68,13 +272,21 @@ function updateUtPresetHelp() {
     const engine = getActiveScannerEngine();
     const presetHelp = UT_PRESET_HELP[preset] || UT_PRESET_HELP.AGGRESSIVE;
     const engineLabel = SCANNER_ENGINE_LABELS[engine] || engine.toUpperCase();
+    if (engine === 'ut_ema') {
+        help.textContent = `${engineLabel}: Native UT + EMA Pine rules and timing. One shared trade per index/timeframe; alignment adds one lot, and the first native exit closes it. Index stop 0.2%; option premium stop capped at 15%. UT presets and the global signal timing toggle do not change this engine.`;
+        return;
+    }
     let scope = 'Affects UT1 flips, ATR trail, chart trail, and exits.';
     if (engine === 'quad_union') {
         scope = 'Runs UT1, EMA, Supertrend, and Consensus raw arrows after repaint buffering; exits are source-aware.';
+    } else if (engine === 'quad_prime_s1' || engine === 'ut_smart_s1') {
+        scope = 'Runs both native engines independently. Signals retain their own stops and exits; portfolio risk and execution limits are shared.';
     } else if (engine === 'quad_prime') {
         scope = 'Runs all four raw entry sources; opposite exits need UT1 plus trend-stack confirmation unless risk is threatened.';
     } else if (engine === 'adaptive_hybrid') {
         scope = 'Engine 10 meta-router: chooses UT1+Consensus, Quad-style thrust, or strict consensus based on trend, chop, volume, ER, and source agreement.';
+    } else if (engine === 'ut_smart') {
+        scope = 'UT Smart Exit: its own UT flips (key x ATR trail) and its own exits (opposite flip, smart peak exit) on the frames the TF toggle selects (15M is the tuned frame; 1M trades bursts only); these UT presets do not drive it - use the UT Smart Exit card.';
     } else if (engine === 'adaptive_dual') {
         scope = 'Engine 11 dual-lane mode: Lane A uses Adaptive Hybrid; Lane B runs APEX five-gate confluence through the same gates and risk stack.';
     } else if (engine === 'quality_hybrid') {
@@ -265,7 +477,7 @@ function setupSettingsExperience() {
     if (!document.getElementById('settIntrabarSignals')) {
         const signalCard = document.createElement('label');
         signalCard.className = 'settings-switch-card';
-        signalCard.title = 'ON fires UT1 entries while the 5m/15m candle is forming. OFF waits for that candle to close.';
+        signalCard.title = 'ON permits buffered forming entries alongside closed signals. UTS waits 20s on 5m/15m and 5-7s on 1m.';
         signalCard.innerHTML = `
             <span>
                 <strong>Intra-candle Signals</strong>
@@ -279,6 +491,7 @@ function setupSettingsExperience() {
             help.textContent = input.checked
                 ? 'ON: faster entries while the candle forms'
                 : 'OFF: confirmed entries only after candle close';
+            syncUtsSignalTiming('settIntrabarSignals');
         });
         body.appendChild(signalCard);
     }
@@ -565,8 +778,9 @@ function setupSettingsExperience() {
         makeSwitchCard('settStabilizationMomentumOverride', 'Stabilization Momentum Override', 'Re-admit a flickered signal when thrust keeps confirming direction'),
         makeInputGroup('settLiveStab5', '5m Stabilization Sec', 'number', { step: '1', min: '30', max: '60' }),
         makeInputGroup('settLiveStab15', '15m Stabilization Sec', 'number', { step: '1', min: '30', max: '60' }),
-        makeInputGroup('settNoEntryAfter', '15m No Entry After', 'time'),
-        makeInputGroup('sett5mNoEntryAfter', '5m No Entry After', 'time'),
+        makeInputGroup('settNoEntryAfter', '15m Last Entry', 'time'),
+        makeInputGroup('sett5mNoEntryAfter', '5m Last Entry', 'time'),
+        makeInputGroup('sett1mNoEntryAfter', '1m Last Entry', 'time'),
         makeInputGroup('settForceExitTime', 'Force Exit Time', 'time'),
         makeInputGroup('settPowerMoveCutoff', 'Power-Move Cutoff', 'time')
     ]);
@@ -736,7 +950,31 @@ function setupSettingsExperience() {
         makeSwitchCard('settExecutionTouchQuoteStrict', 'Strict Touch Quote', 'If touch quote is stale/missing, block instead of falling back to signal/LTP anchor')
     ]);
 
-    advancedContent.append(advTradeCard, advTimingCard, advMomentumCard, advPeakExitCard, advMarketCard, advOneWayCascadeCard, advCascadeBookCard, advMissedReentryCard, advLateReclaimCard, advChoppyScalpCard, advDualLaneCard, advExecutionCard);
+    const makeSelectGroup = (id, label, choices) => {
+        if (document.getElementById(id)) return findGroup(id);
+        const group = document.createElement('div');
+        group.className = 'setting-group';
+        group.innerHTML = `<label>${label}</label><select id="${id}">${choices.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>`;
+        body.appendChild(group);
+        return group;
+    };
+    const advS1Card = makeCard('settings-s1-engine', 'S1 Engine & Lane', S1_SETTINGS_FIELDS.map(([, id, label, kind, , extra]) => (
+        kind === 'bool' ? makeSwitchCard(id, label)
+            : kind === 'enum' ? makeSelectGroup(id, label, extra)
+            : kind === 'time' ? makeInputGroup(id, label, 'time')
+            : makeInputGroup(id, label, 'number', extra || {})
+    )));
+    const advUtsCard = makeCard('settings-uts-engine', 'UT Smart Exit Engine & Lane', UTS_SETTINGS_FIELDS.map(([, id, label, kind, , extra]) => (
+        kind === 'bool' ? makeSwitchCard(id, label)
+            : kind === 'enum' ? makeSelectGroup(id, label, extra)
+            : kind === 'time' ? makeInputGroup(id, label, 'time')
+            : makeInputGroup(id, label, 'number', extra || {})
+    )));
+    const advS12Card = makeCard('settings-s12-engine', 'S1+S2 Dual (Pine v5.4)', []);
+    const advAutoStartCard = makeCard('settings-auto-start', 'Morning REAL Switch', AUTO_START_FIELDS.map(([, id, label, kind]) => (
+        kind === 'bool' ? makeSwitchCard(id, label) : makeInputGroup(id, label, 'time', { step: '1' })
+    )));
+    advancedContent.append(advAutoStartCard, advS1Card, advUtsCard, advS12Card, advTradeCard, advTimingCard, advMomentumCard, advPeakExitCard, advMarketCard, advOneWayCascadeCard, advCascadeBookCard, advMissedReentryCard, advLateReclaimCard, advChoppyScalpCard, advDualLaneCard, advExecutionCard);
     content.append(generalContent, advancedContent, forensicsContent);
 
 
@@ -762,7 +1000,11 @@ function setupSettingsExperience() {
             modal.style.display = 'none';
         });
     }
-    document.getElementById('settScannerEngine')?.addEventListener('change', updateUtPresetHelp);
+    document.getElementById('settScannerEngine')?.addEventListener('change', () => {
+        updateUtPresetHelp();
+        syncUtsSignalTiming('settIntrabarSignals');
+    });
+    document.getElementById('settUtsAllowIntrabar')?.addEventListener('change', () => syncUtsSignalTiming('settUtsAllowIntrabar'));
     document.getElementById('settUtPreset')?.addEventListener('change', updateUtPresetHelp);
     syncSettingsScannerEngine(
         state.latestData?.config?.scanner_engine
@@ -774,6 +1016,7 @@ function setupSettingsExperience() {
 
 
 function syncSettingsFromConfig(data) {
+    refreshS12SettingsCard(data?.config || {});
     const modal = document.getElementById('settingsModal');
     // The dedicated execution control must always mirror backend truth.  General
     // settings stay frozen while their modal is open so the operator's edits are not
@@ -973,6 +1216,33 @@ function syncSettingsFromConfig(data) {
         setVal('settMidcap15mVolume', cfg.midcap_15min_risky_stabilization_min_volume_ratio !== undefined ? cfg.midcap_15min_risky_stabilization_min_volume_ratio : 1.05);
         setVal('settMidcap15mIntel', cfg.midcap_15min_risky_stabilization_min_intel_score !== undefined ? cfg.midcap_15min_risky_stabilization_min_intel_score : 0.25);
         setChecked('settDualLaneEnabled', cfg.dual_lane_enabled !== undefined ? cfg.dual_lane_enabled : true);
+        AUTO_START_FIELDS.forEach(([key, id, , kind, fallback]) => {
+            const value = cfg[key] !== undefined && cfg[key] !== null ? cfg[key] : fallback;
+            if (kind === 'bool') setChecked(id, value === true);
+            else setVal(id, value);
+        });
+        S1_SETTINGS_FIELDS.forEach(([key, id, , kind, fallback]) => {
+            const value = cfg[key] !== undefined && cfg[key] !== null ? cfg[key] : fallback;
+            if (kind === 'bool') setChecked(id, value === true);
+            else setVal(id, value);
+        });
+        UTS_SETTINGS_FIELDS.forEach(([key, id, , kind, fallback]) => {
+            const value = cfg[key] !== undefined && cfg[key] !== null ? cfg[key] : fallback;
+            if (kind === 'bool') setChecked(id, value === true);
+            else setVal(id, value);
+        });
+        S12_SETTINGS_FIELDS.forEach(([key, id, , kind, fallback]) => {
+            const value = cfg[key] !== undefined && cfg[key] !== null ? cfg[key] : fallback;
+            if (kind === 'bool') setChecked(id, value === true);
+            else setVal(id, value);
+        });
+        if (['ut_smart', 'ut_smart_s1'].includes(document.getElementById('settScannerEngine')?.value)) {
+            // Display the effective mode of older saved configurations.
+            const main = document.getElementById('settIntrabarSignals');
+            const uts = document.getElementById('settUtsAllowIntrabar');
+            if (main && uts) main.checked = main.checked && uts.checked;
+            syncUtsSignalTiming('settIntrabarSignals');
+        }
         setVal('settDualLaneGapBars', cfg.dual_lane_same_dir_min_bars_gap !== undefined ? cfg.dual_lane_same_dir_min_bars_gap : 3);
         setVal('settDualLaneMinA_R', cfg.dual_lane_same_dir_min_lane_a_r !== undefined ? cfg.dual_lane_same_dir_min_lane_a_r : 0.50);
         setVal('settDualLaneSizeFraction', cfg.dual_lane_size_fraction !== undefined ? cfg.dual_lane_size_fraction : 0.65);
@@ -1002,8 +1272,9 @@ function syncSettingsFromConfig(data) {
         setVal('settMixedBookMaxFut', cfg.multi_signal_max_fut !== undefined ? cfg.multi_signal_max_fut : 1);
         setVal('settMixedBookFutLots', cfg.multi_signal_fut_lots !== undefined ? cfg.multi_signal_fut_lots : 1);
         setVal('settMixedBookMaxOpt', cfg.multi_signal_max_opt_instruments !== undefined ? cfg.multi_signal_max_opt_instruments : 18);
-        setVal('settNoEntryAfter', cfg.ut_no_entry_after || '15:01');
-        setVal('sett5mNoEntryAfter', cfg.ut_5min_no_entry_after || '15:14');
+        setVal('settNoEntryAfter', cfg.ut_no_entry_after || '14:50');
+        setVal('sett5mNoEntryAfter', cfg.ut_5min_no_entry_after || '15:10');
+        setVal('sett1mNoEntryAfter', cfg.ut_1min_no_entry_after || '15:14');
         setVal('settForceExitTime', cfg.ut_force_exit_time || '15:22');
         setVal('settPowerMoveCutoff', cfg.power_move_late_hard_cutoff || '15:15');
         
@@ -1276,6 +1547,26 @@ function saveSettings() {
         midcap_15min_risky_stabilization_min_volume_ratio: numberVal('settMidcap15mVolume', 1.05),
         midcap_15min_risky_stabilization_min_intel_score: numberVal('settMidcap15mIntel', 0.25),
         dual_lane_enabled: checkedVal('settDualLaneEnabled', true),
+        ...Object.fromEntries(AUTO_START_FIELDS.map(([key, id, , kind, fallback]) => [key,
+            kind === 'bool' ? checkedVal(id, fallback) : timeVal(id, fallback)])),
+        ...Object.fromEntries(S1_SETTINGS_FIELDS.map(([key, id, , kind, fallback]) => [key,
+            kind === 'bool' ? checkedVal(id, fallback)
+                : kind === 'int' ? intVal(id, fallback)
+                : kind === 'float' ? numberVal(id, fallback)
+                : kind === 'time' ? timeVal(id, fallback)
+                : (document.getElementById(id)?.value || fallback)])),
+        ...Object.fromEntries(UTS_SETTINGS_FIELDS.map(([key, id, , kind, fallback]) => [key,
+            kind === 'bool' ? checkedVal(id, fallback)
+                : kind === 'int' ? intVal(id, fallback)
+                : kind === 'float' ? numberVal(id, fallback)
+                : kind === 'time' ? timeVal(id, fallback)
+                : (document.getElementById(id)?.value || fallback)])),
+        ...Object.fromEntries(S12_SETTINGS_FIELDS.map(([key, id, , kind, fallback]) => [key,
+            kind === 'bool' ? checkedVal(id, fallback)
+                : kind === 'int' ? intVal(id, fallback)
+                : kind === 'float' ? numberVal(id, fallback)
+                : kind === 'time' ? timeVal(id, fallback)
+                : (document.getElementById(id)?.value || fallback)])),
         dual_lane_same_dir_min_bars_gap: intVal('settDualLaneGapBars', 3),
         dual_lane_same_dir_min_lane_a_r: numberVal('settDualLaneMinA_R', 0.50),
         dual_lane_size_fraction: numberVal('settDualLaneSizeFraction', 0.65),
@@ -1310,8 +1601,9 @@ function saveSettings() {
         execution_use_touch_quote: checkedVal('settExecutionTouchQuote', false),
         execution_touch_quote_shadow_enabled: checkedVal('settExecutionTouchQuoteShadow', true),
         execution_touch_quote_strict: checkedVal('settExecutionTouchQuoteStrict', false),
-        ut_no_entry_after: timeVal('settNoEntryAfter', '15:01'),
-        ut_5min_no_entry_after: timeVal('sett5mNoEntryAfter', '15:14'),
+        ut_no_entry_after: timeVal('settNoEntryAfter', '14:50'),
+        ut_5min_no_entry_after: timeVal('sett5mNoEntryAfter', '15:10'),
+        ut_1min_no_entry_after: timeVal('sett1mNoEntryAfter', '15:14'),
         ut_force_exit_time: timeVal('settForceExitTime', '15:22'),
         active_indices: activeIndices,
         lots: {

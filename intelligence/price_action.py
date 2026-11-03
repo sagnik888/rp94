@@ -433,7 +433,8 @@ class PriceActionAnalyzer:
                 premium_threshold: float = 0.70,
                 pd_lookback: int = 50,
                 liquidity_tol_pct: float = 0.0010,
-                premium_trend_scale: float = 1.0) -> Optional[Dict]:
+                premium_trend_scale: float = 1.0,
+                adverse_threshold: float = -0.40) -> Optional[Dict]:
         """premium_trend_scale scales ONLY the aligned-continuation chase penalty
         (LONG in premium / SELL in discount) — on a confirmed trend day the top
         (bottom) of the range is where continuation lives, so the caller may
@@ -574,7 +575,14 @@ class PriceActionAnalyzer:
                 score -= 0.25; reasons.append("SELL into equal-lows liquidity")
 
         score = max(-1.0, min(1.0, score))
-        verdict = "ADVERSE" if score <= -0.40 else ("FAVORABLE" if score >= 0.40 else "NEUTRAL")
+        # The ADVERSE boundary was the literal -0.40 written here, while
+        # ``price_action_adverse_threshold`` (default -0.50) was read only by the
+        # exit-side loss-recovery checks. Operators reasonably read that setting as
+        # governing this entry veto; it never did. It is a real parameter now, with the
+        # SAME -0.40 default, so no verdict moves -- and the boundary that decided is
+        # recorded in the result instead of being implied by a constant.
+        adverse_at = float(adverse_threshold)
+        verdict = "ADVERSE" if score <= adverse_at else ("FAVORABLE" if score >= 0.40 else "NEUTRAL")
         target_context = "profile target unavailable"
         trailing_context = "profile trailing neutral"
         if vprof:
@@ -601,6 +609,7 @@ class PriceActionAnalyzer:
         return {
             "score": round(score, 3),
             "verdict": verdict,
+            "adverse_threshold": round(adverse_at, 4),
             "structure": structure,
             "pattern": pat,
             "nearest_resistance": nearest_res,

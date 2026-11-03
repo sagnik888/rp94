@@ -1,0 +1,79 @@
+{
+  "cumulative_boundary_loss": {
+    "known_cumulative_increase": 400,
+    "stored_volume_sum": 200.0,
+    "stored_minutes": [
+      100.0,
+      100.0,
+      0.0
+    ]
+  },
+  "latent_source_switch_relabel": {
+    "stored_volume": 100000.0,
+    "stored_basis": "kite_futures",
+    "internal_volume": 0.0,
+    "reachability": "latent: current production keeps futures outside index candle volume"
+  },
+  "stale_volume_wrong_direction": {
+    "available": true,
+    "current_volume": 500,
+    "volume_ratio": 4.17,
+    "signal": "BEARISH_VOLUME",
+    "measured_volume_bar_close_change": 10.0,
+    "volume_lag_bars": 3
+  },
+  "entire_frame_unit_veto": {
+    "available": false,
+    "reason": "Volume window mixes units (cash shares and futures contracts); no ratio across it is meaningful",
+    "volume_ratio": 1.0,
+    "same_latest_twenty_alone": {
+      "available": true,
+      "volume_ratio": 4.17
+    },
+    "different_basis_bar": "previous session; all current-session bars are cash volume",
+    "reachability": "legacy/mixed cache conditional; no current futures-in-index injection confirmed"
+  },
+  "zero_volume_last_five_flow": {
+    "available": true,
+    "signal": "BULLISH",
+    "buy_pct": 95.0,
+    "source": "ohlcv_close_position"
+  },
+  "mixed_units_accepted_by_flow": {
+    "available": true,
+    "signal": "BULLISH",
+    "ratio": 0.05,
+    "cum_delta": -449955,
+    "source": "ohlcv_close_position"
+  },
+  "timeframe_and_asset_labels": {
+    "aggregate_timeframe": "5min",
+    "volume_current": 100,
+    "five_minute_input_volume": 9000,
+    "one_minute_input_volume": 100,
+    "aggregate_futures_volume": 100,
+    "volume_has_measured_timestamp": false,
+    "volume_has_timeframe": false
+  },
+  "resample_loses_activity_telemetry": {
+    "one_minute_tick_count": true,
+    "five_minute_tick_count": false,
+    "five_minute_columns": [
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+      "volume_basis"
+    ]
+  },
+  "option_oi_flow_double_interpretation": {
+    "oi_signal": "BEARISH",
+    "ce_pe_activity_ratio": 1.5,
+    "flow_confirmation": "BULLISH"
+  },
+  "pcr_repeated_snapshot_trend": {
+    "after_change": "RISING",
+    "after_three_identical_reads": "STABLE"
+  }
+}

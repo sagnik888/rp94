@@ -1,0 +1,593 @@
+{
+  "rejects": {
+    "1min requires confirmed directional burst": 1146,
+    "Quality gate blocked": 970,
+    "After no-entry gate 15:01": 70,
+    "After no-entry gate 14:55": 30
+  },
+  "entry_shadow_skipped": {},
+  "risk_configuration": {
+    "ok": true,
+    "issues": [],
+    "warnings": [],
+    "capital_total": 1000005.0,
+    "capital_fut": 490000.0,
+    "capital_opt": 500000.0,
+    "futures_sl_pct": 0.1,
+    "options_sl_pct": 15.0,
+    "max_trade_loss_abs": 0.0,
+    "fut_daily_budget": 7350.0,
+    "opt_daily_budget": 40000.0,
+    "auto_risk_sizing_enabled": false,
+    "cascade_lot_scale_enabled": true,
+    "cascade_lot_multiplier": 2.0,
+    "cascade_lot_multiplier_fut": 1.0,
+    "cascade_lot_multiplier_opt": 3.0,
+    "cascade_lot_multiplier_opt_min": 2.0,
+    "heavy_trend_lot_scale_enabled": true,
+    "heavy_trend_lot_multiplier_opt": 2.0,
+    "heavy_trend_min_aligned_indices": 2,
+    "cascade_multi_tf_stack_enabled": true,
+    "cascade_midcap_solo_max_tf": 2,
+    "cascade_midcap_dual_main_max": 2,
+    "cascade_midcap_dual_addon_max": 1,
+    "cascade_core_bucket_max_positions": 12,
+    "cascade_midcap_bucket_max_positions": 3,
+    "cascade_max_concurrent_positions": 18,
+    "dual_clone_reduction_enabled": true,
+    "risk_per_trade_daily_fraction": 0.5,
+    "sizing_mode": "fixed_lots"
+  },
+  "option_history": {
+    "attempts": 0,
+    "hits": 0,
+    "misses": 0,
+    "synthetic": 0,
+    "fallback_to_fut": 0,
+    "archived_hits": 1371
+  },
+  "option_history_quality": {
+    "status": "OK",
+    "real_option_hits": 1371,
+    "misses": 0,
+    "fallback_to_fut": 0,
+    "fallback_rate_pct": 0.0,
+    "note": "Historical option candle coverage is sufficient for accepted option rows."
+  },
+  "option_history_bundle": {
+    "rebuilt": true,
+    "files": 322,
+    "seconds": 6.841
+  },
+  "scanner_freshness": {
+    "last_scan": "2026-09-13T00:28:47.716712+05:30",
+    "age_seconds": 0.0,
+    "last_progress": "2026-09-13T00:28:47.713882+05:30",
+    "progress_age_seconds": 0.01,
+    "effective_age_seconds": 0.0,
+    "stale_basis": "last_scan",
+    "stale_after_seconds": 5.0,
+    "is_stale": false,
+    "is_calculating": false,
+    "calculation_lock": false,
+    "cache_age_ms": 9349
+  },
+  "recalculation": {
+    "status": "idle",
+    "reason": "complete",
+    "started_at": "2026-09-12T20:47:18.173211+05:30",
+    "finished_at": "2026-09-13T00:10:54.650774+05:30",
+    "worker": {
+      "status": "ok",
+      "started_at": 1789237248.7778034,
+      "finished_at": 1789237248.784942,
+      "duration_seconds": 0.007,
+      "files": [
+        {
+          "instrument": "NIFTY",
+          "timeframe": "1min",
+          "path": "data_store\\candles\\NIFTY_1min.csv",
+          "rows": 5000,
+          "days_back": 7,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "NIFTY",
+          "timeframe": "5min",
+          "path": "data_store\\candles\\NIFTY_5min.csv",
+          "rows": 1654,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "NIFTY",
+          "timeframe": "15min",
+          "path": "data_store\\candles\\NIFTY_15min.csv",
+          "rows": 1178,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "BANKNIFTY",
+          "timeframe": "1min",
+          "path": "data_store\\candles\\BANKNIFTY_1min.csv",
+          "rows": 5000,
+          "days_back": 7,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "BANKNIFTY",
+          "timeframe": "5min",
+          "path": "data_store\\candles\\BANKNIFTY_5min.csv",
+          "rows": 1654,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "BANKNIFTY",
+          "timeframe": "15min",
+          "path": "data_store\\candles\\BANKNIFTY_15min.csv",
+          "rows": 1178,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "1min",
+          "path": "data_store\\candles\\SENSEX_1min.csv",
+          "rows": 5000,
+          "days_back": 7,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "5min",
+          "path": "data_store\\candles\\SENSEX_5min.csv",
+          "rows": 1653,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "15min",
+          "path": "data_store\\candles\\SENSEX_15min.csv",
+          "rows": 1178,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "MIDCPNIFTY",
+          "timeframe": "1min",
+          "path": "data_store\\candles\\MIDCPNIFTY_1min.csv",
+          "rows": 5000,
+          "days_back": 7,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "MIDCPNIFTY",
+          "timeframe": "5min",
+          "path": "data_store\\candles\\MIDCPNIFTY_5min.csv",
+          "rows": 1654,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        },
+        {
+          "instrument": "MIDCPNIFTY",
+          "timeframe": "15min",
+          "path": "data_store\\candles\\MIDCPNIFTY_15min.csv",
+          "rows": 1178,
+          "days_back": 30,
+          "exists": true,
+          "source": "local_cache"
+        }
+      ],
+      "errors": [],
+      "pid": 29840
+    },
+    "scan_started_at": "2026-09-12T23:50:49.559878+05:30",
+    "simulation_id": 1789237249558,
+    "scanner_engine": "quad_prime",
+    "active_indices": [
+      "NIFTY",
+      "BANKNIFTY",
+      "SENSEX",
+      "MIDCPNIFTY"
+    ],
+    "loaded_rows": 31327,
+    "pre_scan_duration_seconds": 11.15,
+    "worker_duration_seconds": 0.007,
+    "last_progress_at": "2026-09-13T00:10:54.648843+05:30",
+    "processed_indices": 4,
+    "total_indices": 4,
+    "index_processing_ms": {
+      "NIFTY": 275778,
+      "BANKNIFTY": 320191,
+      "SENSEX": 267438,
+      "MIDCPNIFTY": 308786
+    },
+    "duration_seconds": 12216.48,
+    "total_duration_seconds": 12216.48,
+    "scan_duration_seconds": 1205.09,
+    "scan_wait_duration_seconds": 11011.38,
+    "deferred_reason": "settings-refresh",
+    "deferred_at": "2026-09-12T23:38:40.023839+05:30",
+    "lock_age_seconds": 10.12,
+    "queue_status": "idle",
+    "queue_reason": "settings-refresh",
+    "queue_superseded_count": 0
+  },
+  "settings_persistence": {
+    "pending": false,
+    "save_count": 3,
+    "last_error": ""
+  },
+  "latency": {
+    "last_ms": 8304,
+    "high_latency_events": 530,
+    "last_cycle_ms": 18299,
+    "scan_count": 61
+  },
+  "stabilization": {
+    "buffered": 0,
+    "waiting_stability": 0,
+    "waiting_candle_close": 0,
+    "discarded_repaint": 0,
+    "discarded_future": 0,
+    "discarded_stale": 0,
+    "matured": 0,
+    "pending": 0
+  },
+  "recovery_checkpoint": {
+    "enabled": false,
+    "count": 0,
+    "last_at": null,
+    "last_error": "",
+    "path": "data_store\\warm_memory\\live_warm_memory.json",
+    "interval_seconds": 15.0,
+    "ttl_minutes": 15
+  },
+  "timeouts": {
+    "skipped_inflight": 0
+  },
+  "index_processing_ms": {
+    "NIFTY": 1822,
+    "BANKNIFTY": 2545,
+    "SENSEX": 2478,
+    "MIDCPNIFTY": 1454
+  },
+  "worker_resources": {
+    "default_executor_queued_tasks": 0,
+    "logical_cpu_count": 16,
+    "active_threads": 30,
+    "active_indices": 4,
+    "live_inflight": 0,
+    "historical_rebuild_pending": false,
+    "estimated_default_executor_max_workers": 20,
+    "default_executor_max_workers": 20,
+    "live_index_parallelism_needed": 4,
+    "live_processing_capacity_ratio": 5.0,
+    "async_execution_queue": {
+      "available": true,
+      "workers": 4,
+      "alive_workers": 4,
+      "queue_size": 0,
+      "queue_capacity": 500,
+      "queue_remaining": 500,
+      "queue_fill_pct": 0.0
+    },
+    "broker_executor": {
+      "available": true,
+      "max_workers": 5,
+      "queued_tasks": 0
+    },
+    "recalculation_worker_timeout_seconds": 120.0
+  },
+  "sources": {
+    "kite": true,
+    "kite_session_live": true,
+    "kite_tick_age_seconds": 12967.85,
+    "kite_stream_stalled": false,
+    "kite_data_fresh": true,
+    "kite_rest_age_seconds": 27.52,
+    "fyers": true,
+    "fyers_tick_age_seconds": 952.32,
+    "broker_degraded": false,
+    "all_brokers_unavailable": false,
+    "fyers_auth_required": false,
+    "fyers_auth_reason": "",
+    "fyers_refresh_disabled": false,
+    "yahoo": true,
+    "yahoo_mode": "idle_standby",
+    "yahoo_request_count": 0,
+    "yahoo_last_used_at": null,
+    "kite_historical_rest_source": "kite_historical_rest",
+    "kite_historical_rest_available": true,
+    "kite_historical_rest_healthy": false,
+    "kite_historical_rest_fresh": false,
+    "kite_historical_rest_stale": false,
+    "kite_historical_rest_last_call_ok": null,
+    "kite_historical_rest_max_age_seconds": 90.0,
+    "kite_historical_rest_last_attempt_at": null,
+    "kite_historical_rest_last_attempt_age_seconds": null,
+    "kite_historical_rest_last_success_at": null,
+    "kite_historical_rest_age_seconds": null,
+    "kite_historical_rest_last_error_at": null,
+    "kite_historical_rest_last_error_age_seconds": null,
+    "kite_historical_rest_failure": "",
+    "kite_historical_rest_last_error": "",
+    "kite_historical_rest_failures": 0,
+    "angel_rest_backoff_active": false,
+    "angel_rest_backoff_seconds_remaining": 0.0,
+    "angel_rest_backoff_failures": 0,
+    "angelone_index_quotes": {
+      "configured": true,
+      "connected": true,
+      "last_success_age_seconds": 13049.98,
+      "last_error": "option_contract_not_found",
+      "price_only": false,
+      "index_price_only": true,
+      "option_market_data": true,
+      "index_volume_available": false,
+      "option_master_date": "2026-09-12",
+      "option_master_contracts": 8276
+    }
+  },
+  "mode": "HISTORICAL",
+  "repaint_guard": {
+    "checked": 0,
+    "aborted": 0,
+    "passed": 0
+  },
+  "exit_reasons": {},
+  "instrument_selection": {
+    "OPT": 1202,
+    "FUT": 0
+  },
+  "source_fallback": {
+    "delayed_entry_blocked": 0
+  },
+  "pre_candle_prediction": {
+    "NIFTY": {
+      "5min": {
+        "state": "LIKELY_5M_FLIP",
+        "direction": "SHORT",
+        "confidence": 0.71,
+        "progress": 1.0,
+        "reason": "1m volume 7.4x; 1m close 100%; 5min projected volume 3.1x; 5min range 2.4x; 5min close 100%; ADX 24.1"
+      },
+      "15min": {
+        "state": "LIKELY_15M_FLIP",
+        "direction": "SHORT",
+        "confidence": 0.62,
+        "progress": 1.0,
+        "reason": "1m volume 7.4x; 1m close 100%; 15min range 1.1x; 15min close 100%; partial 5m agrees"
+      }
+    },
+    "BANKNIFTY": {
+      "5min": {
+        "state": "EARLY_CONTINUATION",
+        "direction": "SHORT",
+        "confidence": 0.54,
+        "progress": 1.0,
+        "reason": "1m volume 4.7x; 1m close 100%; 5min close 100%; ADX 38.0"
+      },
+      "15min": {
+        "state": "EARLY_CONTINUATION",
+        "direction": "SHORT",
+        "confidence": 0.57,
+        "progress": 1.0,
+        "reason": "1m volume 4.7x; 1m close 100%; 15min close 100%; partial 5m agrees; ADX 24.0"
+      }
+    },
+    "SENSEX": {
+      "5min": {
+        "state": "PULLBACK_NOISE",
+        "direction": "SHORT",
+        "confidence": 0.38,
+        "progress": 1.0,
+        "reason": "live 1m cash volume unavailable; 5min range 2.5x; 5min close 100%; ADX 30.1"
+      },
+      "15min": {
+        "state": "PULLBACK_NOISE",
+        "direction": "SHORT",
+        "confidence": 0.41,
+        "progress": 1.0,
+        "reason": "live 1m cash volume unavailable; 15min range 1.2x; 15min close 100%; partial 5m agrees; ADX 21.0"
+      }
+    },
+    "MIDCPNIFTY": {
+      "5min": {
+        "state": "LIKELY_5M_FLIP",
+        "direction": "SHORT",
+        "confidence": 0.64,
+        "progress": 1.0,
+        "reason": "1m volume 3.1x; 1m close 100%; 5min range 1.9x; 5min close 100%; ADX 49.0"
+      },
+      "15min": {
+        "state": "LIKELY_15M_FLIP",
+        "direction": "SHORT",
+        "confidence": 0.72,
+        "progress": 1.0,
+        "reason": "1m volume 3.1x; 1m close 100%; 15min range 0.9x; 15min close 100%; partial 5m agrees; ADX 25.9"
+      }
+    }
+  },
+  "index_tick_volume": {
+    "SENSEX": {
+      "instrument": "SENSEX",
+      "source": "fyers_ws",
+      "volume_available": false,
+      "volume_source": "",
+      "volume_basis": "",
+      "volume_unit": "",
+      "volume_comparable": false,
+      "volume_unavailable_reason": "no_positive_cumulative_volume",
+      "volume_reliable": false,
+      "volume": 0.0,
+      "volume_key": "",
+      "volume_fields": {},
+      "tick_count_current_minute": 1,
+      "minute_bucket": 29820642,
+      "updated_at": 1789238575.3942442,
+      "volume_observed_at": null,
+      "volume_age_seconds": null
+    },
+    "MIDCPNIFTY": {
+      "instrument": "MIDCPNIFTY",
+      "source": "fyers_ws",
+      "volume_available": false,
+      "volume_source": "",
+      "volume_basis": "",
+      "volume_unit": "",
+      "volume_comparable": false,
+      "volume_unavailable_reason": "no_positive_cumulative_volume",
+      "volume_reliable": false,
+      "volume": 0.0,
+      "volume_key": "",
+      "volume_fields": {},
+      "tick_count_current_minute": 1,
+      "minute_bucket": 29820642,
+      "updated_at": 1789238575.3940794,
+      "volume_observed_at": null,
+      "volume_age_seconds": null
+    },
+    "NIFTY": {
+      "instrument": "NIFTY",
+      "source": "fyers_ws",
+      "volume_available": false,
+      "volume_source": "",
+      "volume_basis": "",
+      "volume_unit": "",
+      "volume_comparable": false,
+      "volume_unavailable_reason": "no_positive_cumulative_volume",
+      "volume_reliable": false,
+      "volume": 0.0,
+      "volume_key": "",
+      "volume_fields": {},
+      "tick_count_current_minute": 1,
+      "minute_bucket": 29820642,
+      "updated_at": 1789238575.394158,
+      "volume_observed_at": null,
+      "volume_age_seconds": null
+    },
+    "BANKNIFTY": {
+      "instrument": "BANKNIFTY",
+      "source": "fyers_ws",
+      "volume_available": false,
+      "volume_source": "",
+      "volume_basis": "",
+      "volume_unit": "",
+      "volume_comparable": false,
+      "volume_unavailable_reason": "no_positive_cumulative_volume",
+      "volume_reliable": false,
+      "volume": 0.0,
+      "volume_key": "",
+      "volume_fields": {},
+      "tick_count_current_minute": 1,
+      "minute_bucket": 29820642,
+      "updated_at": 1789238575.3942025,
+      "volume_observed_at": null,
+      "volume_age_seconds": null
+    }
+  },
+  "simulation": {
+    "id": 1789237249558,
+    "backtest_days": 30,
+    "started_at": "2026-09-12T23:50:48.823676+05:30"
+  },
+  "data_freshness": {
+    "NIFTY": 119028.0,
+    "BANKNIFTY": 119028.0,
+    "SENSEX": 119028.0,
+    "MIDCPNIFTY": 119028.0
+  },
+  "candle_freshness": {
+    "NIFTY": 119028.0,
+    "BANKNIFTY": 119028.0,
+    "SENSEX": 119028.0,
+    "MIDCPNIFTY": 119028.0
+  },
+  "session_stats": {
+    "entries": 0,
+    "exits": 0
+  },
+  "active_peak": {},
+  "system_metrics": {
+    "pid": 38444,
+    "process_ram_mb": 1049.8,
+    "process_cpu_pct": 4.2,
+    "process_cpu_single_core_pct": 66.8,
+    "logical_cpu_count": 16.0,
+    "threads": 30,
+    "ram": {
+      "total_mb": 16088.0,
+      "used_mb": 11206.0,
+      "used_pct": 69.7
+    },
+    "commit": {
+      "total_mb": 27352.0,
+      "used_mb": 14146.0,
+      "available_mb": 13206.0,
+      "used_pct": 51.7
+    },
+    "disk": {
+      "total_gb": 462.5,
+      "free_gb": 103.4,
+      "used_pct": 77.6
+    },
+    "gpu": {
+      "available": true,
+      "label": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "used_mb": 87.0,
+      "total_mb": 8188.0,
+      "used_pct": 1.1,
+      "util_pct": 0.0,
+      "compute_available": true,
+      "compute_backend": "cupy_cuda",
+      "acceleration_mode": "vector_accel_ready",
+      "decision_acceleration": "disabled",
+      "deterministic_parity_required": true,
+      "error": "",
+      "cuda_total_mb": 8187.5,
+      "cuda_free_mb": 7102.0,
+      "benchmark": {
+        "available": true,
+        "backend": "cupy_cuda",
+        "sample_size": 100000,
+        "gpu_ms": 2.84,
+        "cpu_ms": 2.09,
+        "speedup": 0.74,
+        "memory_delta_mb": 0.0,
+        "parity_ok": true,
+        "error": ""
+      }
+    }
+  },
+  "system_performance": {
+    "status": "WARN",
+    "issues": [
+      {
+        "key": "scan_latency_high",
+        "label": "Scan latency high",
+        "severity": "warn",
+        "value": 8304.0
+      }
+    ],
+    "latency_ms": 8304.0,
+    "scan_count": 61,
+    "scanner_stale": false,
+    "recalculation_status": "idle",
+    "sampled_at": "2026-09-13T00:28:47.719668+05:30"
+  }
+}

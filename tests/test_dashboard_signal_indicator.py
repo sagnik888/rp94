@@ -41,7 +41,7 @@ def test_settings_engine_and_ut_trail_controls_are_explicit():
     assert "ensureScannerEngineOptions(settingsEl)" in settings_js
     assert "['quad_union', 'Quad Union']" in settings_js
     assert "['quad_prime', 'Quad Prime']" in settings_js
-    assert "['adaptive_dual', 'Adaptive Dual']" in settings_js
+    assert "['ut_smart', 'UT Smart Exit']" in settings_js      # replaced Adaptive Dual 2026-09-25
     assert "cmd: 'set_scanner_engine'" in settings_js
     assert "settEngineLab" in settings_js
     assert "settEngineLabRealOnly" in settings_js

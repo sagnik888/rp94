@@ -1,0 +1,891 @@
+--- before/config/settings.py
++++ after/config/settings.py
+@@ -2230,8 +2230,11 @@
+     uts_wick_ratio: float = 0.35
+     # Session bars only, as S1: the store's 15:15-15:29 bars are frozen feed + post-close.
+     uts_session_end: str = "15:15"
+-    # The lane: own entries (skips the selection stack), own exits, every safety control.
++    # The lane: UT entries with binding quality, own exits, every safety control.
+     uts_lane_enabled: bool = True
++    # UTS requires confirmed candles by default, independently of other scanners.
++    uts_lane_allow_intrabar_entries: bool = False
++    uts_lane_result_max_age_seconds: float = 30.0
+     # Timeframes: the dashboard TF toggle (ut_timeframe_entry_policy), as for every engine
+     # (2026-09-26 user). Tested: 15m is the tuned frame; 5m had 0 of 4,920 parameter sets
+     # positive in both halves, 1m 0 of 4,920 (1m bursts only: 14 trades, -Rs.1.1k).
+@@ -2257,7 +2260,10 @@
+     uts_lane_guard_mult: float = 2.0
+     uts_lane_guard_min_pct: float = 10.0
+     uts_lane_guard_max_pct: float = 15.0
+-    # Intra-candle mode (the general "Intra-candle Signals" toggle, 2026-09-26 user): a
++    # Protect observed option gains before the index ATR exit can arm.
++    uts_lane_lock_arm_r: float = 1.0
++    uts_lane_lock_giveback_pct: float = 30.0
++    # When both UTS opt-in and the general intra-candle toggle are enabled, a
+     # UT flip on the forming 5m/15m candle must hold this long before entry. Closed-candle
+     # signals never wait.
+     uts_lane_intrabar_wait_seconds: float = 20.0
+--- before/data/sqlite_db.py
++++ after/data/sqlite_db.py
+@@ -82,7 +82,7 @@
+     # repaint_guard_checked: without it a restart rehydrates every intracandle trade as
+     # "structurally unconfirmed", which disables let-winners-run and arms the blunt
+     # sub-1R give-back guard on a position whose source candle closed hours earlier.
+-    "repaint_guard_checked",
++    "repaint_guard_checked", "entered_intracandle", "uts_confirmed",
+     # gtt_arm_uncertain: a possible orphaned server-side trigger. Losing this on a
+     # restart is how a duplicate GTT goes unreconciled until both it and the SL-M
+     # fire, double-exiting the position into a naked reversed leg.
+@@ -564,6 +564,8 @@
+                     "reversal_watch_required": "INTEGER",
+                     "is_reversion_scalp": "INTEGER",
+                     "repaint_guard_checked": "INTEGER",
++                    "entered_intracandle": "INTEGER",
++                    "uts_confirmed": "INTEGER",
+                     "entry_slippage": "REAL",
+                     "exit_slippage": "REAL",
+                     # Present in long-lived databases from an earlier schema, absent from
+--- before/engine/alt_scanners.py
++++ after/engine/alt_scanners.py
+@@ -1034,9 +1034,9 @@
+         """UT SMART EXIT: publish the engine's closed-candle signals, each carrying the
+         exit the chart gave it (uts_exit_*), so a live position follows the chart.
+ 
+-        Session bars only (as S1). The last candle is the forming one and is left out:
+-        the script confirms signals on the close. Per-bar outputs are mapped back onto
+-        the caller's candles.
++        Session bars only (as S1). Bar timestamps denote their opens, so the
++        evaluation clock decides whether the terminal candle is closed. Per-bar
++        outputs are mapped back onto the caller's candles.
+         """
+         from engine import ut_smart_engine as uts
+ 
+@@ -1046,26 +1046,17 @@
+         full = df
+         n_full = len(full)
+         session = uts.drop_off_session_bars(full, p.session_end)
+-        closed = session.iloc[:-1] if n_full and len(session) and session.index[-1] == full.index[-1] else session
++        clock = uts.evaluation_clock(kw.get('as_of'))
++        closed = session.loc[uts.closed_bar_mask(session, timeframe, clock)]
+         # Intra-candle mode: the forming candle may also fire a flip (the script with
+         # confirmClose off). Only a candle still forming by the clock counts; a replay or
+         # an after-hours frame ends on closed candles and keeps the closed-candle answer.
+         forming = None
+         if len(closed) < len(session) and uts_lane.intrabar_enabled():
+-            try:
+-                from datetime import datetime as _dt
+-
+-                import pytz
+-
+-                tf_min = max(1, int(str(timeframe or "15min").lower().replace("min", "") or 15))
+-                last_start = pd.Timestamp(session.index[-1])
+-                if last_start.tzinfo is not None:
+-                    last_start = last_start.tz_convert("Asia/Kolkata").tz_localize(None)
+-                now_ist = _dt.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+-                if last_start + pd.Timedelta(minutes=tf_min) > now_ist:
+-                    forming = session
+-            except Exception:
+-                forming = None
++            stamps = session.index
++            if stamps.tz is not None:
++                stamps = stamps.tz_convert('Asia/Kolkata').tz_localize(None)
++            forming = session.loc[stamps <= clock]
+         if len(closed) < max(15, int(p.atr_period) + 2):
+             return {"error": "Insufficient UT SMART EXIT data", "signals": [], "state": None}
+         ind = uts.indicators(closed, p)
+@@ -1172,6 +1163,12 @@
+         return {
+             "instrument": instrument, "timeframe": timeframe, "candles": n_full,
+             "source_engine": uts.ENGINE_KEY, "signals": signals, "positions": position.tolist(),
++            "uts_evaluation": {
++                "observed_at": clock.to_pydatetime(),
++                "first_bar": index[0],
++                "last_closed_bar": index[-1],
++                "forming_bar": forming.index[-1] if forming is not None and len(forming) > len(closed) else None,
++            },
+             "trailing_stop": vals(trail_full),
+             "trailing_stop_colors": ["green" if v == 1 else "red" if v == -1 else "gray" for v in position],
+             "atr": vals(atr_full), "adx": vals(adx_full),
+--- before/engine/engine_lab.py
++++ after/engine/engine_lab.py
+@@ -707,14 +707,17 @@
+                             )
+                             new_hash = hash((new_hash, frame_hashes, params_from_settings(instrument=instrument)))
+                         elif mode == "ut_smart":
+-                            from engine.ut_smart_engine import params_from_settings
++                            from engine.ut_smart_engine import params_from_settings, evaluation_clock, closed_bar_mask
+                             from engine.uts_lane import intrabar_enabled
+ 
+                             intrabar = intrabar_enabled()
++                            uts_clock = evaluation_clock()
++                            uts_last_closed = bool(closed_bar_mask(df, tf, uts_clock)[-1])
++                            extra['as_of'] = uts_clock
+                             new_hash = hash((
+-                                self._hash_df(df, "realtime" if intrabar else "confirmed"),
++                                self._hash_df(df, "realtime" if intrabar or uts_last_closed else "confirmed"),
+                                 params_from_settings(timeframe=tf),
+-                                intrabar,
++                                intrabar, uts_last_closed,
+                             ))
+                         if new_hash == self._data_hash.get(cache_key) and cache_key in self._result_cache:
+                             result = self._result_cache[cache_key]
+--- before/engine/entry_policy.py
++++ after/engine/entry_policy.py
+@@ -540,6 +540,7 @@
+     underlying_stop_cap_override_pct: Optional[float] = None,
+     require_forecast: bool = True,
+     min_rr_override: Optional[float] = None,
++    require_premium_stop_coverage: bool = False,
+ ) -> EntryPolicyVerdict:
+     """Return the one frozen entry-policy decision for measured execution levels.
+ 
+@@ -719,6 +720,14 @@
+         checks.append(("option_cross_geometry", cross_geometry_ok))
+         if not cross_geometry_ok:
+             reasons.append("option premium/underlying geometry has no valid delta bridge")
++        if require_premium_stop_coverage:
++            # UTS exits follow the index UT stop. A capped option stop that cannot
++            # cover even its delta-mapped distance is a different, shorter strategy.
++            # Reject that exposure rather than widening the universal premium cap.
++            covered = bool(cross_geometry_ok and premium_risk + 0.05 >= underlying_risk * ratio)
++            checks.append(("option_stop_coverage", covered))
++            if not covered:
++                reasons.append("UTS option stop cannot cover the delta-mapped underlying stop")
+ 
+     actual_rr = actual_execution_rr(geometry)
+     rr_ok = bool(_finite(actual_rr) and actual_rr + 1e-9 >= resolved_min_rr)
+--- before/engine/execution_service.py
++++ after/engine/execution_service.py
+@@ -720,7 +720,7 @@
+                 # flow to the canonical evidence verdict below.
+                 grade_allowed, grade_preference_reason = (
+                     (True, "")
+-                    if s1_lane_policy.is_lane(sig)  # lane signals are not graded for selection
++                    if s1_lane_policy.is_s1(sig) or str(getattr(sig, "action", "ENTRY")).upper() == "EXIT"
+                     else scanner._passes_candidate_grade_preference(sig)
+                 )
+                 if not grade_allowed:
+@@ -884,7 +884,7 @@
+                 ).upper()
+                 if (
+                     quality_inst_type_after_concurrency != quality_inst_type_before_concurrency
+-                    and not s1_lane_policy.is_lane(sig)
++                    and not s1_lane_policy.is_s1(sig) and str(getattr(sig, "action", "ENTRY")).upper() == "ENTRY"
+                 ):
+                     # Concurrency may turn a FUT signal into its OPT complement (or the
+                     # reverse).  The first verdict describes the pre-route product, so it
+--- before/engine/exit_cycle.py
++++ after/engine/exit_cycle.py
+@@ -231,7 +231,8 @@
+                 ).get(f"{trade.instrument}_{getattr(trade, 'timeframe', '')}")
+                 s1_bookkeeping = (getattr(trade, "s1_best_spot", None),
+                                   getattr(trade, "s1_t1_locked", False),
+-                                  getattr(trade, "s1_peak_premium", None))
++                                  getattr(trade, "s1_peak_premium", None),
++                                  getattr(trade, "uts_confirmed", False))
+                 s1_decision = s1_lane_policy.exit_decision(
+                     trade,
+                     float(price or 0.0),
+@@ -261,7 +262,8 @@
+                 trade.runner_mode = bool(s1_decision.runner)
+                 if s1_bookkeeping != (getattr(trade, "s1_best_spot", None),
+                                       getattr(trade, "s1_t1_locked", False),
+-                                      getattr(trade, "s1_peak_premium", None)):
++                                      getattr(trade, "s1_peak_premium", None),
++                                      getattr(trade, "uts_confirmed", False)):
+                     mark_dirty = getattr(scanner.trades, "_mark_dirty", None)
+                     if callable(mark_dirty):
+                         mark_dirty()
+--- before/engine/multi_timeframe.py
++++ after/engine/multi_timeframe.py
+@@ -464,13 +464,15 @@
+             elif str(getattr(engine, "signal_source", "") or "") == "ut_smart":
+                 # UT SMART EXIT signals on closed candles only, so forming-bar ticks do
+                 # not change its answer; recompute on a close or a corrected bar.
+-                from engine.ut_smart_engine import params_from_settings as _uts_params
++                from engine.ut_smart_engine import params_from_settings as _uts_params, evaluation_clock, closed_bar_mask
+                 from engine.uts_lane import intrabar_enabled as _uts_intrabar
+ 
+                 # Intra-candle mode reads the forming candle too.
+                 _intrabar = _uts_intrabar()
+-                new_hash = hash((self._hash_df(data, "realtime" if _intrabar else "confirmed"),
+-                                 _uts_params(timeframe=tf), _intrabar))
++                uts_clock = evaluation_clock()
++                uts_last_closed = bool(closed_bar_mask(data, tf, uts_clock)[-1])
++                new_hash = hash((self._hash_df(data, "realtime" if _intrabar or uts_last_closed else "confirmed"),
++                                 _uts_params(timeframe=tf), _intrabar, uts_last_closed))
+             else:
+                 new_hash = self._hash_df(data, getattr(engine, "signal_mode", "realtime"))
+             cached_meta = self._result_metadata.get(key) or {}
+@@ -495,6 +497,8 @@
+             else:
+                 try:
+                     extra = {}
++                    if str(getattr(engine, 'signal_source', '') or '') == 'ut_smart':
++                        extra['as_of'] = uts_clock
+                     if str(getattr(engine, "signal_source", "") or "") == "s1":
+                         for dep in ("5min", "15min"):
+                             if dep != tf:
+--- before/engine/signal_processor.py
++++ after/engine/signal_processor.py
+@@ -3223,6 +3223,21 @@
+ 
+         return evaluate
+ 
++    @staticmethod
++    def _uts_replay_window(signal, timeframe, fallback_end):
++        """Price a confirmed UTS entry and chart exit only after their bars close."""
++        minutes = {"1min": 1, "5min": 5, "15min": 15}[timeframe]
++        source = getattr(signal, "source_signal_timestamp", None) or signal.timestamp
++        start = _market_naive(source).to_pydatetime() + timedelta(minutes=minutes)
++        end = _market_naive(fallback_end).to_pydatetime()
++        exit_bar = getattr(signal, "uts_exit_time", None)
++        reason = ""
++        if exit_bar is not None:
++            chart_end = _market_naive(exit_bar).to_pydatetime() + timedelta(minutes=minutes)
++            if start < chart_end <= end:
++                end, reason = chart_end, str(getattr(signal, "uts_exit_reason", "") or "")
++        return start, end, reason
++
+     def _simulate_actual_option_exit(
+         self,
+         option_df: pd.DataFrame,
+@@ -3247,6 +3262,9 @@
+         replay_regime: str = "UNKNOWN",
+         replay_stop_context: Optional[Dict] = None,
+         live_exits: bool = True,
++        replay_source_lane: str = "",
++        required_stop_distance: float = 0.0,
++        chart_exit_reason: str = "",
+     ) -> Optional[Dict]:
+         """``live_exits=False`` keeps the other engines' live guards out of this replay
+         (the S1 lane) while ``qty`` still prices the recorded path in rupees."""
+@@ -3292,12 +3310,29 @@
+             # Re-anchor to a meaningful premium risk before checking SL/target hits.
+             risk = max_sl_dist
+         risk = min(max_sl_dist, max(0.5, risk))
++        uts_replay = str(replay_source_lane).upper() == "UTS"
++        if uts_replay:
++            # Re-anchor the UTS guard to the observed option fill, not the
++            # provisional premium used before this price path was available.
++            risk = min(max_sl_dist, uts_lane_policy.premium_stop_distance(
++                entry_premium, required_stop_distance, 1.0, get_settings(),
++                regime=replay_regime, confidence=replay_confidence if replay_grade else None,
++                grade=replay_grade,
++            ))
++        if uts_replay and risk + 0.05 < abs(float(required_stop_distance or 0.0)):
++            return None
+         sl_price = max(0.05, entry_premium - risk)
+         target_price = entry_premium + (risk * rr)
+         exit_price = float(window.iloc[-1]["close"])
+         exit_time = window.index[-1] + pd.Timedelta(minutes=1)
+         exit_reason = "HISTORICAL"
+         exit_detail = ""
++        uts_trade = None
++        if uts_replay:
++            live_exits = False  # UTS has its own lane policy, not the generic guards.
++            uts_trade = SimpleNamespace(inst_type="OPT", entry_price=entry_premium,
++                                       initial_stop=sl_price, s1_peak_premium=entry_premium)
++            uts_active_stop = sl_price
+ 
+         # Optionally let the replay see the LIVE trade-management guards. Without this
+         # the only reachable outcomes are SL HIT / TARGET_HIT / HISTORICAL, so a
+@@ -3417,7 +3452,9 @@
+             if peak_qty > 0:
+                 peak_rs = max(peak_rs, (high - entry_premium) * peak_qty)
+             active_stop = float(sl_price)
+-            active_target = float(target_price)
++            active_target = 0.0 if uts_trade is not None else float(target_price)
++            if uts_trade is not None:
++                active_stop = uts_active_stop
+             if live_probe is not None:
+                 # Stop updates returned by the prior closed candle apply now. Newly
+                 # computed stops below apply only to the next candle.
+@@ -3445,6 +3482,18 @@
+                 exit_time = ts if op >= active_target else ts + pd.Timedelta(minutes=1)
+                 exit_reason = "TARGET_HIT"
+                 break
++
++            if uts_trade is not None:
++                decision = uts_lane_policy.exit_decision(
++                    uts_trade, 0.0, close_px, now=(ts + pd.Timedelta(minutes=1)).to_pydatetime(),
++                )
++                uts_active_stop = max(active_stop, float(decision.premium_stop or active_stop))
++                price_path[-1]["next_stop"] = uts_active_stop
++                evaluated_guards = ["UTS_PREMIUM_STOP", "UTS_PROFIT_LOCK", "UTS_CHART_EXIT"]
++                if decision.exit:
++                    exit_price, exit_time = close_px, ts + pd.Timedelta(minutes=1)
++                    exit_reason, exit_detail = decision.reason, decision.detail
++                    break
+ 
+             if live_guard is not None:
+                 try:
+@@ -3525,6 +3574,8 @@
+ 
+         if exit_reason == "HISTORICAL" and pd.Timestamp(exit_time) < pd.Timestamp(end):
+             return None
++        if uts_replay and exit_reason == "HISTORICAL" and chart_exit_reason:
++            exit_reason = uts_lane_policy.EXIT_REASONS.get(chart_exit_reason, "UTS_EXIT")
+         exit_trace.append({"time": pd.Timestamp(exit_time).isoformat(), "guard": exit_reason, "state": "FILL", "price": float(exit_price), "detail": exit_detail})
+         return {
+             "entry_time": entry_time,
+@@ -4847,6 +4898,9 @@
+                                 or next_signal_ts > session_exit_ts
+                             )
+                             effective_exit_ts = session_exit_ts if crosses_session else next_signal_ts
++                            hist_chart_reason = ""
++                            if hist_uts:
++                                entry_ts, effective_exit_ts, hist_chart_reason = self._uts_replay_window(s1, tf, effective_exit_ts)
+ 
+                             if sim_inst == "FUT":
+                                 sim_option_type = ""
+@@ -4923,6 +4977,9 @@
+                                 option_df, trading_symbol, symbol_token = self._load_option_candles(
+                                     scanner, instrument, hist_strike, sim_option_type, "1min", s1.timestamp.date(), now_dt=s1.timestamp
+                                 )
++                                if hist_uts and option_df.empty:
++                                    record_reject("UTS replay requires observed option prices", "OPT")
++                                    continue
+                                 if option_df.empty and getattr(settings, "ut_option_history_mode", "fetch_or_skip") == "fetch_or_skip":
+                                     option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
+                                     if option_pref == "OPT":
+@@ -5013,11 +5070,11 @@
+                                 hist_rr = self._dynamic_rr(hist_grade, hist_conf, timeframe=tf)
+                                 actual_option = self._simulate_actual_option_exit(
+                                     option_df if "option_df" in locals() else pd.DataFrame(),
+-                                    s1.timestamp,
++                                    entry_ts if hist_uts else s1.timestamp,
+                                     effective_exit_ts,
+                                     sl_price,
+-                                    hist_rr,
+-                                    natural_sl_distance=natural_sl_distance,
++                                    uts_lane_policy.target_rr(settings) if hist_uts else hist_rr,
++                                    natural_sl_distance=effective_sl_dist if hist_uts else natural_sl_distance,
+                                     max_sl_pct=hist_option_cap / 100.0,
+                                     qty=qty,
+                                     tf15_qty=qty,
+@@ -5029,6 +5086,9 @@
+                                     replay_grade=hist_grade,
+                                     replay_confidence=hist_conf,
+                                     replay_regime=hist_regime,
++                                    replay_source_lane=hist_lane_tag,
++                                    required_stop_distance=natural_sl_distance if hist_uts else 0.0,
++                                    chart_exit_reason=hist_chart_reason,
+                                 )
+                                 if actual_option:
+                                     entry_premium = actual_option["entry"]
+@@ -5038,6 +5098,9 @@
+                                     exit_time = actual_option["exit_time"]
+                                     is_sl_hit = actual_option["reason"] == "SL HIT"
+                                 else:
++                                    if hist_uts:
++                                        record_reject("UTS replay lacks a complete observed option path or compatible stop", "OPT")
++                                        continue
+                                     spot_diff = raw_exit_spot - s1.price if direction == "LONG" else s1.price - raw_exit_spot
+                                     raw_exit_premium = entry_premium + (spot_diff * sim_multiplier)
+                                     
+@@ -5835,7 +5898,11 @@
+                                 continue
+                             if not any(ct.id == eod_id for ct in scanner.trades.closed_trades):
+                                 eod_exit_time = datetime.combine(sig_date, force_exit_time)
+-                                e_time = IST.localize(last_s.timestamp) if last_s.timestamp.tzinfo is None else last_s.timestamp
++                                eod_start = last_s.timestamp
++                                eod_chart_reason = ""
++                                if eod_uts:
++                                    eod_start, eod_exit_time, eod_chart_reason = self._uts_replay_window(last_s, tf, eod_exit_time)
++                                e_time = IST.localize(eod_start) if eod_start.tzinfo is None else eod_start
+                                 ex_time = IST.localize(eod_exit_time) if eod_exit_time.tzinfo is None else eod_exit_time
+                                 
+                                 
+@@ -5901,6 +5968,8 @@
+                                         scanner, instrument, sim_atm_strike, sim_option_type, "1min", sig_date,
+                                         now_dt=getattr(last_s, "timestamp", None)
+                                     )
++                                    if eod_uts and option_df.empty:
++                                        continue
+                                     history_mode = getattr(settings, "ut_option_history_mode", "fetch_or_skip")
+                                     if option_df.empty and history_mode == "fetch_or_skip":
+                                         option_pref = (getattr(scanner, "inst_pref", "AUTO") or "AUTO").upper()
+@@ -5963,10 +6032,10 @@
+                                         )
+                                         actual_eod = self._simulate_actual_option_exit(
+                                             option_df,
+-                                            last_s.timestamp,
++                                            eod_start,
+                                             eod_exit_time,
+                                             opt_sl_price,
+-                                            eod_rr,
++                                            uts_lane_policy.target_rr(settings) if eod_uts else eod_rr,
+                                             natural_sl_distance=natural_sl_premium_dist,
+                                             max_sl_pct=eod_option_cap / 100.0,
+                                             qty=eod_probe_qty,
+@@ -5979,6 +6048,9 @@
+                                             replay_grade=eod_grade,
+                                             replay_confidence=eod_conf,
+                                             replay_regime=eod_regime,
++                                            replay_source_lane=eod_lane,
++                                            required_stop_distance=abs(spot_stop_dist * sim_multiplier) if eod_uts else 0.0,
++                                            chart_exit_reason=eod_chart_reason,
+                                         )
+                                         if actual_eod:
+                                             entry_premium = actual_eod["entry"]
+@@ -5989,9 +6061,13 @@
+                                             ex_time = IST.localize(eod_exit_time) if (eod_exit_time and getattr(eod_exit_time, "tzinfo", None) is None) else eod_exit_time
+                                             eod_exit_reason = actual_eod["reason"] if actual_eod["reason"] != "HISTORICAL" else "SESSION_END"
+                                         else:
++                                            if eod_uts:
++                                                continue
+                                             fallback_risk = max(0.5, est_entry - opt_sl_price)
+                                             eod_target = est_entry + (fallback_risk * eod_rr)
+                                     else:
++                                        if eod_uts:
++                                            continue
+                                         fallback_risk = max(0.5, entry_premium - opt_sl_price)
+                                         eod_target = entry_premium + (fallback_risk * eod_rr)
+ 
+--- before/engine/ut_smart_engine.py
++++ after/engine/ut_smart_engine.py
+@@ -129,6 +129,27 @@
+     values["rsi_lookback"] = max(2, values["rsi_lookback"])
+     values["exit_ema"] = max(1, values["exit_ema"])
+     return UTSParams(**values)
++
++
++def evaluation_clock(as_of=None) -> pd.Timestamp:
++    """Explicit replay clock, or the live market clock, normalized to local time."""
++    if as_of is None:
++        from datetime import datetime
++        import pytz
++
++        as_of = datetime.now(pytz.timezone('Asia/Kolkata'))
++    stamp = pd.Timestamp(as_of)
++    if pd.isna(stamp):
++        raise ValueError('Missing UT SMART EXIT evaluation clock')
++    return stamp.tz_convert('Asia/Kolkata').tz_localize(None) if stamp.tzinfo else stamp
++
++
++def closed_bar_mask(df, timeframe: str, as_of=None):
++    minutes = max(1, int(str(timeframe).lower().replace('min', '').replace('m', '')))
++    stamps = df.index
++    if stamps.tz is not None:
++        stamps = stamps.tz_convert('Asia/Kolkata').tz_localize(None)
++    return stamps + pd.Timedelta(minutes=minutes) <= evaluation_clock(as_of)
+ 
+ 
+ # ─────────────────────────────────────────────────────────────── Pine built-ins
+@@ -366,14 +387,14 @@
+             signal[i] = 1
+             state = 1
+             entry = cl[i]
+-            peak = hi[i]
++            peak = cl[i]  # Entry is at the close; earlier signal-bar highs are not owned.
+             trough = np.nan
+             bars = 0
+         elif sell:
+             signal[i] = -1
+             state = -1
+             entry = cl[i]
+-            trough = lo[i]
++            trough = cl[i]  # Earlier signal-bar lows precede this entry.
+             peak = np.nan
+             bars = 0
+         elif exit_long:
+--- before/engine/uts_lane.py
++++ after/engine/uts_lane.py
+@@ -1,8 +1,8 @@
+ """UT SMART EXIT lane: how a signal from the UT SMART EXIT engine is admitted and managed.
+ 
+-The engine (engine/ut_smart_engine.py) selects its own entries -- the UT Bot flip on a
+-closed candle -- so, like S1, a UTS signal skips the quality/grading/setup SELECTION stack
+-and the special-entry lanes; every SAFETY control stays (daily-loss and segment breakers,
++The engine (engine/ut_smart_engine.py) selects UT flips on closed candles by default.
++UTS entry quality and operator grade preferences are binding; the lane retains its
++own chart exits and every safety control (daily-loss and segment breakers,
+ position/bucket/capital caps, quote and data checks, Auto/Manual authority, broker stop
+ protection, the dashboard TF toggle and the 1m burst rule). s1_lane.is_lane() is True for both
+ lanes; the values that differ live here.
+@@ -14,7 +14,9 @@
+     2. the premium broker stop: the UT stop distance mapped through delta, times
+        uts_lane_guard_mult (the chart only reacts on the close, so the broker stop sits
+        beyond it as a catastrophe stop), clamped to uts_lane_guard_min_pct..max_pct;
+-    3. the 15:15 squareoff.
++    3. the option premium profit lock, armed at 1R with 30% peak-gain giveback;
++    4. the 15:15 squareoff.
++New option exposure is rejected when the capped stop cannot cover the delta-mapped UT stop.
+ The chart has no target, so the target is nominal (uts_lane_target_r) and never closes
+ the trade.
+ """
+@@ -154,14 +156,37 @@
+ 
+ def exit_decision(trade: Any, spot: float, premium: float, now: Optional[datetime] = None,
+                   engine_exit: Optional[dict] = None, settings=None, **_ignored):
+-    """One monitor pass for a UTS trade or row. The chart's exit is the only lane exit;
+-    the premium guard (the trade's stop) and EOD are enforced by the callers."""
++    """Chart exits plus a premium profit lock; hard stops and EOD remain with callers.
++
++    The premium peak contains only observed post-entry prices. This protection does
++    not wait for the chart's multi-bar ATR arm, which measures a different asset.
++    """
+     from engine.s1_lane import S1ExitDecision
+ 
+     if engine_exit:
+         chart = str(engine_exit.get("reason") or "")
+         return S1ExitDecision(True, EXIT_REASONS.get(chart, "UTS_EXIT"), 0.0,
+                               f"UT SMART EXIT chart exit: {chart or 'exit'}", runner=True)
++    if str(getattr(trade, "inst_type", "") or "").upper() == "OPT":
++        import math
++
++        s = _settings(settings)
++        entry = float(getattr(trade, "entry_price", 0.0) or getattr(trade, "price", 0.0) or 0.0)
++        initial = float(getattr(trade, "initial_stop", 0.0) or getattr(trade, "premium_stop", 0.0)
++                        or getattr(trade, "stop", 0.0) or 0.0)
++        risk = entry - initial
++        if all(math.isfinite(x) for x in (entry, initial, premium)) and 0 < risk < entry and premium > 0:
++            stored = float(getattr(trade, "s1_peak_premium", None) or entry)
++            peak = max(entry, premium, stored if math.isfinite(stored) else entry)
++            setattr(trade, "s1_peak_premium", peak)
++            if peak - entry >= _g(s, "uts_lane_lock_arm_r", 1.0) * risk:
++                giveback = min(100.0, max(0.0, _g(s, "uts_lane_lock_giveback_pct", 30.0)))
++                floor = entry + (peak - entry) * (1.0 - giveback / 100.0)
++                return S1ExitDecision(
++                    premium <= floor, "UTS_PROFIT_LOCK" if premium <= floor else "", 0.0,
++                    f"UTS premium peak {peak:.2f}; profit floor {floor:.2f}",
++                    premium_stop=floor, runner=True,
++                )
+     return S1ExitDecision(False, "", 0.0, runner=True)
+ 
+ 
+@@ -175,10 +200,10 @@
+ 
+ 
+ def intrabar_enabled(settings=None) -> bool:
+-    """UT SMART EXIT signals on the forming candle only with the general Intra-candle
+-    Signals toggle ON (the script's confirmClose = false). Tested 2026-09-26: closed
+-    candles made more (reports/ut_smart_intracandle_study_20260926.py)."""
+-    s = _settings(settings)
++    """Forming entries require both the UTS opt-in and the general intrabar toggle."""
++    s = _settings(settings)
++    if not bool(getattr(s, 'uts_lane_allow_intrabar_entries', False)):
++        return False
+     try:
+         return str(s.get_signal_fire_mode()).upper() == "INTRACANDLE"
+     except Exception:
+@@ -223,11 +248,28 @@
+     s = _settings(settings)
+     bar_minutes = _tf_minutes(getattr(trade, "timeframe", ""))
+     bar_close = want + pd.Timedelta(minutes=bar_minutes)
+-    if clock >= bar_close + pd.Timedelta(minutes=bar_minutes):
+-        # A full bar past the close the running process has judged it (it checks every
+-        # scan); uts_confirmed is in memory only, so a trade restored later is confirmed.
+-        setattr(trade, "uts_confirmed", True)
+-        return ""
++    evidence = result.get('uts_evaluation')
++    if result.get('error') or str(result.get('source_engine') or '').lower() != ENGINE_KEY or not isinstance(evidence, dict):
++        return ""
++    if str(result.get('timeframe') or '') != str(getattr(trade, 'timeframe', '') or ''):
++        return ''
++    instrument = str(getattr(trade, 'instrument', '') or '').split()
++    if not instrument or result.get('instrument') != instrument[0]:
++        return ''
++    try:
++        observed = _market_time(evidence['observed_at'])
++        first = _market_time(evidence['first_bar'])
++        last_closed = _market_time(evidence['last_closed_bar'])
++        forming_bar = _market_time(evidence['forming_bar']) if evidence.get('forming_bar') is not None else None
++        age = (clock - observed).total_seconds()
++        if not (0 <= age <= _g(s, 'uts_lane_result_max_age_seconds', 30.0)) or first > want:
++            return ''
++        if clock >= bar_close and last_closed < want:
++            return ''
++        if clock < bar_close and forming_bar != want:
++            return ''
++    except (KeyError, TypeError, ValueError):
++        return ''
+     side = "BUY" if str(getattr(trade, "direction", "LONG") or "LONG").upper() == "LONG" else "SELL"
+     closed_hit = forming_hit = False
+     for sig in result.get("signals") or []:
+@@ -281,6 +323,8 @@
+     "uts_wick_ratio": ("float", 0.1, 0.9),
+     "uts_session_end": ("time",),
+     "uts_lane_enabled": ("bool",),
++    "uts_lane_allow_intrabar_entries": ("bool",),
++    "uts_lane_result_max_age_seconds": ("float", 1.0, 120.0),
+     "uts_lane_reclaim_start": ("time",),
+     "uts_lane_sl_max_pct": ("float", 0.05, 5.0),
+     "uts_lane_min_entry_rr": ("float", 0.1, 5.0),
+@@ -288,6 +332,8 @@
+     "uts_lane_guard_mult": ("float", 1.0, 10.0),
+     "uts_lane_guard_min_pct": ("float", 1.0, 80.0),
+     "uts_lane_guard_max_pct": ("float", 1.0, 90.0),
++    "uts_lane_lock_arm_r": ("float", 0.5, 10.0),
++    "uts_lane_lock_giveback_pct": ("float", 0.0, 100.0),
+     "uts_lane_intrabar_wait_seconds": ("float", 0.0, 120.0),
+     "uts_lane_repaint_check_seconds": ("float", 1.0, 120.0),
+ }
+--- before/scanner.py
++++ after/scanner.py
+@@ -14251,6 +14251,7 @@
+             # created; recovery is already exempted inside the policy evaluator.
+             supported_instruments=self._fresh_entry_universe(),
+             fresh_exposure=fresh_exposure,
++            require_premium_stop_coverage=uts_lane_policy.is_uts(holder, settings),
+             **(
+                 {
+                     "underlying_stop_cap_override_pct": s1_lane_policy.lane_sl_max_pct(holder, settings),
+@@ -15662,6 +15663,8 @@
+                 getattr(candidate, "signal_fire_mode", "INTRACANDLE") or "INTRACANDLE"
+             ),
+             "entered_intracandle": bool(getattr(candidate, "entered_intracandle", True)),
++            "uts_confirmed": bool(getattr(candidate, "uts_confirmed", False)),
++            "s1_peak_premium": getattr(candidate, "s1_peak_premium", None),
+             "exit_reason": getattr(candidate, "exit_reason", ""),
+             "is_exit": getattr(candidate, "action", "ENTRY") == "EXIT",
+             **manual_exit_state,
+@@ -25233,6 +25236,9 @@
+                 "entered_intracandle",
+                 bool(payload.get("entered_intracandle", True)),
+             )
++            setattr(candidate, "uts_confirmed", bool(payload.get("uts_confirmed", False)))
++            if payload.get("s1_peak_premium") is not None:
++                setattr(candidate, "s1_peak_premium", float(payload["s1_peak_premium"]))
+             raw_entry_ts = payload.get("entry_timestamp") or payload.get("timestamp")
+             if raw_entry_ts:
+                 try:
+@@ -29201,13 +29207,15 @@
+         lane: str,
+     ) -> Tuple[bool, str, str]:
+         """Recheck operator preference and canonical evidence at delayed submit time."""
+-        if s1_lane_policy.is_lane(candidate):
++        if s1_lane_policy.is_s1(candidate) or str(getattr(candidate, "action", "ENTRY")).upper() == "EXIT":
+             # The S1 script selected this signal; grade preference and the quality verdict
+             # are the other engines' selection. Safety checks run on the submit path.
+             return True, "", ""
+         grade_allowed, grade_reason = self._passes_candidate_grade_preference(candidate)
+         if not grade_allowed:
+             return False, grade_reason, "manual_grade_preference"
++        if uts_lane_policy.is_uts(candidate) and not uts_lane_policy.intrabar_enabled() and Scanner._candidate_source_is_intrabar(candidate):
++            return False, "UTS requires a closed source candle", "manual_candle_confirmation"
+         verdict = self._current_quality_verdict_for_candidate(candidate, lane=lane)
+         if not verdict.allowed:
+             return (
+@@ -29418,9 +29426,16 @@
+             )
+ 
+         if s1_lane_policy.is_lane(candidate, settings):
+-            # Lane: the user's script (S1, or UT SMART EXIT) selected this signal itself.
+-            # Every safety check above has run; quality/grading/location are the other
+-            # engines' selection and do not apply. The timeframe policy is configuration.
++            # UTS uses its own exits, but its entry quality evidence is binding.
++            if uts_lane_policy.is_uts(candidate, settings) and str(getattr(candidate, "action", "ENTRY")).upper() == "ENTRY":
++                if not uts_lane_policy.intrabar_enabled(settings) and Scanner._candidate_source_is_intrabar(candidate):
++                    return self._gate_block(candidate, "Live Gate: UTS requires a closed source candle.")
++                quality = Scanner._quality_verdict_for_candidate(
++                    self, candidate, regime=regime, risky_regime=risky_regime,
++                    is_choppy=is_choppy, lane="LIVE",
++                )
++                if not quality.allowed:
++                    return self._gate_block(candidate, f"Live Gate: {quality.reason} [{quality.reason_code}]")
+             setattr(candidate, "s1_lane", True)
+             # Both lanes trade the frames the dashboard TF toggle selects.
+             return self._passes_timeframe_entry_policy(candidate)
+@@ -29922,6 +29937,8 @@
+                     getattr(getattr(self, "mtf", None), "_result_cache", {}) or {}
+                 ).get(f"{previous.instrument}_{previous.timeframe}")
+                 s1_spot = float(self.candles.get_latest_price(previous.instrument) or 0.0)
++                lane_bookkeeping = (getattr(previous, "s1_peak_premium", None),
++                                    getattr(previous, "uts_confirmed", False))
+                 s1_decision = s1_lane_policy.exit_decision(
+                     previous,
+                     s1_spot,
+@@ -29933,6 +29950,9 @@
+                     settings=settings,
+                     market=s1_lane_policy.closed_bar_state(previous, s1_result),
+                 )
++                if lane_bookkeeping != (getattr(previous, "s1_peak_premium", None),
++                                        getattr(previous, "uts_confirmed", False)):
++                    changed = True
+                 if s1_decision.target_premium > 0:
+                     lowered = s1_lane_policy.nearer_target(
+                         float(getattr(previous, "target", 0.0) or 0.0),
+--- before/tests/test_audit_ten_fixes.py
++++ after/tests/test_audit_ten_fixes.py
+@@ -400,6 +400,7 @@
+         entry_spot=25_000.0,
+         is_ghost=True,
+         initial_stop=80.0,
++        confidence=0.8,  # Ordinary setup; an omitted 0.0 score requires the 5% cap.
+     )
+     tid = trade.id
+     tm.update_trade(
+--- before/tests/test_live_option_quote_integrity.py
++++ after/tests/test_live_option_quote_integrity.py
+@@ -67,7 +67,7 @@
+     entry, stop, target = scanner._execution_levels(_option_candidate())
+ 
+     assert entry == 160.50
+-    assert round(stop, 3) == 136.425
++    assert round(stop, 3) == 144.45  # 10% ceiling in ordinary/unknown regimes
+     assert target > entry
+ 
+ 
+@@ -83,7 +83,7 @@
+     entry, stop, target = scanner._execution_levels(_option_candidate(option_type="CE"))
+ 
+     assert entry == 208.50
+-    assert round(stop, 3) == 177.225
++    assert round(stop, 3) == 187.65  # 10% trend ceiling still bounds the operator cap
+     assert target > entry
+ 
+ 
+@@ -256,7 +256,7 @@
+     assert repaired is True
+     assert candidate.price == 160.80
+     assert candidate.current_price == 160.80
+-    assert round(candidate.stop, 2) == 136.68
++    assert round(candidate.stop, 2) == 144.72
+     assert candidate.target > candidate.price
+     assert candidate.quote_verified is True
+ 
+--- before/tests/test_manual_mode_exit.py
++++ after/tests/test_manual_mode_exit.py
+@@ -267,8 +267,8 @@
+ 
+     risk = scanner._trade_like_initial_risk_rs(candidate, qty=25, inst_mult=1.0)
+ 
+-    assert risk == pytest.approx(1197.00 * 0.15 * 25)
+-    assert candidate.initial_stop == pytest.approx(1197.00 * 0.85)
++    assert risk == pytest.approx(1197.00 * 0.10 * 25)
++    assert candidate.initial_stop == pytest.approx(1197.00 * 0.90)
+ 
+     lock_stop, reason, ratio = scanner._profit_lock_floor(
+         entry_price=candidate.price,
+@@ -921,7 +921,7 @@
+     assert clamped is True
+     assert breathing > 0
+     assert adjusted_stop < candidate.price
+-    assert candidate.initial_stop == pytest.approx(1197.00 * 0.85)
++    assert candidate.initial_stop == pytest.approx(1197.00 * 0.90)
+ 
+ 
+ def test_option_breathing_room_allows_profit_stop_after_proved_move():
+@@ -1997,7 +1997,7 @@
+ def test_option_live_stop_distance_respects_configured_sl_pct():
+     scanner = SimpleNamespace(options_sl_pct=15.0)
+ 
+-    assert round(SignalProcessor._option_premium_stop_distance(224.60, scanner, "TRENDING_UP"), 2) == 33.69
++    assert round(SignalProcessor._option_premium_stop_distance(224.60, scanner, "TRENDING_UP"), 2) == 22.46
+     assert round(SignalProcessor._option_premium_stop_distance(224.60, SimpleNamespace(options_sl_pct=10.0), "RANGING"), 2) == 22.46
+ 
+ 
+@@ -2010,14 +2010,14 @@
+     scanner = SimpleNamespace(options_sl_pct=15.0)
+     price = 1200.0
+ 
+-    # Large ATR (12.5% of premium) diverges at the band edges: 5min caps at 10%,
+-    # 15min caps at 15% (but ceiling is options_sl_pct=15% so 12.5% passes through).
++    # The universal 10% trend ceiling applies to both frames, even if the
++    # timeframe's ATR band would otherwise allow a wider stop.
+     big_atr = 150.0
+     s5 = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="5min", atr_premium_stop=big_atr, settings=settings)
+     s15 = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="15min", atr_premium_stop=big_atr, settings=settings)
+     assert round(s5, 2) == 120.0   # 10% cap
+-    assert round(s15, 2) == 150.0  # 12.5% ATR within 15% cap
+-    assert s5 < s15
++    assert round(s15, 2) == 120.0
++    assert s5 == s15
+ 
+     # Tiny ATR floors to the per-timeframe minimum (5min 4%, 15min 6%).
+     tiny_atr = 5.0
+@@ -2026,14 +2026,14 @@
+     assert round(t5, 2) == 48.0    # 4% floor
+     assert round(t15, 2) == 72.0   # 6% floor
+ 
+-    # No ATR supplied → legacy flat percentage (backward compatible).
+-    assert round(SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP"), 2) == 180.0
++    # Without ATR the universal trend ceiling still applies.
++    assert round(SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP"), 2) == 120.0
+ 
+     # Feature flag off → flat percentage even when ATR is supplied.
+     settings.option_stop_tf_atr_aware = False
+     try:
+         off = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="5min", atr_premium_stop=big_atr, settings=settings)
+-        assert round(off, 2) == 180.0
++        assert round(off, 2) == 120.0
+     finally:
+         settings.option_stop_tf_atr_aware = True
+ 
+--- before/tests/test_multi_signal_mixed_book.py
++++ after/tests/test_multi_signal_mixed_book.py
+@@ -144,13 +144,13 @@
+     sc = _scanner()
+     candidate = _cand("NIFTY", inst_type="OPT", conf=0.70)
+     candidate.quote_verified = True
+-    candidate.initial_stop = candidate.stop = 80.0  # 20% risk exceeds the 15% cap
++    candidate.initial_stop = candidate.stop = 80.0  # 20% risk exceeds the 10% ordinary cap
+     candidate.target = 120.0
+ 
+     assert sc._force_candidate_to_options(candidate) is True
+-    assert candidate.stop == pytest.approx(85.0)
+-    assert candidate.initial_stop == pytest.approx(85.0)
+-    assert candidate.target == pytest.approx(122.5)
++    assert candidate.stop == pytest.approx(90.0)
++    assert candidate.initial_stop == pytest.approx(90.0)
++    assert candidate.target == pytest.approx(115.0)
+     assert candidate.risk_geometry_source == "option_cap_rebuilt"
+ 
+ 
+--- before/tests/test_power_move_override.py
++++ after/tests/test_power_move_override.py
+@@ -359,6 +359,7 @@
+         log_signal_decision_once=lambda *args, **kwargs: None,
+     )
+     st._execution_levels = Scanner._execution_levels.__get__(st, Scanner)
++    st._candidate_market_regime = Scanner._candidate_market_regime.__get__(st, Scanner)
+ 
+     entry, stop, target = st._execution_levels(candidate)
+ 
+--- before/trading/trade_manager.py
++++ after/trading/trade_manager.py
+@@ -353,6 +353,7 @@
+     is_reversion_scalp: bool = False
+     signal_fire_mode: str = "INTRACANDLE"
+     entered_intracandle: bool = True
++    uts_confirmed: bool = False
+     # Has the post-entry repaint check completed for this trade? PERSISTED, because it
+     # was previously only a dynamic setattr: a restart lost it, and an intracandle trade
+     # then rehydrated as "structurally unconfirmed" for the rest of the day — which
+@@ -621,6 +622,7 @@
+             "replay_exit_trace": list(self.replay_exit_trace or []),
+             "signal_fire_mode": self.signal_fire_mode,
+             "entered_intracandle": self.entered_intracandle,
++            "uts_confirmed": self.uts_confirmed,
+             "repaint_guard_checked": self.repaint_guard_checked,
+             "gtt_arm_uncertain": self.gtt_arm_uncertain,
+             "market_regime": self.market_regime,
+@@ -726,6 +728,16 @@
+                 return ist.localize(parsed) if parsed.tzinfo is None else parsed.astimezone(ist)
+             except (TypeError, ValueError):
+                 return None
++
++        entered_intracandle = data.get("entered_intracandle")
++        if entered_intracandle is None:
++            entered_intracandle = True  # Unknown legacy entry timing is not confirmation.
++            if str(data.get("source_lane") or "").upper() == "UTS" or data.get("source_engine") == "ut_smart":
++                source_time = parse_ist_datetime(data.get("signal_time") or data.get("signal_timestamp"))
++                fill_time = parse_ist_datetime(data.get("entry_filled_at")) or (entry_time if ts else None)
++                minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(data.get("timeframe") or ""))
++                if source_time is not None and fill_time is not None and minutes is not None:
++                    entered_intracandle = fill_time < source_time + timedelta(minutes=minutes)
+         
+         # Extract base instrument name (strip strike info like "NIFTY 24100 CE" -> "NIFTY")
+         raw_instrument = data.get("instrument", "")
+@@ -874,7 +886,8 @@
+                 if isinstance(row, dict)
+             ],
+             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
+-            entered_intracandle=bool(data.get("entered_intracandle", True)),
++            entered_intracandle=bool(entered_intracandle),
++            uts_confirmed=bool(data.get("uts_confirmed", False)),
+             repaint_guard_checked=bool(data.get("repaint_guard_checked", False)),
+             gtt_arm_uncertain=bool(data.get("gtt_arm_uncertain", False)),
+             market_regime=str(data.get("market_regime") or ""),

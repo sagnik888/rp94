@@ -171,10 +171,13 @@ def test_historical_intel_at_uses_simulation_cache():
     scanner.intel = SimpleNamespace(analyze=analyze)
 
     first = scanner._compute_historical_intel_at("NIFTY", datetime(2026, 6, 25, 9, 35), "5min")
-    second = scanner._compute_historical_intel_at("NIFTY", datetime(2026, 6, 25, 9, 35), "5min")
+    second = scanner._compute_historical_intel_at("NIFTY", datetime(2026, 6, 25, 9, 39), "5min")
 
     assert first == second
     assert calls["count"] == 1
+
+    scanner._compute_historical_intel_at("NIFTY", datetime(2026, 6, 25, 9, 40), "5min")
+    assert calls["count"] == 2
 
 
 def test_recalculation_worker_can_reuse_existing_candle_cache(tmp_path, monkeypatch):

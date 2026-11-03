@@ -1,0 +1,578 @@
+{
+  "observed_at": "2026-09-10T05:24:12.416380+00:00",
+  "method": "Read-only SQLite transaction, persisted prior reports; no broker reconciliation or new market replay",
+  "live_trades": [
+    {
+      "instrument": "BANKNIFTY 56500 PE",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "entry_time": "09 Sep 09:34:47",
+      "exit_time": "09 Sep 09:40:37",
+      "entry_price": 510.7,
+      "requested_entry_price": 510.65,
+      "initial_stop": 476.06097363848596,
+      "current_stop": 476.2225486384892,
+      "exit_price": 489.4,
+      "exit_reason": "EARLY_LOSS_CUT",
+      "pnl": -719.0,
+      "charges": 0.0,
+      "peak_pnl": 227.99999999999898,
+      "max_drawdown": 882.2199999999993,
+      "grade": "A",
+      "confidence": 0.8,
+      "market_regime": "TRENDING_DOWN",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.06576244469793564,
+      "expected_move_floor_pct": 0.029
+    },
+    {
+      "instrument": "MIDCPNIFTY 14600 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "09 Sep 09:47:20",
+      "exit_time": "09 Sep 09:51:37",
+      "entry_price": 167.5,
+      "requested_entry_price": 168.9,
+      "initial_stop": 159.65961098428428,
+      "current_stop": 159.65961098428428,
+      "exit_price": 169.8,
+      "exit_reason": "SMART_PROFIT_LOCK",
+      "pnl": 196.0,
+      "charges": 0.0,
+      "peak_pnl": 606.0000000000014,
+      "max_drawdown": 609.9599999999994,
+      "grade": "A+",
+      "confidence": 0.95,
+      "market_regime": "TRENDING_DOWN",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.04223594216151051,
+      "expected_move_floor_pct": 0.031
+    },
+    {
+      "instrument": "SENSEX 75000 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "09 Sep 12:00:01",
+      "exit_time": "09 Sep 12:02:06",
+      "entry_price": 398.45,
+      "requested_entry_price": 399.7,
+      "initial_stop": 377.52237791096894,
+      "current_stop": 377.52237791096894,
+      "exit_price": 402.3,
+      "exit_reason": "SMART_PROFIT_LOCK",
+      "pnl": -3.0,
+      "charges": 0.0,
+      "peak_pnl": 255.0,
+      "max_drawdown": 244.16000000000022,
+      "grade": "B+",
+      "confidence": 0.68,
+      "market_regime": "RANGING",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.034904473442295116,
+      "expected_move_floor_pct": 0.022
+    },
+    {
+      "instrument": "NIFTY 23500 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "09 Sep 12:00:16",
+      "exit_time": "09 Sep 12:02:01",
+      "entry_price": 105.85,
+      "requested_entry_price": 105.5,
+      "initial_stop": 99.06250320153248,
+      "current_stop": 99.06250320153248,
+      "exit_price": 107.7,
+      "exit_reason": "SMART_PROFIT_LOCK",
+      "pnl": 40.0,
+      "charges": 0.0,
+      "peak_pnl": 328.25000000000074,
+      "max_drawdown": 248.4699999999998,
+      "grade": "B+",
+      "confidence": 0.67,
+      "market_regime": "RANGING",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.03146074026411304,
+      "expected_move_floor_pct": 0.023
+    },
+    {
+      "instrument": "MIDCPNIFTY 14600 PE",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "entry_time": "09 Sep 12:14:21",
+      "exit_time": "09 Sep 12:24:37",
+      "entry_price": 168.0,
+      "requested_entry_price": 168.0,
+      "initial_stop": 157.92,
+      "current_stop": 157.92,
+      "exit_price": 163.55,
+      "exit_reason": "EARLY_LOSS_CUT",
+      "pnl": -614.0,
+      "charges": 0.0,
+      "peak_pnl": 240.0,
+      "max_drawdown": 807.97,
+      "grade": "B+",
+      "confidence": 0.66,
+      "market_regime": "RANGING",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.05042286481395409,
+      "expected_move_floor_pct": 0.031
+    },
+    {
+      "instrument": "MIDCPNIFTY 14600 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "10 Sep 09:15:37",
+      "exit_time": "10 Sep 09:16:05",
+      "entry_price": 181.5,
+      "requested_entry_price": 181.4,
+      "initial_stop": 172.2220844028722,
+      "current_stop": 172.2220844028722,
+      "exit_price": 178.85,
+      "exit_reason": "SMART_PROFIT_LOCK",
+      "pnl": -398.0,
+      "charges": 80.0,
+      "peak_pnl": 623.1168000000628,
+      "max_drawdown": 422.150000000002,
+      "grade": "A+",
+      "confidence": 0.96,
+      "market_regime": "TRENDING_DOWN",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.04340179669758973,
+      "expected_move_floor_pct": 0.031
+    },
+    {
+      "instrument": "NIFTY 23500 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "10 Sep 09:23:14",
+      "exit_time": "10 Sep 09:27:22",
+      "entry_price": 129.9,
+      "requested_entry_price": 129.5,
+      "initial_stop": 116.865,
+      "current_stop": 118.16999999999959,
+      "exit_price": 118.2,
+      "exit_reason": "EARLY_LOSS_CUT",
+      "pnl": -841.0,
+      "charges": 80.0,
+      "peak_pnl": 292.5,
+      "max_drawdown": 1039.3400000000001,
+      "grade": "A+",
+      "confidence": 0.96,
+      "market_regime": "BREAKOUT_DOWN",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.03484795610961351,
+      "expected_move_floor_pct": 0.023
+    },
+    {
+      "instrument": "SENSEX 74900 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "10 Sep 09:23:31",
+      "exit_time": "10 Sep 09:23:56",
+      "entry_price": 267.15,
+      "requested_entry_price": 264.0,
+      "initial_stop": 240.39000000000001,
+      "current_stop": 252.4299999999977,
+      "exit_price": 273.15,
+      "exit_reason": "SMART_PROFIT_LOCK",
+      "pnl": 40.0,
+      "charges": 80.0,
+      "peak_pnl": 344.0000000000009,
+      "max_drawdown": 366.5299999999995,
+      "grade": "A+",
+      "confidence": 0.96,
+      "market_regime": "BREAKOUT_DOWN",
+      "execution_status": "CLOSED",
+      "expected_move_pct": 0.03663746797840766,
+      "expected_move_floor_pct": 0.022
+    },
+    {
+      "instrument": "MIDCPNIFTY 14575 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_time": "10 Sep 09:23:39",
+      "exit_time": "10 Sep 09:23:40",
+      "entry_price": 171.0,
+      "requested_entry_price": 0.0,
+      "initial_stop": 160.6727295530176,
+      "current_stop": 160.6727295530176,
+      "exit_price": 171.0,
+      "exit_reason": "ENTRY_MARGIN_PREFLIGHT",
+      "pnl": 0.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "grade": "A+",
+      "confidence": 0.96,
+      "market_regime": "BREAKOUT_DOWN",
+      "execution_status": "REJECTED",
+      "expected_move_pct": 0.04333827837431704,
+      "expected_move_floor_pct": 0.031
+    }
+  ],
+  "filled_live_summary": {
+    "count": 8,
+    "pnl": -2299.0,
+    "wins": 3
+  },
+  "recent_session_signal_geometry": [
+    {
+      "date": "2026-09-07",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9711480840720771,
+      "forecast_q25_pct": 0.025991771882218444,
+      "probability_meeting_floor": 0.7702702702702703,
+      "target_pct": 0.10833678464545032,
+      "stop_pct": 0.04333471385818013,
+      "rr": 2.4999999999999987
+    },
+    {
+      "date": "2026-09-07",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "confidence": 0.82,
+      "forecast_q25_pct": 0.029388283864501846,
+      "probability_meeting_floor": 0.7837837837837838,
+      "target_pct": 0.07706203235994835,
+      "stop_pct": 0.05137468823997067,
+      "rr": 1.5
+    },
+    {
+      "date": "2026-09-07",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.82,
+      "forecast_q25_pct": 0.041110618973385055,
+      "probability_meeting_floor": 0.8126410835214447,
+      "target_pct": 0.19460243022450407,
+      "stop_pct": 0.07784097208979915,
+      "rr": 2.499999999999998
+    },
+    {
+      "date": "2026-09-07",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9283510186636222,
+      "forecast_q25_pct": 0.04095463915317628,
+      "probability_meeting_floor": 0.8113636363636364,
+      "target_pct": 0.17516042236007523,
+      "stop_pct": 0.07006416894403009,
+      "rr": 1.4999999999999978
+    },
+    {
+      "date": "2026-09-07",
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.82,
+      "forecast_q25_pct": 0.04000943860686573,
+      "probability_meeting_floor": 0.8310502283105022,
+      "target_pct": 0.22830645402024927,
+      "stop_pct": 0.0913225816080997,
+      "rr": 2.499999999999993
+    },
+    {
+      "date": "2026-09-08",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "confidence": 0.82,
+      "forecast_q25_pct": 0.03985047404763659,
+      "probability_meeting_floor": 0.8638613861386139,
+      "target_pct": 0.3099116779293982,
+      "stop_pct": 0.09997150900947983,
+      "rr": 3.0999999999999996
+    },
+    {
+      "date": "2026-09-08",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "confidence": 0.9585703058996268,
+      "forecast_q25_pct": 0.03147000333803818,
+      "probability_meeting_floor": 0.8040540540540541,
+      "target_pct": 0.3022921239727927,
+      "stop_pct": 0.12091684958911708,
+      "rr": 2.499999999999999
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "15min",
+      "confidence": 0.6647064353107404,
+      "forecast_q25_pct": 0.05042286481395409,
+      "probability_meeting_floor": 0.8341584158415841,
+      "target_pct": 0.22202740778336955,
+      "stop_pct": 0.09999999999999673,
+      "rr": 1.4999999999999987
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "confidence": 0.6677838561824782,
+      "forecast_q25_pct": 0.03146074026411304,
+      "probability_meeting_floor": 0.801354401805869,
+      "target_pct": 0.13376768781396145,
+      "stop_pct": 0.06052836552667828,
+      "rr": 1.5
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "confidence": 0.6795571243676118,
+      "forecast_q25_pct": 0.034904473442295116,
+      "probability_meeting_floor": 0.8344671201814059,
+      "target_pct": 0.140975798083755,
+      "stop_pct": 0.06183149038761286,
+      "rr": 1.500000000000004
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9467994406635301,
+      "forecast_q25_pct": 0.04223594216151051,
+      "probability_meeting_floor": 0.8242009132420092,
+      "target_pct": 0.3399292805132781,
+      "stop_pct": 0.13597171220531123,
+      "rr": 2.499999999999994
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9624526759130787,
+      "forecast_q25_pct": 0.042493582731826296,
+      "probability_meeting_floor": 0.825,
+      "target_pct": 0.3081900436763379,
+      "stop_pct": 0.12327601747053768,
+      "rr": 2.5000000000000036
+    },
+    {
+      "date": "2026-09-09",
+      "instrument": "BANKNIFTY",
+      "timeframe": "15min",
+      "confidence": 0.7997718342239508,
+      "forecast_q25_pct": 0.06576244469793564,
+      "probability_meeting_floor": 0.8888888888888888,
+      "target_pct": 0.42593665646167,
+      "stop_pct": 0.14997769593720775,
+      "rr": 2.8400000000000016
+    },
+    {
+      "date": "2026-09-10",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "confidence": 0.961125922043172,
+      "forecast_q25_pct": 0.03663746797840766,
+      "probability_meeting_floor": 0.8487584650112867,
+      "target_pct": 0.3358012703572899,
+      "stop_pct": 0.13432050814291596,
+      "rr": 2.4999999999999996
+    },
+    {
+      "date": "2026-09-10",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9597448673920789,
+      "forecast_q25_pct": 0.03484795610961351,
+      "probability_meeting_floor": 0.8194130925507901,
+      "target_pct": 0.28834479683867054,
+      "stop_pct": 0.1153379187354713,
+      "rr": 2.4999999999999996
+    },
+    {
+      "date": "2026-09-10",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "confidence": 0.9591365188854399,
+      "forecast_q25_pct": 0.04340179669758973,
+      "probability_meeting_floor": 0.831081081081081,
+      "target_pct": 0.35525466637204467,
+      "stop_pct": 0.14210186654882037,
+      "rr": 2.4999999999999925
+    }
+  ],
+  "walkforward_summary": {
+    "available": {
+      "event_sessions": 67,
+      "replayable_sessions": 34,
+      "train_sessions": 14,
+      "holdout_sessions": 20,
+      "matched_trades": 239,
+      "first_session": "2026-07-20",
+      "last_session": "2026-09-08"
+    },
+    "train": {
+      "baseline": {
+        "samples": 80,
+        "net": -4823.49,
+        "expectancy": -60.29,
+        "win_rate_pct": 65.0,
+        "profit_factor": 0.832,
+        "max_drawdown": 11556.18,
+        "p10_trade": -1162.1
+      },
+      "candidate": {
+        "samples": 80,
+        "net": 2199.1,
+        "expectancy": 27.49,
+        "win_rate_pct": 67.5,
+        "profit_factor": 1.0797,
+        "max_drawdown": 7199.1,
+        "p10_trade": -1162.1
+      }
+    },
+    "holdout": {
+      "baseline": {
+        "samples": 159,
+        "net": -31911.69,
+        "expectancy": -200.7,
+        "win_rate_pct": 44.03,
+        "profit_factor": 0.6035,
+        "max_drawdown": 41189.22,
+        "p10_trade": -1037.54
+      },
+      "candidate": {
+        "samples": 159,
+        "net": -30127.49,
+        "expectancy": -189.48,
+        "win_rate_pct": 47.17,
+        "profit_factor": 0.6116,
+        "max_drawdown": 39183.8,
+        "p10_trade": -1037.54
+      }
+    },
+    "all": {
+      "baseline": {
+        "samples": 239,
+        "net": -36735.18,
+        "expectancy": -153.7,
+        "win_rate_pct": 51.05,
+        "profit_factor": 0.6636,
+        "max_drawdown": 44904.34,
+        "p10_trade": -1071.44
+      },
+      "candidate": {
+        "samples": 239,
+        "net": -27928.39,
+        "expectancy": -116.86,
+        "win_rate_pct": 53.97,
+        "profit_factor": 0.7345,
+        "max_drawdown": 39183.8,
+        "p10_trade": -1071.44
+      }
+    },
+    "certification_gates": {
+      "session_count_60_to_90": false,
+      "chronological_holdout_at_least_20": true,
+      "candidate_holdout_expectancy_better": true,
+      "candidate_holdout_pf_not_worse": true,
+      "candidate_holdout_drawdown_not_worse": true,
+      "candidate_tail_not_worse": true,
+      "at_least_one_calibration_segment_ready": false
+    },
+    "candidate_certified": false,
+    "frozen_settings": {
+      "dynamic_rr_runner_unlock_ratio": 0.85,
+      "dynamic_rr_runner_lock_pct": 0.85,
+      "trend_runner_lock_pct_high_vol": 0.8,
+      "trend_runner_min_peak_r_multiple": 0.4,
+      "profit_giveback_exit_ratio": 0.5,
+      "profit_lock_min_r_multiple": 0.2,
+      "option_trade_charge_per_order": null,
+      "option_slippage_pct": null
+    }
+  },
+  "walkforward_grade_groups": [
+    {
+      "grade": "A",
+      "samples": 93,
+      "candidate_net": -850.77
+    },
+    {
+      "grade": "A+",
+      "samples": 85,
+      "candidate_net": -17313.16
+    },
+    {
+      "grade": "B",
+      "samples": 15,
+      "candidate_net": 3192.23
+    },
+    {
+      "grade": "B+",
+      "samples": 36,
+      "candidate_net": -19125.79
+    },
+    {
+      "grade": "C",
+      "samples": 10,
+      "candidate_net": 6169.1
+    }
+  ],
+  "decision_observation_count": 417,
+  "decision_warning": "Decision records include duplicated activity messages and historical/replay rows; counts are not unique live raw signals.",
+  "midcp_20260910_lifecycle": [
+    {
+      "event_ts": "2026-09-10T09:15:38.941+05:30",
+      "phase": "ORDER_SUBMITTED",
+      "ltp": 181.1,
+      "pnl": -174.85000000000068,
+      "peak_pnl": 0.0,
+      "current_stop": 172.2220844028722
+    },
+    {
+      "event_ts": "2026-09-10T09:15:38.943+05:30",
+      "phase": "ACCEPTED",
+      "ltp": 190.0,
+      "pnl": null,
+      "peak_pnl": null,
+      "current_stop": 180.03959304839464
+    },
+    {
+      "event_ts": "2026-09-10T09:15:39.696+05:30",
+      "phase": "ENTERED",
+      "ltp": 181.5,
+      "pnl": -98.29,
+      "peak_pnl": 0.0,
+      "current_stop": 172.2220844028722
+    },
+    {
+      "event_ts": "2026-09-10T09:15:44.790+05:30",
+      "phase": "MARK_TO_MARKET",
+      "ltp": 180.25,
+      "pnl": -248.22,
+      "peak_pnl": 0.0,
+      "current_stop": 172.2220844028722
+    },
+    {
+      "event_ts": "2026-09-10T09:15:49.957+05:30",
+      "phase": "MARK_TO_MARKET",
+      "ltp": 181.55,
+      "pnl": -92.28999999999864,
+      "peak_pnl": 6.000000000001364,
+      "current_stop": 172.2220844028722
+    },
+    {
+      "event_ts": "2026-09-10T09:15:55.206+05:30",
+      "phase": "MARK_TO_MARKET",
+      "ltp": 179.35,
+      "pnl": -356.1800000000007,
+      "peak_pnl": 6.000000000001364,
+      "current_stop": 172.2220844028722
+    },
+    {
+      "event_ts": "2026-09-10T09:16:00.403+05:30",
+      "phase": "MARK_TO_MARKET",
+      "ltp": 178.85,
+      "pnl": -416.15000000000066,
+      "peak_pnl": 6.000000000001364,
+      "current_stop": 172.2220844028722
+    }
+  ],
+  "midcp_20260910_log_evidence": [
+    "2026-09-10 09:16:00.733 | WARNING  | scanner:_update_active_trades:35590 - \ud83d\udea8 Smart Profit Lock Hit for MIDCPNIFTY: Peak \u20b9623, Current \u20b9-318",
+    "2026-09-10 09:16:05.910 | INFO     | trading.trade_manager:_finalize_closed_trade:1730 - \u2705 Trade Closed: MIDCPNIFTY @ 178.85 (Reason: SMART_PROFIT_LOCK) | PnL: -\u20b9398.00"
+  ]
+}

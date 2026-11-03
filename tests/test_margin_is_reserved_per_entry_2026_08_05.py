@@ -82,6 +82,20 @@ def test_concurrent_entries_cannot_all_spend_the_same_cash():
     assert "already reserved" in verdicts[-1]["limitation"]
 
 
+def test_reservation_ids_stay_unique_when_wall_clock_is_frozen(monkeypatch):
+    """Clock resolution must not let one reservation overwrite another."""
+    broker = _broker(available=51_284.0, required=13_240.0)
+    monkeypatch.setattr("trading.kite_broker.time.time", lambda: 1_000.0)
+
+    verdicts = [_preflight(broker) for _ in range(4)]
+    approved = [verdict for verdict in verdicts if verdict["ok"]]
+
+    assert len(approved) == 3
+    assert len({verdict["reservation_id"] for verdict in approved}) == 3
+    assert len(broker._margin_reservations) == 3
+    assert verdicts[-1]["ok"] is False
+
+
 def test_the_buffer_is_applied_and_configurable():
     """A margin figure that is exactly the balance leaves nothing for charges."""
     assert _preflight(_broker(14_000.0, 13_240.0, buffer_pct=10.0))["ok"] is False

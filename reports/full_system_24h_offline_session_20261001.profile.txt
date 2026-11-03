@@ -1,0 +1,43 @@
+         312915240 function calls (310517010 primitive calls) in 10537.904 seconds
+
+   Ordered by: cumulative time
+   List reduced from 4058 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        4    0.001    0.000 10534.653 2633.663 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\signal_processor.py:6757(process_best_signal)
+        4    0.183    0.046 10534.651 2633.663 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\signal_processor.py:4532(_collect_signal_candidates)
+    85961    0.450    0.000 10026.950    0.117 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\generic.py:6560(copy)
+    86191    0.546    0.000 10024.193    0.116 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\internals\managers.py:718(copy)
+     4800    0.018    0.000 10016.963    2.087 C:\Users\sagnik\Desktop\rp94\rp46-3\data\candle_builder.py:947(get_candles)
+    14499    0.222    0.000 10015.346    0.691 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\internals\managers.py:1954(_consolidate_inplace)
+      223    0.022    0.000 10014.656   44.909 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:15966(_detect_power_move)
+     4820    0.149    0.000 10014.457    2.078 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\internals\managers.py:2449(_consolidate)
+    14460    0.678    0.000 10013.454    0.692 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\internals\managers.py:2466(_merge_blocks)
+     4820 10012.478    2.077 10012.544    2.077 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\numpy\_core\shape_base.py:220(vstack)
+      235    0.240    0.001  329.532    1.402 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:33235(_compute_historical_intel_at)
+      239    0.174    0.001  177.326    0.742 C:\Users\sagnik\Desktop\rp94\rp46-3\intelligence\intelligence_aggregator.py:134(analyze)
+      239    0.473    0.002  163.493    0.684 C:\Users\sagnik\Desktop\rp94\rp46-3\intelligence\volume_profiler.py:138(analyze)
+      239   11.221    0.047  144.985    0.607 C:\Users\sagnik\Desktop\rp94\rp46-3\intelligence\price_action.py:329(aroon_context)
+      230    0.023    0.000  135.524    0.589 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\signal_processor.py:2731(_load_option_candles)
+      230    2.174    0.009  134.230    0.584 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\signal_processor.py:2637(_load_cached_historical_option_contract)
+      235    0.077    0.000  114.167    0.486 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:15091(_build_intelligence_contexts)
+     3714    1.751    0.000  112.627    0.030 C:\Users\sagnik\Desktop\rp94\rp46-3\intelligence\regime_detector.py:57(detect)
+   187060    3.089    0.000   80.531    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\tools\datetimes.py:687(to_datetime)
+      507    0.159    0.000   73.949    0.146 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:14967(_detect_regime_warmed)
+  1484227   10.912    0.000   67.064    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\numpy\lib\_nanfunctions_impl.py:572(nanargmax)
+   187060    2.260    0.000   65.980    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\tools\datetimes.py:321(_convert_listlike_datetimes)
+  1484227   10.006    0.000   65.095    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\numpy\lib\_nanfunctions_impl.py:511(nanargmin)
+   186162    7.773    0.000   58.537    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\tools\datetimes.py:459(_array_strptime_with_fallback)
+  5950941   16.190    0.000   53.459    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\numpy\_core\fromnumeric.py:89(_wrapreduction_any_all)
+   206008    3.513    0.000   48.883    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\indexes\base.py:486(__new__)
+177617/163944    0.655    0.000   48.023    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\ops\common.py:67(new_method)
+   478637    6.028    0.000   47.883    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\construction.py:531(sanitize_array)
+      237    0.182    0.001   44.713    0.189 {method 'update' of 'set' objects}
+   548804   27.699    0.000   44.531    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\signal_processor.py:2704(<genexpr>)
+175714/175702    1.034    0.000   42.018    0.000 C:\Users\sagnik\Desktop\rp94\rp46-3\venv\Lib\site-packages\pandas\core\indexing.py:1192(__getitem__)
+      235    0.047    0.000   40.518    0.172 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:14914(_hourly_anchor_regime)
+      235    0.049    0.000   39.625    0.169 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:15021(_market_breadth_context)
+      940    0.128    0.000   39.567    0.042 C:\Users\sagnik\Desktop\rp94\rp46-3\scanner.py:14988(_breadth_regime_at)
+     3726    0.891    0.000   39.178    0.011 C:\Users\sagnik\Desktop\rp94\rp46-3\engine\ut_bot_core.py:232(calculate_adx)
+
+

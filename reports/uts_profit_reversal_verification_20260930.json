@@ -1,0 +1,113 @@
+{
+  "completed_at_ist": "2026-10-01T00:06:54.167500+05:30",
+  "reference_baseline": {
+    "net": 93531,
+    "trades": 63,
+    "sessions": 15,
+    "end_date": "2026-09-25",
+    "raw_archived_output_available": false
+  },
+  "captured_current_run": {
+    "net": -112250.6,
+    "trades": 257,
+    "sessions": 7,
+    "start_date": "2026-09-22",
+    "end_date": "2026-09-30",
+    "mode": "HISTORICAL",
+    "auto": false
+  },
+  "frozen_cohort": {
+    "exact_price_paths": 257,
+    "exact_contracts": 124,
+    "unavailable": 0,
+    "baseline_all_results_reproduced": true,
+    "summary": {
+      "before_net": -112250.6,
+      "verified_fill_only_net": 16027.65,
+      "after_net": 16724.9,
+      "verified_fill_only_net_with_estimated_charges": 14118.4,
+      "after_net_raw_fill_flat_80": 16724.36,
+      "after_net_with_estimated_charges": 14813.23,
+      "trades": 257,
+      "difference": 128975.5,
+      "fill_preservation_difference": 128278.25,
+      "high_peak_difference": 697.25,
+      "improved": 55,
+      "worsened": 3,
+      "unchanged": 199,
+      "before_wins": 59,
+      "after_wins": 108,
+      "additional_estimated_cost_vs_flat_80": 1911.14
+    },
+    "by_index_modeled_net": {
+      "BANKNIFTY": -4025.66,
+      "MIDCPNIFTY": 28810.94,
+      "NIFTY": -9436.73,
+      "SENSEX": -535.32
+    }
+  },
+  "verification": {
+    "gates": [
+      {
+        "report": "uts_profit_reversal_final_gate_20260930.xml",
+        "tests": 814,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      {
+        "report": "uts_futures_rr_metadata_final_20261001.xml",
+        "tests": 44,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      }
+    ],
+    "gate_counts_overlap_do_not_add": true,
+    "syntax_files": 10,
+    "source_unchanged_during_full_gate": true,
+    "after_full_gate_change": "FUT RR metadata scoped to existing FUT dynamic target model; verified by final 44-case gate. No fill or exit changes.",
+    "observed_option_exit_helper_unchanged_since_eod_repair": true,
+    "exit_helper_sha256": "edacb8783e0d006368dfa6029ccd78928ace09b0f45bf539c1bf5b8f73a74b75"
+  },
+  "source_sha256": {
+    "engine/signal_processor.py": "a7f075a38d82e0e26ea416c385405965e8e132da32ebc8fb0bdaec02758248f7",
+    "engine/trade_row_adapter.py": "d8d934b977dfe84c9bcbc108968b3012ad732d312fb6e7e191a36c3c3549e868",
+    "trading/trade_manager.py": "8a363e42790935e62b363aac4d91e299c5e47d01ec6931b9c228f024d04a62be",
+    "trading/trade_dashboard.py": "4145c98ef3c68dbf3cece784d77a5432861de0b1ad18661f1c5d63a38fdb49dc",
+    "engine/uts_lane.py": "bee51e5c5787858f4156b9f31ccbe6addb3a2a37deb9a957069059501db4ec78",
+    "tests/test_uts_backtest_profit_lock_2026_09_30.py": "171a9ff4ca495b971d228decd165d8318ea137d328fab741c043ec1a39c34d8d",
+    "tests/test_uts_final_historical_signal_2026_09_30.py": "7e68ee4e2c199d97cbf9dfc9e89fe5727022180b2a4fcef9cb885cc42b2f04bf",
+    "tests/test_verified_replay_fill_accounting_2026_09_30.py": "aa7c45f9a7315f0256f71eff284dfc4c11c7beaffcfd3d00e562daf2938fa324",
+    "tests/test_ut_smart_loss_repairs_2026_09_30.py": "58b508a80a27e500539cf6c9a0e70b6c0c73e8060163e42941148d3bb92d1652",
+    "reports/uts_profit_lock_cohort_20260930.py": "e2b4152cc6026034c9724b2a86fbf3b68c929478d74db74da7cf7253efa4b368"
+  },
+  "activation": {
+    "runtime_restarted_by_audit": false,
+    "fresh_full_application_backtest_run": false,
+    "restart_required": true,
+    "prior_automatic_restart_rejection": "blocked by policy"
+  },
+  "preserved_policy": {
+    "standard_index_caps_pct": [
+      5,
+      10,
+      15
+    ],
+    "midcap_caps_pct": [
+      3.5,
+      7,
+      10
+    ],
+    "generic_grade_veto_for_uts_5m_15m": false
+  },
+  "production_database_modified": false,
+  "settings_modified": false,
+  "live_orders_modified": false,
+  "limitations": [
+    "Minute OHLC lacks tick order. Existing stops are checked first. New locks cross at observed close or apply in the next minute.",
+    "A frozen opportunity cohort does not simulate changed portfolio overlap, capital constraints, later admissions or retry opportunities.",
+    "Twenty-second buffering and ten-second repaint checks require finer data.",
+    "Results do not guarantee profit or executable broker fills."
+  ]
+}

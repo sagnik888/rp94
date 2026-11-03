@@ -267,8 +267,8 @@ def test_missing_initial_stop_derives_configured_option_risk_before_locking():
 
     risk = scanner._trade_like_initial_risk_rs(candidate, qty=25, inst_mult=1.0)
 
-    assert risk == pytest.approx(1197.00 * 0.15 * 25)
-    assert candidate.initial_stop == pytest.approx(1197.00 * 0.85)
+    assert risk == pytest.approx(1197.00 * 0.10 * 25)
+    assert candidate.initial_stop == pytest.approx(1197.00 * 0.90)
 
     lock_stop, reason, ratio = scanner._profit_lock_floor(
         entry_price=candidate.price,
@@ -379,6 +379,55 @@ def test_active_session_entries_match_exits_by_lifecycle_not_timeframe_direction
     )
 
     assert [candidate.signal_timestamp for candidate in active] == [new_entry_ts]
+
+
+def test_rejected_session_entry_never_reaches_exit_tracker():
+    from engine.signal_processor import TradeCandidate
+
+    scanner = Scanner.__new__(Scanner)
+    scanner._ensure_session_candidate_day = lambda: None
+    scanner._normalize_loaded_exit_candidate = lambda candidate: None
+
+    def row(strike, minute, *, accepted, watch_only=False):
+        candidate = TradeCandidate(
+            instrument="SENSEX",
+            direction="LONG",
+            price=765.9,
+            stop=689.31,
+            target=995.67,
+            lots=1,
+            lot_size=20,
+            grade="A+",
+            confidence=0.92,
+            timeframe="15min",
+            inst_type="OPT",
+            option_type="CE",
+            atm_strike=strike,
+            multiplier=1.0,
+            trading_symbol=f"SENSEX26O08{strike}CE",
+            symbol_token=str(strike),
+            signal_timestamp=datetime(2026, 9, 30, 9, minute),
+        )
+        candidate.accepted_by_gate = accepted
+        candidate.watch_only = watch_only
+        return candidate
+
+    refused = row(72600, 30, accepted=False)
+    refused.status = "REJECTED - TRADE MANAGER"
+    accepted = row(72700, 31, accepted=True)
+    watched = row(72800, 32, accepted=False, watch_only=True)
+    scanner._session_trade_candidates = {
+        "SENSEX": {
+            scanner._candidate_history_key(candidate): candidate
+            for candidate in (refused, accepted, watched)
+        }
+    }
+
+    active = scanner._active_session_entry_candidates("SENSEX")
+
+    assert accepted in active
+    assert watched in active
+    assert refused not in active
 
 
 def _supersede_scanner():
@@ -678,6 +727,8 @@ def test_opposite_direction_signal_still_supersedes_active_entry():
     scanner = _supersede_scanner()
     old_ts = datetime(2026, 7, 1, 12, 30)
     new_ts = datetime(2026, 7, 1, 13, 10)
+    observed_exit_ts = datetime(2026, 7, 1, 13, 11, 12)
+    scanner._session_squareoff_clock = lambda: observed_exit_ts
     old_entry = _supersede_candidate("LONG", old_ts, option_type="CE")
     new_entry = _supersede_candidate("SHORT", new_ts, option_type="PE")
 
@@ -691,7 +742,8 @@ def test_opposite_direction_signal_still_supersedes_active_entry():
     exits = [row for row in rows if getattr(row, "action", "ENTRY") == "EXIT"]
     assert len(exits) == 1
     assert exits[0].exit_reason == "SUPERSEDED_SIGNAL"
-    assert exits[0].exit_timestamp == new_ts
+    assert exits[0].exit_timestamp == observed_exit_ts
+    assert exits[0].exit_observation["signal_bar_at"] == new_ts.isoformat()
 
 
 def test_legacy_same_direction_superseded_rows_are_scrubbed_from_session_ledger():
@@ -872,7 +924,7 @@ def test_option_breathing_room_blocks_premature_profit_side_stop():
     assert clamped is True
     assert breathing > 0
     assert adjusted_stop < candidate.price
-    assert candidate.initial_stop == pytest.approx(1197.00 * 0.85)
+    assert candidate.initial_stop == pytest.approx(1197.00 * 0.90)
 
 
 def test_option_breathing_room_allows_profit_stop_after_proved_move():
@@ -1634,6 +1686,12 @@ def test_session_smart_lock_falls_back_to_giveback_exit_when_floor_unavailable()
     # guard book -Rs.294. It is stubbed off so the assertion stays pointed at the
     # fallback under test rather than at whichever guard happens to reach it first.
     scanner._peak_giveback_cap_exit = lambda *_args, **_kwargs: (False, "")
+    # Same reasoning for the separate major-win rung. Before 2026-10-07 a manual
+    # candidate was sized as unpriced (it stores `price`, not `entry_price`), so the
+    # rung sat on the Rs.3,000 fallback and never reached this shape. Priced like the
+    # broker trade it now arms at ~Rs.1,166 (5.5% of BANKNIFTY cost) and exits first,
+    # at the same 702.60 mark -- also correct, but not the fallback under test.
+    scanner._major_win_guard_ladder_arm_rs = lambda *_args, **_kwargs: 100_000.0
 
     scanner._check_session_candidates_breaches_locked("BANKNIFTY")
 
@@ -1765,6 +1823,20 @@ def test_faded_winner_below_the_ladder_floor_still_exits_on_the_lock():
 
     assert len(scanner._captured_exits) == 1
     assert scanner._captured_exits[0].exit_reason == "SMART_PROFIT_LOCK"
+
+
+@pytest.mark.parametrize("direction,option_type", [("LONG", "CE"), ("SHORT", "PE")])
+def test_session_option_lock_records_observed_premium_after_floor_breach(direction, option_type):
+    scanner = _faded_winner_scanner(400.0)
+    candidate = scanner._active_session_entry_candidates("NIFTY")[0]
+    candidate.direction, candidate.option_type = direction, option_type
+    observed_premium = candidate.current_price
+
+    scanner._check_session_candidates_breaches_locked("NIFTY")
+
+    assert len(scanner._captured_exits) == 1
+    assert scanner._captured_exits[0].exit_reason == "SMART_PROFIT_LOCK"
+    assert scanner._captured_exits[0].exit_price == pytest.approx(observed_premium)
 
 
 def test_a_flat_trade_is_not_losing_just_because_it_owes_its_own_costs():
@@ -1934,7 +2006,7 @@ def test_legacy_repaint_stop_hit_payload_loads_as_repaint_abort():
 def test_option_live_stop_distance_respects_configured_sl_pct():
     scanner = SimpleNamespace(options_sl_pct=15.0)
 
-    assert round(SignalProcessor._option_premium_stop_distance(224.60, scanner, "TRENDING_UP"), 2) == 33.69
+    assert round(SignalProcessor._option_premium_stop_distance(224.60, scanner, "TRENDING_UP"), 2) == 22.46
     assert round(SignalProcessor._option_premium_stop_distance(224.60, SimpleNamespace(options_sl_pct=10.0), "RANGING"), 2) == 22.46
 
 
@@ -1947,14 +2019,14 @@ def test_option_stop_timeframe_atr_aware():
     scanner = SimpleNamespace(options_sl_pct=15.0)
     price = 1200.0
 
-    # Large ATR (12.5% of premium) diverges at the band edges: 5min caps at 10%,
-    # 15min caps at 15% (but ceiling is options_sl_pct=15% so 12.5% passes through).
+    # The universal 10% trend ceiling applies to both frames, even if the
+    # timeframe's ATR band would otherwise allow a wider stop.
     big_atr = 150.0
     s5 = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="5min", atr_premium_stop=big_atr, settings=settings)
     s15 = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="15min", atr_premium_stop=big_atr, settings=settings)
     assert round(s5, 2) == 120.0   # 10% cap
-    assert round(s15, 2) == 150.0  # 12.5% ATR within 15% cap
-    assert s5 < s15
+    assert round(s15, 2) == 120.0
+    assert s5 == s15
 
     # Tiny ATR floors to the per-timeframe minimum (5min 4%, 15min 6%).
     tiny_atr = 5.0
@@ -1963,14 +2035,14 @@ def test_option_stop_timeframe_atr_aware():
     assert round(t5, 2) == 48.0    # 4% floor
     assert round(t15, 2) == 72.0   # 6% floor
 
-    # No ATR supplied → legacy flat percentage (backward compatible).
-    assert round(SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP"), 2) == 180.0
+    # Without ATR the universal trend ceiling still applies.
+    assert round(SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP"), 2) == 120.0
 
     # Feature flag off → flat percentage even when ATR is supplied.
     settings.option_stop_tf_atr_aware = False
     try:
         off = SignalProcessor._option_premium_stop_distance(price, scanner, "TRENDING_UP", timeframe="5min", atr_premium_stop=big_atr, settings=settings)
-        assert round(off, 2) == 180.0
+        assert round(off, 2) == 120.0
     finally:
         settings.option_stop_tf_atr_aware = True
 
@@ -3047,6 +3119,8 @@ def test_exit_before_entry_session_row_is_quarantined():
 def test_opposite_signal_exits_broker_backed_open_trade_once():
     scanner = Scanner.__new__(Scanner)
     signal_ts = datetime(2026, 6, 15, 12, 30)
+    observed_exit_ts = datetime(2026, 6, 15, 12, 31, 35)
+    scanner._session_squareoff_clock = lambda: observed_exit_ts
     signal = SimpleNamespace(signal_type="SELL", timestamp=signal_ts, price=23950.0)
     trade = SimpleNamespace(
         id="T-OPEN",
@@ -3086,7 +3160,7 @@ def test_opposite_signal_exits_broker_backed_open_trade_once():
     assert calls == [
         (
             ("T-OPEN", 23948.0, "OPPOSITE_SIGNAL"),
-            {"exit_time": signal_ts},
+            {"exit_time": observed_exit_ts},
         )
     ]
 

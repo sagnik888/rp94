@@ -8,6 +8,28 @@ function escHtml(value) {
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+function renderSignalScore(row = {}) {
+    const finite = value => value !== null && value !== undefined && value !== '' &&
+        typeof value !== 'boolean' && Number.isFinite(Number(value));
+    const rawSetup = row.setup_score != null ? row.setup_score : row.confidence;
+    const score = finite(rawSetup) && Number(rawSetup) >= 0 && Number(rawSetup) <= 1
+        ? `${(Number(rawSetup) * 100).toFixed(0)}/100` : '--';
+    const grade = String(row.grade || '--');
+    const gradeClass = grade.replace('+', 'p').replace(/[^a-zA-Z0-9]/g, '-');
+    const assessment = row.signal_learning?.assessment || {};
+    const probability = assessment.calibrated_win_probability;
+    const expected = assessment.expected_net_r;
+    const validated = row.learning_evidence_valid === true && assessment.status === 'SHADOW_VALIDATED' &&
+        finite(probability) && Number(probability) >= 0 && Number(probability) <= 1 && finite(expected);
+    const research = validated
+        ? `Research ${escHtml(assessment.research_grade || '--')} · Win ${(Number(probability) * 100).toFixed(0)}% · Net ${Number(expected) > 0 ? '+' : ''}${Number(expected).toFixed(2)}R`
+        : '';
+    const timeframe = String(row.timeframe || '').toLowerCase().replace(/minutes?$/, 'm').replace(/mins?$/, 'm');
+    const details = [`${score}`, grade, timeframe].filter(Boolean).map(escHtml).join(' · ');
+    return `<span class="conf-chip grade-${gradeClass}" title="Heuristic setup grade ${escHtml(grade)}; this score is not a win probability">${details}</span>` +
+        (research ? `<span style="display:block;font-size:0.65rem;opacity:0.7" title="Outcome estimates require a validated research model. Entry eligibility is separate.">${research}</span>` : '');
+}
+
 function formatTradeTableSharpeDailyYearly(source = {}) {
     if (source && source.sharpe_ratio_display) return source.sharpe_ratio_display;
     const dailyRaw = source && source.sharpe_ratio_daily !== undefined
@@ -127,6 +149,72 @@ function formatTradePoints(points) {
     })}`;
 }
 
+function isTerminalSessionSignal(sig = {}) {
+    return !!(sig && (sig.is_exit || sig.action === 'EXIT' || sig.status === 'EXIT SIGNAL'));
+}
+
+// Lifecycle identity of a session signal, mirroring Scanner._candidate_lifecycle_key.
+// The composite covers rows restored without an explicit id; it includes the source
+// lane because parallel lanes on one candle and contract are separate positions.
+function sessionSignalLifecycleKeys(sig = {}) {
+    const keys = [];
+    const explicit = String(sig.lifecycle_id || '').trim();
+    if (explicit) keys.push(`id:${explicit}`);
+    const sourceTs = sig.source_signal_timestamp || sig.signal_timestamp || '';
+    if (sourceTs) {
+        keys.push(`row:${[
+            String(sig.instrument || '').split(/\s+/)[0],
+            sig.timeframe || '',
+            sig.direction || '',
+            sourceTs,
+            sig.source_lane || '',
+            sig.trading_symbol || '',
+        ].join('|')}`);
+    }
+    return keys;
+}
+
+function sessionSignalClockMs(value) {
+    if (value === null || value === undefined || value === '') return NaN;
+    return Date.parse(String(value));
+}
+
+// Exit clocks per lifecycle key. The key alone is not enough: a re-signal on the same
+// candle and contract shares the key of the signal that exited before it.
+function terminalSessionSignalKeys(signals = []) {
+    const exits = new Map();
+    (signals || []).forEach(sig => {
+        if (!isTerminalSessionSignal(sig)) return;
+        const exitedAt = sessionSignalClockMs(sig.exit_timestamp);
+        sessionSignalLifecycleKeys(sig).forEach(key => {
+            if (!exits.has(key)) exits.set(key, []);
+            exits.get(key).push(exitedAt);
+        });
+    });
+    return exits;
+}
+
+// A cut lifecycle ships its ENTRY and EXIT rows side by side in instrument snapshots.
+// The ENTRY row stays TRADE SIGNAL / accepted_by_gate, so unless it is paired with its
+// exit it renders as a live signal with an enabled ENTRY button long after the scanner
+// closed it (2026-09-15: two EARLY_LOSS_CUT signals were still offered 17 minutes on).
+// An exit closes an entry accepted at or before it; a missing clock counts as closed.
+function sessionSignalHasExited(sig, terminalKeys) {
+    if (!sig || isTerminalSessionSignal(sig)) return false;
+    const enteredAt = sessionSignalClockMs(sig.entry_timestamp || sig.timestamp);
+    return sessionSignalLifecycleKeys(sig).some(key => (terminalKeys.get(key) || []).some(
+        exitedAt => Number.isNaN(exitedAt) || Number.isNaN(enteredAt) || exitedAt >= enteredAt
+    ));
+}
+
+// The instrument snapshot contains every scanner candidate, including candidates still
+// waiting for execution checks and candidates TradeManager refused before submission.
+// Only an accepted manual lifecycle (or an explicit watch row) belongs in the signal
+// tracker. Broker-backed positions are supplied separately by open/closed manager rows.
+function isTrackedSessionSignal(sig = {}) {
+    return sig.accepted_by_gate === true || sig.watch_only === true;
+}
+
 function collectSessionSignalRows(existingRows = [], backendSignals = []) {
     const baseName = value => String(value || '').split(/\s+/)[0];
     const renderedIds = new Set(existingRows.map(row => String(row.id || '')).filter(Boolean));
@@ -161,12 +249,20 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
 
     const rawRows = [];
     const candidateSignals = [];
-    (backendSignals || []).forEach(sig => candidateSignals.push(sig));
-    Object.values((state.latestData && state.latestData.instruments) || {}).forEach(inst => {
-        (inst.trade_candidates || []).forEach(sig => candidateSignals.push(sig));
+    (backendSignals || []).forEach(sig => {
+        if (isTrackedSessionSignal(sig)) candidateSignals.push(sig);
     });
+    Object.values((state.latestData && state.latestData.instruments) || {}).forEach(inst => {
+        (inst.trade_candidates || []).forEach(sig => {
+            if (isTrackedSessionSignal(sig)) candidateSignals.push(sig);
+        });
+    });
+    // Pair every entry with its exits before the loop, across both sources: an ENTRY that
+    // a later exit closed renders only through that exit row.
+    const terminalKeys = terminalSessionSignalKeys(candidateSignals);
 
     candidateSignals.forEach(sig => {
+            if (sessionSignalHasExited(sig, terminalKeys)) return;
             const sigId = String(sig.id || '');
             const sigLifecycleId = String(sig.lifecycle_id || '');
             if (sigId && renderedIds.has(sigId)) return;
@@ -189,15 +285,12 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
             const isExit = sig.is_exit || sig.action === 'EXIT' || sig.status === 'EXIT SIGNAL';
             const isNoEntry = sig.action === 'NO_ENTRY' || String(sig.status || '').includes('NO ENTRY');
             const exitReason = sig.exit_reason || sig.status || '';
-            // A terminal session signal is an internal tracking/audit event, not a
-            // broker trade.  Do not resurrect it from instrument snapshots after the
-            // API has correctly excluded it, otherwise a REPAINT_ABORT can appear as
-            // a second closed position with fictional P&L.
-            if (isExit) return;
+            // A completed lifecycle renders once, as its exit row: a signal-tracker mark,
+            // never a broker trade. A lifecycle TradeManager executed was skipped above in
+            // favour of its broker row, and signal rows never enter the money totals.
 
-            // An actionable manual signal has not been placed yet; it carries no
-            // realised or mark-to-market broker P&L.
-            const rowPnl = 0;
+            // An open manual signal has not been placed yet; it carries no P&L.
+            const rowPnl = isExit ? accountingTradePnl({ ...sig, exit_reason: exitReason }) : 0;
             
             // Fix: Filter out ghost 'NO_ENTRY' signals so they do not flash on the dashboard
             if (isNoEntry) return;
@@ -235,6 +328,12 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
                 lot_size: sig.lot_size || 0,
                 grade: sig.grade || '--',
                 confidence: sig.confidence || 0,
+                setup_score: sig.setup_score,
+                grade_basis: sig.grade_basis,
+                calibrated_win_probability: sig.calibrated_win_probability,
+                expected_net_r: sig.expected_net_r,
+                signal_learning: sig.signal_learning,
+                learning_evidence_valid: sig.learning_evidence_valid === true,
                 rr_ratio: sig.rr || 0,
                 atm_strike: sig.atm_strike,
                 option_type: sig.option_type,
@@ -249,6 +348,10 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
                 exit_timestamp: isValidExitTs ? Math.floor(exitTs.getTime() / 1000) : 0,
                 exit_reason: exitReason,
                 accepted_by_gate: !!sig.accepted_by_gate,
+                execution_status: sig.execution_status || '',
+                execution_state: sig.execution_state || '',
+                data_stale: sig.data_stale === true,
+                data_stale_reason: sig.data_stale_reason || '',
                 watch_only: !!sig.watch_only,
                 manual_entry_executed: !!sig.manual_entry_executed,
                 manual_exit_trade_id: sig.manual_exit_trade_id || '',
@@ -256,7 +359,8 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
                 manual_exit_enabled: sig.manual_exit_enabled === true,
                 manual_exit_status: sig.manual_exit_status || '',
                 manual_exit_execution_status: sig.manual_exit_execution_status || '',
-                exec_type: isExit ? 'EXIT' : (isNoEntry ? 'BLOCK' : 'SIG'),
+                // Never executed, whether still open or already closed by the tracker.
+                exec_type: isNoEntry ? 'BLOCK' : 'SIG',
             });
     });
 
@@ -264,36 +368,39 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
     rawRows.length = 0;
     rawRows.push(...rowsNotAlreadyRendered);
 
-    const exitEntryKeys = new Set();
-    rawRows.forEach(row => {
-        if (row.status !== 'EXIT_SIGNAL') return;
-        exitEntryKeys.add(row.lifecycle_id || [
-            row.base_instrument || row.instrument,
-            row.timeframe,
-            row.direction,
-            row.entry_timestamp || 0
-        ].join('|'));
-    });
-
+    // Exit pairing already ran before the loop (terminalKeys); only duplicate ids remain.
     const byKey = new Map();
-    rawRows.forEach(row => {
-        if (row.status === 'SIGNAL') {
-            const entryKey = row.lifecycle_id || [
-                row.base_instrument || row.instrument,
-                row.timeframe,
-                row.direction,
-                row.entry_timestamp || 0
-            ].join('|');
-            if (exitEntryKeys.has(entryKey)) return;
-        }
-        byKey.set(row.id, row);
-    });
+    rawRows.forEach(row => byKey.set(row.id, row));
 
     return Array.from(byKey.values());
 }
 
 function buildSessionSummary(baseSummary, openRows, closedRows, signalRows) {
     const summary = { ...(baseSummary || {}) };
+    // An older/live backend can still report a refused scanner candidate in the
+    // SIGNAL_TRACKER totals even though the row fence above correctly hid it. Do not
+    // leave a phantom TRADES=1/P&L headline behind when no admissible row exists.
+    if (
+        summary.is_signal_tracker === true
+        && !openRows.length
+        && !closedRows.length
+        && !signalRows.length
+    ) {
+        return {
+            ...summary,
+            daily_pnl: 0,
+            fut_pnl: 0,
+            opt_pnl: 0,
+            fut_trades: 0,
+            opt_trades: 0,
+            total_trades: 0,
+            open_count: 0,
+            wins: 0,
+            losses: 0,
+            win_rate: 0,
+            max_drawdown: 0,
+        };
+    }
     const backendHasTrades = (summary.total_trades || 0) > 0 || (summary.open_count || 0) > 0 || openRows.length || closedRows.length;
     if (backendHasTrades || !signalRows.length) return summary;
 
@@ -359,8 +466,14 @@ function buildSessionSummary(baseSummary, openRows, closedRows, signalRows) {
     const sharpeDaily = std > 0 ? avg / std : 0;
     const sharpeYearly = sharpeDaily * Math.sqrt(252);
 
+    // These totals are signal marks, not the broker ledger. Name the lane so the headline
+    // never presents them as money, whatever lane the empty backend summary claimed.
     return {
         ...summary,
+        lane: 'SIGNAL_TRACKER',
+        pnl_label: 'SIGNAL P&L',
+        is_signal_tracker: true,
+        pnl_is_money: false,
         daily_pnl: totalPnl,
         fut_pnl: futPnl,
         opt_pnl: optPnl,
@@ -411,6 +524,10 @@ function parseRiskRewardValue(value) {
 }
 
 function resolveRiskReward(row = {}) {
+    // Broker fills can change entry risk. This measured RR remains frozen after
+    // trailing stops move or runner mode removes the displayed target.
+    const actual = parseRiskRewardValue(row.entry_policy_actual_rr);
+    if (actual !== null) return actual;
     const stored = parseRiskRewardValue(row.rr_ratio) ?? parseRiskRewardValue(row.rr);
     if (stored !== null) return stored;
 
@@ -428,7 +545,7 @@ function resolveRiskReward(row = {}) {
 function formatRiskReward(row = {}) {
     const rr = resolveRiskReward(row);
     if (rr === null) return '--';
-    return `1:${rr.toFixed(1)}`;
+    return `1:${rr.toFixed(2).replace(/0$/, '')}`;
 }
 
 function renderTradeControlCell(row = {}, flags = {}) {
@@ -546,6 +663,12 @@ function updateTradesPanel(trades, simId) {
     const summary = isPagedHistory && trades.summary
         ? trades.summary
         : buildSessionSummary(trades.summary || {}, open, closed, signalRows);
+    // When the rows came from instrument snapshots the backend summary still names the
+    // broker lane; the badge must name the lane the table actually rendered.
+    if (modeBadge && summary.is_signal_tracker === true && backendSummary.is_signal_tracker !== true) {
+        modeBadge.textContent = `SESSION SIGNAL TRACKER (${signalRows.length})`;
+        modeBadge.className = 'trade-data-mode restored';
+    }
     const makeTradeRowKey = (row, fallbackIndex) => String(row.id || `${row.row_kind || 'row'}:${row.entry_timestamp || row.exit_timestamp || fallbackIndex}`);
 
     if (all.length === 0) {
@@ -594,8 +717,6 @@ function updateTradesPanel(trades, simId) {
                 ? (t.trade_side || `BUY ${t.option_type || (t.instrument.includes('PE') ? 'PE' : 'CE')}`)
                 : t.direction;
 
-            const conf = (t.confidence || 0) * 100;
-            const gradeText = t.grade || '--';
             const actionText = String(t.action || '').toUpperCase();
             const statusText = String(t.status || '').toUpperCase();
             const isExitSignalRow = actionText === 'EXIT' || statusText.indexOf('EXIT') !== -1;
@@ -631,6 +752,14 @@ function updateTradesPanel(trades, simId) {
                 isOpenTrade: t.status === 'OPEN',
                 executionRetryable,
             });
+            const signalStateLabel = isExitSignalRow
+                ? ((t.exit_reason || '').replace(/_/g, ' ') || 'exit signal')
+                : (isSignalRow && (executionStatus === 'SIGNAL_ONLY' || t.execution_state === 'NOT_PLACED')
+                    ? 'Awaiting execution'
+                    : 'signal');
+            const staleBadgeHtml = t.data_stale === true
+                ? `<span class="data-stale-badge" style="color:var(--orange); border:1px solid currentColor; border-radius:3px; padding:1px 3px; margin-left:4px; font-size:0.62rem" title="${escHtml(t.data_stale_reason || 'Live scan data is stale')}">DATA STALE</span>`
+                : '';
 
             const rowHtml = `
                 <td class="font-bold">${escHtml(baseInstrumentLabel(t.base_instrument || t.instrument))}</td>
@@ -641,11 +770,10 @@ function updateTradesPanel(trades, simId) {
                 <td style="opacity:0.5">${targetPrice}</td>
                 <td style="color:var(--orange); opacity:0.6">${stopPrice}</td>
                 <td class="rr-cell">${rrText}</td>
-                <td class="${pnlClass} font-bold pnl-points-cell">${pnlText}</td>
+                <td class="${pnlClass} font-bold pnl-points-cell"${isSignalRow ? ' style="font-style:italic" title="Signal tracker mark; no broker fill is implied"' : ''}>${pnlText}</td>
                 <td>
                     <div class="conf-grade-cell">
-                        <span class="conf-chip grade-${gradeText.replace('+', 'p').replace(/[^a-zA-Z0-9]/g, '-')}" title="Grade ${gradeText} (grade is a label for this confidence)">${conf.toFixed(0)}%</span>
-                        <span style="font-size:0.8rem; opacity:0.6">${t.timeframe || '5min'}</span>
+                        ${renderSignalScore(t)}
                     </div>
                 </td>
                 <td><span class="exe-badge ${execLabel === 'A' ? 'exe-a' : 'exe-m'}">${execLabel}</span></td>
@@ -660,7 +788,7 @@ function updateTradesPanel(trades, simId) {
                     ${t.is_ghost ? `<div style="color:var(--orange); font-size:0.75rem; font-weight:bold; margin-bottom:4px; text-align:center;">[WATCH]</div>` : ''}
                     <div style="text-align:center;">
                     ${isSignalRow ?
-                        `<span style="opacity:0.55; font-size:0.75rem">${t.status === 'EXIT_SIGNAL' ? ((t.exit_reason || '').replace(/_/g, ' ') || 'exit signal') : (t.status === 'NO_ENTRY' ? 'no entry' : 'signal')}</span>` :
+                        `<span style="opacity:0.75; font-size:0.75rem">${escHtml(signalStateLabel)}</span>${staleBadgeHtml}` :
                         t.status === 'ORPHANED' ?
                         `<span style="color:var(--sell); font-size:0.75rem">broker orphan</span>` :
                         t.status === 'OPEN' && executionRetryable ?
@@ -747,6 +875,19 @@ function updateTradesPanel(trades, simId) {
     }
     setText('totalTrades', summary.total_trades || 0);
     setText('winLoss', `${summary.wins || 0}/${summary.losses || 0}`);
+    // Signals accepted while Auto Mode was OFF are a separate, non-money lane. The
+    // server publishes it beside the broker headline so neither hides the other.
+    const signalLane = (!isNonMoney && summary.signal_lane && Number(summary.signal_lane.trades || 0) > 0)
+        ? summary.signal_lane
+        : null;
+    const signalItem = document.getElementById('signalPnlItem');
+    if (signalItem) signalItem.style.display = signalLane ? '' : 'none';
+    if (signalLane) {
+        const sp = Number(signalLane.pnl || 0);
+        setText('signalPnl', '₹' + sp.toLocaleString());
+        setText('totalTrades', `${summary.total_trades || 0} +${signalLane.trades} sig`);
+        setText('winLoss', `${summary.wins || 0}/${summary.losses || 0} · sig ${signalLane.wins || 0}/${signalLane.losses || 0}`);
+    }
     if (document.getElementById('futOptTrades')) {
         setText('futOptTrades', `FUT: ${summary.fut_trades || 0} / OPT: ${summary.opt_trades || 0}`);
     }
@@ -764,12 +905,22 @@ function updateSignalsFeed(instruments) {
     const hasRealTradeRows = currentRows.some(row => row.cells.length > 1 && !/No (active )?trades/i.test(row.innerText));
     if (hasRealTradeRows) return;
 
-    const byKey = new Map();
+    const candidates = [];
     Object.values(instruments || {}).forEach(inst => {
         (inst.trade_candidates || []).forEach(sig => {
-            const key = `${sig.instrument}_${sig.timeframe}_${sig.action || 'ENTRY'}_${sig.direction}_${sig.trading_symbol || sig.atm_strike || 'FUT'}`;
-            byKey.set(key, { ...sig, source: 'candidate' });
+            if (isTrackedSessionSignal(sig)) candidates.push(sig);
         });
+    });
+    // Same contract as collectSessionSignalRows and the server payload: a terminal row is
+    // audit history, and so is the ENTRY of a lifecycle it closed. This renderer runs
+    // exactly when the payload has no rows, so without the filter the cut signals the
+    // trade table just hid would reappear here.
+    const terminalKeys = terminalSessionSignalKeys(candidates);
+    const byKey = new Map();
+    candidates.forEach(sig => {
+        if (isTerminalSessionSignal(sig) || sessionSignalHasExited(sig, terminalKeys)) return;
+        const key = `${sig.instrument}_${sig.timeframe}_${sig.action || 'ENTRY'}_${sig.direction}_${sig.trading_symbol || sig.atm_strike || 'FUT'}`;
+        byKey.set(key, { ...sig, source: 'candidate' });
     });
 
     const signalsArray = Array.from(byKey.values())
@@ -807,7 +958,6 @@ function updateSignalsFeed(instruments) {
         const isExit = sig.is_exit || sig.action === 'EXIT' || sig.status === 'EXIT SIGNAL';
         const direction = sig.direction || (sig.type === 'BUY' ? 'LONG' : 'SHORT');
         const sideColor = isExit ? 'var(--orange)' : (direction === 'LONG' ? 'var(--buy)' : 'var(--sell)');
-        const conf = Math.round((sig.confidence || 0) * 100);
         const actionable = isCandidate || sig.is_actionable !== false;
         const grade = sig.grade || (actionable ? 'B' : 'C');
         const ts = sig.timestamp ? new Date(sig.timestamp) : null;
@@ -867,8 +1017,7 @@ function updateSignalsFeed(instruments) {
             <td class="font-bold" style="opacity:0.5">--</td>
             <td>
                 <div class="conf-grade-cell">
-                    <span class="conf-chip grade-${grade.replace('+', 'p').replace(/[^a-zA-Z0-9]/g, '-')}" title="Grade ${grade} (grade is a label for this confidence)">${conf}%</span>
-                    <span style="font-size:0.8rem; opacity:0.6">${sig.timeframe || '5min'}</span>
+                    ${renderSignalScore({ ...sig, grade })}
                 </div>
             </td>
             <td><span class="exe-badge ${exeClass}">${exeLabel}</span></td>
@@ -879,8 +1028,9 @@ function updateSignalsFeed(instruments) {
                 <span class="time-val">--:--</span>
             </td>
             <td>${controlHtml}</td>
-            <td style="font-size:0.8rem; opacity:0.6" title="${reasons}">
-                ${(sig.status || '').replace(/_/g, ' ') || 'SCANNING'}
+            <td style="font-size:0.8rem; opacity:0.8" title="${escHtml(sig.data_stale_reason || reasons)}">
+                ${sig.execution_status === 'SIGNAL_ONLY' || sig.execution_state === 'NOT_PLACED' ? 'Awaiting execution' : ((sig.status || '').replace(/_/g, ' ') || 'SCANNING')}
+                ${sig.data_stale === true ? `<span class="data-stale-badge" style="color:var(--orange); border:1px solid currentColor; border-radius:3px; padding:1px 3px; margin-left:4px; font-size:0.62rem">DATA STALE</span>` : ''}
             </td>
         `;
 

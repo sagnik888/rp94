@@ -181,6 +181,26 @@ class RiskManager:
             if not math.isfinite(stop):
                 return None
 
+            # A UTS widening request can reach the exchange before its acknowledgement
+            # is lost. During that specific recovery, current_stop remains the tighter
+            # software stop and protective_trigger holds the conservative broker bound.
+            # Reserve the actual possible exposure until protection is reconciled.
+            verdict = getattr(trade, "quality_verdict", {}) or {}
+            checks = verdict.get("checks", {}) if isinstance(verdict, dict) else {}
+            uncertain_uts_extension = (
+                inst_type == "OPT"
+                and str(getattr(trade, "source_lane", "") or "").upper() == "UTS"
+                and isinstance(verdict, dict) and verdict.get("policy_version") == "uts_native.v1"
+                and isinstance(checks, dict) and checks.get("uts_stop_extension_attempted")
+                and checks.get("uts_stop_extension_uncertain")
+                and str(getattr(trade, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED"
+            )
+            if uncertain_uts_extension:
+                protective = float(getattr(trade, "protective_trigger", 0.0) or 0.0)
+                if not math.isfinite(protective) or protective <= 0:
+                    return None
+                stop = min(stop, protective) if stop > 0 else protective
+
             # OPTIONS ARE ALWAYS BOUGHT, so the adverse move is always a FALL in premium
             # regardless of what `direction` says. A bearish view is a bought PE, and this
             # system stores it as direction="SHORT" while its stop sits BELOW entry: the
@@ -205,12 +225,13 @@ class RiskManager:
                     stop_distance = (
                         max(0.0, entry - stop) if direction == "LONG" else max(0.0, stop - entry)
                     )
-                stop_risk = min(configured_risk, stop_distance * quantity * multiplier)
+                actual_risk = stop_distance * quantity * multiplier
+                stop_risk = actual_risk if uncertain_uts_extension else min(configured_risk, actual_risk)
             else:
                 stop_risk = configured_risk
 
             cap = max(0.0, float(self.max_trade_loss_abs or 0.0))
-            return min(stop_risk, cap) if cap > 0 else stop_risk
+            return min(stop_risk, cap) if cap > 0 and not uncertain_uts_extension else stop_risk
         except Exception as exc:
             logger.warning(f"Unable to estimate projected stop risk: {exc}")
             return None

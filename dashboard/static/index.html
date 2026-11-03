@@ -84,10 +84,12 @@
             <div class="tf-policy-wrapper">
                 <span class="switch-label">TF</span>
                 <select id="topTimeframePolicy" class="tf-policy-select modern-select" aria-label="Signal timeframe policy">
+                    <option value="PRIMARY_1">1M</option>
                     <option value="PRIMARY_5">5M</option>
                     <option value="PRIMARY_15">15M</option>
-                    <option value="INCLUDE_5MIN">5M+15M</option>
                     <option value="INCLUDE_1MIN_5MIN">1M+5M</option>
+                    <option value="INCLUDE_1MIN_15MIN">1M+15M</option>
+                    <option value="INCLUDE_5MIN">5M+15M</option>
                     <option value="INCLUDE_1MIN_5MIN_15MIN">1M+5M+15M</option>
                 </select>
             </div>
@@ -129,14 +131,19 @@
             </div>
             <div class="switch-group">
                 <span class="switch-label">ENGINE</span>
-                <select id="scannerEngineSelect" class="tf-policy-select modern-select" title="Signal engine - UT1 / EMA / Consensus / UT1+Consensus / Quad Union / Quad Prime / Adaptive Dual">
+                <select id="scannerEngineSelect" class="tf-policy-select modern-select" title="Signal engine - UT1 / EMA / Consensus / UT1+Consensus / Quad Union / Quad Prime / Quad Prime + S1 / UT Smart Exit + S1 / UT Smart Exit / S1 / S1+S2 Dual / ut/ema">
                     <option value="utbot">UTBOT</option>
                     <option value="ema">EMA</option>
                     <option value="consensus">CONSENSUS</option>
                     <option value="utbot_consensus">UTBOT+CONS</option>
                     <option value="quad_union">QUAD UNION</option>
                     <option value="quad_prime" selected>QUAD PRIME</option>
-                    <option value="adaptive_dual">ADAPTIVE DUAL</option>
+                    <option value="quad_prime_s1">QUAD PRIME + S1</option>
+                    <option value="ut_smart_s1">UT SMART EXIT + S1</option>
+                    <option value="ut_smart">UT SMART EXIT</option>
+                    <option value="s1">S1 CONFLUENCE</option>
+                    <option value="s1s2_dual">S1+S2 DUAL</option>
+                    <option value="ut_ema">ut/ema</option>
                 </select>
             </div>
             <div class="switch-group">
@@ -184,6 +191,7 @@
         <!-- ─── LEFT: CHART AREA ─── -->
         <section class="panel chart-panel" id="chartPanel">
             <div class="panel-header">
+                <span id="chartCandleSource" class="inst-quote-status reference" hidden></span>
                 <div class="tf-tabs" id="tfTabs">
                     <button class="tf-tab" data-tf="1min">1M <span class="tf-pos-dot" id="dot1m"></span></button>
                     <button class="tf-tab active" data-tf="5min">5M <span class="tf-pos-dot" id="dot5m"></span></button>
@@ -282,7 +290,7 @@
                     <button class="intel-tab" data-target="pnlContentView">P&L</button>
                 </div>
                 <div class="header-right-actions" style="display:flex; align-items:center; gap:8px;">
-                    <div id="manipulationAlert" class="manipulation-banner" style="display: none;">⚠️ MANIPULATION</div>
+                    <div id="manipulationAlert" class="manipulation-banner" style="display: none;">PRESSURE DIVERGENCE</div>
                     <span class="diag-mode" id="diagMode" style="display: none;">--</span>
                 </div>
             </div>
@@ -292,9 +300,9 @@
                 <div id="intelContentView" class="intel-view-pane active">
                     <div class="intel-grid">
                         <div class="intel-card glass-card">
-                            <div class="intel-card-title">📊 Volume</div>
-                            <div class="intel-card-value glow-text" id="intelVolRatio">1.0x</div>
-                            <div class="intel-card-label" id="intelVolLabel">vs Avg</div>
+                            <div class="intel-card-title">📊 Volume <span id="intelVolFrame" style="color: #a3aab6; font-size: 10px; font-weight: 400;"></span></div>
+                            <div class="intel-card-value glow-text" id="intelVolRatio">--</div>
+                            <div class="intel-card-label" id="intelVolLabel">Waiting for data</div>
                             <div class="intel-card-bar"><div class="bar-fill" id="intelVolBar"></div></div>
                         </div>
                         <div class="intel-card glass-card">
@@ -412,9 +420,10 @@
                                 <small id="diagRejectContext">Waiting for diagnostics...</small>
                             </div>
                             <div class="diag-reject-total">
-                                <span>Total Blocks</span>
+                                <span id="diagRejectTotalLabel" title="Decision events across the session; not a count of unique trades.">Total Blocks</span>
                                 <b id="diagRejectTotal">--</b>
                                 <small id="diagRejectDiversity">--</small>
+                                <small id="diagWaitingTotal">Waiting for deferred-signal counters...</small>
                             </div>
                         </div>
                         <div class="diag-reject-insights" id="diagRejectInsights">No rejected-signal counters yet.</div>
@@ -572,6 +581,10 @@
                         <div class="h-summary-item">
                             <span class="h-summary-label" id="dailyPnlLabel">DAILY P&L:</span>
                             <span class="h-summary-value" id="dailyPnl">₹0</span>
+                        </div>
+                        <div class="h-summary-item" id="signalPnlItem" style="display: none;" title="Accepted signals that were not placed with the broker (Auto Mode OFF). Marks only; not money.">
+                            <span class="h-summary-label nonmoney-label">SIGNAL P&L:</span>
+                            <span class="h-summary-value nonmoney-value" id="signalPnl">₹0</span>
                         </div>
                         <div class="h-summary-item">
                             <span class="h-summary-label">FUT P&L:</span>
@@ -838,16 +851,16 @@
     <div class="toast-container" id="toastContainer"></div>
 
     <script src="/static/js/trade-pagination.js?v=2-fut-opt"></script>
-    <script src="/static/js/trade-table.js?v=9-signal-pnl-basis"></script>
-    <script src="/static/js/dashboard-charts.js?v=5.2.0-only"></script>
+    <script src="/static/js/trade-table.js?v=15-compact-conf-tf"></script>
+    <script src="/static/js/dashboard-charts.js?v=5.2.0-s12-dual-chart-window-race-fix-4"></script>
     <!-- Bump this ?v= whenever dashboard-settings.js changes, or the browser serves the
          cached copy and the new controls simply never appear. That is exactly what
          happened on 2026-08-18: the breakeven-stop, give-back-cap and backtest-live-exit
          controls were present in the file and mounted in the DOM, but invisible in the
          running dashboard because the version string still said v=24. -->
-    <script src="/static/js/dashboard-settings.js?v=32-single-auto-authority"></script>
+    <script src="/static/js/dashboard-settings.js?v=53-s12-dual-engine"></script>
     <script src="/static/js/signal-forensics.js?v=3-integration-fixed"></script>
-    <script src="/static/js/app.js?v=sep2026-v46-angelone-refresh"></script>
+    <script src="/static/js/app.js?v=oct2026-v56-intel-truthful-native-atr"></script>
 </body>
 
 

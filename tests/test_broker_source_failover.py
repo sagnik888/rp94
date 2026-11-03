@@ -221,9 +221,10 @@ def test_index_quote_keeps_fresh_kite_source_when_fyers_tick_is_newer(monkeypatc
 def test_index_quote_fails_over_to_fyers_when_kite_tick_is_stale(monkeypatch):
     provider = _provider(monkeypatch)
     now = time.time()
+    monkeypatch.setattr(market_data_module.time, "time", lambda: now)
     provider._ws_cache["99926000"] = {
         "ltp": 23200.0,
-        "time": now - 7.0,
+        "time": now - provider.INDEX_KITE_PRICE_FRESH_SECONDS - 1.0,
         "source": "kite_ws",
     }
     provider._ws_cache[FYERS_INDEX_SYMBOLS["NIFTY"]] = {

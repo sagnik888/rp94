@@ -7,6 +7,7 @@ import inspect
 import threading
 
 import pytest
+from tests.source_views import scanner_runtime_source
 
 from trading.order_retry import BrokerOrderRejected
 from trading.trade_manager import IST, Trade, TradeManager
@@ -761,6 +762,8 @@ def test_acknowledged_stale_entry_emits_a_second_result_when_replacement_guard_b
 def test_scanner_wires_candidate_lifecycle_and_worker_guard_to_entry_calls():
     from scanner import Scanner
 
-    source = inspect.getsource(Scanner)
-    assert source.count("lifecycle_id=self._candidate_lifecycle_key(") == 3
-    assert "entry_submission_guard=self._queued_auto_entry_submission_guard" in source
+    source = scanner_runtime_source()
+    lifecycle_sites = source.count("lifecycle_id=self._candidate_lifecycle_key(")
+    lifecycle_sites += source.count("lifecycle_id=scanner._candidate_lifecycle_key(")
+    assert lifecycle_sites == 3
+    assert "entry_submission_guard=scanner._queued_auto_entry_submission_guard" in source

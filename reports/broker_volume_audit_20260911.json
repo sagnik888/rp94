@@ -1,0 +1,110 @@
+{
+  "futures_rollover_without_new_data": {
+    "before": {
+      "available": true,
+      "reliable": true,
+      "source": "kite_index_futures_minute",
+      "unit": "contracts",
+      "tradingsymbol": "NIFTY26SEPFUT",
+      "current_volume": 100.0,
+      "baseline_volume": 100.0,
+      "ratio": 1.0,
+      "projected_ratio": 1.0169,
+      "completed_samples": 5,
+      "age_seconds": 14.0
+    },
+    "after": {
+      "available": true,
+      "reliable": true,
+      "source": "kite_index_futures_minute",
+      "unit": "contracts",
+      "tradingsymbol": "NIFTY26SEPFUT",
+      "current_volume": 100.0,
+      "baseline_volume": 100.0,
+      "ratio": 1.0,
+      "projected_ratio": 4.0,
+      "completed_samples": 5,
+      "age_seconds": 16.0
+    }
+  },
+  "cross_boundary_delta_charged_to_new_minute": {
+    "tradingsymbol": "NIFTY26SEPFUT",
+    "session_day": "2026-09-08",
+    "minute": 29814151,
+    "current_volume": 1000.0,
+    "completed": [
+      0.0
+    ],
+    "last_cumulative": 11000.0,
+    "last_at": 1788849061.0
+  },
+  "day_old_futures_quote_accepted": {
+    "available": true,
+    "tradingsymbol": "NIFTY26SEPFUT",
+    "instrument_token": 1,
+    "expiry": "2026-09-21",
+    "volume": 10000.0,
+    "oi": 50000.0,
+    "oi_day_high": 0.0,
+    "oi_day_low": 0.0,
+    "last_price": 25000.0,
+    "unit": "contracts"
+  },
+  "strike_only_oi_overlay_crosses_expiry": {
+    "calls": [
+      {
+        "args": [
+          "NIFTY"
+        ],
+        "kwargs": {
+          "spot": 0.0,
+          "strikes_each_side": 20
+        }
+      }
+    ],
+    "rows": [
+      {
+        "strike": 25000,
+        "call_oi": 100,
+        "put_oi": 200,
+        "call_symbol": "NIFTY_NEXT_EXPIRY_CE",
+        "put_symbol": "NIFTY_NEXT_EXPIRY_PE"
+      }
+    ],
+    "attrs": {
+      "expiry": "2026-09-21"
+    }
+  },
+  "oi_change_horizon_changes_with_provider": {
+    "fyers": [
+      {
+        "strike": 25000,
+        "call_oi": 1100,
+        "put_oi": 1100,
+        "call_oi_change": 500,
+        "put_oi_change": 500,
+        "oi_change_source": "fyers_reported"
+      }
+    ],
+    "angel": [
+      {
+        "strike": 25000,
+        "call_oi": 1100,
+        "put_oi": 1100,
+        "call_oi_change": 100.0,
+        "put_oi_change": 100.0,
+        "oi_change_source": "angelone_snapshot_delta"
+      }
+    ]
+  },
+  "gamma_execution_differs_from_chain_active_label": {
+    "chain_active_label": "22SEP2026",
+    "execution_contract": {
+      "name": "NIFTY",
+      "expiry": "15SEP2026",
+      "strike": 2500000.0,
+      "symbol": "NIFTY_CURRENT_CE",
+      "token": "current"
+    }
+  }
+}

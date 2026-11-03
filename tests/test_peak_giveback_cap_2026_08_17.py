@@ -36,6 +36,7 @@ import pytest
 from config.settings import Settings, get_settings
 from intelligence.rtracker import normalize_replay_pnl_event
 from scanner import IST, Scanner
+from tests.source_views import scanner_runtime_source
 
 
 # The quantitative claim was validated on these four closed sessions. New rtracker
@@ -219,13 +220,12 @@ def test_it_runs_before_the_loss_guard_in_both_monitor_paths():
     disagreed about exit order."""
     import inspect
 
-    src = inspect.getsource(Scanner)
-    caps = [i for i in range(len(src)) if src.startswith("self._peak_giveback_cap_exit(", i)]
-    guards = [i for i in range(len(src)) if src.startswith("self._loss_guard_decision(", i)]
-    assert len(caps) == 2, f"expected 2 cap call sites, found {len(caps)}"
-    assert len(guards) == 2, f"expected 2 loss-guard call sites, found {len(guards)}"
-    for cap_at, guard_at in zip(caps, guards):
-        assert cap_at < guard_at, "the cap is evaluated after the loss guard"
+    from engine.exit_cycle import ExitCycleService
+
+    session = inspect.getsource(Scanner._check_session_candidates_breaches_locked)
+    live = inspect.getsource(ExitCycleService.update_active_trades)
+    assert session.index("self._peak_giveback_cap_exit(") < session.index("self._loss_guard_decision(")
+    assert live.index("scanner._peak_giveback_cap_exit(") < live.index("scanner._loss_guard_decision(")
 
 
 def test_the_exit_reason_is_not_registered_as_a_stop_out():

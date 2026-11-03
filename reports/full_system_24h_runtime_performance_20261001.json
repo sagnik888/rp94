@@ -1,0 +1,152 @@
+{
+  "option_history": {
+    "attempts": 29,
+    "hits": 221,
+    "misses": 29,
+    "synthetic": 0,
+    "fallback_to_fut": 0,
+    "archived_hits": 182
+  },
+  "option_history_quality": {
+    "status": "OK",
+    "real_option_hits": 403,
+    "misses": 29,
+    "fallback_to_fut": 0,
+    "fallback_rate_pct": 0.0,
+    "note": "Historical option candle coverage is sufficient for accepted option rows."
+  },
+  "option_history_bundle": {
+    "rebuilt": true,
+    "files": 442,
+    "seconds": 46.647
+  },
+  "phase_processing_ms": {
+    "NIFTY": {
+      "scanner_1min_ms": 5.259,
+      "scanner_5min_ms": 4.021,
+      "scanner_15min_ms": 2.421,
+      "chain_depth_ms": 0.007,
+      "intelligence_ms": 0.184
+    },
+    "BANKNIFTY": {
+      "scanner_1min_ms": 5.355,
+      "scanner_5min_ms": 4.087,
+      "scanner_15min_ms": 3.948,
+      "chain_depth_ms": 0.004,
+      "intelligence_ms": 0.316
+    },
+    "SENSEX": {
+      "scanner_1min_ms": 5.263,
+      "scanner_5min_ms": 3.938,
+      "scanner_15min_ms": 2.423,
+      "chain_depth_ms": 0.004,
+      "intelligence_ms": 0.177
+    },
+    "MIDCPNIFTY": {
+      "scanner_1min_ms": 4.379,
+      "scanner_5min_ms": 3.204,
+      "scanner_15min_ms": 4.026,
+      "chain_depth_ms": 0.006,
+      "intelligence_ms": 0.276
+    },
+    "dashboard_trade_payload_ms": 192.322
+  },
+  "timeouts": {
+    "skipped_inflight": 0
+  },
+  "external_call_bulkheads": {},
+  "latency": {
+    "last_ms": 258,
+    "high_latency_events": 1,
+    "last_cycle_ms": 566,
+    "scan_count": 2710
+  },
+  "worker_resources": {
+    "default_executor_queued_tasks": 0,
+    "logical_cpu_count": 16,
+    "active_threads": 26,
+    "active_indices": 4,
+    "live_inflight": 0,
+    "historical_rebuild_pending": false,
+    "estimated_default_executor_max_workers": 20,
+    "default_executor_max_workers": 20,
+    "live_index_parallelism_needed": 4,
+    "live_processing_capacity_ratio": 5.0,
+    "async_execution_queue": {
+      "available": true,
+      "workers": 4,
+      "alive_workers": 4,
+      "queue_size": 0,
+      "queue_capacity": 500,
+      "queue_remaining": 500,
+      "queue_fill_pct": 0.0
+    },
+    "broker_executor": {
+      "available": true,
+      "max_workers": 5,
+      "queued_tasks": 0
+    },
+    "recalculation_worker_timeout_seconds": 120.0
+  },
+  "historical_intelligence_coverage": {
+    "simulation_id": 1790794089210,
+    "by_index_timeframe": {
+      "NIFTY_5min": {
+        "evaluations": 97,
+        "option_chain_available": 0,
+        "vix_available": 91,
+        "futures_participation_available": 89,
+        "options_participation_available": 89
+      },
+      "NIFTY_15min": {
+        "evaluations": 28,
+        "option_chain_available": 0,
+        "vix_available": 26,
+        "futures_participation_available": 24,
+        "options_participation_available": 24
+      },
+      "BANKNIFTY_5min": {
+        "evaluations": 79,
+        "option_chain_available": 0,
+        "vix_available": 73,
+        "futures_participation_available": 72,
+        "options_participation_available": 72
+      },
+      "BANKNIFTY_15min": {
+        "evaluations": 29,
+        "option_chain_available": 0,
+        "vix_available": 25,
+        "futures_participation_available": 24,
+        "options_participation_available": 24
+      },
+      "SENSEX_5min": {
+        "evaluations": 92,
+        "option_chain_available": 0,
+        "vix_available": 86,
+        "futures_participation_available": 86,
+        "options_participation_available": 87
+      },
+      "SENSEX_15min": {
+        "evaluations": 28,
+        "option_chain_available": 0,
+        "vix_available": 26,
+        "futures_participation_available": 25,
+        "options_participation_available": 26
+      },
+      "MIDCPNIFTY_5min": {
+        "evaluations": 83,
+        "option_chain_available": 0,
+        "vix_available": 71,
+        "futures_participation_available": 70,
+        "options_participation_available": 70
+      },
+      "MIDCPNIFTY_15min": {
+        "evaluations": 25,
+        "option_chain_available": 0,
+        "vix_available": 22,
+        "futures_participation_available": 20,
+        "options_participation_available": 20
+      }
+    }
+  }
+}

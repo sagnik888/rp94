@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pytz
@@ -207,8 +208,26 @@ def accounting_pnl(row: Dict[str, Any]) -> float:
         return 0.0
 
 
+def is_rejected_entry_row(row: Dict[str, Any]) -> bool:
+    """An entry the broker (or its margin pre-check) refused: nothing was ever filled.
+
+    TradeManager.get_summary already leaves these out, but the dashboard rebuilds its
+    headline from rows. On 2026-09-17 a MIDCPNIFTY entry refused by
+    ENTRY_MARGIN_PREFLIGHT was counted as a closed losing trade carrying -Rs.80 of
+    charges that were never incurred.
+    """
+    return str(row.get("execution_status") or "").upper() == "REJECTED"
+
+
 def normalize_dashboard_accounting_row(row: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(row)
+    if is_rejected_entry_row(row):
+        row.setdefault("raw_pnl", row.get("pnl", 0.0))
+        row["pnl"] = 0.0
+        row["accounting_pnl"] = 0.0
+        row["charges"] = 0.0
+        row["accounting_excluded"] = "REJECTED"
+        return row
     if is_quote_invalid_row(row):
         row.setdefault("raw_pnl", row.get("pnl", 0.0))
         row["pnl"] = 0.0
@@ -282,6 +301,34 @@ def trade_row_event_seconds(row: Dict[str, Any], prefer_exit: bool = False) -> f
     return 0.0
 
 
+def live_signal_exit_mark(row: Any) -> Optional[float]:
+    """Return an observed manual exit only when the live lifecycle evidence is valid.
+
+    Historical and unidentified legacy rows keep their existing geometry repairs.
+    A live advisory mark is still not a broker fill.
+    """
+    def value(name: str, default=None):
+        return row.get(name, default) if isinstance(row, dict) else getattr(row, name, default)
+
+    if str(value("data_provenance", "") or "").upper() != "LIVE":
+        return None
+    if not (value("accepted_by_gate", False) or value("watch_only", False)):
+        return None
+    if str(value("action", "") or "").upper() != "EXIT":
+        return None
+    try:
+        price = float(value("exit_price"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    entered = trade_row_event_seconds({"entry_timestamp": value("entry_timestamp")})
+    exited = trade_row_event_seconds({"exit_timestamp": value("exit_timestamp")}, prefer_exit=True)
+    if not (math.isfinite(entered) and math.isfinite(exited) and 0 < entered <= exited):
+        return None
+    return price
+
+
 def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Apply final accounting guards to persisted rows before dashboard display."""
     row = normalize_dashboard_accounting_row(row)
@@ -297,6 +344,93 @@ def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
         and str(row.get("exit_order_id") or "").strip()
     )
     actual_exit = float(row.get("exit_price") or 0.0)
+    evidence = [row.get("replay_input")]
+    trace = row.get("replay_exit_trace")
+    if isinstance(trace, (list, tuple)):
+        evidence.extend(trace)
+    verified_option_replay = (
+        inst_type == "OPT"
+        and _normalized_text(row.get("data_provenance"), upper=True) == "BACKTEST"
+        and any(
+            isinstance(item, dict)
+            and item.get("guard") == "replay_input"
+            and item.get("state") == "VERIFIED_PRICE_PATH"
+            for item in evidence
+        )
+    )
+    if (inst_type == "OPT" and not verified_option_replay
+            and _normalized_text(row.get("data_provenance"), upper=True) == "BACKTEST_OBSERVED_OPTION_MINUTES"
+            and _normalized_text(row.get("source_engine")) == "ut_ema"
+            and _normalized_text(row.get("source_lane"), upper=True) == "UTEMA"
+            and _normalized_text(row.get("exit_policy_owner"), upper=True) == "UTEMA"):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            digest = str(item.get("input_sha256") or "")
+            if (item.get("guard") != "replay_input" or item.get("state") != "VERIFIED_PRICE_PATH"
+                    or item.get("source_engine") != "ut_ema" or item.get("complete_path") is not True
+                    or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+                continue
+            try:
+                matches = all(math.isclose(float(item[name]), float(value), rel_tol=0., abs_tol=1e-6)
+                    for name, value in (("entry_price", entry_price), ("exit_price", actual_exit),
+                        ("lots", row.get("lots")), ("lot_size", row.get("lot_size")),
+                        ("charges", row.get("charges")), ("pnl", row.get("pnl"))))
+                charges = float(item["charges"])
+                expected = round((actual_exit-entry_price)*int(item["lots"])*int(item["lot_size"])-charges, 2)
+                verified_option_replay = (matches and charges >= 0 and math.isfinite(charges)
+                    and math.isclose(expected, float(item["pnl"]), rel_tol=0., abs_tol=.011))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if verified_option_replay:
+                break
+    modeled_futures_replay = False
+    if inst_type == "FUT" and _normalized_text(row.get("data_provenance"), upper=True) == "BACKTEST":
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            digest = str(item.get("input_sha256") or "")
+            if (item.get("guard") != "replay_input" or item.get("state") != "INDEX_PRICE_PROXY"
+                    or item.get("fill_accounting") != "CAUSAL_INDEX_PROXY_V1"
+                    or item.get("complete_path") is not True
+                    or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+                continue
+            try:
+                prices_match = (math.isclose(float(item["entry_price"]), entry_price, rel_tol=0., abs_tol=1e-8)
+                                and math.isclose(float(item["exit_price"]), actual_exit, rel_tol=0., abs_tol=1e-8))
+                times_match = True
+                for name in ("entry_time", "exit_time"):
+                    def market_time(value):
+                        if isinstance(value, (int, float)):
+                            return datetime.fromtimestamp(value, IST).replace(tzinfo=None)
+                        stamp = datetime.fromisoformat(str(value))
+                        return stamp.astimezone(IST).replace(tzinfo=None) if stamp.tzinfo else stamp
+                    row_time = row.get(name.replace("_time", "_timestamp")) or row.get(name)
+                    times_match = times_match and market_time(item[name]) == market_time(row_time)
+                modeled_futures_replay = prices_match and times_match and item["exit_reason"] == row.get("exit_reason")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if modeled_futures_replay:
+                break
+    if (verified_option_replay or modeled_futures_replay) and math.isfinite(actual_exit) and actual_exit > 0:
+        # The replay already priced the observed option path, including gap fills
+        # and a raised profit stop. Legacy display stops/targets are entry geometry;
+        # substituting them would rewrite both the fill and its accounting. Covered
+        # futures index-proxy paths retain the same accounting, without claiming
+        # that their prices came from observed futures contracts.
+        row["exit_price"] = actual_exit
+        row["current_price"] = actual_exit
+        recorded_pnl = _normalized_number(row.get("pnl"))
+        if recorded_pnl is not None and math.isfinite(recorded_pnl):
+            return row
+        charges = _normalized_number(row.get("charges"))
+        if charges is None or not math.isfinite(charges) or charges < 0:
+            charges = max(0.0, float(getattr(get_settings(), "opt_cost" if inst_type == "OPT" else "fut_cost", 0.0) or 0.0))
+        quantity = int(row.get("lots") or 1) * int(row.get("lot_size") or 1)
+        row["charges"] = charges
+        sign = -1 if inst_type == "FUT" and direction == "SHORT" else 1
+        row["pnl"] = round(sign * (actual_exit - entry_price) * quantity - charges, 2)
+        return row
     if broker_fill_pair and actual_exit > 0:
         # Repair rows written before exact-fill accounting was fixed.  Never replace an
         # actual exit fill with the requested stop/target, and never add simulated
@@ -319,7 +453,10 @@ def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
     target = float(row.get("current_target") or row.get("target") or 0.0)
     exit_reason = str(row.get("exit_reason") or "").upper()
     exit_price = float(row.get("exit_price") or row.get("current_price") or 0.0)
-    if exit_reason == "TARGET_HIT" and target > 0:
+    live_mark = live_signal_exit_mark(row)
+    if live_mark is not None:
+        exit_price = live_mark
+    elif exit_reason == "TARGET_HIT" and target > 0:
         exit_price = target
     elif exit_reason in {"STOP_HIT", "TRAILING_STOP", "SL HIT", "SL_HIT"} and stop > 0:
         exit_price = stop

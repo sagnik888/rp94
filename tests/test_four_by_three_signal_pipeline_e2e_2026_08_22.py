@@ -239,6 +239,10 @@ def _scanner_harness(mtf, initial_lanes, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_every_four_by_three_lane_is_virgin_buffered_stabilized_and_accepted(monkeypatch):
+    # The matrix defines one generic owner per timeframe and asserts standalone
+    # identity keys. Keep the operator's combined .env mode out of this fixture.
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "scanner_engine", "utbot")
     assert len(INDICES) == 4
     assert set(INDICES) == {"NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"}
     mtf, lane_engines, frames = _build_mtf()

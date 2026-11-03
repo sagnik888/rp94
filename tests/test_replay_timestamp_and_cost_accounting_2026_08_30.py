@@ -85,7 +85,9 @@ def test_exit_lifecycle_run_day_accepts_one_mixed_format_archive(tmp_path, monke
         "price": 101.0,
         "stop": 91.0,
         "target": 121.0,
+        "entry_timestamp": f"{day}T04:00:00Z",
         "signal_timestamp": f"{day}T04:00:00Z",
+        "contract": {"trading_symbol": "NIFTY31JUL2624000CE"},
         "regime": {"raw_regime": "TRENDING_UP", "adx": 30.0},
     }])
     monkeypatch.setattr(bt, "ROOT", tmp_path)

@@ -429,7 +429,11 @@ def test_the_index_history_call_is_the_bounded_one():
     assert "self.fyers.history(data=data)" not in src, (
         "the index-history call is unbounded again"
     )
-    assert "_call_bounded(" in src
+    assert "_call_fyers_history_with_backoff(" in src
+    history_call = inspect.getsource(MarketDataProvider._call_fyers_history_with_backoff)
+    assert "_call_fyers_bounded(" in history_call
+    recurring_call = inspect.getsource(MarketDataProvider._call_fyers_bounded)
+    assert "_call_bounded(" in recurring_call
     assert "fyers_history_timeout_seconds" in src
 
 

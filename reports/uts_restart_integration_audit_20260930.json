@@ -1,0 +1,72 @@
+{
+  "date": "2026-09-30",
+  "prepared_at": "2026-09-30T15:18:24.900434+05:30",
+  "live_broker_mutations": false,
+  "audit_repairs_loaded_in_running_process": false,
+  "runtime_evidence": "reports/uts_restart_runtime_evidence_20260930.json",
+  "test_results": {
+    "uts_restart_audit_combined_20260930.xml": {
+      "tests": 822,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "uts_restart_final_integration_20260930.xml": {
+      "tests": 341,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "uts_restart_full_verification_20260930.xml": {
+      "tests": 7495,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0
+    },
+    "uts_restart_full_final_20260930.xml": {
+      "tests": 7500,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "uts_restart_optional_integration_20260930.xml": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "final_full_run": {
+    "status": "passed",
+    "xml": "reports/uts_restart_full_final_20260930.xml",
+    "tests": 7500,
+    "integration_marker_excluded_by_repository_default": true,
+    "excluded_cases_separately_passed": 4
+  },
+  "files": {
+    "engine/uts_lane.py": "9964d914debc576ba24976d897f38447c83dc1b41889a6f7ef8a652883453df2",
+    "engine/market_regime.py": "9e6736b2ce0f772b5a7f117ba7d59979ed06fb4300e99f71ecf9d561a68e111b",
+    "engine/candidate_selection.py": "3c4db8e315bb12df740a61399325e5716b8ba1bd587f4bef080cd9876ed4fb35",
+    "engine/execution_service.py": "13f494ac4e57943b02806bdff8f803a2b722f546a54b972f375dc0144c598f0e",
+    "engine/exit_cycle.py": "b3a0be0676e899a9828bc4a0709767a3e03ea5c5c27edad862ea4924f0ce25c0",
+    "engine/signal_processor.py": "dded9a89eab6cbc381910db5e1ac3131edd60d8bc4b0ae837e0588b084245359",
+    "engine/alt_scanners.py": "e966fb0288a6cbb15cc958d5b017e016ff13bd3fbd77c1c941aee41e64b21214",
+    "scanner.py": "d348f8da5aa3fe6146464c2e5dcc7a484676f635d0c561256de8c7d0ed9d48d4",
+    "trading/trade_manager.py": "cf682b2c4dc41145c817e408828680332f37e43092c7196fad36746e822cce2c",
+    "engine/s1_lane.py": "efb880f6e6f6cd053d06d36f08fef4eb76b5cb1c20fd4d847e1b7c591795c634",
+    "engine/risk_manager.py": "e34cc6da656608ed3b6b4f4455c6afb68a78ab8576dc8ebb7bd0e7054ab3df8c"
+  },
+  "unique_repository_cases_passed": 7504,
+  "verified_at": "2026-09-30T15:27:45.440433+05:30",
+  "runtime_at_completion": {
+    "status": "running",
+    "scanner_running": true,
+    "mode": "REAL",
+    "pid": 31600,
+    "last_scan": "2026-09-30T15:27:50.821002+05:30",
+    "scan_count": 1854,
+    "latency": 396,
+    "auto_mode": true
+  },
+  "running_import_snapshot": "2026-09-30T09:04:35.317138+00:00"
+}

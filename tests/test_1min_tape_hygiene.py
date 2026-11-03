@@ -2,14 +2,15 @@
 
 A 1min signal can ONLY enter via the volume-spike first filter: normally 2.5x
 volume, or the stronger-context 2.0x floor when ADX/intel/power context agrees.
-No-spike 1min rejections/detections are pure tape noise. `_suppress_1min_no_spike_tape`
-decides whether to keep such a signal off the live tape.
+S1+S2 D2 also has its own confirmed native burst route. No-route 1min detections are
+pure tape noise. `_suppress_1min_no_spike_tape` decides whether to keep them off the tape.
 """
 
 import inspect
 from types import SimpleNamespace
 
 from engine.signal_processor import SignalProcessor
+from tests.source_views import signal_pipeline_source
 
 _S = lambda **kw: SimpleNamespace(live_1min_log_only_volume_spike=kw.get("enabled", True))
 
@@ -57,8 +58,33 @@ def test_spike_1min_can_compete_for_entry_selection():
     ]
 
 
+def test_s12_native_d2_burst_is_a_1min_fast_route_without_becoming_host_spike():
+    burst = SimpleNamespace(
+        source_engine="s1s2_dual", source_lane="D2", s12_lane="D2", s12_burst=True,
+        volume_spike_entry=False,
+    )
+    plain = SimpleNamespace(
+        source_engine="s1s2_dual", source_lane="D2", s12_lane="D2", s12_burst=False,
+        volume_spike_entry=False,
+    )
+    one_min_burst = {"tf": "1min", "sig": burst}
+    one_min_plain = {"tf": "1min", "sig": plain}
+
+    assert SignalProcessor._is_s12_native_burst(burst) is True
+    assert SignalProcessor._has_1min_burst_or_spike(burst) is True
+    assert SignalProcessor._has_1min_burst_or_spike(plain) is False
+    assert SignalProcessor._entry_admissible_raw_candidates([one_min_burst, one_min_plain]) == [one_min_burst]
+    assert SignalProcessor._suppress_1min_no_spike_tape(
+        "1min", False, _S(), native_burst=True
+    ) is False
+    assert SignalProcessor._suppress_1min_no_spike_tape("1min", False, _S()) is True
+    assert SignalProcessor._should_log_tf_select_diagnostic(
+        "1min", burst, [(1.0, burst, "1min", "A", 0.8, [], False)], _S()
+    ) is True
+
+
 def test_historical_1min_reject_resolves_product_before_recording():
-    source = inspect.getsource(SignalProcessor.process_best_signal)
+    source = signal_pipeline_source()
     replay_start = source.index("# Replay 1m with same burst-only admission as live")
     product_resolution = source.rfind("sim_inst = scanner._resolve_instrument_type", 0, replay_start)
 

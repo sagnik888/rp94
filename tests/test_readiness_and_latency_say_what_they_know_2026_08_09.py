@@ -177,7 +177,8 @@ def test_the_telemetry_payload_carries_it_through():
 def test_the_measured_tail_is_not_trivial():
     """If everything between the two marks were cheap this fix would be pointless."""
     src = _scan_source()
-    tail = src[src.index("latency_ms = round(elapsed * 1000)"):src.index("cycle_ms = round(")]
+    start = src.index("latency_ms = round(elapsed * 1000)")
+    tail = src[start:src.index("cycle_ms = round(", start)]
     for expensive in ("_get_diagnostics_payload", "_build_dashboard_trade_payload",
                       "_update_dashboard_cache", "on_update"):
         assert expensive in tail, f"{expensive} is no longer inside the unmeasured tail"

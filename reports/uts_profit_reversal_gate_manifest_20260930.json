@@ -1,0 +1,53 @@
+{
+  "files": [
+    "tests\\test_accepted_lifecycle_replay_and_dashboard_2026_09_24.py",
+    "tests\\test_backtest_accounting_isolation_2026_09_06.py",
+    "tests\\test_backtest_can_see_live_exits_2026_08_18.py",
+    "tests\\test_backtest_scan_signature_2026_09_30.py",
+    "tests\\test_backtest_sweep_hygiene.py",
+    "tests\\test_historical_context_causality_20260913.py",
+    "tests\\test_historical_entry_gates_causality_20260914.py",
+    "tests\\test_historical_expiry_context_20260914.py",
+    "tests\\test_historical_offline_boundary_2026_09_27.py",
+    "tests\\test_legacy_option_type_recovery_2026_09_05.py",
+    "tests\\test_replay_causality_20260913.py",
+    "tests\\test_replay_evidence_visibility_20260913.py",
+    "tests\\test_replay_timestamp_and_cost_accounting_2026_08_30.py",
+    "tests\\test_scanner_modules.py",
+    "tests\\test_trade_row_adapter.py",
+    "tests\\test_ut_smart_exit_2026_09_25.py",
+    "tests\\test_ut_smart_live_path_2026_09_26.py",
+    "tests\\test_ut_smart_loss_repairs_2026_09_30.py",
+    "tests\\test_uts_backtest_profit_lock_2026_09_30.py",
+    "tests\\test_uts_chart_cache_parity_2026_09_30.py",
+    "tests\\test_uts_chart_display_parity_2026_09_30.py",
+    "tests\\test_uts_extension_broker_integration_2026_09_30.py",
+    "tests\\test_uts_final_historical_signal_2026_09_30.py",
+    "tests\\test_uts_intrabar_buffer_integration_2026_09_30.py",
+    "tests\\test_uts_midcap_repaint_retry_2026_09_30.py",
+    "tests\\test_uts_native_verdict_integration_2026_09_30.py",
+    "tests\\test_uts_nifty_chart_parity_2026_09_30.py",
+    "tests\\test_uts_pine_settings_2026_09_30.py",
+    "tests\\test_uts_replay_integration_2026_09_30.py",
+    "tests\\test_uts_restart_integration_2026_09_30.py",
+    "tests\\test_uts_uploaded_pine_parity_2026_09_30.py",
+    "tests\\test_uts_user_cap_policy_2026_09_30.py",
+    "tests\\test_verified_replay_fill_accounting_2026_09_30.py"
+  ],
+  "source_sha256_before": {
+    "engine\\signal_processor.py": "5bab177400bedf26b6e6ce2601203f4d95009ab53cce0bb7b4dd502806124b7c",
+    "engine\\trade_row_adapter.py": "d8d934b977dfe84c9bcbc108968b3012ad732d312fb6e7e191a36c3c3549e868",
+    "trading\\trade_manager.py": "8a363e42790935e62b363aac4d91e299c5e47d01ec6931b9c228f024d04a62be",
+    "trading\\trade_dashboard.py": "4145c98ef3c68dbf3cece784d77a5432861de0b1ad18661f1c5d63a38fdb49dc",
+    "engine\\uts_lane.py": "bee51e5c5787858f4156b9f31ccbe6addb3a2a37deb9a957069059501db4ec78"
+  },
+  "source_sha256_after": {
+    "engine\\signal_processor.py": "5bab177400bedf26b6e6ce2601203f4d95009ab53cce0bb7b4dd502806124b7c",
+    "engine\\trade_row_adapter.py": "d8d934b977dfe84c9bcbc108968b3012ad732d312fb6e7e191a36c3c3549e868",
+    "trading\\trade_manager.py": "8a363e42790935e62b363aac4d91e299c5e47d01ec6931b9c228f024d04a62be",
+    "trading\\trade_dashboard.py": "4145c98ef3c68dbf3cece784d77a5432861de0b1ad18661f1c5d63a38fdb49dc",
+    "engine\\uts_lane.py": "bee51e5c5787858f4156b9f31ccbe6addb3a2a37deb9a957069059501db4ec78"
+  },
+  "source_unchanged": true,
+  "exit_code": 0
+}

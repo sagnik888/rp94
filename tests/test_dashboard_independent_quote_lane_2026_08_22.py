@@ -115,6 +115,6 @@ def test_trade_table_normalizes_iso_time_instead_of_substringing_the_date():
     assert "function normalizeTradeDateTime" in js
     assert "entryClock.timeText" in js
     assert "entryTime.substring(0, 8)" not in js
-    assert 'trade-table.js?v=9-signal-pnl-basis' in Path(
+    assert 'trade-table.js?v=' in Path(
         "dashboard/static/index.html"
     ).read_text(encoding="utf-8")

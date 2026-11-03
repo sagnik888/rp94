@@ -1,0 +1,42 @@
+{
+  "unique_passed": 7682,
+  "unresolved_failed": 0,
+  "runs": {
+    "uts_midcap_retry_full_20260930.xml": {
+      "passed": 7670,
+      "failed": 1,
+      "skipped": 0,
+      "errors": 0
+    },
+    "uts_midcap_retry_final_20260930.xml": {
+      "passed": 572,
+      "failed": 0,
+      "skipped": 0,
+      "errors": 0
+    },
+    "uts_midcap_retry_persistence_20260930.xml": {
+      "passed": 25,
+      "failed": 0,
+      "skipped": 0,
+      "errors": 0
+    },
+    "uts_midcap_retry_optional_integration_20260930.xml": {
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0,
+      "errors": 0
+    }
+  },
+  "source_hashes": {
+    "engine/uts_lane.py": "bee51e5c5787858f4156b9f31ccbe6addb3a2a37deb9a957069059501db4ec78",
+    "engine/uts_repaint.py": "ec5330bc05edaef5bbd5da32dfc74876b4620905d47de715c34474ba602b5f24",
+    "engine/execution_service.py": "50ed4057c5a66e899696368934e9943b79d72e2b233ed4abed0aab88bcc7997e",
+    "engine/signal_processor.py": "025b7e3edafd4466739b545625d0e005b365bed602d66bc173c0855f8f6eae9b",
+    "scanner.py": "f4cfd566787a5319213beac10d155f8e120c93a0315cab4b362392b9e6604b9d",
+    "trading/trade_manager.py": "8cc8f4c9930a32e0c07c0a604d806433eafd80b66e28a816e19a7b6e94744b22",
+    "data/sqlite_db.py": "06b12921df549ea571d801826e31db7185f418e9e1cec6217c4fe5c3971d07cd"
+  },
+  "runtime_verified": false,
+  "live_orders_submitted": false,
+  "lot_sizes_changed": false
+}

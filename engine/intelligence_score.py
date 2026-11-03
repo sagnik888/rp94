@@ -42,6 +42,20 @@ def normalize_intelligence_score(value: float) -> float:
     return max(-1.0, min(1.0, score))
 
 
+def aligned_intelligence_score(value: float, direction: str = "") -> float:
+    """Return canonical conviction aligned with a trade direction.
+
+    Positive means corroborating evidence for the proposed trade. Negative means
+    contradictory evidence. A blank direction keeps backward compatibility for callers
+    that already supply an aligned score.
+    """
+    score = normalize_intelligence_score(value)
+    side = str(direction or "").strip().upper()
+    if side in {"SHORT", "SELL", "PE"}:
+        return -score
+    return score
+
+
 def aggregate_intelligence_score(aggregate) -> float:
     """Canonical -1..+1 conviction from an aggregator ``aggregate`` payload.
 

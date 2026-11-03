@@ -125,7 +125,10 @@ def test_failed_sample_never_clears_an_existing_pressure_latch(monkeypatch):
 
     monkeypatch.setattr(module, "get_settings", lambda: _settings())
     telemetry = _Telemetry()
-    samples = iter([_metrics(commit=95.0), {}, _metrics(commit=50.0), _metrics(commit=50.0)])
+    # Latched by exhausted headroom: since 2026-09-11 a percentage alone only warns.
+    samples = iter(
+        [_metrics(commit=95.0, available=900.0), {}, _metrics(commit=50.0), _metrics(commit=50.0)]
+    )
     telemetry._fresh_resource_memory_payload = lambda: next(samples)
 
     assert telemetry._auto_execution_resource_blockers()

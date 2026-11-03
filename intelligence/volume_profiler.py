@@ -40,6 +40,49 @@ MAX_STUB_WALKBACK = 4
 # bottoms out near 0.4x the daily median at midday, twice this floor.
 TIME_OF_DAY_MIN_SUPPORT_FRACTION = 0.20
 
+# A single bar must not own the denominator of every volume gate.
+#
+# The 20-bar mean is what "typical" means to the scalp (1.05x), thrust (1.6x), cascade
+# (1.40x) and power-move (2.5x) gates. Captured live 2026-09-18: the Fyers history
+# backfill delivered a SENSEX 10:22 bar of 12,599,042 against a 20,752 session median --
+# 607x, 84.6% of the entire session, source=fyers_history with tick_count=0. None of the
+# candle builder's cumulative-rebase guards can see that, because it never came through
+# the tick path; it arrived pre-aggregated from the vendor. It is not rare: 13 of 23
+# SENSEX sessions carry at least one, 29 in total.
+#
+# One such bar lifts the mean for the next 20 bars on EVERY frame -- 1min to 10:42, 5min
+# to ~12:00, 15min to ~15:20 -- and measured on the bars after it:
+#   1min   0.04x measured vs 1.44x on clean data, 98% understated, 10/10 bars refused
+#   5min   0.11x vs 0.70x, 85% understated
+#   15min  0.03x vs 0.21x, 84% understated
+# So the index cannot pass a volume gate for most of the session.
+#
+# Only the BASELINE is capped, never the measured bar: clipping the denominator can move
+# a ratio up but never down, and a genuine surge still reads at its true size in the
+# numerator. The cap is a multiple of the session's own median bar, so it scales with the
+# instrument and the day instead of assuming a volume scale.
+#
+# 10x chosen on measurement over 23 sessions x 4 indices x 3 frames (41,214 rows). Bars
+# newly clearing a gate, by index:
+#   scalp 1.05x   186 total -- SENSEX 171, NIFTY 7, BANKNIFTY 4, MIDCPNIFTY 4
+#   thrust 1.6x    79      power move 2.5x   44
+# 92% of the recovered bars are on the one index that is actually broken, and the
+# collateral on the other three is 15 bars across 23 sessions (0.04% of rows). 15x and
+# 20x halve the SENSEX recovery for no meaningful reduction in collateral.
+#
+# WINSORISE, do not substitute. Clipping to the cap leaves a bounded residue -- one bar
+# can still lift a 20-bar mean by (multiple-1)/20, i.e. 45% here. Replacing the outlier
+# with the session median erases that residue, and was rejected on measurement: it
+# quadrupled the collateral on the healthy indices (bars newly clearing the 1.05x scalp
+# gate went NIFTY 7 -> 25, BANKNIFTY 4 -> 46, MIDCPNIFTY 4 -> 41, total 186 -> 689). A
+# bounded residue on the broken index is cheaper than moving gates on the three that work.
+BASELINE_OUTLIER_MEDIAN_MULTIPLE = 10.0
+
+# A median needs support before it can define an outlier. Below this many positive bars
+# the session median is itself noise, so the window's own median is used instead, and if
+# that is also too thin the cap is not applied at all.
+BASELINE_OUTLIER_MIN_BARS = 8
+
 
 def volume_window_is_homogeneous(frame) -> bool:
     """False when the window mixes volume UNITS, so no ratio across it is meaningful.
@@ -75,6 +118,17 @@ def volume_window_is_homogeneous(frame) -> bool:
 
 
 class VolumeProfiler:
+    @staticmethod
+    def _infer_timeframe(df: pd.DataFrame) -> str:
+        """Best-effort candle interval carried as output provenance."""
+        try:
+            if isinstance(df.index, pd.DatetimeIndex) and len(df) >= 2:
+                minutes = (df.index[-1] - df.index[-2]).total_seconds() / 60.0
+                return {1.0: "1min", 5.0: "5min", 15.0: "15min"}.get(minutes, f"{minutes:g}min")
+        except Exception:
+            pass
+        return "unknown"
+
     """Intraday volume analysis engine"""
 
     def __init__(self):
@@ -126,11 +180,24 @@ class VolumeProfiler:
             active_tick_nonzero_count = int(
                 tick_activity.loc[active_mask][tick_activity.loc[active_mask] > 0].count()
             )
+            # How many measured bars this session can possibly have yet.
+            #
+            # The requirement used to be a flat five bars from TODAY, which a 5-minute
+            # frame cannot reach until 09:40 and a 15-minute frame until 10:30. Both
+            # therefore reported "no volume data" every morning while every bar carried
+            # real volume, and the ratio's own baseline (a 20-bar rolling mean) happily
+            # spanned prior sessions. Ask for five once five exist, and for whatever the
+            # session has before that; the dead-feed case still fails because a dead feed
+            # has ZERO positive bars however young the session is.
+            active_bar_count = int(active_mask.sum())
+            required_active = max(1, min(5, active_bar_count))
             is_proxy = (
-                active_real_nonzero_count < 5
-                and active_tick_nonzero_count >= 5
+                active_real_nonzero_count < required_active
+                and active_tick_nonzero_count >= required_active
+                # A proxy still needs enough history for its own 20-bar baseline.
+                and tick_nonzero_count >= 5
             )
-            if active_real_nonzero_count >= 5:
+            if active_real_nonzero_count >= required_active and real_nonzero_count >= 5:
                 volume = raw_volume
                 nonzero_volume = real_nonzero
                 nonzero_count = active_real_nonzero_count
@@ -179,7 +246,15 @@ class VolumeProfiler:
             if len(volume) >= 2:
                 forming = False
                 try:
-                    interval = volume.index[-1] - volume.index[-2]
+                    # The bar interval is the MEDIAN recent gap, not the last one. At the
+                    # first bar of a session the last gap is the overnight break, so
+                    # `now - last_bar < interval` was true for hours and the session's
+                    # opening bar was treated as forming all morning - the walk-back then
+                    # measured yesterday's close instead.
+                    deltas = pd.Series(volume.index[1:]) - pd.Series(volume.index[:-1])
+                    interval = deltas.tail(20).median()
+                    if pd.isna(interval) or interval <= pd.Timedelta(0):
+                        interval = volume.index[-1] - volume.index[-2]
                     now_ts = pd.Timestamp.now(tz=volume.index.tz)
                     forming = (now_ts - volume.index[-1]) < interval
                 except (TypeError, ValueError, AttributeError):
@@ -218,6 +293,8 @@ class VolumeProfiler:
                 # by the same rule rather than trusting the one behind a stub.
                 def _stub_at(pos: int) -> bool:
                     """True when the bar at `pos` cannot be a complete observation."""
+                    if "volume_complete" in df.columns and df["volume_complete"].eq(False).fillna(False).iloc[pos]:
+                        return True
                     try:
                         bar_vol = float(volume.iloc[pos])
                     except (IndexError, TypeError, ValueError):
@@ -249,7 +326,21 @@ class VolumeProfiler:
                     # a phantom 0.0x that claims to be a measurement is strictly worse.
                     measured_index = -1
                     recent_vol = 0.0
-            volume_available = bool(nonzero_count >= 5 and recent_vol > 0)
+            # The measured bar must belong to THIS session once the session has bars:
+            # the stub walk-back can otherwise step back into yesterday's close and
+            # report it as today's participation.
+            measured_in_session = True
+            if isinstance(volume.index, pd.DatetimeIndex) and active_bar_count > 0:
+                try:
+                    measured_in_session = volume.index[measured_index].date() == active_date
+                except (AttributeError, IndexError, NameError):
+                    measured_in_session = True
+            volume_available = bool(
+                nonzero_count >= required_active
+                and recent_vol > 0
+                and measured_in_session
+                and metric_source != "UNAVAILABLE"
+            )
             # Every RATIO below is measured against recent_vol for the same reason. Using
             # the forming bar made vol_ratio 0.0/avg = 0.0x, which is what the intel panel
             # displayed on all four indices while the candles held real volume -- and 0.0x
@@ -258,6 +349,46 @@ class VolumeProfiler:
             # the volume component of the confidence score to its floor.
             measured_vol = recent_vol if recent_vol > 0 else current_vol
             volume_for_stats = volume.loc[active_mask]
+
+            # A vendor-delivered outlier must not define what "typical" means. See
+            # BASELINE_OUTLIER_MEDIAN_MULTIPLE: the cap applies to the BASELINE only, so
+            # it can lift a suppressed ratio but never suppress a real one, and the
+            # measured bar is passed through untouched.
+            baseline_for_stats = volume_for_stats
+            baseline_cap = 0.0
+            baseline_outliers_clipped = 0
+            try:
+                support = volume_for_stats[volume_for_stats > 0]
+                if len(support) < BASELINE_OUTLIER_MIN_BARS:
+                    # Early in a session a 15min frame has only a handful of bars, so its
+                    # own median is noise. Fall back to the whole analysis window, which
+                    # carries prior-session warmup rows for exactly this reason.
+                    window_support = volume[volume > 0]
+                    support = (
+                        window_support
+                        if len(window_support) >= BASELINE_OUTLIER_MIN_BARS
+                        else support
+                    )
+                if len(support) >= BASELINE_OUTLIER_MIN_BARS:
+                    median_bar = float(support.median())
+                    if median_bar > 0:
+                        baseline_cap = BASELINE_OUTLIER_MEDIAN_MULTIPLE * median_bar
+                        exceeds = volume_for_stats > baseline_cap
+                        baseline_outliers_clipped = int(exceeds.sum())
+                        if baseline_outliers_clipped:
+                            baseline_for_stats = volume_for_stats.clip(upper=baseline_cap)
+                            logger.info(
+                                f"📊 {instrument} volume baseline: clipped "
+                                f"{baseline_outliers_clipped} outlier bar(s) above "
+                                f"{baseline_cap:,.0f} ({BASELINE_OUTLIER_MEDIAN_MULTIPLE:g}x "
+                                f"the {median_bar:,.0f} median) out of the 20-bar mean; "
+                                f"largest was {float(volume_for_stats.max()):,.0f}"
+                            )
+            except Exception as exc:
+                logger.debug(f"Volume baseline outlier guard skipped for {instrument}: {exc}")
+                baseline_for_stats = volume_for_stats
+                baseline_cap = 0.0
+                baseline_outliers_clipped = 0
 
             # ── Intraday Daily VWAP (Resets every day at 09:15) ──
             df_copy = df.copy()
@@ -280,10 +411,10 @@ class VolumeProfiler:
             # inflates the ratio for part of every minute.
             current_idx = volume.index[measured_index]
 
-            vol_ma = volume_for_stats.rolling(20, min_periods=5).mean()
+            vol_ma = baseline_for_stats.rolling(20, min_periods=5).mean()
             avg_at_current = vol_ma.loc[current_idx] if current_idx in vol_ma.index else vol_ma.iloc[-1]
             if pd.isna(avg_at_current) or avg_at_current <= 0:
-                fallback_avg = volume_for_stats.tail(20).mean()
+                fallback_avg = baseline_for_stats.tail(20).mean()
                 avg_vol = float(fallback_avg) if not pd.isna(fallback_avg) and fallback_avg > 0 else max(measured_vol, 1.0)
             else:
                 avg_vol = float(avg_at_current)
@@ -387,7 +518,16 @@ class VolumeProfiler:
             # whatever direction the last bar happened to close. Two homogeneity guards
             # already existed for exactly this and neither was wired to the pillar that
             # feeds the score.
-            if volume_available and not volume_window_is_homogeneous(df):
+            # Validate only the actual numerator/baseline window.  The caller may prepend
+            # old indicator warmup rows; a stale label outside this 20-bar measurement
+            # must not veto a coherent current-session observation.
+            measurement_window = df.loc[:current_idx].tail(21)
+            measurement_lag_bars = max(0, -measured_index - 1)
+            # A missing live edge must not recycle an old surge as current evidence.
+            # Keep its identity for diagnostics while abstaining after two bars.
+            if measurement_lag_bars > 2:
+                volume_available = False
+            if volume_available and not volume_window_is_homogeneous(measurement_window):
                 volume_available = False
                 is_proxy = False
                 metric_source = "MIXED_UNITS"
@@ -434,7 +574,12 @@ class VolumeProfiler:
             # ── Signal Generation ──
             signal = "NEUTRAL"
             if is_surge:
-                if close.iloc[-1] > close.iloc[-2]:
+                # The participation numerator can deliberately walk back over a forming
+                # or missing right edge.  Its direction must come from that same candle,
+                # not from a later price-only candle which can reverse the claim.
+                measured_close = float(close.iloc[measured_index])
+                prior_close = float(close.iloc[measured_index - 1]) if len(close) + measured_index > 0 else measured_close
+                if measured_close > prior_close:
                     signal = "BULLISH_VOLUME"
                 else:
                     signal = "BEARISH_VOLUME"
@@ -455,6 +600,8 @@ class VolumeProfiler:
             # These are context layers. They can slightly refine the volume score,
             # but they do not create a standalone trade signal.
             profile = market_structure_profile(df_copy, lookback=200, bins=40)
+            if not volume_available:
+                profile = {"available": False, "signal": "", "reason": "volume_unavailable"}
             aroon = aroon_context(high.to_numpy(dtype=float), low.to_numpy(dtype=float))
             wavetrend = wavetrend_context(
                 high.to_numpy(dtype=float),
@@ -482,7 +629,16 @@ class VolumeProfiler:
                 "vwap": round(vwap_current, 2),
                 "vwap_deviation_pct": round(float(vwap_deviation), 2),
                 "current_volume": int(measured_vol),
+                "measurement_timestamp": str(current_idx),
+                "measurement_lag_bars": measurement_lag_bars,
+                "measurement_timeframe": self._infer_timeframe(df),
+                "measurement_basis": metric_source,
                 "avg_volume": int(avg_vol),
+                # How many bars the outlier guard kept out of the 20-bar mean, and the
+                # cap it used. Nonzero means a vendor spike was neutralised on this read;
+                # the operator needs to see that rather than wonder why the average moved.
+                "baseline_outliers_clipped": int(baseline_outliers_clipped),
+                "baseline_outlier_cap": int(baseline_cap) if baseline_cap > 0 else 0,
                 "volume_ratio": round(vol_ratio, 2),
                 "relative_volume_ratio": round(relative_volume_ratio, 2),
                 "display_volume_ratio": round(display_ratio, 2),
@@ -548,7 +704,8 @@ class VolumeProfiler:
             "source": "UNAVAILABLE", "metric_kind": "TRADED_VOLUME", "is_proxy": False,
             "sample_count": 0, "nonzero_bar_count": 0,
             "real_volume_nonzero_bar_count": 0, "tick_activity_nonzero_bar_count": 0,
-            "avg_volume": 0, "volume_ratio": 1.0, "relative_volume_ratio": 1.0,
+            "avg_volume": 0, "baseline_outliers_clipped": 0, "baseline_outlier_cap": 0,
+            "volume_ratio": 1.0, "relative_volume_ratio": 1.0,
             "display_volume_ratio": 1.0, "effective_volume_ratio": 1.0,
             "volume_ratio_basis": "INSUFFICIENT",
             "time_of_day_avg_volume": 0, "volume_confidence": 0, "is_surge": False,

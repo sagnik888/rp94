@@ -81,6 +81,7 @@ def _declining_1min_df():
 
 
 def _location_scanner(regime, trend_agrees):
+    import time
     df = _declining_1min_df()
     st = SimpleNamespace(
         mode="REAL",
@@ -88,6 +89,7 @@ def _location_scanner(regime, trend_agrees):
         # Own-timeframe store, empty: the candidate here is 5min, which legitimately
         # OWNS the instrument-keyed label, so the scalp-lock release is still earned.
         _timeframe_regimes={},
+        _intel_cache_time={"NIFTY_5min": time.time()},
         candles=SimpleNamespace(get_candles=lambda inst, tf: df),
         _setting_enabled=Scanner._setting_enabled,
         _timeframe_intel_key=Scanner._timeframe_intel_key,

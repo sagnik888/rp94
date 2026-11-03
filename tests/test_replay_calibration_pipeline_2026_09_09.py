@@ -117,11 +117,11 @@ def test_replay_resolves_existing_broker_stop_before_bar_close_management(monkey
     processor._historical_live_management_probe = make_probe
     idx = pd.date_range("2026-09-08 10:00", periods=2, freq="1min")
     bars = pd.DataFrame(
-        {"open": [100.0, 100.0], "high": [100.0, 101.0], "low": [100.0, 90.0], "close": [100.0, 92.0]},
+        {"open": [100.0, 100.0], "high": [101.0, 101.0], "low": [90.0, 90.0], "close": [92.0, 92.0]},
         index=idx,
     )
     out = processor._simulate_actual_option_exit(
-        bars, idx[0], idx[-1], sl_price=95.0, rr=3.0,
+        bars, idx[0], idx[-1] + pd.Timedelta(minutes=1), sl_price=95.0, rr=3.0,
         max_sl_pct=0.60, qty=65, tf15_exit_scanner=SimpleNamespace(),
         tf15_instrument="NIFTY", tf15_direction="LONG", tf15_option_type="CE",
         tf15_timeframe="5min",

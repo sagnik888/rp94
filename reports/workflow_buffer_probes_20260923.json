@@ -1,0 +1,53 @@
+{
+  "source_sha256": "312bc5d9b70acb4e2166aa7c2e7fac8d253b2488deadedd30c8dc9b084eaceb2",
+  "source_method_lines": {
+    "_regrade_matured_candidate": 20585,
+    "_refresh_pending_live_signal": 20683,
+    "_market_location_entry_gate": 27884,
+    "_candidate_15m_trend_agrees": 28079
+  },
+  "scope": "Synthetic current-source methods only. No broker, scanner startup, production data/config writes, or realized-P&L claim.",
+  "mode_caveat": "Stabilization regrade requires INTRACANDLE; CANDLE_CLOSE skips the buffer at scanner.py:34011-34015.",
+  "frozen_forming_bar_technical": {
+    "same_bar_snapshot_adopted": false,
+    "maturity_confidence": 0.9635611345791598,
+    "current_candle_full_grade_confidence": 0.7815974639023655,
+    "current_candle_full_grade": "A",
+    "current_candle_reasons": [
+      "Momentum: Healthy (ADX: 30.0)",
+      "Technical: Moderate Multi-TF Confluence",
+      "Technical: Tight Risk-Window (1.0x ATR)",
+      "Intelligence: Institutional Volume/OI Confirmed",
+      "Regime: Trend-Following alignment",
+      "\u26a0\ufe0f ALERT: Supply-Trap Wick Detected"
+    ],
+    "qualification": "Design mismatch if maturity is meant to re-evaluate the forming setup; frozen birth technicals are explicit policy today."
+  },
+  "stale_intelligence_handoff": {
+    "maturity_intelligence_score": -0.6,
+    "candidate_intelligence_score": 0.6,
+    "candidate_reasons": [
+      "Momentum: Strong (ADX: 40.0)",
+      "Technical: Strong Multi-TF Confluence",
+      "Technical: Tight Risk-Window (1.0x ATR)",
+      "Intelligence: Institutional Volume/OI Confirmed",
+      "Regime: Trend-Following alignment"
+    ],
+    "maturity_confidence": 0.5560138905446199,
+    "maturity_quality_allowed": true,
+    "location_gate_with_stale_fields": true,
+    "location_gate_with_synchronized_fields": false,
+    "location_reason": "Market location risk LONG: spot 100.00 below/against EMA structure (EMA9 103.94, EMA21 108.36, day-pos 5%)",
+    "synchronized_location_reason": "Market location risk LONG: spot 100.00 below/against EMA structure (EMA9 103.94, EMA21 108.36, day-pos 5%)",
+    "qualification": "Canonical quality also passes this synthetic setup. Other portfolio, quote, geometry and broker gates are not simulated."
+  },
+  "stale_15m_confirmation": {
+    "live_15m_position": -1,
+    "stored_agreement": true,
+    "helper_with_stored_agreement": true,
+    "helper_without_stored_agreement": false,
+    "quality_with_stored_agreement": true,
+    "quality_with_live_agreement": false,
+    "qualification": "Applies whenever 15m state changes after candidate creation; buffers and queued/manual entries lengthen that interval."
+  }
+}

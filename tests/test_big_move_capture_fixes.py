@@ -58,13 +58,21 @@ def test_census_yield_respects_min_total_and_dominance():
 
 
 def test_census_yield_is_wired_into_the_trend_guard():
+    import ast
     import inspect
+    import textwrap
     from engine.signal_processor import SignalProcessor
-    src = inspect.getsource(SignalProcessor.process_best_signal)
-    yield_pos = src.find("session_trend_guard_census_yield(")
-    veto_pos = src.find("REJECTED - Session Trend Guard")
-    assert yield_pos != -1 and veto_pos != -1
-    assert yield_pos < veto_pos  # yield is consulted BEFORE the veto fires
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SignalProcessor.process_best_signal)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    yields = [node.lineno for node in calls if isinstance(node.func, ast.Name)
+              and node.func.id == 'session_trend_guard_census_yield']
+    vetoes = [node.lineno for node in calls if isinstance(node.func, ast.Name)
+              and node.func.id == '_build_rejected_candidate'
+              and any(isinstance(arg, ast.Constant) and arg.value == 'REJECTED - Session Trend Guard'
+                      for arg in node.args)]
+    # An earlier retry-status allowlist contains the same label; it is not a veto.
+    assert yields and vetoes
+    assert max(yields) < min(vetoes)
 
 
 # ── Fix A: cascade chase extension ──────────────────────────────────────────

@@ -12,6 +12,7 @@ import math
 import os
 import secrets
 import time
+import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -139,6 +140,17 @@ async def _await_on_scanner_loop(coro, timeout_seconds: float = 8.0):
 # a chart build there would queue behind a state save and vice versa. Two workers is
 # enough — builds are ~10-20ms and _build_chart_from_cache serialises itself anyway.
 _chart_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chart")
+_chart_request_locks = weakref.WeakKeyDictionary()
+
+
+def _chart_request_lock_for_loop() -> asyncio.Lock:
+    """Serialize chart selection through build without binding a lock across test/app loops."""
+    loop = asyncio.get_running_loop()
+    lock = _chart_request_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chart_request_locks[loop] = lock
+    return lock
 
 
 async def _build_chart_off_loop(instrument: str, timeframe: str):
@@ -152,17 +164,21 @@ async def _build_chart_off_loop(instrument: str, timeframe: str):
     """
     if not scanner_ref:
         return {}
-    await _call_on_scanner_loop(
-        lambda: (
-            setattr(scanner_ref, "active_chart_instrument", instrument),
-            setattr(scanner_ref, "active_chart_tf", timeframe),
+    # Selection is shared scanner state. Keep it paired with the worker build so
+    # an overlapping REST/WebSocket request cannot switch the active instrument
+    # or timeframe between selection and _build_chart_from_cache().
+    async with _chart_request_lock_for_loop():
+        await _call_on_scanner_loop(
+            lambda: (
+                setattr(scanner_ref, "active_chart_instrument", instrument),
+                setattr(scanner_ref, "active_chart_tf", timeframe),
+            )
         )
-    )
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _chart_executor,
-        lambda: scanner_ref.get_chart_snapshot(instrument=instrument, timeframe=timeframe),
-    )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _chart_executor,
+            lambda: scanner_ref.get_chart_snapshot(instrument=instrument, timeframe=timeframe),
+        )
 
 
 async def _call_on_scanner_loop(
@@ -176,6 +192,31 @@ async def _call_on_scanner_loop(
         return func()
 
     return await _await_on_scanner_loop(_invoke(), timeout_seconds=timeout_seconds)
+
+
+def _start_on_scanner_loop(func: Callable[[], Any]) -> asyncio.Future:
+    """Start one synchronous scanner call on the scanner-owned loop; return its future.
+
+    Unlike _call_on_scanner_loop nothing here times out or cancels. The caller decides
+    how long to wait, and a result that arrives late is still a good result -- throwing
+    it away and asking again is how the trades heartbeat saturated the loop.
+    """
+
+    async def _invoke():
+        return func()
+
+    coro = _invoke()
+    scanner_loop = getattr(scanner_ref, "_event_loop", None)
+    if scanner_loop is not None and scanner_loop is not asyncio.get_running_loop():
+        if not scanner_loop.is_running():
+            coro.close()
+            raise RuntimeError("scanner event loop is not running")
+        try:
+            return asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, scanner_loop))
+        except Exception:
+            coro.close()
+            raise
+    return asyncio.ensure_future(coro)
 
 
 def _schedule_call_on_scanner_loop(func: Callable[[], Any]) -> bool:
@@ -639,6 +680,7 @@ _ADVANCED_CONFIG_FIELDS = {
     "ut_confidence_calibration_min_samples",
     "ut_no_entry_after",
     "ut_5min_no_entry_after",
+    "ut_1min_no_entry_after",
     "ut_force_exit_time",
     "real_mode_premarket_arm_start",
     "real_mode_premarket_settle_end",
@@ -739,6 +781,7 @@ _TIME_COMMAND_FIELDS = {
     "power_move_late_hard_cutoff",
     "ut_no_entry_after",
     "ut_5min_no_entry_after",
+    "ut_1min_no_entry_after",
     "ut_force_exit_time",
     "late_session_reclaim_start",
     "late_session_reclaim_end",
@@ -879,8 +922,12 @@ _NUMERIC_FIELD_BOUNDS: Dict[str, tuple] = {
     "volume_spike_entry_min_range_atr_ratio": (0.5, 10.0),
     "volume_spike_entry_min_close_location": (0.5, 1.0),
     "volume_spike_entry_stabilization_seconds": (3.0, 15.0),
-    "live_signal_stabilization_seconds_5min": (30.0, 120.0),
-    "live_signal_stabilization_seconds_15min": (30.0, 120.0),
+    # Floor was 30s while the code default is 15s (config/settings.py), so the shorter
+    # clean-trend wait the operator asks for could not be configured at all: anything
+    # under 30 was silently raised. 10s keeps a real repaint buffer - the 1m spike lane
+    # runs at 3-15s through its own knob above - without dictating the 5m/15m wait.
+    "live_signal_stabilization_seconds_5min": (10.0, 120.0),
+    "live_signal_stabilization_seconds_15min": (10.0, 120.0),
     "max_trades_per_index": (1, 50),
     "max_consecutive_losses": (1, 20),
     "index_cooldown_minutes": (0, 240),
@@ -898,6 +945,36 @@ _INTEGER_NUMERIC_COMMAND_FIELDS = {
     "max_trades_per_index",
     "max_consecutive_losses",
 }
+# S1 engine / lane settings: one spec (engine/s1_lane.py) drives validation, forwarding
+# and the broadcast, so a new S1 knob cannot be accepted here and dropped elsewhere.
+from engine.s1_lane import S1_SETTING_SPEC as _S1_SETTING_SPEC
+from engine.uts_lane import UTS_SETTING_SPEC as _UTS_SETTING_SPEC
+from engine.s12_lane import S12_SETTING_SPEC as _S12_SETTING_SPEC
+
+# UT SMART EXIT settings take the same path as S1's.
+_LANE_SETTING_SPEC = {**_S1_SETTING_SPEC, **_UTS_SETTING_SPEC, **_S12_SETTING_SPEC}
+_ADVANCED_CONFIG_FIELDS |= set(_LANE_SETTING_SPEC)
+_COMMAND_FIELDS["configure"] |= set(_LANE_SETTING_SPEC)
+for _s1_name, _s1_spec in _LANE_SETTING_SPEC.items():
+    if _s1_spec[0] in {"float", "int"}:
+        _NUMERIC_COMMAND_FIELDS.add(_s1_name)
+        _NUMERIC_FIELD_BOUNDS[_s1_name] = (_s1_spec[1], _s1_spec[2])
+        if _s1_spec[0] == "int":
+            _INTEGER_NUMERIC_COMMAND_FIELDS.add(_s1_name)
+    elif _s1_spec[0] == "bool":
+        _BOOLEAN_COMMAND_FIELDS.add(_s1_name)
+    elif _s1_spec[0] == "time":
+        _TIME_COMMAND_FIELDS.add(_s1_name)
+_S1_ENUM_FIELDS = {k: v[1] for k, v in _LANE_SETTING_SPEC.items() if v[0] == "enum"}
+
+# Unattended morning start: editable any time from the dashboard (the worker re-reads
+# them every minute). premarket = switch to REAL/manual at the switch time; startup =
+# turn Auto on once the day's full readiness has passed.
+for _name in ("auto_real_mode_premarket_enabled", "auto_real_mode_startup_enabled"):
+    _ADVANCED_CONFIG_FIELDS.add(_name)
+    _COMMAND_FIELDS["configure"].add(_name)
+    _BOOLEAN_COMMAND_FIELDS.add(_name)
+
 _ALLOWED_ACTIVE_INDICES = frozenset({"NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"})
 # Stay under common 1 MiB WebSocket client frame limits (leave headroom).
 _WS_MAX_FRAME_BYTES = 900_000
@@ -978,6 +1055,10 @@ def _valid_command_payload(msg: Dict[str, Any]) -> Optional[str]:
         if not cleaned:
             return "invalid_active_indices"
         msg["active_indices"] = cleaned
+
+    for field, choices in _S1_ENUM_FIELDS.items():
+        if field in msg and msg[field] is not None and str(msg[field]) not in choices:
+            return f"invalid_choice:{field}"
 
     if "signal_fire_mode" in msg:
         mode = str(msg.get("signal_fire_mode") or "").upper()
@@ -1363,9 +1444,10 @@ async def _security_headers(request: Request, call_next):
     from fastapi.responses import JSONResponse
 
     path = request.url.path
-    if path in _LOCAL_ONLY_API_PATHS and not _is_loopback_request(request):
+    replay_audit = path.startswith("/api/replay-audit/")
+    if (path in _LOCAL_ONLY_API_PATHS or replay_audit) and not _is_loopback_request(request):
         return JSONResponse({"error": "local access only"}, status_code=403)
-    if path in _TOKEN_REQUIRED_API_PATHS and not _read_api_authorized(request):
+    if (path in _TOKEN_REQUIRED_API_PATHS or replay_audit) and not _read_api_authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     response = await call_next(request)
     # Same-origin scripts only (blocks injected/3rd-party JS) while still allowing the
@@ -1797,14 +1879,20 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 execution_touch_quote_shadow_enabled=msg.get("execution_touch_quote_shadow_enabled"),
                 execution_touch_quote_strict=msg.get("execution_touch_quote_strict"),
                 ut_confidence_calibration_min_samples=msg.get("ut_confidence_calibration_min_samples"),
+                **{name: msg.get(name) for name in _S1_SETTING_SPEC},
+                **{name: msg.get(name) for name in _UTS_SETTING_SPEC},
+                **{name: msg.get(name) for name in _S12_SETTING_SPEC},
                 ut_no_entry_after=msg.get("ut_no_entry_after"),
                 ut_5min_no_entry_after=msg.get("ut_5min_no_entry_after"),
+                ut_1min_no_entry_after=msg.get("ut_1min_no_entry_after"),
                 ut_force_exit_time=msg.get("ut_force_exit_time"),
                 real_mode_premarket_arm_start=msg.get("real_mode_premarket_arm_start"),
                 real_mode_premarket_settle_end=msg.get("real_mode_premarket_settle_end"),
                 real_mode_premarket_refresh_end=msg.get("real_mode_premarket_refresh_end"),
                 real_mode_live_start=msg.get("real_mode_live_start"),
                 auto_real_mode_premarket_switch_time=msg.get("auto_real_mode_premarket_switch_time"),
+                auto_real_mode_premarket_enabled=msg.get("auto_real_mode_premarket_enabled"),
+                auto_real_mode_startup_enabled=msg.get("auto_real_mode_startup_enabled"),
                 # Market LTP shock + rolling mood: whitelisted in
                 # _ADVANCED_CONFIG_FIELDS but previously never forwarded here —
                 # the dashboard controls were silently dropped (2026-07-10).
@@ -1953,7 +2041,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
     elif cmd == "set_scanner_engine":
         if scanner_ref:
             state = str(msg.get("state", "utbot") or "utbot").lower()
-            if state not in {"utbot", "ema", "consensus", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual"}:
+            if state not in {"utbot", "ema", "consensus", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual", "s1", "ut_smart", "quad_prime_s1", "ut_smart_s1", "s1s2_dual", "ut_ema"}:
                 await _send_command_response(ws, msg, "config_ack", {"status": "blocked", "reason": "invalid_scanner_engine"})
                 return
 
@@ -2397,27 +2485,61 @@ def _build_fresh_trades_payload() -> Dict[str, Any]:
     if not _trade_payload_is_windowed(payload):
         _latest_full_trades_payload = payload
     try:
-        if hasattr(scanner_ref, "dashboard_cache"):
+        if hasattr(scanner_ref, "dashboard_cache") and not _republish_cached_trades(payload):
+            # No state from this mode/simulation yet (before the first scan cycle, or
+            # just after a switch): build the whole thing, as before.
             state = make_serializable(
                 scanner_ref.dashboard_cache.state()
                 or getattr(scanner_ref, "latest_results", {})
                 or {}
             )
             state["mode"] = getattr(scanner_ref, "mode", None)
+            # Every container in ``state`` is rebuilt here, so the cache can take it
+            # without a second deep copy on the scanner loop. The two scanner-built
+            # parts and the returned trades payload are detached explicitly.
             if hasattr(scanner_ref, "get_broadcast_config"):
-                state["config"] = scanner_ref.get_broadcast_config()
+                state["config"] = make_serializable(scanner_ref.get_broadcast_config())
             if hasattr(scanner_ref, "_get_diagnostics_payload"):
-                state["diagnostics"] = scanner_ref._get_diagnostics_payload()
+                state["diagnostics"] = make_serializable(scanner_ref._get_diagnostics_payload())
             state["simulation_id"] = int(getattr(scanner_ref, "simulation_id", 0) or 0)
-            state["trades"] = payload
+            state["trades"] = make_serializable(payload)
             if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
-                scanner_ref._sync_engine_lab_active_row(state, (payload.get("summary") or {}))
+                scanner_ref._sync_engine_lab_active_row(state, (state["trades"].get("summary") or {}))
             _schedule_call_on_scanner_loop(
-                lambda snapshot=state: scanner_ref.dashboard_cache.update(snapshot)
+                lambda snapshot=state: scanner_ref.dashboard_cache.update(snapshot, detached=True)
             )
     except Exception:
         logger.debug("Unable to refresh dashboard trade cache", exc_info=True)
     return payload
+
+
+def _republish_cached_trades(payload: Dict[str, Any]) -> bool:
+    """Swap fresh trades into the dashboard state the scan cycle last published.
+
+    The scan cycle republishes diagnostics, config and instruments on every cycle, so a
+    trades refresh only has to replace the trades and the Engine Lab row derived from
+    them. Rebuilding the rest here, once a second on the scanner loop, is what starved
+    that loop on 2026-10-06 (see
+    tests/test_trades_heartbeat_cannot_starve_the_scanner_loop_2026_10_06.py).
+    """
+    cache = getattr(scanner_ref, "dashboard_cache", None)
+    update_trades = getattr(cache, "update_trades", None)
+    if not callable(update_trades):
+        return False
+    mode = getattr(scanner_ref, "mode", None)
+    simulation_id = int(getattr(scanner_ref, "simulation_id", 0) or 0)
+
+    def retarget(state: Dict[str, Any]) -> bool:
+        if state.get("mode") != mode or int(state.get("simulation_id") or 0) != simulation_id:
+            return False
+        if isinstance(state.get("engine_lab"), dict) and hasattr(scanner_ref, "_sync_engine_lab_active_row"):
+            # Retargeting edits the lab rows in place, so this generation gets its own
+            # copy: a reader may still be serializing the previous one.
+            state["engine_lab"] = make_serializable(state["engine_lab"])
+            scanner_ref._sync_engine_lab_active_row(state, payload.get("summary") or {})
+        return True
+
+    return bool(update_trades(payload, retarget))
 
 
 def build_trades_payload() -> Dict[str, Any]:
@@ -2509,14 +2631,51 @@ def _window_ws_instrument_candidates(
 
 
 def _ws_frame_size(data: Dict[str, Any]) -> int:
-    return len(json.dumps({"type": "full_update", "data": data}, default=str).encode("utf-8"))
+    """Byte size of the frame this data would actually be sent as.
+
+    ``data`` has already been through ``make_serializable``, so encode it directly
+    with the encoder ``_send_one`` uses rather than framing a stdlib JSON string and
+    re-walking the entire payload. On 2026-10-30 ``_ws_frame_size`` alone measured 45
+    GIL samples per 15s of broadcast, on top of the send's own serialization.
+    """
+    return len(_frame_bytes({"type": "full_update", "data": data}))
 
 
-def _cap_ws_payload(safe_data: Dict[str, Any]) -> Dict[str, Any]:
+def _cap_ws_payload(safe_data: Dict[str, Any], *, frame_cache=None) -> Dict[str, Any]:
     """Ensure WS/full_update frames stay under ~1 MiB client limits."""
+    first_frame = True
+    encoded_fields = {}
+
+    def frame_size(candidate):
+        nonlocal first_frame
+        if first_frame:
+            first_frame = False
+            encoded = _frame_bytes({"type": "full_update", "data": candidate})
+        else:
+            # Oversized snapshots may retain a large unchanged diagnostics/log
+            # field across every rescue stage. Encode each such field once;
+            # count bytes before assembling another full frame. The initial,
+            # normally sized frame keeps the native encoder's single-call path.
+            parts = []
+            size = len(b'{"type":"full_update","data":{}}')
+            for key, value in candidate.items():
+                previous = encoded_fields.get(key)
+                if previous is not None and previous[0] is value:
+                    part = previous[1]
+                else:
+                    part = _frame_bytes(key) + b":" + _frame_bytes(value)
+                    encoded_fields[key] = (value, part)
+                size += len(part) + bool(parts)
+                if size > _WS_MAX_FRAME_BYTES:
+                    return size
+                parts.append(part)
+            encoded = b'{"type":"full_update","data":{' + b",".join(parts) + b"}}"
+        if frame_cache is not None:
+            frame_cache.update(payload=candidate, encoded=encoded)
+        return len(encoded)
     data = safe_data
     try:
-        if _ws_frame_size(data) <= _WS_MAX_FRAME_BYTES:
+        if frame_size(data) <= _WS_MAX_FRAME_BYTES:
             return data
     except Exception:
         return {
@@ -2545,7 +2704,7 @@ def _cap_ws_payload(safe_data: Dict[str, Any]) -> Dict[str, Any]:
     )
     light["ws_truncated"] = True
     try:
-        if _ws_frame_size(light) <= _WS_MAX_FRAME_BYTES:
+        if frame_size(light) <= _WS_MAX_FRAME_BYTES:
             return light
     except Exception:
         pass
@@ -2563,7 +2722,7 @@ def _cap_ws_payload(safe_data: Dict[str, Any]) -> Dict[str, Any]:
         light["activity_log"] = activity_log[-_WS_ACTIVITY_LOG_LIMIT:]
 
     try:
-        if _ws_frame_size(light) <= _WS_MAX_FRAME_BYTES:
+        if frame_size(light) <= _WS_MAX_FRAME_BYTES:
             return light
     except Exception:
         pass
@@ -2581,7 +2740,7 @@ def _cap_ws_payload(safe_data: Dict[str, Any]) -> Dict[str, Any]:
         "ws_truncation_reason": "frame_limit",
     }
     try:
-        minimal_size = _ws_frame_size(minimal)
+        minimal_size = frame_size(minimal)
         if minimal_size <= _WS_MAX_FRAME_BYTES:
             return minimal
     except Exception:
@@ -2645,10 +2804,18 @@ async def _deliver_broadcast(data: Dict) -> None:
     payload["dashboard_heartbeat"] = _dashboard_heartbeat()
     payload = _historical_building_state(payload)
     incoming_trades = payload.get("trades")
-    if isinstance(incoming_trades, dict) and not _trade_payload_is_windowed(incoming_trades):
-        _latest_full_trades_payload = make_serializable(incoming_trades)
-    safe_data = make_serializable(_lighten_state_payload(payload))
-    safe_data = _cap_ws_payload(safe_data)
+    if isinstance(incoming_trades, dict):
+        serialized_trades = make_serializable(incoming_trades)
+        if not _trade_payload_is_windowed(incoming_trades):
+            _latest_full_trades_payload = serialized_trades
+        payload["trades"] = serialized_trades
+        light = _lighten_state_payload(payload)
+        safe_data = make_serializable({key: value for key, value in light.items() if key != "trades"})
+        safe_data["trades"] = light["trades"]
+    else:
+        safe_data = make_serializable(_lighten_state_payload(payload))
+    frame_cache = {}
+    safe_data = _cap_ws_payload(safe_data, frame_cache=frame_cache)
     
     # The lock protects the published reference only. Never hold it while a
     # client socket is awaited.
@@ -2667,22 +2834,26 @@ async def _deliver_broadcast(data: Dict) -> None:
         ),
     )
     clients = list(active_connections)
+    messages = {}
 
     async def _send_one(ws) -> None:
         try:
             ws_id = id(ws)
             old_state = dashboard_state.last_sent_states.get(ws_id)
-
-            if old_state is None:
-                message = json.dumps({"type": "full_update", "data": safe_data}, default=str)
+            key = id(old_state)
+            if key not in messages:
+                if old_state is None:
+                    encoded = (frame_cache["encoded"] if frame_cache.get("payload") is safe_data else
+                               _frame_bytes({"type": "full_update", "data": safe_data}))
+                    messages[key] = encoded.decode("utf-8")
+                else:
+                    delta = compute_delta(old_state, safe_data)
+                    messages[key] = (_frame_bytes({"type": "delta_update", "data": delta}).decode("utf-8")
+                                     if delta else None)
+            message = messages[key]
+            if message is not None:
                 await asyncio.wait_for(ws.send_text(message), timeout=send_timeout)
                 dashboard_state.last_sent_states[ws_id] = safe_data
-            else:
-                delta = compute_delta(old_state, safe_data)
-                if delta:
-                    message = json.dumps({"type": "delta_update", "data": delta}, default=str)
-                    await asyncio.wait_for(ws.send_text(message), timeout=send_timeout)
-                    dashboard_state.last_sent_states[ws_id] = safe_data
         except Exception:
             disconnected.add(ws)
 
@@ -2773,6 +2944,17 @@ def compute_delta(old, new):
 
 def make_serializable(obj: Any) -> Any:
     """High-performance serialization for large trading data"""
+    # Most snapshot nodes are builtins. Avoid a NumPy item-attribute probe and
+    # repeated isinstance dispatch for every price, key, row and nested context.
+    obj_type = type(obj)
+    if obj_type is str or obj_type is int or obj_type is bool or obj is None:
+        return obj
+    if obj_type is float:
+        return obj if math.isfinite(obj) else 0
+    if obj_type is dict:
+        return {str(k): make_serializable(v) for k, v in list(obj.items())}
+    if obj_type is list:
+        return [make_serializable(i) for i in list(obj)]
     if hasattr(obj, "item") and callable(getattr(obj, "item", None)):
         try:
             return make_serializable(obj.item())
@@ -2781,7 +2963,8 @@ def make_serializable(obj: Any) -> Any:
     if isinstance(obj, (int, str, bool, type(None))):
         return obj
     if isinstance(obj, Decimal):
-        return float(obj)
+        number = float(obj)
+        return number if math.isfinite(number) else 0
     if isinstance(obj, float):
         if obj != obj or obj == float('inf') or obj == float('-inf'): return 0
         return obj
@@ -2794,17 +2977,29 @@ def make_serializable(obj: Any) -> Any:
     return str(obj)
 
 
-def _encode_json_bytes(payload: Dict[str, Any]) -> bytes:
-    safe = make_serializable(payload)
+def _frame_bytes(safe_obj: Any) -> bytes:
+    """Encode a payload that has already been through ``make_serializable``."""
     if orjson is not None:
-        return orjson.dumps(safe)
-    return json.dumps(safe, default=str, separators=(",", ":")).encode("utf-8")
+        return orjson.dumps(safe_obj)
+    return json.dumps(safe_obj, default=str, separators=(",", ":")).encode("utf-8")
 
 
-def _api_state_json_response(payload: Dict[str, Any]) -> Response:
+def _encode_json_bytes(payload: Dict[str, Any]) -> bytes:
+    return _frame_bytes(make_serializable(payload))
+
+
+def _api_state_json_response(payload: Dict[str, Any], *, lightened: bool = False) -> Response:
     """Serve a pre-lightened JSON response without FastAPI re-walking it."""
-    light_payload = _lighten_state_payload(payload)
+    light_payload = payload if lightened else _lighten_state_payload(payload)
     return Response(content=_encode_json_bytes(light_payload), media_type="application/json")
+
+
+def _prepare_api_state_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Window before conversion; detach the lab table before its active-row edit."""
+    light = _lighten_state_payload(_historical_building_state(payload))
+    if isinstance(light.get("engine_lab"), dict) and hasattr(scanner_ref, "_sync_engine_lab_active_row"):
+        light["engine_lab"] = make_serializable(light["engine_lab"])
+    return light
 
 
 def _trim_chart_payload(payload: Dict[str, Any], requested_bars: int) -> Dict[str, Any]:
@@ -2883,8 +3078,7 @@ async def api_state():
     if hasattr(scanner_ref, "dashboard_cache"):
         cached_state = scanner_ref.dashboard_cache.state()
         if cached_state and _payload_matches_scanner_mode(cached_state):
-            payload = make_serializable(cached_state)
-            payload = _historical_building_state(payload)
+            payload = _prepare_api_state_payload(cached_state)
             if not getattr(scanner_ref, "chart_stream_enabled", True) and payload.get("instruments"):
                 instruments = {}
                 for name, ui_data in payload.get("instruments", {}).items():
@@ -2901,40 +3095,37 @@ async def api_state():
                     ((payload.get("trades") or {}).get("summary") or {}),
                 )
             payload["dashboard_heartbeat"] = _dashboard_heartbeat()
-            return _api_state_json_response(payload)
+            return _api_state_json_response(payload, lightened=True)
     if not getattr(scanner_ref, "chart_stream_enabled", True):
-        payload = make_serializable(
+        payload = _prepare_api_state_payload(
             scanner_ref.get_latest_results(include_full_charts=False) or {}
         )
-        payload = _historical_building_state(payload)
         if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
             scanner_ref._sync_engine_lab_active_row(
                 payload,
                 ((payload.get("trades") or {}).get("summary") or {}),
             )
         payload["dashboard_heartbeat"] = _dashboard_heartbeat()
-        return _api_state_json_response(payload)
+        return _api_state_json_response(payload, lightened=True)
     if dashboard_state.latest_safe_state and _payload_matches_scanner_mode(dashboard_state.latest_safe_state):
-        payload = make_serializable(dashboard_state.latest_safe_state)
-        payload = _historical_building_state(payload)
+        payload = _prepare_api_state_payload(dashboard_state.latest_safe_state)
         if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
             scanner_ref._sync_engine_lab_active_row(
                 payload,
                 ((payload.get("trades") or {}).get("summary") or {}),
             )
         payload["dashboard_heartbeat"] = _dashboard_heartbeat()
-        return _api_state_json_response(payload)
-    payload = make_serializable(
+        return _api_state_json_response(payload, lightened=True)
+    payload = _prepare_api_state_payload(
         scanner_ref.get_latest_results(include_full_charts=False) or {}
     )
-    payload = _historical_building_state(payload)
     if hasattr(scanner_ref, "_sync_engine_lab_active_row"):
         scanner_ref._sync_engine_lab_active_row(
             payload,
             ((payload.get("trades") or {}).get("summary") or {}),
         )
     payload["dashboard_heartbeat"] = _dashboard_heartbeat()
-    return _api_state_json_response(payload)
+    return _api_state_json_response(payload, lightened=True)
 
 
 _DASHBOARD_QUOTE_FIELDS = {
@@ -3604,6 +3795,33 @@ def _lighten_state_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return light
 
 
+@app.get("/api/replay-audit/{trade_id}")
+async def api_replay_audit(trade_id: str):
+    """Return the original contract and guard trace for one current replay row."""
+    if not scanner_ref or str(getattr(scanner_ref, "mode", "")).upper() != "HISTORICAL":
+        return {"status": "unavailable", "reason": "No historical replay is active"}
+    if not trade_id or len(trade_id) > 160:
+        return {"status": "error", "reason": "Invalid trade id"}
+
+    def capture():
+        # The request can wait behind a mode switch on the scanner-owned loop.
+        if not _scanner_is_historical():
+            return {"status": "unavailable", "reason": "No historical replay is active"}
+        if _scanner_is_historical_building():
+            return {"status": "building", "reason": "Historical replay is still calculating"}
+        row = next((t for t in scanner_ref.trades.closed_trades if t.id == trade_id), None)
+        if row is None or not getattr(row, "replay_exit_trace", None):
+            return {"status": "unavailable", "reason": "No original replay trace is available for this row"}
+        return make_serializable({
+            "status": "ok", "simulation_id": scanner_ref.simulation_id,
+            "runtime_build": scanner_ref._runtime_build_status(),
+            "historical_intelligence_coverage": getattr(scanner_ref, "_historical_intel_coverage", {}),
+            "trade": row.to_dict(),
+        })
+
+    return await _call_on_scanner_loop(capture)
+
+
 @app.get("/api/trades")
 async def api_trades(
     limit: int | None = None,
@@ -3652,47 +3870,154 @@ async def api_trades(
     return _window_trades_payload(trades, requested_limit, requested_offset)
 
 
+# The trades heartbeat builds ON the scanner loop -- the loop that also runs the scan
+# cycle and the trade monitor -- so it must never be able to monopolise it: at most one
+# request in flight, and after each build it waits long enough that heartbeat builds
+# take at most _PERIODIC_TRADES_MAX_LOOP_SHARE of that loop. A healthy ~50ms build keeps
+# the 1s cadence; a contended 2s build refreshes every 8s. Entry/exit pokes still
+# refresh immediately, and the scan cycle publishes trades on every cycle regardless.
+_PERIODIC_TRADES_POLL_SECONDS = 1.0
+_PERIODIC_TRADES_WAIT_SECONDS = 5.0
+_PERIODIC_TRADES_MAX_LOOP_SHARE = 0.2
+_PERIODIC_TRADES_MAX_PACING_SECONDS = 30.0
+_PERIODIC_TRADES_WARNING_INTERVAL_SECONDS = 60.0
+
+
+def _timed_trades_build() -> tuple[Dict[str, Any], float]:
+    """Build the trades payload, reporting how long it held the scanner loop."""
+    started = time.perf_counter()
+    trades = build_trades_payload()
+    return trades, time.perf_counter() - started
+
+
 async def periodic_trades_updater():
-    """Low-cost heartbeat so live open/closed trade rows stay fresh between scans."""
+    """Low-cost heartbeat so live open/closed trade rows stay fresh between scans.
+
+    On 2026-10-06 this heartbeat held the scanner loop 96% of the time and stretched a
+    scan cycle to 167s: each build overran the 5s wait and was thrown away, and 1s later
+    the next request queued behind the one still running, so builds ran back to back.
+    A late result is now awaited and used instead of being replaced by another request.
+    """
     global _last_periodic_trades_hash, _trade_dirty_event, _trade_dirty_loop
     logger.info("Periodic trades updater background task started (change-driven loop)")
     _trade_dirty_event = asyncio.Event()
     _trade_dirty_loop = asyncio.get_running_loop()
+    clock = _trade_dirty_loop.time
+    request: Optional[asyncio.Future] = None
+    request_loop = None
+    requested_at = 0.0
+    overdue = False
+    hang_reported = False
+    next_refresh_at = 0.0
+    last_slow_report_at: Optional[float] = None
+    unreported_slow = 0
+
     while True:
         try:
-            # Wake immediately on an entry/exit poke, else fall back to a 1s poll.
-            try:
-                await asyncio.wait_for(_trade_dirty_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
-            _trade_dirty_event.clear()
-            if scanner_ref and active_connections:
-                trades = await _call_on_scanner_loop(
-                    build_trades_payload,
-                    timeout_seconds=5.0,
-                )
-                limit = _HISTORICAL_TRADE_PAGE_SIZE if _scanner_is_historical() else _DASHBOARD_STATE_TRADE_LIMIT
-                trades = _window_trades_payload(trades, limit, 0)
-                trade_hash = hashlib.blake2b(
-                    json.dumps(make_serializable(trades), sort_keys=True, default=str).encode("utf-8"),
-                    digest_size=12,
-                ).hexdigest()
-                if trade_hash == _last_periodic_trades_hash:
+            if request is None:
+                # Wake immediately on an entry/exit poke, else at the paced poll.
+                try:
+                    await asyncio.wait_for(
+                        _trade_dirty_event.wait(),
+                        timeout=max(_PERIODIC_TRADES_POLL_SECONDS, next_refresh_at - clock()),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                _trade_dirty_event.clear()
+                if not (scanner_ref and active_connections):
                     continue
-                _last_periodic_trades_hash = trade_hash
-                await broadcast({
-                    "trades": trades,
-                    "trade_update_id": trade_hash,
-                    "timestamp": datetime.now().isoformat(),
-                })
+                request_loop = getattr(scanner_ref, "_event_loop", None)
+                request = _start_on_scanner_loop(_timed_trades_build)
+                requested_at = clock()
+                overdue = hang_reported = False
+            try:
+                # Shielded: running out of patience must not cancel the request.
+                trades, build_seconds = await asyncio.wait_for(
+                    asyncio.shield(request),
+                    timeout=_PERIODIC_TRADES_WAIT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                overdue = True
+                waited = clock() - requested_at
+                if request_loop is not None and (
+                    not request_loop.is_running()
+                    or getattr(scanner_ref, "_event_loop", None) is not request_loop
+                ):
+                    # That loop has stopped or been replaced; its request can never finish.
+                    try:
+                        request.cancel()
+                    except Exception:
+                        pass
+                    request = None
+                elif not hang_reported and waited >= _PERIODIC_TRADES_WARNING_INTERVAL_SECONDS:
+                    hang_reported = True
+                    logger.warning(
+                        f"Periodic trades updater: still waiting after {waited:.0f}s for the "
+                        "scanner loop to serve one trades payload; no further request is queued"
+                    )
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The build itself failed: report it below and start a fresh request.
+                request = None
+                raise
+            request = None
+            pacing = min(
+                _PERIODIC_TRADES_MAX_PACING_SECONDS,
+                build_seconds * (1.0 / _PERIODIC_TRADES_MAX_LOOP_SHARE - 1.0),
+            )
+            next_refresh_at = clock() + pacing
+            if overdue:
+                # One line per minute at most; the old "TimeoutError: (no message)" ERROR
+                # fired every ~6s and said neither how long the loop was held nor by what.
+                now = clock()
+                if (
+                    last_slow_report_at is None
+                    or now - last_slow_report_at >= _PERIODIC_TRADES_WARNING_INTERVAL_SECONDS
+                ):
+                    since = f"; {unreported_slow} more since the last report" if unreported_slow else ""
+                    logger.warning(
+                        f"Periodic trades updater: the scanner loop took {now - requested_at:.1f}s "
+                        f"to serve the trades payload ({build_seconds:.2f}s of it building); next "
+                        f"unprompted refresh in {max(pacing, _PERIODIC_TRADES_POLL_SECONDS):.1f}s{since}"
+                    )
+                    last_slow_report_at = now
+                    unreported_slow = 0
+                else:
+                    unreported_slow += 1
+            limit =_HISTORICAL_TRADE_PAGE_SIZE if _scanner_is_historical() else _DASHBOARD_STATE_TRADE_LIMIT
+            trades = _window_trades_payload(trades, limit, 0)
+            trade_hash = hashlib.blake2b(
+                json.dumps(make_serializable(trades), sort_keys=True, default=str).encode("utf-8"),
+                digest_size=12,
+            ).hexdigest()
+            if trade_hash == _last_periodic_trades_hash:
+                continue
+            _last_periodic_trades_hash = trade_hash
+            await broadcast({
+                "trades": trades,
+                "trade_update_id": trade_hash,
+                "timestamp": datetime.now().isoformat(),
+            })
         except asyncio.CancelledError:
+            if request is not None:
+                try:
+                    request.cancel()
+                except Exception:
+                    pass
             break
         except Exception as exc:
-            # Include the type: the common failure here is asyncio.TimeoutError from the
-            # 5s _call_on_scanner_loop budget under startup/scan contention, and its
-            # str() is empty — which logged a bare "Error in periodic trades updater:".
+            # Include the type: some exceptions have an empty str(). A slow scanner loop
+            # no longer lands here (see the overdue handling above); a failed build or a
+            # stopped scanner loop does.
             logger.error(
-                f"Error in periodic trades updater: {type(exc).__name__}: {exc or '(no message)'}"
+                # str(exc), not exc: an exception instance is truthy even when its
+                # message is empty, so "exc or ..." always kept the exception and the
+                # fallback never rendered -- the live log still read "TimeoutError:"
+                # with nothing after the colon.
+                f"Error in periodic trades updater: {type(exc).__name__}: "
+                f"{str(exc) or '(no message)'}"
             )
 
 

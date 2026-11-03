@@ -1,0 +1,2666 @@
+{
+  "captured_at_ist": "2026-09-30 11:01:47.060956+05:30",
+  "runtime_config": {
+    "auto_mode": true,
+    "scanner_engine": "ut_smart",
+    "ut_no_entry_after": "14:50",
+    "signal_fire_mode": "INTRACANDLE",
+    "live_intrabar_signal_entries": true,
+    "ut_timeframe_entry_policy": "INCLUDE_5MIN",
+    "uts_key_value": 2,
+    "uts_atr_period": 14,
+    "uts_key_value_5min": 4.5,
+    "uts_atr_period_5min": 21,
+    "uts_key_value_1min": 15,
+    "uts_atr_period_1min": 21,
+    "uts_use_heikin_ashi": true,
+    "uts_smart_exit": true,
+    "uts_arm_atr": 2.5,
+    "uts_retrace_atr": 0.7,
+    "uts_hard_retrace_atr": 2.5,
+    "uts_min_bars": 2,
+    "uts_confirmations": 4,
+    "uts_rsi_length": 14,
+    "uts_rsi_ob": 70,
+    "uts_rsi_os": 30,
+    "uts_rsi_lookback": 5,
+    "uts_exit_ema": 5,
+    "uts_wick_ratio": 0.35,
+    "uts_session_end": "15:15",
+    "uts_lane_enabled": true,
+    "uts_lane_reclaim_start": "13:00",
+    "uts_lane_sl_max_pct": 1,
+    "uts_lane_min_entry_rr": 0.5,
+    "uts_lane_target_r": 3,
+    "uts_lane_guard_mult": 2,
+    "uts_lane_guard_min_pct": 10,
+    "uts_lane_guard_max_pct": 15,
+    "uts_lane_intrabar_wait_seconds": 20,
+    "uts_lane_repaint_check_seconds": 10
+  },
+  "runtime": {
+    "mode": "REAL",
+    "scanner_running": true,
+    "pid": 32516,
+    "last_scan": "2026-09-30T11:01:45.202516+05:30",
+    "scan_count": 2198
+  },
+  "diagnostics": {
+    "runtime_build": {
+      "fingerprint": "f6f344e4b21c5dad2bb585f4581043cffa0221527490e4285aa8f1c867d50cf7",
+      "pid": 32516,
+      "captured_at": "2026-09-30T04:38:17.237706+00:00",
+      "basis": "source_snapshot_at_scanner_import",
+      "files": {
+        "scanner.py": {
+          "sha256": "f9d390140fa2a230040d037a75789af768d029ff866bea292821ac4722a6c173",
+          "mtime_ns": 1790742512237068000,
+          "size": 1818971
+        },
+        "engine/signal_processor.py": {
+          "sha256": "64629e56898dd7652f58aec2803d56c58478a31e1901edef4124f23979bb2212",
+          "mtime_ns": 1790695065823393300,
+          "size": 477785
+        },
+        "engine/signal_manager.py": {
+          "sha256": "ea47bd853c33846ceec616b3432ae64fa2942db26c621d432c0e15ed04e8a58c",
+          "mtime_ns": 1790135044809516900,
+          "size": 24143
+        },
+        "engine/scanner_recalculation.py": {
+          "sha256": "bfe69170bd4669597e0a057dfbc0e87a35b7e27753ee06f621f16c039fdc962c",
+          "mtime_ns": 1790528125366848600,
+          "size": 25420
+        },
+        "engine/recalculation_worker.py": {
+          "sha256": "f034669a0e059f1ce5271e1f774a976497a7a872cbc70a2ded20317edfeada25",
+          "mtime_ns": 1790528125361484200,
+          "size": 7970
+        },
+        "data/candle_builder.py": {
+          "sha256": "e2a1e6c7371219b4a6c5095fc473d489eba7fdefe6ae8a9c78b83ccfb37c2626",
+          "mtime_ns": 1790320548319945200,
+          "size": 55967
+        },
+        "data/market_data.py": {
+          "sha256": "dc756833e1ecadc27ac2fb36cb40b85b146b161c27645509c7d703b510ded437",
+          "mtime_ns": 1790673889376899300,
+          "size": 328778
+        },
+        "data/kite_market_data.py": {
+          "sha256": "071ccefa954174a68a4317c1fd1fc3d743851bd27522c198eff1ba3398cd7e59",
+          "mtime_ns": 1790294265947719300,
+          "size": 41588
+        },
+        "data/derivative_participation.py": {
+          "sha256": "9933f09ac1d72164dd17c08eccb7a4ffba5c0f3698d0c16a402817f4323c1613",
+          "mtime_ns": 1789636041391995000,
+          "size": 22107
+        },
+        "intelligence/intelligence_aggregator.py": {
+          "sha256": "57edb8637ebd04a92ffb17b3eb3b78ba671c37a409fedb3ce744f2d076efac5c",
+          "mtime_ns": 1790320843621678300,
+          "size": 46741
+        },
+        "intelligence/derivative_context.py": {
+          "sha256": "70c017aeade38e51d06534d3b1cbc0eeb9aa13f71fcc69f67e64781a0c5b828e",
+          "mtime_ns": 1789257627430644300,
+          "size": 6794
+        },
+        "intelligence/regime_detector.py": {
+          "sha256": "42e03e47168864b6badb931cedc2d582971becdf48c61ec22df0849bf1495b6f",
+          "mtime_ns": 1789533755428185500,
+          "size": 46978
+        },
+        "intelligence/session_context.py": {
+          "sha256": "29b2b5092a4b9d4ae2470caf7f569d8a58a9ba7c3fa6010c47bb00be71d6ffc5",
+          "mtime_ns": 1789228511131825000,
+          "size": 27954
+        },
+        "intelligence/oi_tracker.py": {
+          "sha256": "86801093cb4b0128306de2d36e11f7306a5b4cea869af645e4148b168bf1b50d",
+          "mtime_ns": 1790320862412721200,
+          "size": 17383
+        },
+        "engine/multi_timeframe.py": {
+          "sha256": "ebbb3319eaa83ffed05098d1bd245171f4200944fb2420bcb89a552ad657f23c",
+          "mtime_ns": 1790425219859510400,
+          "size": 30728
+        },
+        "intelligence/confidence_calibration.py": {
+          "sha256": "2849e3d68d55abf2c5d0334e02a98d258504aa1bd8b6bbea7e9a97b09e9b293c",
+          "mtime_ns": 1789257797704213400,
+          "size": 8031
+        },
+        "engine/expiry_manager.py": {
+          "sha256": "59fd88c86514179274ad96f41cb16fb168ce8481de1e275f68385cb3f40042da",
+          "mtime_ns": 1790152106649609100,
+          "size": 45438
+        },
+        "trading/trade_manager.py": {
+          "sha256": "e1bf0a68ab784ab4c8132b8c69feb449a19a5c410df784d60f31e592e62fa92e",
+          "mtime_ns": 1790695278435923700,
+          "size": 482576
+        },
+        "engine/entry_policy.py": {
+          "sha256": "ffceaf783ae0c09e889f24752c1f8f77aaf346478f221ea9d74ca0b63c3fb86f",
+          "mtime_ns": 1790287193839342800,
+          "size": 35180
+        },
+        "config/settings.py": {
+          "sha256": "1a29e6621b3bea758d91610b82edff2c14e8835fd39d55e1b9339c5c3b771a50",
+          "mtime_ns": 1790695024507950800,
+          "size": 240409
+        },
+        "engine/pre_candle_predictor.py": {
+          "sha256": "04d81e23b462a538cc6e5acc847651c3c5ced9d4276aac703066ea0efe9562e8",
+          "mtime_ns": 1790152100973694300,
+          "size": 21439
+        },
+        "engine/entry_data_quality.py": {
+          "sha256": "eae7489fe6016fc44edbb7b44eebff66f692d28cbce42f0ac9dc7d275e0c8121",
+          "mtime_ns": 1789624299937085600,
+          "size": 6431
+        },
+        "engine/runtime_build.py": {
+          "sha256": "375d0dd2005be180c1b1676be0775905704419e5471071cee834559c42170e9d",
+          "mtime_ns": 1789464014771421400,
+          "size": 2118
+        },
+        "engine/scanner_telemetry.py": {
+          "sha256": "73d8a490cf502a37d51f4dc5ee6978367fcbb4c43ab20856039c389457760761",
+          "mtime_ns": 1790528439740052900,
+          "size": 60137
+        },
+        "trading/trade_dashboard.py": {
+          "sha256": "4bdafda4f82649a75aa61c10365190bc0921cbe0d711923a113a7c72259c2d85",
+          "mtime_ns": 1789283827277190200,
+          "size": 11092
+        },
+        "dashboard/server.py": {
+          "sha256": "813a94f6bf1a7f49c9de9922843007e72e7d65c5b5247b88707fd40f0f8e5455",
+          "mtime_ns": 1790436430272927400,
+          "size": 176650
+        }
+      },
+      "source_files_changed_since_import": [],
+      "reload_required": false
+    },
+    "scanner_freshness": {
+      "last_scan": "2026-09-30T11:01:45.202516+05:30",
+      "age_seconds": 0.62,
+      "last_progress": null,
+      "progress_age_seconds": null,
+      "effective_age_seconds": 0.62,
+      "stale_basis": "last_scan",
+      "stale_after_seconds": 5.0,
+      "is_stale": false,
+      "is_calculating": false,
+      "calculation_lock": false,
+      "cache_age_ms": 559
+    },
+    "timeouts": {
+      "skipped_inflight": 2,
+      "SENSEX": 2,
+      "NIFTY": 1,
+      "MIDCPNIFTY": 1,
+      "SENSEX_skipped_inflight": 1,
+      "MIDCPNIFTY_skipped_inflight": 1
+    },
+    "latency": {
+      "last_ms": 320,
+      "high_latency_events": 2,
+      "last_cycle_ms": 400,
+      "scan_count": 2198
+    },
+    "exit_reasons": {
+      "UTS_REPAINT": 2,
+      "STOP_HIT": 1
+    },
+    "repaint_guard": {
+      "checked": 0,
+      "aborted": 0,
+      "passed": 0
+    },
+    "risk_configuration": {
+      "ok": true,
+      "issues": [],
+      "warnings": [],
+      "capital_total": 1000005.0,
+      "capital_fut": 490000.0,
+      "capital_opt": 500000.0,
+      "futures_sl_pct": 0.1,
+      "options_sl_pct": 15.0,
+      "max_trade_loss_abs": 0.0,
+      "fut_daily_budget": 7350.0,
+      "opt_daily_budget": 45000.0,
+      "auto_risk_sizing_enabled": false,
+      "cascade_lot_scale_enabled": true,
+      "cascade_lot_multiplier": 2.0,
+      "cascade_lot_multiplier_fut": 1.0,
+      "cascade_lot_multiplier_opt": 3.0,
+      "cascade_lot_multiplier_opt_min": 2.0,
+      "heavy_trend_lot_scale_enabled": true,
+      "heavy_trend_lot_multiplier_opt": 2.0,
+      "heavy_trend_min_aligned_indices": 3,
+      "cascade_multi_tf_stack_enabled": true,
+      "cascade_midcap_solo_max_tf": 2,
+      "cascade_midcap_dual_main_max": 2,
+      "cascade_midcap_dual_addon_max": 1,
+      "cascade_core_bucket_max_positions": 12,
+      "cascade_midcap_bucket_max_positions": 3,
+      "cascade_max_concurrent_positions": 18,
+      "dual_clone_reduction_enabled": true,
+      "risk_per_trade_daily_fraction": 0.5,
+      "sizing_mode": "fixed_lots"
+    },
+    "live_session_measurement": {
+      "started_at": "2026-09-30T04:38:26.919461+00:00",
+      "duration_seconds": 3198.907,
+      "cycles": 2198,
+      "cycle_ms": {
+        "p50": 194.394,
+        "p95": 1497.305,
+        "p99": 3670.381,
+        "max": 15436.58
+      },
+      "analysis": {
+        "runs": 1366,
+        "skips": 832,
+        "skip_ratio": 0.3785,
+        "skip_reasons": {
+          "intracandle analysis throttled": 676,
+          "inputs unchanged": 156
+        }
+      },
+      "exit_tick_ms": {
+        "samples": 24576,
+        "p50": 0.132,
+        "p95": 94.574,
+        "p99": 290.184,
+        "max": 1129.489
+      },
+      "timeout_count": 8,
+      "bulkheads": {
+        "option_chain:NIFTY": {
+          "state": "CLOSED",
+          "failures": 0,
+          "inflight": 0,
+          "timed_out_inflight": 0
+        },
+        "option_chain:BANKNIFTY": {
+          "state": "CLOSED",
+          "failures": 0,
+          "inflight": 0,
+          "timed_out_inflight": 0
+        },
+        "option_chain:SENSEX": {
+          "state": "CLOSED",
+          "failures": 0,
+          "inflight": 0,
+          "timed_out_inflight": 0
+        },
+        "option_chain:MIDCPNIFTY": {
+          "state": "CLOSED",
+          "failures": 0,
+          "inflight": 0,
+          "timed_out_inflight": 0
+        }
+      },
+      "saturated_bulkheads": 0,
+      "full_session_evidence": false
+    }
+  },
+  "archived_actual_fills": {
+    "2026-09-28": {
+      "trades": [
+        {
+          "instrument": "NIFTY",
+          "timeframe": "15min",
+          "direction": "SHORT",
+          "signal_timestamp": "2026-09-28T09:15:00",
+          "entry_timestamp": "2026-09-28T15:12:01.897605",
+          "exit_timestamp": "2026-09-28T15:14:44.485537",
+          "price": 255.55,
+          "stop": 242.915,
+          "exit_price": 256.35,
+          "pnl": -27.99999999999926,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 52.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "NIFTY|15min|SHORT|2026-09-28T09:15:00|UTS|NIFTY26O0623000PE",
+          "exit_reason": "MANUAL_SYNC",
+          "grade": "C",
+          "confidence": 0.22153414467741625,
+          "held_seconds": 162.587932,
+          "entry_before_signal_bar_close": false,
+          "premium_stop_pct": 4.94423791821562,
+          "quality_allowed": false,
+          "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.4982,
+            "observed_at": "2026-09-28T15:12:06.999945",
+            "premium_entry": 255.55,
+            "premium_stop": 242.915,
+            "premium_target": 294.055,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 22790.6,
+            "underlying_stop": 22924.473717945355,
+            "underlying_target": 22388.97884616393,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": null,
+            "regime_label": null,
+            "day_type": null,
+            "aggregate_score": null,
+            "delta": null
+          }
+        }
+      ],
+      "count": 1,
+      "net_pnl": -27.99999999999926,
+      "exit_reasons": {
+        "MANUAL_SYNC": 1
+      },
+      "repaint_net": 0,
+      "quality_rejected_count": 1,
+      "quality_rejected_net": -27.99999999999926
+    },
+    "2026-09-29": {
+      "trades": [
+        {
+          "instrument": "SENSEX",
+          "timeframe": "5min",
+          "direction": "LONG",
+          "signal_timestamp": "2026-09-29T11:20:00",
+          "entry_timestamp": "2026-09-29T11:21:29.898514",
+          "exit_timestamp": "2026-09-29T11:23:55.071846",
+          "price": 433.2,
+          "stop": 218.15,
+          "exit_price": 424.0,
+          "pnl": -263.9999999999998,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 0.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "SENSEX|5min|LONG|2026-09-29T11:20:00|UTS|SENSEX26O0172500CE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "A",
+          "confidence": 0.82,
+          "held_seconds": 145.173332,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 49.642197599261316,
+          "quality_allowed": true,
+          "quality_reason_code": "BPLUS_SETUP_CONFIRMED",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.4956,
+            "observed_at": "2026-09-29T11:21:34.999945",
+            "premium_entry": 433.2,
+            "premium_stop": 218.15,
+            "premium_target": 1090.7500000000002,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 72459.53,
+            "underlying_stop": 72101.38310338177,
+            "underlying_target": 73533.97068985469,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 37.5,
+            "regime_label": "TRENDING_UP",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": 38.6,
+            "delta": 0.4972
+          }
+        },
+        {
+          "instrument": "BANKNIFTY",
+          "timeframe": "5min",
+          "direction": "LONG",
+          "signal_timestamp": "2026-09-29T11:25:00",
+          "entry_timestamp": "2026-09-29T11:29:52.166762",
+          "exit_timestamp": "2026-09-29T11:30:09.328358",
+          "price": 222.95,
+          "stop": 111.45,
+          "exit_price": 222.8,
+          "pnl": -84.49999999999932,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 0.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "BANKNIFTY|5min|LONG|2026-09-29T11:25:00|UTS|BANKNIFTY26SEP54100CE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "A+",
+          "confidence": 0.9278720218944112,
+          "held_seconds": 17.161596,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 50.01121327651939,
+          "quality_allowed": false,
+          "quality_reason_code": "BPLUS_SETUP_INSUFFICIENT",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.607,
+            "observed_at": "2026-09-29T11:29:58.999945",
+            "premium_entry": 222.95,
+            "premium_stop": 111.45,
+            "premium_target": 557.2500000000001,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 54182.6,
+            "underlying_stop": 53786.28715010871,
+            "underlying_target": 55371.538549673875,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 38.0,
+            "regime_label": "TRENDING_UP",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": 39.6,
+            "delta": 0.4715
+          }
+        },
+        {
+          "instrument": "NIFTY",
+          "timeframe": "5min",
+          "direction": "LONG",
+          "signal_timestamp": "2026-09-29T11:30:00",
+          "entry_timestamp": "2026-09-29T11:30:38.198149",
+          "exit_timestamp": "2026-09-29T11:35:11.562500",
+          "price": 109.45,
+          "stop": 55.4,
+          "exit_price": 113.05,
+          "pnl": 153.99999999999963,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 1021.9300000000001,
+          "source_lane": "UTS",
+          "lifecycle_id": "NIFTY|5min|LONG|2026-09-29T11:30:00|UTS|NIFTY26SEP22650CE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "A+",
+          "confidence": 0.9136795257346123,
+          "held_seconds": 273.364351,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 49.38328003654637,
+          "quality_allowed": true,
+          "quality_reason_code": "BPLUS_SETUP_CONFIRMED",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.7006,
+            "observed_at": "2026-09-29T11:30:40.999955",
+            "premium_entry": 109.45,
+            "premium_stop": 55.4,
+            "premium_target": 277.0,
+            "schema": "dual_price_geometry.v1",
+            "source": "instrument_conversion.option_preserved_underlying|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 22714.35,
+            "underlying_stop": 22680.27915,
+            "underlying_target": 22816.56255,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 39.0,
+            "regime_label": "TRENDING_UP",
+            "day_type": "UNDECIDED",
+            "aggregate_score": 18.1,
+            "delta": 0.5597
+          }
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "15min",
+          "direction": "SHORT",
+          "signal_timestamp": "2026-09-29T12:30:00",
+          "entry_timestamp": "2026-09-29T12:33:07.627686",
+          "exit_timestamp": "2026-09-29T12:35:39.785727",
+          "price": 397.8,
+          "stop": 199.375,
+          "exit_price": 343.85,
+          "pnl": -1158.9999999999998,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 0.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "SENSEX|15min|SHORT|2026-09-29T12:30:00|UTS|SENSEX26O0172400PE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "C",
+          "confidence": 0.08075269238695636,
+          "held_seconds": 152.158041,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 49.8805932629462,
+          "quality_allowed": false,
+          "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.5443,
+            "observed_at": "2026-09-29T12:33:29.999977",
+            "premium_entry": 397.8,
+            "premium_stop": 199.375,
+            "premium_target": 996.875,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 72266.61,
+            "underlying_stop": 72609.04009996846,
+            "underlying_target": 71239.31970009461,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 37.2,
+            "regime_label": "TRENDING_UP",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": 30.2,
+            "delta": -0.5031
+          }
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "15min",
+          "direction": "SHORT",
+          "signal_timestamp": "2026-09-29T13:30:00",
+          "entry_timestamp": "2026-09-29T13:30:42.936713",
+          "exit_timestamp": "2026-09-29T13:32:45.816310",
+          "price": 342.65,
+          "stop": 171.3,
+          "exit_price": 327.65,
+          "pnl": -380.0,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 0.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "SENSEX|15min|SHORT|2026-09-29T13:30:00|UTS|SENSEX26O0172400PE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "B",
+          "confidence": 0.4323423938361122,
+          "held_seconds": 122.879597,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 50.007296074711796,
+          "quality_allowed": false,
+          "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.5096,
+            "observed_at": "2026-09-29T13:30:43.999967",
+            "premium_entry": 342.65,
+            "premium_stop": 171.3,
+            "premium_target": 856.5000000000001,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 72337.19,
+            "underlying_stop": 72599.23042552543,
+            "underlying_target": 71551.06872342373,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 35.0,
+            "regime_label": "TRENDING_DOWN",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": -21.6,
+            "delta": -0.5095
+          }
+        },
+        {
+          "instrument": "SENSEX",
+          "timeframe": "5min",
+          "direction": "SHORT",
+          "signal_timestamp": "2026-09-29T13:40:00",
+          "entry_timestamp": "2026-09-29T13:40:35.969139",
+          "exit_timestamp": "2026-09-29T13:45:35.711727",
+          "price": 369.2,
+          "stop": 184.65,
+          "exit_price": 338.9,
+          "pnl": -686.0000000000002,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 0.0,
+          "source_lane": "UTS",
+          "lifecycle_id": "SENSEX|5min|SHORT|2026-09-29T13:40:00|UTS|SENSEX26O0172400PE",
+          "exit_reason": "UTS_REPAINT",
+          "grade": "C",
+          "confidence": 0.2760446092028507,
+          "held_seconds": 299.742588,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 49.98645720476706,
+          "quality_allowed": false,
+          "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.5398,
+            "observed_at": "2026-09-29T13:40:36.999962",
+            "premium_entry": 369.2,
+            "premium_stop": 184.65,
+            "premium_target": 923.25,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 72275.93,
+            "underlying_stop": 72580.81229767897,
+            "underlying_target": 71361.28310696305,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 20.0,
+            "regime_label": "RANGING",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": -4.6,
+            "delta": -0.499
+          }
+        },
+        {
+          "instrument": "NIFTY",
+          "timeframe": "15min",
+          "direction": "SHORT",
+          "signal_timestamp": "2026-09-29T13:30:00",
+          "entry_timestamp": "2026-09-29T13:37:05.588244",
+          "exit_timestamp": "2026-09-29T15:10:24.479927",
+          "price": 162.35,
+          "stop": 81.15,
+          "exit_price": 116.15,
+          "pnl": -3082.999999999999,
+          "round_trip_cost": 80.0,
+          "peak_pnl": 217.97000000000034,
+          "source_lane": "UTS",
+          "lifecycle_id": "NIFTY|15min|SHORT|2026-09-29T13:30:00|UTS|NIFTY26O0622700PE",
+          "exit_reason": "MANUAL",
+          "grade": "B",
+          "confidence": 0.4795668500016489,
+          "held_seconds": 5598.891683,
+          "entry_before_signal_bar_close": true,
+          "premium_stop_pct": 50.01539882968894,
+          "quality_allowed": false,
+          "quality_reason_code": "BELOW_BPLUS_ELIGIBILITY",
+          "quality_lane": "TELEMETRY",
+          "geometry": {
+            "conversion_ratio": 0.5236,
+            "observed_at": "2026-09-29T13:37:06.999985",
+            "premium_entry": 162.35,
+            "premium_stop": 81.15,
+            "premium_target": 405.75,
+            "schema": "dual_price_geometry.v1",
+            "source": "signal_processor.dual_geometry|actual_broker_fill|underlying:kite_ws",
+            "underlying_entry": 22644.4,
+            "underlying_stop": 22738.514094882103,
+            "underlying_target": 22362.057715353698,
+            "verified": true
+          },
+          "entry_intel": {
+            "adx": 42.2,
+            "regime_label": "TRENDING_DOWN",
+            "day_type": "RANGE_DAY",
+            "aggregate_score": -17.4,
+            "delta": -0.4708
+          }
+        }
+      ],
+      "count": 7,
+      "net_pnl": -5502.499999999998,
+      "exit_reasons": {
+        "UTS_REPAINT": 6,
+        "MANUAL": 1
+      },
+      "repaint_net": -2419.4999999999995,
+      "quality_rejected_count": 5,
+      "quality_rejected_net": -5392.499999999998
+    }
+  },
+  "current_sqlite_trades": [
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|SHORT|2026-09-29T13:40:00",
+      "instrument": "SENSEX 72400 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_price": 365.0,
+      "entry_time": "29 Sep 13:40:35",
+      "exit_price": 344.05,
+      "exit_time": "29 Sep 13:45:30",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -499.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 182.5,
+      "current_stop": 310.25,
+      "entry_spot": 72275.94,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T12:30:00",
+      "instrument": "SENSEX 72400 PE",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "entry_price": 395.0,
+      "entry_time": "29 Sep 12:33:07",
+      "exit_price": 344.55,
+      "exit_time": "29 Sep 12:35:35",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -1089.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 197.5,
+      "current_stop": 335.75,
+      "entry_spot": 72271.25,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|LONG|2026-09-29T11:20:00",
+      "instrument": "SENSEX 72500 CE",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "entry_price": 449.2,
+      "entry_time": "29 Sep 11:21:29",
+      "exit_price": 425.45,
+      "exit_time": "29 Sep 11:23:53",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -555.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 224.6,
+      "current_stop": 381.82,
+      "entry_spot": 72450.15,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|NIFTY|15min|ENTRY|SHORT|2026-09-29T13:30:00",
+      "instrument": "NIFTY 22700 PE",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "entry_price": 160.5,
+      "entry_time": "29 Sep 13:37:05",
+      "exit_price": 136.425,
+      "exit_time": "29 Sep 14:18:28",
+      "exit_reason": "STOP_HIT",
+      "pnl": -1645.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 80.25,
+      "current_stop": 136.425,
+      "entry_spot": 22645.4,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|NIFTY|5min|ENTRY|LONG|2026-09-29T11:30:00",
+      "instrument": "NIFTY 22650 CE",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "entry_price": 109.55,
+      "entry_time": "29 Sep 11:30:38",
+      "exit_price": 111.15,
+      "exit_time": "29 Sep 11:35:07",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": 24.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 54.775,
+      "current_stop": 93.1175,
+      "entry_spot": 22713.25,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|BANKNIFTY|5min|ENTRY|LONG|2026-09-29T11:25:00",
+      "instrument": "BANKNIFTY 54100 CE",
+      "timeframe": "5min",
+      "direction": "LONG",
+      "entry_price": 221.4,
+      "entry_time": "29 Sep 11:29:52",
+      "exit_price": 223.1,
+      "exit_time": "29 Sep 11:30:03",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -29.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 1,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "UTS",
+      "signal_time": "",
+      "initial_stop": 110.7,
+      "current_stop": 188.19,
+      "entry_spot": 54172.6,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T13:30:00",
+      "instrument": "SENSEX 72400 PE",
+      "timeframe": "15min",
+      "direction": "SHORT",
+      "entry_price": 341.6,
+      "entry_time": "29 Sep 13:30:42",
+      "exit_price": 330.5,
+      "exit_time": "29 Sep 13:32:42",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -302.0,
+      "charges": 0.0,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "is_ghost": 0,
+      "status": "CLOSED",
+      "execution_status": "OPEN",
+      "source_lane": "",
+      "signal_time": "",
+      "initial_stop": 290.36,
+      "current_stop": 290.36,
+      "entry_spot": 72338.48,
+      "spot_stop": 0.0,
+      "entry_filled_at": "",
+      "actual_costs_known": null
+    },
+    {
+      "id": "T0001_NIFTY_09301015",
+      "instrument": "NIFTY 22700 CE",
+      "timeframe": "15min",
+      "direction": "LONG",
+      "entry_price": 203.8,
+      "entry_time": "30 Sep 10:15:16",
+      "exit_price": 183.5,
+      "exit_time": "30 Sep 10:33:16",
+      "exit_reason": "STOP_HIT",
+      "pnl": -1400.0,
+      "charges": 80.0,
+      "peak_pnl": 372.8599999999989,
+      "max_drawdown": 1744.8999999999996,
+      "is_ghost": 0,
+      "status": "CLOSED",
+      "execution_status": "CLOSED",
+      "source_lane": "UTS",
+      "signal_time": "2026-09-30T10:00:00",
+      "initial_stop": 183.55,
+      "current_stop": 183.55,
+      "entry_spot": 22757.6,
+      "spot_stop": 22654.46489330771,
+      "entry_filled_at": "2026-09-30T10:15:19.002675+05:30",
+      "actual_costs_known": null
+    },
+    {
+      "id": "T0002_MIDCPNIFTY_09301056",
+      "instrument": "MIDCPNIFTY 13750 PE",
+      "timeframe": "5min",
+      "direction": "SHORT",
+      "entry_price": 218.85,
+      "entry_time": "30 Sep 10:56:35",
+      "exit_price": 223.25,
+      "exit_time": "30 Sep 11:00:06",
+      "exit_reason": "UTS_REPAINT",
+      "pnl": 448.0,
+      "charges": 80.0,
+      "peak_pnl": 230.22000000000205,
+      "max_drawdown": 646.7300000000007,
+      "is_ghost": 0,
+      "status": "CLOSED",
+      "execution_status": "CLOSED",
+      "source_lane": "UTS",
+      "signal_time": "2026-09-30T10:55:00",
+      "initial_stop": 207.95,
+      "current_stop": 207.95,
+      "entry_spot": 13732.55,
+      "spot_stop": 13825.4001373165,
+      "entry_filled_at": "2026-09-30T10:56:37.215499+05:30",
+      "actual_costs_known": null
+    }
+  ],
+  "session_rows": [
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|SHORT|2026-09-29T13:40:00",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T13:40:00",
+      "entry_time": "2026-09-29T13:40:35.969139",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -3157.0
+    },
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|SHORT|2026-09-29T13:40:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T13:40:00",
+      "entry_time": "2026-09-29T13:40:35.969139",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -499.0
+    },
+    {
+      "id": "SESSION|NIFTY|15min|ENTRY|SHORT|2026-09-29T13:30:00",
+      "date": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "entry_time": "2026-09-29T13:37:05.588244",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -3365.75
+    },
+    {
+      "id": "SESSION|NIFTY|15min|ENTRY|SHORT|2026-09-29T13:30:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "entry_time": "2026-09-29T13:37:05.588244",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "STOP_HIT",
+      "pnl": -1644.87
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T13:30:00",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "entry_time": "2026-09-29T13:30:42.936713",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -2689.0
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T13:30:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "entry_time": "2026-09-29T13:30:42.936713",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -302.0
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T12:30:00",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T12:30:00",
+      "entry_time": "2026-09-29T12:33:07.627686",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -3757.0
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|SHORT|2026-09-29T12:30:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T12:30:00",
+      "entry_time": "2026-09-29T12:33:07.627686",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -1089.0
+    },
+    {
+      "id": "SESSION|NIFTY|5min|ENTRY|LONG|2026-09-29T11:30:00",
+      "date": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:30:00",
+      "entry_time": "2026-09-29T11:30:38.198149",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -3788.25
+    },
+    {
+      "id": "SESSION|NIFTY|5min|ENTRY|LONG|2026-09-29T11:30:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:30:00",
+      "entry_time": "2026-09-29T11:30:38.198149",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": 24.0
+    },
+    {
+      "id": "SESSION|BANKNIFTY|5min|ENTRY|LONG|2026-09-29T11:25:00",
+      "date": "2026-09-29",
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:25:00",
+      "entry_time": "2026-09-29T11:29:52.166762",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -2658.5
+    },
+    {
+      "id": "SESSION|BANKNIFTY|5min|ENTRY|LONG|2026-09-29T11:25:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:25:00",
+      "entry_time": "2026-09-29T11:29:52.166762",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -29.0
+    },
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|LONG|2026-09-29T11:20:00",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:20:00",
+      "entry_time": "2026-09-29T11:21:29.898514",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": 782.0
+    },
+    {
+      "id": "SESSION|SENSEX|5min|ENTRY|LONG|2026-09-29T11:20:00|EXIT",
+      "date": "2026-09-29",
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:20:00",
+      "entry_time": "2026-09-29T11:21:29.898514",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": -555.0
+    },
+    {
+      "id": "SESSION|MIDCPNIFTY|5min|ENTRY|SHORT|2026-09-30T10:55:00",
+      "date": "2026-09-30",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-30T10:55:00",
+      "entry_time": "2026-09-30T10:56:35.703272",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": 286.0
+    },
+    {
+      "id": "SESSION|MIDCPNIFTY|5min|ENTRY|SHORT|2026-09-30T10:55:00|EXIT",
+      "date": "2026-09-30",
+      "instrument": "MIDCPNIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-30T10:55:00",
+      "entry_time": "2026-09-30T10:56:35.703272",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": 286.0
+    },
+    {
+      "id": "SESSION|NIFTY|15min|ENTRY|LONG|2026-09-30T10:00:00",
+      "date": "2026-09-30",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-30T10:00:00",
+      "entry_time": "2026-09-30T10:15:16.820178",
+      "status": "TRADE SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "",
+      "pnl": -2816.5
+    },
+    {
+      "id": "SESSION|NIFTY|15min|ENTRY|LONG|2026-09-30T10:00:00|EXIT",
+      "date": "2026-09-30",
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-30T10:00:00",
+      "entry_time": "2026-09-30T10:15:16.820178",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "STOP_HIT",
+      "pnl": -1397.88
+    },
+    {
+      "id": "SESSION|SENSEX|15min|ENTRY|LONG|2026-09-30T09:30:00|EXIT",
+      "date": "2026-09-30",
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-30T09:30:00",
+      "entry_time": "2026-09-30T09:30:00",
+      "status": "EXIT SIGNAL",
+      "entered_intracandle": true,
+      "exit_reason": "UTS_REPAINT",
+      "pnl": 404.0
+    }
+  ],
+  "final_bar_confirmations": [
+    {
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:20:00",
+      "live_direction": "LONG",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1466,
+          "signal": 0,
+          "state": 0,
+          "close": 72401.14,
+          "source": 72430.08750000001,
+          "trail": 72448.08917675268,
+          "atr": 79.13994111434698
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": 0,
+          "state": 0,
+          "close": 72401.14,
+          "source": 72430.08750000001,
+          "trail": 72448.0891044993,
+          "atr": 79.13993217359578
+        }
+      }
+    },
+    {
+      "instrument": "BANKNIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:25:00",
+      "live_direction": "LONG",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1467,
+          "signal": 1,
+          "state": 1,
+          "close": 54183.05,
+          "source": 54147.45,
+          "trail": 53783.56216679447,
+          "atr": 80.86396293456052
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": 1,
+          "state": 1,
+          "close": 54183.05,
+          "source": 54147.45,
+          "trail": 53783.56219342844,
+          "atr": 80.86395701590085
+        }
+      }
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T11:30:00",
+      "live_direction": "LONG",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1468,
+          "signal": 1,
+          "state": 1,
+          "close": 22721.6,
+          "source": 22711.237500000003,
+          "trail": 22590.83086099736,
+          "atr": 26.75703088947578
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": 1,
+          "state": 1,
+          "close": 22721.6,
+          "source": 22711.237500000003,
+          "trail": 22590.830875621683,
+          "atr": 26.75702763962699
+        }
+      }
+    },
+    {
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T12:30:00",
+      "live_direction": "SHORT",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1094,
+          "signal": 0,
+          "state": 1,
+          "close": 72387.18,
+          "source": 72382.5875,
+          "trail": 72357.36781985508,
+          "atr": 142.359390164515
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": 0,
+          "state": 1,
+          "close": 72387.18,
+          "source": 72382.5875,
+          "trail": 72357.36781986018,
+          "atr": 142.35939016231478
+        }
+      }
+    },
+    {
+      "instrument": "SENSEX",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "live_direction": "SHORT",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1098,
+          "signal": -1,
+          "state": -1,
+          "close": 72307.57,
+          "source": 72326.0975,
+          "trail": 72596.01274638114,
+          "atr": 134.95762319056533
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": -1,
+          "state": -1,
+          "close": 72307.57,
+          "source": 72326.0975,
+          "trail": 72596.01274637503,
+          "atr": 134.9576231875091
+        }
+      }
+    },
+    {
+      "instrument": "SENSEX",
+      "timeframe": "5min",
+      "signal_timestamp": "2026-09-29T13:40:00",
+      "live_direction": "SHORT",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1494,
+          "signal": -1,
+          "state": -1,
+          "close": 72307.57,
+          "source": 72293.54250000001,
+          "trail": 72606.92044371358,
+          "atr": 69.63954304746007
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": -1,
+          "state": -1,
+          "close": 72307.57,
+          "source": 72293.54250000001,
+          "trail": 72606.9204221178,
+          "atr": 69.63953824839692
+        }
+      }
+    },
+    {
+      "instrument": "NIFTY",
+      "timeframe": "15min",
+      "signal_timestamp": "2026-09-29T13:30:00",
+      "live_direction": "SHORT",
+      "reconstruction": {
+        "full_history": {
+          "bars": 1098,
+          "signal": -1,
+          "state": -1,
+          "close": 22642.85,
+          "source": 22649.612500000003,
+          "trail": 22736.74445202361,
+          "atr": 43.565976011803016
+        },
+        "last_300_bars": {
+          "bars": 300,
+          "signal": -1,
+          "state": -1,
+          "close": 22642.85,
+          "source": 22649.612500000003,
+          "trail": 22736.744452021856,
+          "atr": 43.56597601092624
+        }
+      }
+    }
+  ],
+  "today_stop_analysis": {
+    "trade": {
+      "id": "T0001_NIFTY_09301015",
+      "instrument": "NIFTY 22700 CE",
+      "timeframe": "15min",
+      "direction": "LONG",
+      "entry_price": 203.8,
+      "entry_time": "30 Sep 10:15:16",
+      "exit_price": 183.5,
+      "exit_time": "30 Sep 10:33:16",
+      "exit_reason": "STOP_HIT",
+      "pnl": -1400.0,
+      "charges": 80.0,
+      "peak_pnl": 372.8599999999989,
+      "max_drawdown": 1744.8999999999996,
+      "is_ghost": 0,
+      "status": "CLOSED",
+      "execution_status": "CLOSED",
+      "source_lane": "UTS",
+      "signal_time": "2026-09-30T10:00:00",
+      "initial_stop": 183.55,
+      "current_stop": 183.55,
+      "entry_spot": 22757.6,
+      "spot_stop": 22654.46489330771,
+      "entry_filled_at": "2026-09-30T10:15:19.002675+05:30",
+      "actual_costs_known": null
+    },
+    "entry_intel": {
+      "regime_label": "TRENDING_UP",
+      "regime_confidence": 57.0,
+      "kaufman_er": 0.784,
+      "adx": 27.8,
+      "atr_pct": 0.17,
+      "bb_width": 0.0,
+      "vol_buy_sell_ratio": 1.0,
+      "volume_ratio": 1.0,
+      "oi_signal": "NEUTRAL",
+      "total_call_oi": 127874435.0,
+      "total_put_oi": 103815075.0,
+      "pcr": 0.812,
+      "order_ratio": 3.98,
+      "adverse_votes": 0,
+      "aggregate_score": 56.8,
+      "breadth_aligned": 3.0,
+      "breadth_bias": "BULLISH",
+      "day_type": "RANGE_DAY",
+      "session_confidence": 0.62,
+      "close_above_vwap_pct": 75.0,
+      "iv_percentile": 76.3,
+      "delta": 0.5375,
+      "gamma": 0.001066,
+      "theta": -14.48,
+      "vega": 11.59,
+      "iv": 12.8,
+      "india_vix": 12.99,
+      "vix_percentile": 60.6
+    },
+    "index_stop_distance": 103.13510669228708,
+    "delta_mapped_index_risk": 55.4351198471043,
+    "actual_premium_risk": 20.25,
+    "actual_stop_pct": 9.93621197252208,
+    "premium_risk_to_delta_mapped_index_risk": 0.3652918953878256,
+    "underlying_low_until_stop_minute": 22718.95,
+    "entry_bar_atr_reconstructed": 42.81404192318173,
+    "entry_bar_flip_reconstructed": 1,
+    "smart_arm_move_reconstructed": 107.03510480795433,
+    "earliest_two_post_signal_closed_bars_time": "2026-09-30T10:45:00"
+  },
+  "mechanism_probes": {
+    "error_result_exit": "REPAINT",
+    "stale_result_exit": "REPAINT",
+    "signal_bar_peak_exit": "SMART_HARD_EXIT",
+    "counted_runup_atr": 3.0,
+    "actual_post_entry_high_runup_atr": 0.1,
+    "chartless_lane_exit": false,
+    "chartless_lane_stop": 0.0,
+    "scope": "Synthetic mechanism proofs; not proof these defects caused recorded exits."
+  },
+  "closing_boundary_probe": {
+    "clock": "2026-09-29T11:30:03",
+    "signal_time": "2026-09-29T11:25:00",
+    "closed_signal_without_next_input_bar": false,
+    "closed_signal_with_next_input_bar": true,
+    "exit_without_next_input_bar": "REPAINT",
+    "exit_with_next_input_bar": "",
+    "scope": "Production engine reproduction using final archived OHLC; original intrabar input state is unavailable."
+  },
+  "runtime_chart": {
+    "state": {
+      "position": 1,
+      "position_label": "LONG",
+      "trailing_stop": 22677.227605010226,
+      "last_entry_price": 22755.2,
+      "last_exit_price": 0.0,
+      "stop_distance": 33.17239498977506,
+      "suggested_qty": 447,
+      "current_price": 22710.4,
+      "atr_value": 41.79173406446963,
+      "adx_value": 24.8374326193904,
+      "is_trending": false,
+      "uts_runup_atr": 0.397207734294794,
+      "uts_retrace_atr": 2.007574030562366,
+      "uts_state_bar_time": "2026-09-30T10:45:00"
+    },
+    "engine": "ut_smart",
+    "candle_type": "standard",
+    "candles": [
+      {
+        "time": 1790066700,
+        "open": 23385.3,
+        "high": 23403.1,
+        "low": 23377.05,
+        "close": 23389.8,
+        "volume": 8045577
+      },
+      {
+        "time": 1790067600,
+        "open": 23390.25,
+        "high": 23397.65,
+        "low": 23359.9,
+        "close": 23369.0,
+        "volume": 8925330
+      },
+      {
+        "time": 1790068500,
+        "open": 23369.15,
+        "high": 23383.5,
+        "low": 23350.75,
+        "close": 23357.7,
+        "volume": 12190465
+      },
+      {
+        "time": 1790069400,
+        "open": 23358.05,
+        "high": 23365.3,
+        "low": 23346.7,
+        "close": 23349.55,
+        "volume": 20971195
+      },
+      {
+        "time": 1790070300,
+        "open": 23349.5,
+        "high": 23349.5,
+        "low": 23329.0,
+        "close": 23329.0,
+        "volume": 8447187
+      },
+      {
+        "time": 1790135100,
+        "open": 23352.15,
+        "high": 23414.55,
+        "low": 23351.75,
+        "close": 23367.85,
+        "volume": 18501197
+      },
+      {
+        "time": 1790136000,
+        "open": 23369.3,
+        "high": 23381.35,
+        "low": 23362.7,
+        "close": 23378.0,
+        "volume": 9476357
+      },
+      {
+        "time": 1790136900,
+        "open": 23380.45,
+        "high": 23388.8,
+        "low": 23349.55,
+        "close": 23377.05,
+        "volume": 8419633
+      },
+      {
+        "time": 1790137800,
+        "open": 23377.85,
+        "high": 23384.0,
+        "low": 23355.6,
+        "close": 23364.85,
+        "volume": 7310011
+      },
+      {
+        "time": 1790138700,
+        "open": 23366.35,
+        "high": 23401.15,
+        "low": 23365.85,
+        "close": 23398.4,
+        "volume": 6193176
+      },
+      {
+        "time": 1790139600,
+        "open": 23399.35,
+        "high": 23413.7,
+        "low": 23395.85,
+        "close": 23412.8,
+        "volume": 7384884
+      },
+      {
+        "time": 1790140500,
+        "open": 23414.15,
+        "high": 23424.0,
+        "low": 23411.1,
+        "close": 23415.5,
+        "volume": 12562885
+      },
+      {
+        "time": 1790141400,
+        "open": 23416.35,
+        "high": 23441.25,
+        "low": 23413.65,
+        "close": 23435.95,
+        "volume": 10461924
+      },
+      {
+        "time": 1790142300,
+        "open": 23437.4,
+        "high": 23437.4,
+        "low": 23420.1,
+        "close": 23427.8,
+        "volume": 6770354
+      },
+      {
+        "time": 1790143200,
+        "open": 23429.0,
+        "high": 23445.9,
+        "low": 23427.05,
+        "close": 23438.55,
+        "volume": 9499272
+      },
+      {
+        "time": 1790144100,
+        "open": 23439.9,
+        "high": 23444.4,
+        "low": 23424.3,
+        "close": 23428.95,
+        "volume": 7486708
+      },
+      {
+        "time": 1790145000,
+        "open": 23431.2,
+        "high": 23462.9,
+        "low": 23429.35,
+        "close": 23458.1,
+        "volume": 12082469
+      },
+      {
+        "time": 1790145900,
+        "open": 23459.4,
+        "high": 23466.9,
+        "low": 23447.05,
+        "close": 23449.5,
+        "volume": 7811193
+      },
+      {
+        "time": 1790146800,
+        "open": 23451.15,
+        "high": 23456.05,
+        "low": 23443.7,
+        "close": 23448.85,
+        "volume": 5659671
+      },
+      {
+        "time": 1790147700,
+        "open": 23449.85,
+        "high": 23454.05,
+        "low": 23440.45,
+        "close": 23453.0,
+        "volume": 8053200
+      },
+      {
+        "time": 1790148600,
+        "open": 23454.05,
+        "high": 23458.6,
+        "low": 23440.8,
+        "close": 23446.3,
+        "volume": 6232747
+      },
+      {
+        "time": 1790149500,
+        "open": 23446.75,
+        "high": 23453.75,
+        "low": 23438.45,
+        "close": 23439.4,
+        "volume": 9112268
+      },
+      {
+        "time": 1790150400,
+        "open": 23440.1,
+        "high": 23440.75,
+        "low": 23417.6,
+        "close": 23431.05,
+        "volume": 6469267
+      },
+      {
+        "time": 1790151300,
+        "open": 23432.1,
+        "high": 23432.5,
+        "low": 23422.15,
+        "close": 23426.55,
+        "volume": 5270219
+      },
+      {
+        "time": 1790152200,
+        "open": 23427.05,
+        "high": 23451.9,
+        "low": 23425.95,
+        "close": 23451.65,
+        "volume": 6133930
+      },
+      {
+        "time": 1790153100,
+        "open": 23452.55,
+        "high": 23458.8,
+        "low": 23439.05,
+        "close": 23457.55,
+        "volume": 7768666
+      },
+      {
+        "time": 1790154000,
+        "open": 23459.3,
+        "high": 23459.95,
+        "low": 23426.8,
+        "close": 23427.6,
+        "volume": 7867772
+      },
+      {
+        "time": 1790154900,
+        "open": 23428.1,
+        "high": 23435.4,
+        "low": 23415.9,
+        "close": 23422.45,
+        "volume": 13925084
+      },
+      {
+        "time": 1790155800,
+        "open": 23422.55,
+        "high": 23435.15,
+        "low": 23408.4,
+        "close": 23431.65,
+        "volume": 26552928
+      },
+      {
+        "time": 1790156700,
+        "open": 23431.65,
+        "high": 23446.8,
+        "low": 23431.35,
+        "close": 23446.8,
+        "volume": 8635943
+      },
+      {
+        "time": 1790221500,
+        "open": 23221.8,
+        "high": 23281.95,
+        "low": 23205.45,
+        "close": 23260.2,
+        "volume": 29644482
+      },
+      {
+        "time": 1790222400,
+        "open": 23260.55,
+        "high": 23272.0,
+        "low": 23224.9,
+        "close": 23226.75,
+        "volume": 15627835
+      },
+      {
+        "time": 1790223300,
+        "open": 23226.7,
+        "high": 23239.35,
+        "low": 23208.9,
+        "close": 23225.5,
+        "volume": 9894753
+      },
+      {
+        "time": 1790224200,
+        "open": 23225.9,
+        "high": 23245.1,
+        "low": 23215.7,
+        "close": 23218.5,
+        "volume": 7782718
+      },
+      {
+        "time": 1790225100,
+        "open": 23218.8,
+        "high": 23223.15,
+        "low": 23196.45,
+        "close": 23210.55,
+        "volume": 6357352
+      },
+      {
+        "time": 1790226000,
+        "open": 23210.65,
+        "high": 23236.0,
+        "low": 23209.85,
+        "close": 23218.5,
+        "volume": 7035685
+      },
+      {
+        "time": 1790226900,
+        "open": 23218.65,
+        "high": 23242.75,
+        "low": 23215.8,
+        "close": 23240.2,
+        "volume": 7675770
+      },
+      {
+        "time": 1790227800,
+        "open": 23241.05,
+        "high": 23241.8,
+        "low": 23211.85,
+        "close": 23216.55,
+        "volume": 9365318
+      },
+      {
+        "time": 1790228700,
+        "open": 23216.25,
+        "high": 23244.7,
+        "low": 23211.9,
+        "close": 23223.05,
+        "volume": 9283918
+      },
+      {
+        "time": 1790229600,
+        "open": 23223.35,
+        "high": 23224.65,
+        "low": 23202.1,
+        "close": 23210.25,
+        "volume": 8281328
+      },
+      {
+        "time": 1790230500,
+        "open": 23210.9,
+        "high": 23215.15,
+        "low": 23190.3,
+        "close": 23197.35,
+        "volume": 8318709
+      },
+      {
+        "time": 1790231400,
+        "open": 23197.4,
+        "high": 23212.95,
+        "low": 23193.6,
+        "close": 23195.7,
+        "volume": 6711711
+      },
+      {
+        "time": 1790232300,
+        "open": 23195.6,
+        "high": 23203.6,
+        "low": 23174.75,
+        "close": 23187.85,
+        "volume": 8337985
+      },
+      {
+        "time": 1790233200,
+        "open": 23187.95,
+        "high": 23192.2,
+        "low": 23166.0,
+        "close": 23172.65,
+        "volume": 14615445
+      },
+      {
+        "time": 1790234100,
+        "open": 23172.6,
+        "high": 23179.75,
+        "low": 23164.85,
+        "close": 23168.65,
+        "volume": 5177291
+      },
+      {
+        "time": 1790235000,
+        "open": 23168.5,
+        "high": 23189.9,
+        "low": 23165.4,
+        "close": 23182.8,
+        "volume": 6495159
+      },
+      {
+        "time": 1790235900,
+        "open": 23183.1,
+        "high": 23186.65,
+        "low": 23135.1,
+        "close": 23147.2,
+        "volume": 7570848
+      },
+      {
+        "time": 1790236800,
+        "open": 23147.15,
+        "high": 23163.75,
+        "low": 23104.85,
+        "close": 23106.35,
+        "volume": 8401380
+      },
+      {
+        "time": 1790237700,
+        "open": 23107.2,
+        "high": 23115.95,
+        "low": 23048.0,
+        "close": 23057.5,
+        "volume": 12058242
+      },
+      {
+        "time": 1790238600,
+        "open": 23057.75,
+        "high": 23096.65,
+        "low": 23056.45,
+        "close": 23077.75,
+        "volume": 8920859
+      },
+      {
+        "time": 1790239500,
+        "open": 23077.9,
+        "high": 23084.15,
+        "low": 23046.15,
+        "close": 23062.15,
+        "volume": 11478703
+      },
+      {
+        "time": 1790240400,
+        "open": 23062.25,
+        "high": 23108.5,
+        "low": 23058.25,
+        "close": 23092.2,
+        "volume": 9663653
+      },
+      {
+        "time": 1790241300,
+        "open": 23092.15,
+        "high": 23119.1,
+        "low": 23088.15,
+        "close": 23098.05,
+        "volume": 14963824
+      },
+      {
+        "time": 1790242200,
+        "open": 23097.95,
+        "high": 23107.3,
+        "low": 23070.25,
+        "close": 23083.45,
+        "volume": 26488208
+      },
+      {
+        "time": 1790243100,
+        "open": 23085.6,
+        "high": 23085.6,
+        "low": 23063.1,
+        "close": 23063.1,
+        "volume": 8437799
+      },
+      {
+        "time": 1790307900,
+        "open": 23035.0,
+        "high": 23116.65,
+        "low": 23030.0,
+        "close": 23116.5,
+        "volume": 22374446
+      },
+      {
+        "time": 1790308800,
+        "open": 23117.7,
+        "high": 23121.6,
+        "low": 23044.05,
+        "close": 23052.6,
+        "volume": 13407776
+      },
+      {
+        "time": 1790309700,
+        "open": 23053.95,
+        "high": 23063.75,
+        "low": 23036.05,
+        "close": 23059.0,
+        "volume": 9197675
+      },
+      {
+        "time": 1790310600,
+        "open": 23059.45,
+        "high": 23108.5,
+        "low": 23053.8,
+        "close": 23100.6,
+        "volume": 8452548
+      },
+      {
+        "time": 1790311500,
+        "open": 23100.85,
+        "high": 23106.9,
+        "low": 23078.1,
+        "close": 23085.15,
+        "volume": 6685654
+      },
+      {
+        "time": 1790312400,
+        "open": 23084.65,
+        "high": 23090.25,
+        "low": 23059.45,
+        "close": 23065.7,
+        "volume": 9448186
+      },
+      {
+        "time": 1790313300,
+        "open": 23067.1,
+        "high": 23068.3,
+        "low": 23047.5,
+        "close": 23063.8,
+        "volume": 12811237
+      },
+      {
+        "time": 1790314200,
+        "open": 23064.2,
+        "high": 23093.5,
+        "low": 23060.7,
+        "close": 23091.25,
+        "volume": 7403164
+      },
+      {
+        "time": 1790315100,
+        "open": 23092.25,
+        "high": 23104.95,
+        "low": 23075.2,
+        "close": 23077.1,
+        "volume": 7150907
+      },
+      {
+        "time": 1790316000,
+        "open": 23079.4,
+        "high": 23091.15,
+        "low": 23075.45,
+        "close": 23083.9,
+        "volume": 6387073
+      },
+      {
+        "time": 1790316900,
+        "open": 23084.25,
+        "high": 23091.6,
+        "low": 23076.05,
+        "close": 23076.25,
+        "volume": 7643890
+      },
+      {
+        "time": 1790317800,
+        "open": 23077.0,
+        "high": 23084.8,
+        "low": 23059.5,
+        "close": 23081.95,
+        "volume": 6743331
+      },
+      {
+        "time": 1790318700,
+        "open": 23082.4,
+        "high": 23084.25,
+        "low": 23069.25,
+        "close": 23082.45,
+        "volume": 4738760
+      },
+      {
+        "time": 1790319600,
+        "open": 23084.0,
+        "high": 23089.85,
+        "low": 23056.65,
+        "close": 23057.0,
+        "volume": 5057354
+      },
+      {
+        "time": 1790320500,
+        "open": 23057.75,
+        "high": 23058.7,
+        "low": 23020.95,
+        "close": 23040.7,
+        "volume": 9151235
+      },
+      {
+        "time": 1790321400,
+        "open": 23041.5,
+        "high": 23055.45,
+        "low": 23040.2,
+        "close": 23043.0,
+        "volume": 5569947
+      },
+      {
+        "time": 1790322300,
+        "open": 23043.25,
+        "high": 23045.95,
+        "low": 23030.65,
+        "close": 23040.45,
+        "volume": 5832890
+      },
+      {
+        "time": 1790323200,
+        "open": 23040.35,
+        "high": 23047.9,
+        "low": 23027.25,
+        "close": 23043.15,
+        "volume": 7156880
+      },
+      {
+        "time": 1790324100,
+        "open": 23043.2,
+        "high": 23063.7,
+        "low": 23040.25,
+        "close": 23063.2,
+        "volume": 6636083
+      },
+      {
+        "time": 1790325000,
+        "open": 23063.1,
+        "high": 23162.7,
+        "low": 23063.1,
+        "close": 23116.3,
+        "volume": 14525838
+      },
+      {
+        "time": 1790325900,
+        "open": 23116.45,
+        "high": 23132.6,
+        "low": 23109.05,
+        "close": 23118.9,
+        "volume": 11838899
+      },
+      {
+        "time": 1790326800,
+        "open": 23119.0,
+        "high": 23139.15,
+        "low": 23116.95,
+        "close": 23122.05,
+        "volume": 11618828
+      },
+      {
+        "time": 1790327700,
+        "open": 23122.45,
+        "high": 23127.3,
+        "low": 23108.2,
+        "close": 23123.4,
+        "volume": 13217765
+      },
+      {
+        "time": 1790328600,
+        "open": 23123.1,
+        "high": 23130.45,
+        "low": 23103.5,
+        "close": 23127.6,
+        "volume": 23234886
+      },
+      {
+        "time": 1790329500,
+        "open": 23128.1,
+        "high": 23140.5,
+        "low": 23128.1,
+        "close": 23140.5,
+        "volume": 4481013
+      },
+      {
+        "time": 1790567100,
+        "open": 23064.9,
+        "high": 23080.25,
+        "low": 22905.25,
+        "close": 22908.6,
+        "volume": 20353886
+      },
+      {
+        "time": 1790568000,
+        "open": 22909.6,
+        "high": 22912.1,
+        "low": 22855.45,
+        "close": 22857.4,
+        "volume": 15094179
+      },
+      {
+        "time": 1790568900,
+        "open": 22857.9,
+        "high": 22886.5,
+        "low": 22856.3,
+        "close": 22874.9,
+        "volume": 11288967
+      },
+      {
+        "time": 1790569800,
+        "open": 22874.1,
+        "high": 22880.35,
+        "low": 22849.9,
+        "close": 22865.4,
+        "volume": 8609891
+      },
+      {
+        "time": 1790570700,
+        "open": 22865.8,
+        "high": 22865.8,
+        "low": 22833.8,
+        "close": 22842.95,
+        "volume": 8081894
+      },
+      {
+        "time": 1790571600,
+        "open": 22843.4,
+        "high": 22852.7,
+        "low": 22820.25,
+        "close": 22827.25,
+        "volume": 7085522
+      },
+      {
+        "time": 1790572500,
+        "open": 22827.4,
+        "high": 22845.55,
+        "low": 22819.65,
+        "close": 22838.85,
+        "volume": 8052308
+      },
+      {
+        "time": 1790573400,
+        "open": 22839.3,
+        "high": 22840.0,
+        "low": 22815.35,
+        "close": 22820.7,
+        "volume": 7352929
+      },
+      {
+        "time": 1790574300,
+        "open": 22822.25,
+        "high": 22833.6,
+        "low": 22807.55,
+        "close": 22829.95,
+        "volume": 7282844
+      },
+      {
+        "time": 1790575200,
+        "open": 22831.35,
+        "high": 22849.15,
+        "low": 22822.9,
+        "close": 22842.05,
+        "volume": 8161818
+      },
+      {
+        "time": 1790576100,
+        "open": 22842.05,
+        "high": 22849.35,
+        "low": 22813.9,
+        "close": 22826.35,
+        "volume": 8834260
+      },
+      {
+        "time": 1790577000,
+        "open": 22827.7,
+        "high": 22838.1,
+        "low": 22822.45,
+        "close": 22834.15,
+        "volume": 10326614
+      },
+      {
+        "time": 1790577900,
+        "open": 22835.25,
+        "high": 22855.45,
+        "low": 22824.8,
+        "close": 22853.8,
+        "volume": 9111248
+      },
+      {
+        "time": 1790578800,
+        "open": 22854.95,
+        "high": 22855.35,
+        "low": 22835.5,
+        "close": 22838.45,
+        "volume": 7969387
+      },
+      {
+        "time": 1790579700,
+        "open": 22839.6,
+        "high": 22842.2,
+        "low": 22822.8,
+        "close": 22830.15,
+        "volume": 8878716
+      },
+      {
+        "time": 1790580600,
+        "open": 22831.2,
+        "high": 22837.65,
+        "low": 22809.45,
+        "close": 22820.4,
+        "volume": 9336507
+      },
+      {
+        "time": 1790581500,
+        "open": 22820.85,
+        "high": 22848.7,
+        "low": 22818.2,
+        "close": 22846.35,
+        "volume": 9410150
+      },
+      {
+        "time": 1790582400,
+        "open": 22847.05,
+        "high": 22848.6,
+        "low": 22830.15,
+        "close": 22836.1,
+        "volume": 7060971
+      },
+      {
+        "time": 1790583300,
+        "open": 22837.2,
+        "high": 22845.1,
+        "low": 22828.55,
+        "close": 22842.75,
+        "volume": 7038488
+      },
+      {
+        "time": 1790584200,
+        "open": 22843.7,
+        "high": 22846.1,
+        "low": 22819.5,
+        "close": 22821.8,
+        "volume": 7230718
+      },
+      {
+        "time": 1790585100,
+        "open": 22823.3,
+        "high": 22825.65,
+        "low": 22785.55,
+        "close": 22794.2,
+        "volume": 11971635
+      },
+      {
+        "time": 1790586000,
+        "open": 22795.5,
+        "high": 22805.85,
+        "low": 22762.2,
+        "close": 22778.8,
+        "volume": 12395023
+      },
+      {
+        "time": 1790586900,
+        "open": 22778.85,
+        "high": 22808.5,
+        "low": 22777.5,
+        "close": 22797.9,
+        "volume": 14189460
+      },
+      {
+        "time": 1790587800,
+        "open": 22796.9,
+        "high": 22798.6,
+        "low": 22777.6,
+        "close": 22788.25,
+        "volume": 27936970
+      },
+      {
+        "time": 1790588700,
+        "open": 22788.25,
+        "high": 22788.25,
+        "low": 22780.25,
+        "close": 22780.25,
+        "volume": 6874114
+      },
+      {
+        "time": 1790653500,
+        "open": 22732.45,
+        "high": 22753.2,
+        "low": 22624.2,
+        "close": 22625.3,
+        "volume": 28302796
+      },
+      {
+        "time": 1790654400,
+        "open": 22624.35,
+        "high": 22638.1,
+        "low": 22569.65,
+        "close": 22613.4,
+        "volume": 19416722
+      },
+      {
+        "time": 1790655300,
+        "open": 22614.15,
+        "high": 22619.25,
+        "low": 22590.8,
+        "close": 22604.35,
+        "volume": 11893325
+      },
+      {
+        "time": 1790656200,
+        "open": 22603.6,
+        "high": 22608.55,
+        "low": 22571.55,
+        "close": 22578.75,
+        "volume": 12467873
+      },
+      {
+        "time": 1790657100,
+        "open": 22578.45,
+        "high": 22605.3,
+        "low": 22573.0,
+        "close": 22600.3,
+        "volume": 9772039
+      },
+      {
+        "time": 1790658000,
+        "open": 22598.95,
+        "high": 22615.35,
+        "low": 22580.55,
+        "close": 22613.05,
+        "volume": 10658135
+      },
+      {
+        "time": 1790658900,
+        "open": 22611.95,
+        "high": 22628.65,
+        "low": 22592.5,
+        "close": 22617.05,
+        "volume": 11506695
+      },
+      {
+        "time": 1790659800,
+        "open": 22616.1,
+        "high": 22701.45,
+        "low": 22590.95,
+        "close": 22683.75,
+        "volume": 16221854
+      },
+      {
+        "time": 1790660700,
+        "open": 22683.75,
+        "high": 22697.0,
+        "low": 22663.2,
+        "close": 22696.65,
+        "volume": 11533387
+      },
+      {
+        "time": 1790661600,
+        "open": 22696.2,
+        "high": 22733.85,
+        "low": 22694.1,
+        "close": 22719.85,
+        "volume": 12411541
+      },
+      {
+        "time": 1790662500,
+        "open": 22719.95,
+        "high": 22728.9,
+        "low": 22707.05,
+        "close": 22728.35,
+        "volume": 9491227
+      },
+      {
+        "time": 1790663400,
+        "open": 22727.85,
+        "high": 22753.25,
+        "low": 22726.3,
+        "close": 22741.9,
+        "volume": 10714037
+      },
+      {
+        "time": 1790664300,
+        "open": 22741.95,
+        "high": 22743.8,
+        "low": 22672.75,
+        "close": 22677.3,
+        "volume": 10544306
+      },
+      {
+        "time": 1790665200,
+        "open": 22677.35,
+        "high": 22698.0,
+        "low": 22627.5,
+        "close": 22669.1,
+        "volume": 11619008
+      },
+      {
+        "time": 1790666100,
+        "open": 22668.4,
+        "high": 22705.0,
+        "low": 22656.6,
+        "close": 22687.65,
+        "volume": 17475754
+      },
+      {
+        "time": 1790667000,
+        "open": 22687.45,
+        "high": 22703.2,
+        "low": 22673.55,
+        "close": 22681.9,
+        "volume": 10468160
+      },
+      {
+        "time": 1790667900,
+        "open": 22681.35,
+        "high": 22687.45,
+        "low": 22650.4,
+        "close": 22658.3,
+        "volume": 11863160
+      },
+      {
+        "time": 1790668800,
+        "open": 22657.95,
+        "high": 22668.55,
+        "low": 22629.1,
+        "close": 22642.85,
+        "volume": 13883062
+      },
+      {
+        "time": 1790669700,
+        "open": 22642.55,
+        "high": 22675.55,
+        "low": 22641.2,
+        "close": 22662.95,
+        "volume": 8748003
+      },
+      {
+        "time": 1790670600,
+        "open": 22663.0,
+        "high": 22684.15,
+        "low": 22645.8,
+        "close": 22672.0,
+        "volume": 10230835
+      },
+      {
+        "time": 1790671500,
+        "open": 22670.95,
+        "high": 22684.4,
+        "low": 22654.15,
+        "close": 22666.75,
+        "volume": 10952758
+      },
+      {
+        "time": 1790672400,
+        "open": 22666.45,
+        "high": 22696.0,
+        "low": 22665.85,
+        "close": 22673.15,
+        "volume": 13582930
+      },
+      {
+        "time": 1790673300,
+        "open": 22673.35,
+        "high": 22692.5,
+        "low": 22662.35,
+        "close": 22673.25,
+        "volume": 19983971
+      },
+      {
+        "time": 1790674200,
+        "open": 22673.1,
+        "high": 22706.1,
+        "low": 22661.4,
+        "close": 22683.75,
+        "volume": 64791479
+      },
+      {
+        "time": 1790675100,
+        "open": 22683.75,
+        "high": 22716.2,
+        "low": 22683.75,
+        "close": 22716.2,
+        "volume": 227845978
+      },
+      {
+        "time": 1790739900,
+        "open": 22665.0,
+        "high": 22736.65,
+        "low": 22659.8,
+        "close": 22721.65,
+        "volume": 29854290
+      },
+      {
+        "time": 1790740800,
+        "open": 22720.4,
+        "high": 22720.4,
+        "low": 22681.15,
+        "close": 22715.15,
+        "volume": 13877455
+      },
+      {
+        "time": 1790741700,
+        "open": 22714.95,
+        "high": 22735.35,
+        "low": 22689.1,
+        "close": 22722.3,
+        "volume": 13437376
+      },
+      {
+        "time": 1790742600,
+        "open": 22722.25,
+        "high": 22755.75,
+        "low": 22716.65,
+        "close": 22755.2,
+        "volume": 14376112
+      },
+      {
+        "time": 1790743500,
+        "open": 22754.8,
+        "high": 22771.8,
+        "low": 22753.0,
+        "close": 22758.1,
+        "volume": 10781829
+      },
+      {
+        "time": 1790744400,
+        "open": 22757.25,
+        "high": 22757.7,
+        "low": 22698.1,
+        "close": 22702.75,
+        "volume": 12378897
+      },
+      {
+        "time": 1790745300,
+        "open": 22702.95,
+        "high": 22718.9,
+        "low": 22685.65,
+        "close": 22687.9,
+        "volume": 12329073
+      },
+      {
+        "time": 1790746200,
+        "open": 22687.45,
+        "high": 22710.45,
+        "low": 22686.65,
+        "close": 22710.4,
+        "volume": 0
+      }
+    ],
+    "markers": [
+      {
+        "time": 1790221500,
+        "position": "aboveBar",
+        "color": "#ef4444",
+        "shape": "arrowDown",
+        "text": "SELL UTS @ 23260"
+      },
+      {
+        "time": 1790325000,
+        "position": "belowBar",
+        "color": "#ff9800",
+        "shape": "circle",
+        "text": "EXIT SHORT UTS | UT_REVERSE"
+      },
+      {
+        "time": 1790325000,
+        "position": "belowBar",
+        "color": "#22c55e",
+        "shape": "arrowUp",
+        "text": "BUY UTS @ 23116"
+      },
+      {
+        "time": 1790567100,
+        "position": "aboveBar",
+        "color": "#ff9800",
+        "shape": "circle",
+        "text": "EXIT LONG UTS | UT_REVERSE"
+      },
+      {
+        "time": 1790567100,
+        "position": "aboveBar",
+        "color": "#ef4444",
+        "shape": "arrowDown",
+        "text": "SELL UTS @ 22909"
+      },
+      {
+        "time": 1790659800,
+        "position": "belowBar",
+        "color": "#ff9800",
+        "shape": "circle",
+        "text": "EXIT SHORT UTS | SMART_HARD_EXIT"
+      },
+      {
+        "time": 1790660700,
+        "position": "belowBar",
+        "color": "#22c55e",
+        "shape": "arrowUp",
+        "text": "BUY UTS @ 22697"
+      },
+      {
+        "time": 1790668800,
+        "position": "aboveBar",
+        "color": "#ff9800",
+        "shape": "circle",
+        "text": "EXIT LONG UTS | UT_REVERSE"
+      },
+      {
+        "time": 1790668800,
+        "position": "aboveBar",
+        "color": "#ef4444",
+        "shape": "arrowDown",
+        "text": "SELL UTS @ 22643"
+      },
+      {
+        "time": 1790742600,
+        "position": "belowBar",
+        "color": "#ff9800",
+        "shape": "circle",
+        "text": "EXIT SHORT UTS | UT_REVERSE"
+      },
+      {
+        "time": 1790742600,
+        "position": "belowBar",
+        "color": "#22c55e",
+        "shape": "arrowUp",
+        "text": "BUY UTS @ 22755"
+      }
+    ]
+  },
+  "source_sha256": {
+    "engine/ut_smart_engine.py": "e22f09f97003f49114e999954f99dcda5124a8436f44460b4393e7d7df09f641",
+    "engine/uts_lane.py": "f582e884b565446eb78953490571839215da12bf59519e7e678984562c997c43",
+    "engine/s1_lane.py": "9509d5260c5ebfcd5425139dd563de01c93d1d2e9d4dd4dc47d9e8e69109ce00",
+    "engine/alt_scanners.py": "981747f869a30eef3a3d209954181dddc2ecd4b043702d84ab5026df342619d6",
+    "engine/multi_timeframe.py": "ebbb3319eaa83ffed05098d1bd245171f4200944fb2420bcb89a552ad657f23c",
+    "engine/exit_cycle.py": "d8603bb68d3340a6a65b58808557119fe8e5e3eb223c358893f7f189779cbcc6",
+    "engine/signal_processor.py": "64629e56898dd7652f58aec2803d56c58478a31e1901edef4124f23979bb2212",
+    "engine/execution_service.py": "04309373d1d29dfffad8a9bbb92686010e950ee1ca403589ff5d870b11c3a9f0",
+    "scanner.py": "f9d390140fa2a230040d037a75789af768d029ff866bea292821ac4722a6c173",
+    "config/settings.py": "1a29e6621b3bea758d91610b82edff2c14e8835fd39d55e1b9339c5c3b771a50",
+    "trading/trade_manager.py": "e1bf0a68ab784ab4c8132b8c69feb449a19a5c410df784d60f31e592e62fa92e",
+    "reports/ut_smart_exit_study_20260925.py": "34f1fc5b5008ed84c7dd134b513bf3f138c68e6d498b2aa091ca2cfbf85a1c5c",
+    "reports/ut_smart_intracandle_study_20260926.py": "40f13e0c6eaede4c8555d75b6942590dad1e021fc015815da9b8f9f261e2da85"
+  },
+  "limitations": [
+    "Archived terminal-fill rows are app-recorded fills; exchange contract notes and actual charges are unavailable.",
+    "Do not sum filled-trade P&L with mirrored session/ghost rows.",
+    "Final candles cannot distinguish every original intrabar disappearance from a stale/failed engine result.",
+    "Final-bar reconstruction uses present parameters and revised vendor history, not immutable live input snapshots.",
+    "Synthetic mechanism probes demonstrate behavior, not realized P&L improvement.",
+    "No matched actual-contract live comparison with other engines exists in this sample."
+  ]
+}

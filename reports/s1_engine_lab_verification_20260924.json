@@ -1,0 +1,153 @@
+{
+  "checks": [
+    {
+      "key": "s1|NIFTY|1min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|NIFTY|5min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|NIFTY|15min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|BANKNIFTY|1min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|BANKNIFTY|5min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|BANKNIFTY|15min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|MIDCPNIFTY|1min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|MIDCPNIFTY|5min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|MIDCPNIFTY|15min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|SENSEX|1min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|SENSEX|5min",
+      "matches_scanner": true
+    },
+    {
+      "key": "s1|SENSEX|15min",
+      "matches_scanner": true
+    }
+  ],
+  "snapshot": {
+    "enabled": true,
+    "modes": [
+      "s1"
+    ],
+    "active_engine": "s1",
+    "rows": [
+      {
+        "engine": "s1",
+        "active": true,
+        "signals": 494,
+        "fresh_signals": 1,
+        "buy": 195,
+        "sell": 299,
+        "bias": 0.17,
+        "open": 5,
+        "open_rows": [
+          {
+            "instrument": "NIFTY",
+            "timeframe": "15min",
+            "direction": "LONG",
+            "entry": 23415.5,
+            "ltp": 23431.65,
+            "pnl_points": 16.15,
+            "source_lane": ""
+          },
+          {
+            "instrument": "NIFTY",
+            "timeframe": "5min",
+            "direction": "LONG",
+            "entry": 23436.65,
+            "ltp": 23431.65,
+            "pnl_points": -5.0,
+            "source_lane": ""
+          },
+          {
+            "instrument": "BANKNIFTY",
+            "timeframe": "15min",
+            "direction": "LONG",
+            "entry": 56523.15,
+            "ltp": 56542.85,
+            "pnl_points": 19.7,
+            "source_lane": ""
+          },
+          {
+            "instrument": "MIDCPNIFTY",
+            "timeframe": "5min",
+            "direction": "LONG",
+            "entry": 14556.45,
+            "ltp": 14562.8,
+            "pnl_points": 6.35,
+            "source_lane": ""
+          },
+          {
+            "instrument": "MIDCPNIFTY",
+            "timeframe": "15min",
+            "direction": "LONG",
+            "entry": 14562.8,
+            "ltp": 14562.8,
+            "pnl_points": 0.0,
+            "source_lane": ""
+          }
+        ],
+        "closed": 229,
+        "wins": 77,
+        "losses": 152,
+        "win_rate": 33.6,
+        "gross_gain": 9499.87,
+        "gross_loss": 13460.77,
+        "net_points": -3960.9,
+        "open_points": 37.2,
+        "total_points": -3923.7,
+        "profit_factor": 0.71,
+        "sharpe": -2.23,
+        "lane_A_signals": 0,
+        "lane_B_signals": 0,
+        "lane_A_pnl": 0.0,
+        "lane_B_pnl": 0.0,
+        "dual_concurrent_pnl": 0,
+        "lane_jaccard": 0.0,
+        "last_signal": {
+          "type": "BUY",
+          "instrument": "SENSEX",
+          "timeframe": "15min",
+          "price": 74924.72,
+          "source": "s1",
+          "source_lane": ""
+        },
+        "errors": 0
+      }
+    ],
+    "summary": {
+      "engines": 1,
+      "signals": 494,
+      "fresh_signals": 1,
+      "open": 5,
+      "closed": 229,
+      "latency_ms": 2574
+    },
+    "updated_at": "2026-09-24T09:03:19.856560"
+  }
+}

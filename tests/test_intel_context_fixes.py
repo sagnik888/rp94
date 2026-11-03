@@ -133,8 +133,10 @@ def test_breadth_context_as_of_does_not_read_live_cache():
 
 
 def test_breadth_context_live_path_still_uses_cache():
+    import time
     scanner = Scanner.__new__(Scanner)
     scanner.active_indices = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
+    scanner._intel_cache_time={f'{name}_5min':time.time() for name in scanner.active_indices}
     scanner.latest_regimes = {}
     scanner._cached_timeframe_intel = lambda *a, **k: {
         "regime": {"regime": "TRENDING_UP"},

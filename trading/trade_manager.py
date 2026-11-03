@@ -11,6 +11,7 @@ Handles:
 """
 
 import uuid
+import copy
 import inspect
 import math
 import re
@@ -311,6 +312,10 @@ class Trade:
     # Full versioned signal-quality evidence, kept as JSON-compatible data so the
     # ACCEPTED decision and eventual EXIT can be attributed to the same gate route.
     quality_verdict: Dict[str, Any] = field(default_factory=dict)
+    decision_record: Dict[str, Any] = field(default_factory=dict)
+    # Why the position was closed (engine/exit_decision_record.py): owner, controlling
+    # reason, profit-lock trace and proposals a HOLD suppressed.
+    exit_decision_record: Dict[str, Any] = field(default_factory=dict)
     # Frozen entry evidence used for exit comparison and offline outcome calibration.
     # These used to be runtime-only setattrs and disappeared on restart.
     entry_intel: Dict[str, Any] = field(default_factory=dict)
@@ -335,6 +340,10 @@ class Trade:
     # that gap put the answer between -Rs.18,114 and +Rs.10,988 — a range wide enough to
     # be useless. The path closes it. See _sample_pnl_path for the cost bound.
     pnl_path: List[Tuple[float, float]] = field(default_factory=list)
+    # Units of pnl_path: gross before round-trip cost, the same basis as peak_pnl and the
+    # TradeCandidate path (rtracker's PNL_BASIS_GROSS). The path is not persisted, so a
+    # restored trade restarts it on this basis. Net before 2026-09-17.
+    pnl_path_basis: str = "GROSS_BEFORE_ROUND_TRIP_COST"
     # Historical-only point-in-time audit evidence. Empty on live trades. Keeping it
     # on the trade row lets backtest reports prove which guards were evaluated and
     # which minute path produced the exit instead of exposing only the final P&L.
@@ -348,6 +357,8 @@ class Trade:
     is_reversion_scalp: bool = False
     signal_fire_mode: str = "INTRACANDLE"
     entered_intracandle: bool = True
+    uts_confirmed: bool = False
+    uts_repaint_exit_required: bool = False
     # Has the post-entry repaint check completed for this trade? PERSISTED, because it
     # was previously only a dynamic setattr: a restart lost it, and an intracandle trade
     # then rehydrated as "structurally unconfirmed" for the rest of the day — which
@@ -375,6 +386,12 @@ class Trade:
     source_engine: str = ""
     source_engines: List[str] = field(default_factory=list)
     source_lane: str = ""
+    # Exit-policy owner frozen at admission ("S1"/"UTS"/"GENERIC"; "" = legacy row).
+    # Management reads this, never the lane admission switches. See s1_lane.
+    exit_policy_owner: str = ""
+    s1_best_spot: Optional[float] = None
+    s1_t1_locked: bool = False
+    s1_peak_premium: Optional[float] = None
     quad_union_entry: bool = False
     raw_union_entry: bool = False
     initial_stop: float = 0.0
@@ -384,6 +401,9 @@ class Trade:
     # remain dynamic setattrs that disappear on a process restart.
     lifecycle_id: str = ""
     runner_mode: bool = False
+    # Contract-price distance frozen when the hard target is removed. Retain it
+    # across restart so runner protection does not revert to a planned RR.
+    original_target_distance: float = 0.0
     runner_activation_timestamp: Optional[datetime] = None
     runner_activation_reason: str = ""
     runner_stop: float = 0.0
@@ -543,7 +563,8 @@ class Trade:
             # entry was still pending, and it survived onto the closed row after the
             # order turned out to have been rejected.
             "pnl": 0.0 if self._never_reached_market() else round(
-                (self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0, 0
+                (self.unrealized_pnl if self.status == "OPEN" else self.pnl) or 0.0,
+                2,
             ),
             "charges": self.charges,
             "broker_realised_cumulative": self.broker_realised_cumulative,
@@ -598,6 +619,8 @@ class Trade:
             "entry_policy_underlying_stop_pct": self.entry_policy_underlying_stop_pct,
             "entry_policy_version": self.entry_policy_version,
             "quality_verdict": dict(self.quality_verdict or {}),
+            "decision_record": dict(self.decision_record or {}),
+            "exit_decision_record": dict(self.exit_decision_record or {}),
             "entry_intel": dict(self.entry_intel or {}),
             "decision_intel": dict(self.decision_intel or {}),
             "calibration_outcome_recorded": bool(self.calibration_outcome_recorded),
@@ -612,6 +635,8 @@ class Trade:
             "replay_exit_trace": list(self.replay_exit_trace or []),
             "signal_fire_mode": self.signal_fire_mode,
             "entered_intracandle": self.entered_intracandle,
+            "uts_confirmed": self.uts_confirmed,
+            "uts_repaint_exit_required": self.uts_repaint_exit_required,
             "repaint_guard_checked": self.repaint_guard_checked,
             "gtt_arm_uncertain": self.gtt_arm_uncertain,
             "market_regime": self.market_regime,
@@ -627,12 +652,17 @@ class Trade:
             "source_engine": self.source_engine,
             "source_engines": list(self.source_engines or []),
             "source_lane": self.source_lane,
+            "exit_policy_owner": self.exit_policy_owner,
+            "s1_best_spot": self.s1_best_spot,
+            "s1_t1_locked": self.s1_t1_locked,
+            "s1_peak_premium": self.s1_peak_premium,
             "quad_union_entry": self.quad_union_entry,
             "raw_union_entry": self.raw_union_entry,
             "initial_stop": self.initial_stop if self.initial_stop is not None else 0.0,
             "scalp_lock_mode": bool(self.scalp_lock_mode),
             "lifecycle_id": str(self.lifecycle_id or self.id or ""),
             "runner_mode": bool(self.runner_mode),
+            "original_target_distance": float(self.original_target_distance or 0.0),
             "runner_activation_timestamp": (
                 self.runner_activation_timestamp.isoformat()
                 if self.runner_activation_timestamp
@@ -714,6 +744,16 @@ class Trade:
                 return ist.localize(parsed) if parsed.tzinfo is None else parsed.astimezone(ist)
             except (TypeError, ValueError):
                 return None
+
+        entered_intracandle = data.get("entered_intracandle")
+        if entered_intracandle is None:
+            entered_intracandle = True  # Unknown legacy entry timing is not confirmation.
+            if str(data.get("source_lane") or "").upper() == "UTS" or data.get("source_engine") == "ut_smart":
+                source_time = parse_ist_datetime(data.get("signal_time") or data.get("signal_timestamp"))
+                fill_time = parse_ist_datetime(data.get("entry_filled_at")) or (entry_time if ts else None)
+                minutes = {"1min": 1, "5min": 5, "15min": 15}.get(str(data.get("timeframe") or ""))
+                if source_time is not None and fill_time is not None and minutes is not None:
+                    entered_intracandle = fill_time < source_time + timedelta(minutes=minutes)
         
         # Extract base instrument name (strip strike info like "NIFTY 24100 CE" -> "NIFTY")
         raw_instrument = data.get("instrument", "")
@@ -831,6 +871,11 @@ class Trade:
             ),
             entry_policy_version=str(data.get("entry_policy_version") or ""),
             quality_verdict=dict(data.get("quality_verdict") or {}),
+            decision_record=dict(data.get("decision_record") or {}),
+            exit_decision_record=(
+                dict(data.get("exit_decision_record"))
+                if isinstance(data.get("exit_decision_record"), dict) else {}
+            ),
             entry_intel=dict(data.get("entry_intel") or {}),
             decision_intel=dict(data.get("decision_intel") or {}),
             calibration_outcome_recorded=bool(data.get("calibration_outcome_recorded", False)),
@@ -838,6 +883,7 @@ class Trade:
             exit_time=exit_time,
             exit_reason=data.get("exit_reason", ""),
             pnl=data.get("pnl", 0.0),
+            charges=float(data.get("charges") or 0.0),
             broker_realised_cumulative=(
                 float(data.get("broker_realised_cumulative"))
                 if data.get("broker_realised_cumulative") is not None
@@ -861,7 +907,9 @@ class Trade:
                 if isinstance(row, dict)
             ],
             signal_fire_mode=str(data.get("signal_fire_mode") or "INTRACANDLE"),
-            entered_intracandle=bool(data.get("entered_intracandle", True)),
+            entered_intracandle=bool(entered_intracandle),
+            uts_confirmed=bool(data.get("uts_confirmed", False)),
+            uts_repaint_exit_required=bool(data.get("uts_repaint_exit_required", False)),
             repaint_guard_checked=bool(data.get("repaint_guard_checked", False)),
             gtt_arm_uncertain=bool(data.get("gtt_arm_uncertain", False)),
             market_regime=str(data.get("market_regime") or ""),
@@ -881,12 +929,17 @@ class Trade:
             source_engine=str(data.get("source_engine") or ""),
             source_engines=list(data.get("source_engines") or []),
             source_lane=str(data.get("source_lane") or ""),
+            exit_policy_owner=str(data.get("exit_policy_owner") or ""),
+            s1_best_spot=data.get("s1_best_spot"),
+            s1_t1_locked=bool(data.get("s1_t1_locked", False)),
+            s1_peak_premium=data.get("s1_peak_premium"),
             quad_union_entry=bool(data.get("quad_union_entry", False)),
             raw_union_entry=bool(data.get("raw_union_entry", False)),
             initial_stop=float(data.get("initial_stop") or data.get("trailing_stop") or 0.0),
             scalp_lock_mode=bool(data.get("scalp_lock_mode", False)),
             lifecycle_id=str(data.get("lifecycle_id") or data.get("id") or ""),
             runner_mode=bool(data.get("runner_mode", False)),
+            original_target_distance=float(data.get("original_target_distance") or 0.0),
             runner_activation_timestamp=parse_ist_datetime(
                 data.get("runner_activation_timestamp")
             ),
@@ -970,6 +1023,23 @@ class Trade:
                 gross = (self.entry_price - self.current_price) * sized
             
         return gross - est_charges
+
+    @property
+    def unrealized_gross_pnl(self) -> float:
+        """The gross half of unrealized_pnl: mark-to-market before any charges.
+
+        Mirrors the gross arithmetic above exactly (pinned by a test) without touching
+        the net figure the loss cap reads. pnl_path and peak_pnl are gross; sampling the
+        net ``pnl`` left broker rows on a different basis from every paper row.
+        """
+        if self.status != "OPEN":
+            return 0.0
+        sized = self.pnl_quantity
+        if self.inst_type == "OPT":
+            return (self.current_price - self.entry_price) * sized
+        if self.direction == "LONG":
+            return (self.current_price - self.entry_price) * sized
+        return (self.entry_price - self.current_price) * sized
 
 
 class TradeManager:
@@ -1170,6 +1240,36 @@ class TradeManager:
                 logger.debug(f"Exit-fill lookup failed for {order_id}: {exc}")
         return self._position_exit_price(trade, position)
 
+    def _adopt_completed_protective_fill(self, trade: Trade) -> bool:
+        """Bind a flat position to its own completed protective order, before cleanup."""
+        order_id = str(getattr(trade, "protective_order_id", "") or "").strip()
+        getter = getattr(getattr(self, "broker", None), "get_fill", None)
+        if not order_id or not callable(getter):
+            return False
+        try:
+            fill = getter(order_id) or {}
+            quantity = int(fill.get("quantity") or 0)
+            required = int(getattr(trade, "protective_quantity", 0) or trade.quantity)
+            price = float(fill.get("average_price") or 0.)
+            # get_fill's FILLED includes partial executions. A partial protective
+            # fill must not replace a separate exit or erase a still-working stop.
+            if (fill.get("state") != "FILLED" or quantity < required or required <= 0
+                    or not math.isfinite(price) or price <= 0):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        except Exception as exc:
+            logger.debug(f"Protective fill lookup deferred for {order_id}: {type(exc).__name__}")
+            return False
+        trade.exit_order_id = order_id
+        trade.exit_price = price
+        trade.exit_reason = "STOP_HIT"
+        # The order has filled. Retain its identity in exit_order_id and never
+        # send a cancellation or an unowned-stop alert for this completed order.
+        trade.protective_order_id = ""
+        self._record_fill(trade, order_id, -quantity, "PROTECTIVE")
+        return True
+
     @staticmethod
     def _position_exit_price(trade: Trade, position: Dict) -> float:
         value = (
@@ -1190,8 +1290,58 @@ class TradeManager:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _is_utema_trade(trade) -> bool:
+        """Persisted native ownership, independent of the selected scanner or switches."""
+        return bool(
+            str(getattr(trade, "exit_policy_owner", "") or "").upper() == "UTEMA"
+            and str(getattr(trade, "source_lane", "") or "").upper() == "UTEMA"
+            and str(getattr(trade, "source_engine", "") or "").lower() in {"", "ut_ema"}
+        )
+
+    @staticmethod
+    def _utema_execution_geometry(inst_type, direction, entry, stop, target, *, protected_add=False):
+        """Validate native execution prices without another strategy's RR or stop floor."""
+        try:
+            entry, stop, target = float(entry), float(stop), float(target)
+        except (TypeError, ValueError, OverflowError):
+            return False, "UTEMA execution geometry is malformed"
+        if not all(math.isfinite(v) for v in (entry, stop, target)) or entry <= 0 or stop <= 0 or target < 0:
+            return False, "UTEMA execution geometry must be finite and positive"
+        kind, side = str(inst_type or "").upper(), str(direction or "").upper()
+        if kind not in {"OPT", "FUT"} or side not in {"LONG", "SHORT"}:
+            return False, "UTEMA execution identity is unsupported"
+        long_price = kind == "OPT" or side == "LONG"
+        if not protected_add and (stop >= entry if long_price else stop <= entry):
+            return False, "UTEMA initial stop is not protective"
+        if target > 0 and (target <= entry if long_price else target >= entry):
+            return False, "UTEMA target is not on the profitable side"
+        return True, ""
+
+    @staticmethod
+    def _utema_touch_admission(price, quote, *, inst_type="OPT", direction="LONG", required=False):
+        """Require measured executable prices, without inherited spread/liquidity filters."""
+        if not required:
+            return True, ""
+        from config.settings import get_settings
+        try:
+            quote = quote if isinstance(quote, dict) else {}
+            bid, ask, age = float(quote.get("bid") or 0), float(quote.get("ask") or 0), float(quote["age_seconds"])
+            limit = max(.05, float(getattr(get_settings(), "execution_touch_quote_max_age_seconds", 1.5) or 1.5))
+            mark = float(price)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, "UTEMA fresh executable quote is unavailable"
+        if (not quote.get("usable") or not all(math.isfinite(v) for v in (bid, ask, age, mark))
+                or bid <= 0 or ask < bid or not 0 <= age <= limit):
+            return False, "UTEMA executable quote is invalid or stale"
+        touch = ask if str(inst_type).upper() == "OPT" or str(direction).upper() == "LONG" else bid
+        if abs(mark - touch) > .050000001:
+            return False, "UTEMA execution price does not match the current touch"
+        return True, ""
+
     def _same_contract_entry_blocked(
-        self, trading_symbol: str, *, is_recovery: bool = False, is_ghost: bool = False
+        self, trading_symbol: str, *, is_recovery: bool = False, is_ghost: bool = False,
+        native_owner: str = "",
     ) -> Tuple[bool, str]:
         """Refuse a second REAL position on a contract that already holds one.
 
@@ -1233,9 +1383,13 @@ class TradeManager:
         if not siblings:
             return False, ""
 
+        native_stack = str(native_owner or "").upper() == "UTEMA" and all(
+            self._is_utema_trade(existing) for existing in siblings
+        )
+
         if _setting_enabled(
             getattr(settings, "forbid_concurrent_same_contract_real", True), True
-        ):
+        ) and not native_stack:
             first = siblings[0]
             return True, (
                 f"{symbol} already held by trade {getattr(first, 'id', '?')} "
@@ -1251,7 +1405,7 @@ class TradeManager:
         # falls back to splitting the aggregate, and that split is a guess the moment a
         # sibling exits. Refusing to ADD to such a contract keeps the guess confined to
         # a single position, where it cannot mis-size anything.
-        if not _setting_enabled(
+        if not native_stack and not _setting_enabled(
             getattr(settings, "same_contract_requires_ledger_evidence", True), True
         ):
             return False, ""
@@ -2472,6 +2626,169 @@ class TradeManager:
         logger.info(f"GTT {trigger_id} released for {trade.trading_symbol}: {note}")
         return True
 
+    @staticmethod
+    def _verified_uts_protective_stop(order, trade, quantity, expected_trigger) -> bool:
+        """Match the actual exchange stop before a UTS extension or its restoration."""
+        if not isinstance(order, dict):
+            return False
+        try:
+            actual = float(order.get("triggerprice") or order.get("trigger_price") or 0.0)
+            units = float(order.get("quantity", 0))
+            filled = float(order.get("filledshares") or order.get("filled_quantity") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            TradeManager._order_status_text(order) in {"trigger pending", "triggerpending"}
+            and str(order.get("orderid") or order.get("order_id") or "") == str(trade.protective_order_id)
+            and str(order.get("tradingsymbol") or order.get("trading_symbol") or "") == trade.trading_symbol
+            and str(order.get("transactiontype") or order.get("transaction_type") or "").upper() == "SELL"
+            and all(math.isfinite(value) for value in (actual, units, filled))
+            and actual >= expected_trigger - 1e-9 and abs(actual - expected_trigger) <= 0.05 + 1e-9
+            and units == quantity and filled == 0
+        )
+
+    def request_uts_stop_extension(self, trade, stop, *, quote_verified: bool, now) -> bool:
+        """Queue one UTS exception; the original stop stays active until broker acknowledgement."""
+        from engine import uts_lane
+        if not quote_verified or not uts_lane.is_uts(trade) or stop <= 0:
+            return False
+        guard = getattr(self, "uts_stop_extension_guard", None)
+        entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+        current = float(getattr(trade, "current_stop", 0.0) or 0.0)
+        recorded = getattr(trade, "quality_verdict", {}) or {}
+        checks = recorded.get("checks") or {}
+        _, normal, wide = uts_lane.premium_cap_tiers(trade)
+        normal_ratio, wide_ratio = 1.0 - normal / 100., 1.0 - wide / 100.
+        approach_ratio = 1.0 - normal * .7 / 100.
+        if (entry <= 0 or recorded.get("policy_version") != "uts_native.v1"
+                or checks.get("uts_premium_cap_pct") != normal
+                or checks.get("uts_stop_extension_attempted") or checks.get("uts_stop_extended")
+                or str(getattr(trade, "timeframe", "")) != "5min"
+                or abs(current / entry - normal_ratio) > 0.001 or stop < entry * wide_ratio - 1e-9
+                or abs(stop / entry - wide_ratio) > 0.001
+                or not current < float(getattr(trade, "current_price", 0.0)) <= entry * approach_ratio
+                or getattr(self, "options_sl_pct", 15.0) < wide
+                or getattr(trade, "is_recovery", False)
+                or stop >= current or getattr(trade, "pending_exit", False)):
+            return False
+        if not callable(guard) or not guard(trade, stop):
+            return False
+        if self.mode != "REAL" or getattr(trade, "is_ghost", False):
+            uts_lane.commit_extension(trade, stop, now)
+            self._mark_dirty()
+            return True
+        if not getattr(trade, "protective_order_id", ""):
+            return False
+        if not getattr(self, "_protection_lock", None):
+            self._protection_lock = threading.RLock()
+        with self._protection_lock:
+            if getattr(trade, "_uts_extension_request", None):
+                return False
+            trade._uts_extension_request = dict(stop=float(stop), at=time.monotonic(), clock=now)
+        self.nudge_position_sync()
+        return False
+
+    def _apply_uts_stop_extension(self, trade, quantity) -> bool:
+        """Called only under the broker protection lock; never relax a touched/profit stop."""
+        request = getattr(trade, "_uts_extension_request", None)
+        if not request:
+            return False
+        trade._uts_extension_request = None
+        from engine import uts_lane
+        recorded = dict(getattr(trade, "quality_verdict", {}) or {})
+        checks = dict(recorded.get("checks") or {})
+        entry, stop, price = float(trade.entry_price), float(trade.current_stop), float(trade.current_price)
+        desired = math.ceil(float(request["stop"]) / 0.05 - 1e-9) * 0.05
+        guard = getattr(self, "uts_stop_extension_guard", None)
+        _, normal, wide = uts_lane.premium_cap_tiers(trade)
+        normal_ratio, wide_ratio = 1.0 - normal / 100., 1.0 - wide / 100.
+        approach_ratio = 1.0 - normal * .7 / 100.
+        if (not uts_lane.is_uts(trade) or recorded.get("policy_version") != "uts_native.v1"
+                or entry <= 0 or checks.get("uts_premium_cap_pct") != normal
+                or trade.timeframe != "5min" or getattr(trade, "is_recovery", False)
+                or getattr(self, "options_sl_pct", 15.0) < wide
+                or checks.get("uts_stop_extension_attempted") or checks.get("uts_stop_extended")
+                or time.monotonic() - request["at"] > 2.0 or trade.pending_exit
+                or getattr(trade, "quote_verified", True) is False
+                or getattr(trade, "_uts_stop_touch_pending", False)
+                or abs(stop / entry - normal_ratio) > 0.001 or not stop < price <= entry * approach_ratio
+                or desired < entry * wide_ratio - 1e-9 or desired > entry * wide_ratio + 0.05 or desired >= stop
+                or not callable(guard) or not guard(trade, desired)):
+            return False
+        existing = str(getattr(trade, "protective_order_id", "") or "")
+        qty = self._transactable_quantity(trade, quantity)
+        if not existing or qty <= 0:
+            return False
+        if self._trade_owning_protective_order(existing, exclude_id=trade.id) is not None:
+            return False
+        getter = getattr(self.broker, "get_order_status", None)
+
+        try:
+            before = getter(existing) if callable(getter) else None
+        except Exception:
+            return False
+        if not self._verified_uts_protective_stop(before, trade, qty, stop):
+            return False  # Never relax a tighter, mismatched, triggered or unknown stop.
+        # A slow status request can outlive the permission window, or another
+        # cycle can observe a stop touch while that broker read is in flight.
+        if (trade.pending_exit or getattr(trade, "_uts_stop_touch_pending", False)
+                or getattr(trade, "quote_verified", True) is False
+                or float(trade.current_stop) != stop
+                or not stop < float(trade.current_price) <= entry * approach_ratio
+                or not guard(trade, desired) or time.monotonic() - request["at"] > 2.0):
+            return False
+        checks["uts_stop_extension_attempted"] = True
+        recorded["checks"] = checks
+        trade.quality_verdict = recorded
+        self._mark_dirty()
+        try:
+            accepted = self.broker.modify_protective_stop(existing, trade.trading_symbol,
+                trade.symbol_token, qty, "SELL", round(desired, 2), self.product_type)
+        except Exception as exc:
+            logger.warning("UTS stop extension refused: {}", type(exc).__name__)
+            accepted = False
+        if not accepted:
+            # A timeout/refusal can arrive after the exchange accepted the write.
+            # Preserve the tighter local stop and force conservative reconciliation.
+            trade.protective_trigger = min(float(getattr(trade, "protective_trigger", 0.0) or desired), desired)
+            trade.protective_quantity = qty
+            checks["uts_stop_extension_uncertain"] = True
+            trade.quality_verdict = {**recorded, "checks": checks}
+            self._mark_recovery(trade, "UTS stop extension not acknowledged; restore original protection")
+            self._mark_dirty()
+            self.nudge_position_sync()
+            return False
+        try:
+            after = getter(existing)
+        except Exception:
+            after = None
+        if (not self._verified_uts_protective_stop(after, trade, qty, desired)
+                or trade.pending_exit or getattr(trade, "_uts_stop_touch_pending", False)
+                or getattr(trade, "quote_verified", True) is False
+                or float(trade.current_stop) != stop
+                or not stop < float(trade.current_price) <= entry * approach_ratio
+                or not guard(trade, desired)
+                or self._transactable_quantity(trade, quantity) != qty
+                or time.monotonic() - request["at"] > 2.0):
+            # The broker may already hold the wider stop even though confirmation or
+            # this cycle's permission disappeared. Keep the local stop, account for
+            # that possible lower trigger and let normal protection tighten it back.
+            trade.protective_trigger = min(float(getattr(trade, "protective_trigger", 0.0) or desired), desired)
+            trade.protective_quantity = qty
+            checks["uts_stop_extension_uncertain"] = True
+            trade.quality_verdict = {**recorded, "checks": checks}
+            self._mark_recovery(trade, "UTS stop extension state uncertain; restore original protection")
+            self._mark_dirty()
+            self.nudge_position_sync()
+            return False
+        uts_lane.commit_extension(trade, round(desired, 2), request["clock"])
+        trade._entry_option_stop_cap_pct = wide
+        trade.protective_trigger = round(desired, 2)
+        trade.protective_quantity = qty
+        trade.protective_updated_at = datetime.now(IST)
+        self._mark_dirty()
+        return True
+
     def ensure_broker_protection(self, trade: Trade, quantity: Optional[int] = None) -> bool:
         """Create or tighten the exchange-side SL-M for a confirmed REAL position."""
         if getattr(self, "mode", "HISTORICAL") != "REAL" or getattr(trade, "is_ghost", False):
@@ -2495,6 +2812,8 @@ class TradeManager:
         if not hasattr(self, "_protection_lock"):
             self._protection_lock = threading.RLock()
         with self._protection_lock:
+            if self._apply_uts_stop_extension(trade, quantity):
+                return True
             now = time.monotonic()
             if not hasattr(self, "_last_protective_sync"):
                 self._last_protective_sync = {}
@@ -2551,6 +2870,26 @@ class TradeManager:
                     ok = False
                 self._last_protective_sync[trade.id] = now
                 if ok:
+                    verdict = getattr(trade, "quality_verdict", {}) or {}
+                    checks = verdict.get("checks", {}) if isinstance(verdict, dict) else {}
+                    uncertain_uts = (
+                        str(getattr(trade, "source_lane", "") or "").upper() == "UTS"
+                        and isinstance(verdict, dict) and verdict.get("policy_version") == "uts_native.v1"
+                        and isinstance(checks, dict) and checks.get("uts_stop_extension_uncertain")
+                    )
+                    if uncertain_uts:
+                        getter = getattr(self.broker, "get_order_status", None)
+                        try:
+                            restored = getter(existing) if callable(getter) else None
+                        except Exception:
+                            restored = None
+                        if not self._verified_uts_protective_stop(restored, trade, qty, trigger):
+                            self._mark_recovery(trade, "UTS original protection restoration not verified")
+                            self._mark_dirty()
+                            return False
+                        clean_checks = dict(checks)
+                        clean_checks.pop("uts_stop_extension_uncertain", None)
+                        trade.quality_verdict = {**verdict, "checks": clean_checks}
                     trade.protective_trigger = trigger
                     trade.protective_quantity = qty
                     trade.protective_updated_at = datetime.now(IST)
@@ -2874,6 +3213,59 @@ class TradeManager:
                 f"{verdict.get('limitation') or verdict.get('reason') or 'insufficient margin'}"
             )
         return verdict
+
+    def _trim_lots_to_funds_enabled(self) -> bool:
+        try:
+            from config.settings import get_settings
+
+            value = getattr(get_settings(), "entry_trim_lots_to_funds_enabled", True)
+        except Exception:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", ""}
+        return bool(value)
+
+    def _trim_entry_lots_to_funds(self, trade: Trade, symbol: str, side: str, price: float, verdict):
+        """Shrink an unaffordable multi-lot entry to the most lots the funds cover.
+
+        2026-09-25 user: "if lack of capital then use 1 lot or whatever possible with the
+        available capital and avoid the rest ... without cancelling the full trade". Only a
+        definitive shortfall with both numbers known is trimmed; the trimmed size is priced
+        by the broker again (and reserved) before it is used. Returns the passing verdict,
+        or None when not even one lot can be funded.
+        """
+        lots = int(getattr(trade, "lots", 1) or 1)
+        if lots <= 1 or not self._trim_lots_to_funds_enabled() or not isinstance(verdict, dict):
+            return None
+        try:
+            available = float(verdict.get("available"))
+            required = float(verdict.get("required"))
+            reserved = float(verdict.get("reserved") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if required <= 0:
+            return None
+        per_lot = required / lots
+        fit = int((available - reserved) // per_lot) if per_lot > 0 else 0
+        fit = max(0, min(lots - 1, fit))
+        lot_size = int(getattr(trade, "lot_size", 1) or 1)
+        for size in range(fit, max(0, fit - 3), -1):
+            if size < 1:
+                break
+            check = self._entry_margin_verdict(symbol, size * lot_size, side, price)
+            if check is None or check.get("ok", True):
+                with self._lock:
+                    setattr(trade, "requested_lots", lots)
+                    trade.lots = size
+                self._mark_dirty()
+                msg = (
+                    f"Entry trimmed to funds: {symbol} {size} of {lots} lots "
+                    f"(available {available:,.0f}, {lots} lots need {required:,.0f})"
+                )
+                logger.warning(msg)
+                self._log_ui(msg, "warning")
+                return check if check is not None else {"ok": True, "reservation_id": ""}
+        return None
 
     def _live_position_for_trade(self, trade: Trade):
         """This trade's broker position row, or None when the book says flat.
@@ -3243,7 +3635,7 @@ class TradeManager:
     # ── scale-in ─────────────────────────────────────────────────────────────
     def scale_in_trade(
         self, trade_id: str, add_lots: Optional[int] = None, price: float = 0.0,
-        reason: str = "CASCADE_ADD",
+        reason: str = "CASCADE_ADD", *, native_alignment: bool = False,
     ) -> Tuple[bool, str]:
         """Add lots to a position that is already working.
 
@@ -3261,13 +3653,28 @@ class TradeManager:
         from config.settings import get_settings
 
         settings = get_settings()
-        if not _setting_enabled(getattr(settings, "scale_in_enabled", False), False):
+        if not native_alignment and not _setting_enabled(getattr(settings, "scale_in_enabled", False), False):
             return False, "scale-in disabled"
 
         with self._lock:
             trade = self.open_trades.get(trade_id)
             if not trade or trade.status != "OPEN":
                 return False, "trade is not cleanly open"
+            if native_alignment:
+                if not self._is_utema_trade(trade):
+                    return False, "native alignment requires persisted UTEMA ownership"
+                if add_lots != 1 or int(getattr(trade, "scale_in_count", 0) or 0) != 0:
+                    return False, "UTEMA alignment permits exactly one additional lot once"
+                if getattr(trade, "pending_execution", False):
+                    return False, "UTEMA entry fill is not confirmed"
+                if self._live_orders_permitted() and not getattr(trade, "is_ghost", False):
+                    if not bool(getattr(getattr(self, "scanner", None), "auto_mode", False)):
+                        return False, "UTEMA alignment is virtual while Auto is off"
+                    if getattr(self, "broker", None) is None:
+                        return False, "UTEMA broker is unavailable"
+                    owned = self._ledger_owned_quantity(str(trade.id))
+                    if owned is None or owned <= 0 or self._confirmed_broker_quantity(trade) <= 0:
+                        return False, "UTEMA alignment requires its own confirmed entry fill"
             if trade.pending_exit or str(trade.execution_status or "").upper() in {
                 "EXIT_PENDING", "PARTIAL_EXIT", "RECOVERY_REQUIRED",
             }:
@@ -3291,24 +3698,24 @@ class TradeManager:
             if add_lots < 1:
                 return False, "no lots to add"
             max_adds = max(0, int(getattr(settings, "scale_in_max_adds_per_trade", 2) or 0))
-            if int(getattr(trade, "scale_in_count", 0) or 0) >= max_adds:
+            if not native_alignment and int(getattr(trade, "scale_in_count", 0) or 0) >= max_adds:
                 return False, f"add cap {max_adds} reached"
             max_total = max(1, int(getattr(settings, "scale_in_max_total_lots", 6) or 6))
-            if int(trade.lots or 0) + add_lots > max_total:
+            if not native_alignment and int(trade.lots or 0) + add_lots > max_total:
                 return False, f"would exceed {max_total} total lots"
 
             price = float(price or trade.current_price or trade.entry_price or 0.0)
             if price <= 0:
                 return False, "no usable price"
 
-            ok, why = self._scale_in_is_earned(trade, settings)
+            ok, why = (True, "") if native_alignment else self._scale_in_is_earned(trade, settings)
             if not ok:
                 return False, why
 
             # An add-on is new money at risk even though it is not a new position, so it
             # faces the rupee budget. It does NOT face the per-index/bucket count caps —
             # those bound how many ideas are live, and this is the same idea.
-            admitted, risk_why = self._entry_risk_admission(
+            admitted, risk_why = (True, "") if native_alignment else self._entry_risk_admission(
                 inst_type=trade.inst_type,
                 direction=trade.direction,
                 price=price,
@@ -3379,7 +3786,9 @@ class TradeManager:
                 return True, "booked"
             setattr(trade, "_scale_in_inflight", True)
 
-        self._request_broker_scale_in(trade, add_lots, price, reason)
+        submitted = self._request_broker_scale_in(trade, add_lots, price, reason)
+        if native_alignment and submitted is False:
+            return False, "UTEMA alignment execution queue is unavailable"
         return True, "submitted"
 
     def _scale_in_is_earned(self, trade: Trade, settings) -> Tuple[bool, str]:
@@ -3492,6 +3901,21 @@ class TradeManager:
         trade.scale_in_lots = int(getattr(trade, "scale_in_lots", 0) or 0) + int(add_lots)
         trade.scale_in_count = int(getattr(trade, "scale_in_count", 0) or 0) + 1
         trade.broker_quantity = total_qty
+        if self._is_utema_trade(trade):
+            self._cap_option_entry_stop(trade)
+            if str(getattr(trade, "inst_type", "")).upper() == "OPT":
+                trade.premium_entry = float(trade.entry_price)
+            state = getattr(trade, "utema_state", None)
+            if not isinstance(state, dict):
+                state = ((getattr(trade, "quality_verdict", {}) or {}).get("checks", {}) or {}).get("utema_state")
+            if isinstance(state, dict):
+                state["alignment_added"] = True
+                trade.utema_state = state
+                recorded = dict(getattr(trade, "quality_verdict", {}) or {})
+                checks = dict(recorded.get("checks", {}) or {})
+                checks["utema_state"] = dict(state)
+                recorded["checks"] = checks
+                trade.quality_verdict = recorded
         # add_qty is what was INTENDED; the ledger records what the add order executed.
         self._record_leg_fill_from_order(
             trade, getattr(trade, "scale_in_order_id", ""), "ADD", 1
@@ -3504,7 +3928,7 @@ class TradeManager:
 
     def _request_broker_scale_in(
         self, trade: Trade, add_lots: int, price: float, reason: str,
-    ) -> None:
+    ) -> bool:
         quantity = int(add_lots) * int(trade.lot_size or 1)
 
         def add_bg():
@@ -3527,6 +3951,8 @@ class TradeManager:
                 f"Scale-in for {trade.trading_symbol} was refused by the execution queue; "
                 "the position is untouched and fully protected."
             )
+            return False
+        return True
 
     def _option_contract_liquidity_admission(
         self,
@@ -3677,6 +4103,10 @@ class TradeManager:
             return None, "executable option book is empty or crossed"
         if age != age or age < 0 or age > max_age:
             return None, f"executable option book is stale ({age:.2f}s)"
+        if self._is_utema_trade(trade):
+            if not math.isfinite(bid) or not math.isfinite(ask):
+                return None, "executable option book has non-finite prices"
+            return dict(quote), ""
 
         spread = ask - bid
         mid = (ask + bid) / 2.0
@@ -3709,6 +4139,12 @@ class TradeManager:
     def _run_scale_in(
         self, trade: Trade, add_lots: int, quantity: int, price: float, reason: str,
     ) -> None:
+        if self._is_utema_trade(trade) and (
+            not self._live_orders_permitted()
+            or not bool(getattr(getattr(self, "scanner", None), "auto_mode", False))
+        ):
+            logger.warning(f"UTEMA alignment cancelled for {trade.id}: live Auto authority changed")
+            return
         entry_side = "BUY" if trade.inst_type == "OPT" else (
             "BUY" if str(trade.direction).upper() in {"LONG", "BUY"} else "SELL"
         )
@@ -3839,6 +4275,11 @@ class TradeManager:
                     delattr(trade, "_entry_policy_add_quantity")
                 except AttributeError:
                     pass
+        if self._is_utema_trade(trade) and (
+            not self._live_orders_permitted()
+            or not bool(getattr(getattr(self, "scanner", None), "auto_mode", False))
+        ):
+            allowed, guard_reason = False, "UTEMA live Auto authority changed during preflight"
         if not allowed:
             self._release_margin_reservations(reservations)
             logger.warning(
@@ -4010,7 +4451,14 @@ class TradeManager:
         return None
 
     def _sample_pnl_path(self, trade) -> None:
-        return sample_pnl_path(trade)
+        # Gross, like peak_pnl and the TradeCandidate path, so every rtracker EXIT path
+        # is on one basis. Diagnostics only: no exit guard reads pnl_path.
+        # Trade.pnl_path_basis declares it; a sample that cannot be gross is skipped.
+        try:
+            gross = float(trade.unrealized_gross_pnl)
+        except Exception:
+            return None
+        return sample_pnl_path(trade, pnl=gross)
 
     @staticmethod
     def _session_live_start() -> dtime:
@@ -4173,12 +4621,19 @@ class TradeManager:
             return True, ""
         if is_recovery:
             return True, ""
+        # Enabled means the operator asked for a PROOF that this entry fits the budget.
+        # When that proof cannot be computed the entry is refused, the same answer the
+        # pure evaluator gives for unknown risk. This used to admit the entry on import
+        # or evaluation failure (guard audit 2026-10-06, defect 5). Disabled, recovery
+        # and exits are unaffected; the broker-margin fallback is a separate check.
         try:
             from engine.entry_risk_policy import evaluate_entry_risk
         except Exception as exc:
-            # A missing policy module must not silently stop trading.
-            logger.debug(f"Entry-risk policy unavailable: {exc}")
-            return True, ""
+            logger.error(f"Entry-risk policy unavailable, refusing entry: {exc}")
+            return False, (
+                f"entry-risk budget enabled but its policy is unavailable "
+                f"({type(exc).__name__}); new exposure refused"
+            )
 
         candidate = {
             "inst_type": inst_type, "direction": direction, "price": price,
@@ -4202,8 +4657,11 @@ class TradeManager:
                 realized_loss_by_segment=self._realized_loss_by_segment(),
             )
         except Exception as exc:
-            logger.error(f"Entry-risk evaluation failed, allowing entry: {exc}")
-            return True, ""
+            logger.error(f"Entry-risk evaluation failed, refusing entry: {exc}")
+            return False, (
+                f"entry-risk budget could not be evaluated ({type(exc).__name__}: {exc}); "
+                "new exposure refused"
+            )
         return bool(decision.allowed), str(decision.reason)
 
     def _realized_loss_by_segment(self) -> Dict[str, float]:
@@ -5402,6 +5860,7 @@ class TradeManager:
             trade.broker_quantity = allocated_qty
             expected_qty = max(1, trade.quantity)
             if net_qty == 0:
+                protective_fill = self._adopt_completed_protective_fill(trade)
                 if trade.protective_order_id:
                     # This call used to be bare, and both halves of that were wrong.
                     #
@@ -5474,7 +5933,7 @@ class TradeManager:
                 if self._finalize_closed_trade(
                     trade_id,
                     trade,
-                    self._reconciled_exit_price(trade, position),
+                    trade.exit_price if protective_fill else self._reconciled_exit_price(trade, position),
                     reason,
                     realised_pnl=realised_pnl,
                     broker_realised_cumulative=realised_total,
@@ -5776,11 +6235,15 @@ class TradeManager:
     def save_state(self) -> bool:
         """Save active and recent closed trades to SQLite for crash recovery"""
         try:
-            with self._lock:
-                open_tr = list(self.open_trades.values())
-                self.closed_trades = self.closed_trades[-500:]
-                closed = list(self.closed_trades)
-                snapshot = [t.to_dict() for t in open_tr + closed]
+            # Serialize checkpoints in snapshot order, but let price/exit updates
+            # acquire the trade book while SQLite performs its transaction.
+            save_lock = self.__dict__.setdefault("_save_state_lock", threading.RLock())
+            with save_lock:
+                with self._lock:
+                    open_tr = list(self.open_trades.values())
+                    self.closed_trades = self.closed_trades[-500:]
+                    closed = list(self.closed_trades)
+                    snapshot = copy.deepcopy([t.to_dict() for t in open_tr + closed])
                 db.save_trades(snapshot)
         except Exception as e:
             self._mark_dirty()
@@ -6200,7 +6663,7 @@ class TradeManager:
         """Scanner arms this before opening a multi-signal cascade batch."""
         setattr(self, "_cascade_wave_capacity", bool(enabled))
 
-    def can_open_trade(self, is_recovery: bool = False) -> Tuple[bool, str]:
+    def can_open_trade(self, is_recovery: bool = False, *, native_utema: bool = False) -> Tuple[bool, str]:
         """Check if we can open a new trade"""
         with self._lock:
             if not is_recovery and self.orphan_positions:
@@ -6211,7 +6674,7 @@ class TradeManager:
                 if not getattr(trade, "is_ghost", False)
             )
             cap = self._effective_max_positions()
-            if not is_recovery and active_positions >= cap:
+            if not is_recovery and not native_utema and active_positions >= cap:
                 return False, f"Max positions ({cap}) reached"
         return True, ""
 
@@ -6321,6 +6784,76 @@ class TradeManager:
             return True, reason
         return False, reason or "entry submission guard rejected the queued entry"
 
+    def _cap_option_entry_stop(self, trade: Trade) -> None:
+        """Enforce the option premium ceiling at new-entry and actual-fill boundaries.
+
+        Existing recovered exposure is not repriced or given a retroactive stop.
+        This only tightens a stop; it never changes broker quantity or sends an order.
+        """
+        if trade.inst_type != "OPT" or bool(getattr(trade, "is_recovery", False)):
+            return
+        from engine.market_regime import option_stop_tolerance_pct
+
+        entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+        if not math.isfinite(entry) or entry <= 0:
+            return
+        cap = 15.0 if self._is_utema_trade(trade) else option_stop_tolerance_pct(
+            getattr(self, "options_sl_pct", 15.0), getattr(trade, "market_regime", "UNKNOWN"),
+            confidence=getattr(trade, "confidence", None), grade=getattr(trade, "grade", ""),
+            setup=trade,
+            fast_entry=bool(getattr(trade, "volume_spike_entry", False)
+                            or getattr(trade, "is_reversion_scalp", False)),
+        )
+        native_state = None
+        if self._is_utema_trade(trade):
+            state = getattr(trade, "utema_state", None)
+            if not isinstance(state, dict):
+                state = ((getattr(trade, "quality_verdict", {}) or {}).get("checks", {}) or {}).get("utema_state", {})
+            try:
+                frozen_cap = float(state.get("premium_risk_pct", 15.))
+                if math.isfinite(frozen_cap) and 0 < frozen_cap <= 15.:
+                    cap = min(cap, frozen_cap)
+                    native_state = state
+            except (TypeError, ValueError, AttributeError):
+                pass
+        selected_cap = getattr(trade, "_entry_option_stop_cap_pct", None)
+        if native_state is None:
+            current_stop = float(getattr(trade, "current_stop", 0.0) or 0.0)
+            if selected_cap is None and 0 < current_stop < entry:
+                selected_cap = (entry - current_stop) / entry * 100.0
+            if selected_cap is not None and 0 < float(selected_cap) <= 15.0:
+                cap = min(cap, float(selected_cap))
+        # Carry the selected risk percentage across the order queue and actual fill,
+        # including tight ATR/burst geometry whose candidate-only flags were dropped.
+        trade._entry_option_stop_cap_pct = cap
+        # Round the minimum SELL trigger upward to the broker's 0.05 option grid.
+        # Nearest-tick rounding can otherwise put a 15% stop slightly below its cap.
+        minimum_stop = math.ceil(entry * (1.0 - cap / 100.0) / 0.05 - 1e-9) * 0.05
+        stop = max(float(getattr(trade, "current_stop", 0.0) or 0.0), round(minimum_stop, 2))
+        if self._is_utema_trade(trade):
+            # Native alignment retains any protection already earned by the filled
+            # position. Reprice its option target from the effective stop, rather
+            # than retaining a target calculated from the old quote or old average.
+            stop = round(math.ceil(stop / 0.05 - 1e-9) * 0.05, 2)
+            native_state = native_state if isinstance(native_state, dict) else {}
+            try:
+                rr = float(native_state.get("rr", getattr(trade, "rr_ratio", 0.)))
+            except (TypeError, ValueError, OverflowError):
+                rr = 0.
+            if math.isfinite(rr) and rr > 0 and stop < entry:
+                trade.target = entry + (entry - stop) * rr
+                trade.rr_ratio = rr
+                trade.entry_policy_actual_rr = rr
+            # A protected add may have stop >= its new average. Preserve that
+            # protection and its existing profitable target; negative risk cannot
+            # define a new positive RR target.
+            trade.premium_entry = entry
+            trade.premium_target = float(getattr(trade, "target", 0.) or 0.)
+        trade.current_stop = stop
+        trade.trailing_stop = stop
+        trade.initial_stop = stop
+        trade.premium_stop = stop
+
     def _actual_fill_entry_policy_verdict(
         self,
         trade: Trade,
@@ -6338,6 +6871,28 @@ class TradeManager:
         # evidence. Scanner installs this guard for every live fresh-entry path. Do not
         # fabricate a partial RR-only policy in the unintegrated case; the queued check
         # above already follows the same optional-service boundary.
+        self._cap_option_entry_stop(trade)
+        if self._is_utema_trade(trade):
+            if not bool(getattr(trade, "_entry_policy_actual_fill_verified", True)):
+                return False, "actual broker fill price is unavailable or unverified"
+            state = getattr(trade, "utema_state", None)
+            if not isinstance(state, dict):
+                state = ((getattr(trade, "quality_verdict", {}) or {}).get("checks", {}) or {}).get("utema_state", {})
+            try:
+                rr = float(state.get("rr", getattr(trade, "rr_ratio", 0.)))
+            except (TypeError, ValueError, OverflowError, AttributeError):
+                rr = 0.
+            if not math.isfinite(rr) or rr <= 0:
+                return False, "UTEMA selected option RR is invalid"
+            allowed, reason = self._utema_execution_geometry(
+                trade.inst_type, trade.direction, trade.entry_price, trade.current_stop,
+                getattr(trade, "target", 0.), protected_add=str(phase).startswith("scale_in_"),
+            )
+            if allowed and str(trade.inst_type).upper() == "OPT":
+                trade.premium_entry = float(trade.entry_price)
+                trade.premium_stop = float(trade.current_stop)
+                trade.premium_target = float(getattr(trade, "target", 0.) or 0.)
+            return allowed, reason
         guard = getattr(self, "fresh_entry_policy_guard", None)
         if guard is None:
             return True, ""
@@ -6357,6 +6912,16 @@ class TradeManager:
         if not all(math.isfinite(value) for value in (configured_min_rr, entry, stop, target)):
             return False, "actual fill has non-finite policy or execution geometry"
         min_rr = max(1.5, configured_min_rr)
+        try:
+            from engine import s1_lane
+
+            if s1_lane.is_managed_lane(trade, settings):
+                # S1 targets are 1R (0.7R on a weak move); holding them to 1.5R here
+                # tightened every S1 stop by a third on the fill, or refused the fill.
+                # UT SMART EXIT has its own floor (nominal target, the chart exits).
+                min_rr = s1_lane.lane_min_entry_rr(trade, settings)
+        except Exception:
+            pass
         inst_type = str(getattr(trade, "inst_type", "FUT") or "FUT").upper()
         direction = str(getattr(trade, "direction", "LONG") or "LONG").upper()
         if inst_type not in {"OPT", "FUT"} or direction not in {"LONG", "SHORT"}:
@@ -6461,6 +7026,7 @@ class TradeManager:
         source_engine: str = "",
         source_engines: Optional[List[str]] = None,
         source_lane: str = "",
+        exit_policy_owner: str = "",
         quad_union_entry: bool = False,
         raw_union_entry: bool = False,
         initial_stop: float = 0.0,
@@ -6477,6 +7043,7 @@ class TradeManager:
         expected_move_forecast: Optional[Dict[str, Any]] = None,
         entry_policy_verdict: Optional[Dict[str, Any]] = None,
         quality_verdict: Optional[Dict[str, Any]] = None,
+        decision_record: Optional[Dict[str, Any]] = None,
         execution_touch_quote: Optional[Dict[str, Any]] = None,
         on_execution_result: Optional[Callable[[Trade, bool], None]] = None,
         lifecycle_id: str = "",
@@ -6484,6 +7051,14 @@ class TradeManager:
         entry_refusal_outcome: Optional[Dict[str, Any]] = None,
     ) -> Optional[Trade]:
         """Open a new trade and execute via broker"""
+        native_utema = (str(exit_policy_owner or "").upper() == "UTEMA"
+                        and str(source_lane or "").upper() == "UTEMA"
+                        and str(source_engine or "").lower() == "ut_ema")
+        if native_utema:
+            valid, reason = self._utema_execution_geometry(inst_type, direction, price, trailing_stop, target)
+            if not valid:
+                logger.warning(f"Cannot open UTEMA trade: {reason}")
+                return None
         if entry_time is not None:
             now = entry_time
         elif is_recovery and signal_time is not None:
@@ -6491,12 +7066,14 @@ class TradeManager:
         else:
             now = datetime.now(IST)
         with self._lock:
-            can, reason = self.can_open_trade(is_recovery)
+            can, reason = (self.can_open_trade(is_recovery, native_utema=True) if native_utema
+                           else self.can_open_trade(is_recovery))
             if not can:
                 logger.warning(f"Cannot open trade: {reason}")
                 return None
             same, same_reason = self._same_contract_entry_blocked(
-                trading_symbol, is_recovery=is_recovery, is_ghost=is_ghost
+                trading_symbol, is_recovery=is_recovery, is_ghost=is_ghost,
+                **({"native_owner": "UTEMA"} if native_utema else {}),
             )
             if same:
                 logger.warning(f"Cannot open trade: {same_reason}")
@@ -6507,21 +7084,24 @@ class TradeManager:
             # target and every P&L reading derived from them.
             require_usable_touch = (
                 self._live_orders_permitted()
-                and str(exec_type or "").upper() in {"A", "AUTO"}
+                and (native_utema or str(exec_type or "").upper() in {"A", "AUTO"})
                 and not is_ghost
                 and not bool(getattr(self, "is_warmup", False))
             )
-            mark_ok, mark_reason = self._entry_mark_admission(
+            mark_ok, mark_reason = (self._utema_touch_admission(
+                price, execution_touch_quote, inst_type=inst_type, direction=direction,
+                required=require_usable_touch,
+            ) if native_utema else self._entry_mark_admission(
                 inst_type=inst_type, price=price, signal_time=signal_time,
                 entry_time=now, touch_quote=execution_touch_quote,
                 trading_symbol=trading_symbol, is_recovery=is_recovery,
                 require_usable_touch=require_usable_touch,
-            )
+            ))
             if not mark_ok:
                 logger.warning(f"Entry refused on mark validation: {mark_reason}")
                 self._log_ui(f"Entry refused: {mark_reason}", "warning")
                 return None
-            liquid_ok, liquid_reason = self._option_contract_liquidity_admission(
+            liquid_ok, liquid_reason = (True, "") if native_utema else self._option_contract_liquidity_admission(
                 inst_type=inst_type,
                 lot_size=lot_size,
                 touch_quote=execution_touch_quote,
@@ -6536,7 +7116,7 @@ class TradeManager:
             # stops? can_open_trade counts positions; the circuit breaker measures a book
             # that already exists. Neither refuses the entry that creates the breach.
             # Off by default — see _entry_risk_admission.
-            admitted, risk_reason = self._entry_risk_admission(
+            admitted, risk_reason = (True, "") if native_utema else self._entry_risk_admission(
                 inst_type=inst_type, direction=direction, price=price,
                 trailing_stop=trailing_stop, initial_stop=initial_stop,
                 lots=lots, lot_size=lot_size,
@@ -6560,6 +7140,10 @@ class TradeManager:
                 _qty = int(lots or 1) * int(lot_size or 1)
                 _cached_refusal = getattr(self.broker, "cached_entry_margin_refusal", None)
                 _early_verdict = None
+                # A multi-lot entry is not refused here: the background preflight trims it
+                # to the lots the funds cover (entry_trim_lots_to_funds_enabled).
+                if int(lots or 1) > 1 and self._trim_lots_to_funds_enabled():
+                    _cached_refusal = None
                 if callable(_cached_refusal):
                     try:
                         _early_verdict = _cached_refusal(
@@ -6678,6 +7262,7 @@ class TradeManager:
             entry_policy_underlying_stop_pct=float(policy.get("underlying_stop_pct") or 0.0),
             entry_policy_version=str(policy.get("policy_version") or ""),
             quality_verdict=dict(quality_verdict or {}),
+            decision_record=dict(decision_record or {}),
             is_ghost=is_ghost,
             is_recovery=bool(is_recovery),
             is_reversion_scalp=is_reversion_scalp,
@@ -6715,7 +7300,25 @@ class TradeManager:
         )
         # Not a Trade field: it matters only at the instant the entry order is placed,
         # so it never needs to persist or survive a restart.
+        if native_utema:
+            trade.exit_policy_owner = "UTEMA"
+            state = ((trade.quality_verdict or {}).get("checks", {}) or {}).get("utema_state")
+            if isinstance(state, dict):
+                trade.utema_state = dict(state)
+        self._cap_option_entry_stop(trade)
         setattr(trade, "entry_momentum_urgency", float(entry_momentum_urgency or 0.0))
+        # Freeze the exit-policy owner at this admission boundary. A caller that
+        # already froze it (the candidate it executes) passes it through; otherwise it
+        # is taken from the lane switches as they stand now.
+        try:
+            from engine import s1_lane
+
+            if native_utema or str(exit_policy_owner or "").strip().upper() in s1_lane.EXIT_OWNERS:
+                trade.exit_policy_owner = str(exit_policy_owner).strip().upper()
+            if not native_utema:
+                s1_lane.stamp_exit_owner(trade)
+        except Exception as exc:
+            logger.debug(f"Exit-policy owner stamp skipped: {exc}")
         # Runtime-only admission state. Recovery rows re-establish bookkeeping for
         # exposure that already exists and must never be blocked by a *new exposure*
         # guard. The callable is retained on fresh AUTO trades so later scale-ins and a
@@ -6727,7 +7330,8 @@ class TradeManager:
         trade.pending_execution = not is_recovery
         trade.execution_status = "OPEN" if (is_recovery or is_ghost) else "ENTRY_PENDING"
         with self._lock:
-            can, reason = self.can_open_trade(is_recovery)
+            can, reason = (self.can_open_trade(is_recovery, native_utema=True) if native_utema
+                           else self.can_open_trade(is_recovery))
             if not can:
                 logger.warning(f"Cannot reserve trade after concurrent update: {reason}")
                 return None
@@ -6740,7 +7344,7 @@ class TradeManager:
         qty = lots * lot_size
         logger.info(
             f"🟢 TRADE LOGGED: {trade_id} | {direction} {trading_symbol or instrument} @ {price:.2f} | "
-            f"Stop: {trailing_stop:.2f} | {lots}×{lot_size}={qty}{' [GHOST]' if is_ghost else ''}"
+            f"Stop: {trade.current_stop:.2f} | {lots}×{lot_size}={qty}{' [GHOST]' if is_ghost else ''}"
         )
 
         # ⚡ REAL BROKER ENTRY (Background Thread) ⚡ 
@@ -6767,6 +7371,12 @@ class TradeManager:
                     preflight = self._entry_margin_verdict(
                         trading_symbol, trade.quantity, order_side, price
                     )
+                    if preflight is not None and not preflight.get("ok", True):
+                        trimmed = self._trim_entry_lots_to_funds(
+                            trade, trading_symbol, order_side, price, preflight
+                        )
+                        if trimmed is not None:
+                            preflight = trimmed
                     if preflight is not None and not preflight.get("ok", True):
                         margin_rejection_reason = str(
                             preflight.get("limitation")
@@ -7075,11 +7685,14 @@ class TradeManager:
         quote_verified: Optional[bool] = None,
         allow_broker_protection: bool = True,
         observed_contract_ticks: Optional[List[Tuple[float, Optional[datetime]]]] = None,
+        early_loss_cut_decision: Optional[bool] = None,
     ):
         """
         Update trade with latest price and trailing stop from 1-min data.
         Automatically closes trade if trailing stop is hit. ``observed_contract_ticks``
         carries exact, ordered websocket prices hidden between sampled monitor passes.
+        ``early_loss_cut_decision`` is the scanner's verdict for this call only;
+        None retains the standalone backstop. Hard stops/targets remain independent.
         """
         trade = self.open_trades.get(trade_id)
         if not trade or trade.status != "OPEN":
@@ -7216,6 +7829,8 @@ class TradeManager:
                     if current <= 0 or incoming_stop < current:
                         trade.current_stop = incoming_stop
 
+        trade.quote_verified = quote_verified is not False
+        trade._uts_stop_touch_pending = bool(observed_exit_touch and observed_exit_touch[0] == "TRAILING_STOP")
         if int(getattr(trade, "broker_quantity", 0) or 0) > 0:
             if allow_broker_protection:
                 self.ensure_broker_protection(trade, trade.broker_quantity)
@@ -7277,9 +7892,10 @@ class TradeManager:
         runner_mode = bool(getattr(trade, "runner_mode", False))
         target = float(getattr(trade, "target", 0.0) or 0.0)
 
-        # Early loss-guard backstop (R2): use scanner-published loss_guard_cut_r
-        # when present (intel-accelerated); else base 0.8R settings.
-        cut_override = getattr(trade, "loss_guard_cut_r", None)
+        # Honor this cycle's complete scanner decision, including cost/peak/age
+        # deferrals. A persisted threshold cannot carry those guards and may be
+        # stale. Independent callers (or scanner evaluation failures) keep the base
+        # backstop; no verdict is stored on the position for a later cycle.
         if observed_exit_touch is not None:
             touch_reason, touch_price, touch_time = observed_exit_touch
             self.close_trade(
@@ -7288,8 +7904,10 @@ class TradeManager:
                 touch_reason,
                 exit_time=touch_time if isinstance(touch_time, datetime) else current_time,
             )
-        elif self._early_loss_cut_min_hold_met(trade) and self._early_loss_cut_hit(
-            trade, cut_r_override=cut_override
+        elif early_loss_cut_decision is True or (
+            early_loss_cut_decision is None
+            and self._early_loss_cut_min_hold_met(trade)
+            and self._early_loss_cut_hit(trade)
         ):
             self.close_trade(
                 trade_id, trade.current_price, "EARLY_LOSS_CUT", exit_time=current_time
@@ -7851,10 +8469,32 @@ class TradeManager:
             self._alert_carrying_through_a_closed_day(now)
             return
 
+        # ...and only while the F&O segment still accepts orders. The clock gate above
+        # has no upper bound and the scanner does not idle while trades are open, so a
+        # position that survived the square-off was re-sent every scan cycle for the
+        # rest of the evening, and a rejected exit clears pending_exit so each cycle sent
+        # a fresh one. Same rule as the closed-day gate: escalate, do not fire orders
+        # that can only be rejected. Outside REAL mode no order is sent, so local
+        # closes carry on.
+        fno_close = self._fno_segment_closed(now)
+        if fno_close is not None:
+            self._alert_carrying_through_a_closed_day(
+                now,
+                headline=f"F&O CLOSED AT {fno_close.strftime('%H:%M')} ON",
+                instruction=(
+                    "The exchange no longer accepts F&O orders today, so they carry "
+                    "overnight. Close them at the next open at the Zerodha terminal."
+                ),
+            )
+            return
+
         with self._lock:
             snapshot = list(self.open_trades.items())
             
         for tid, trade in snapshot:
+            if self._is_utema_trade(trade):
+                continue  # Native Pine management spans sessions and has no time exit.
+
             # Strategy-owned square-off. CARRYFORWARD avoids broker intraday auto-squareoff.
             status = str(getattr(trade, "execution_status", "") or "").upper()
             # PARTIAL_EXIT joins RECOVERY_REQUIRED here. close_trade REFUSES that status
@@ -7897,6 +8537,65 @@ class TradeManager:
         except Exception as exc:
             logger.critical(f"Orphan sweep failed at session end: {exc}", exc_info=True)
 
+    def eod_exit_recheck(self, current_time: Optional[datetime] = None) -> bool:
+        """The 15:15:30 exit recheck (2026-09-26 user). Returns True when it ran.
+
+        check_session_end re-sends a still-open trade's exit on every pass and PositionSync
+        reconciles every 5s, so exits already retry on their own. This is the one explicit
+        checkpoint: once a day, eod_exit_recheck_seconds after ut_force_exit_time, reconcile
+        with the broker now and raise a critical alert naming anything still open.
+        """
+        from config.settings import get_settings
+
+        now = current_time or datetime.now(IST)
+        if now.tzinfo is None:
+            now = IST.localize(now)
+        settings = get_settings()
+        force_exit = self._parse_time(str(getattr(settings, "ut_force_exit_time", "15:25") or "15:25"))
+        delay = max(0.0, float(getattr(settings, "eod_exit_recheck_seconds", 30.0) or 0.0))
+        checkpoint = IST.localize(datetime.combine(now.date(), force_exit)) + timedelta(seconds=delay)
+        if now < checkpoint or getattr(self, "_eod_exit_recheck_date", None) == now.date():
+            return False
+        if not self._session_is_a_trading_day(now):
+            return False
+        self._eod_exit_recheck_date = now.date()
+        if self._live_orders_permitted():
+            try:
+                self.reconcile_broker_positions()
+            except Exception as exc:
+                logger.error(f"EOD exit recheck: broker reconcile failed: {exc}")
+        with self._lock:
+            still_open = [
+                str(getattr(t, "trading_symbol", "") or tid) for tid, t in self.open_trades.items()
+                if not self._is_utema_trade(t)
+            ]
+        orphans = list(getattr(self, "orphan_positions", None) or [])
+        label = checkpoint.strftime("%H:%M:%S")
+        if still_open or orphans:
+            message = (
+                f"EOD EXIT RECHECK {label}: {len(still_open)} trade(s) still open "
+                f"{still_open[:6]}" + (f" and {len(orphans)} broker-only position(s)" if orphans else "")
+                + ". Exits keep retrying; square off at the Zerodha terminal if they do not clear."
+            )
+            logger.critical(message)
+            self._log_ui(message, "error")
+        else:
+            logger.info(f"EOD exit recheck {label}: every position is flat.")
+        return True
+
+    def _fno_segment_closed(self, now: datetime) -> Optional[dtime]:
+        """The F&O close time when `now` is at/after it and this manager sends real
+        orders; None otherwise (including a blank fno_market_close_time)."""
+        if not self._live_orders_permitted():
+            return None
+        from config.settings import get_settings
+
+        label = str(getattr(get_settings(), "fno_market_close_time", "15:40") or "").strip()
+        if not label:
+            return None
+        close = self._parse_time(label)
+        return close if now.time() >= close else None
+
     def _session_is_a_trading_day(self, now: datetime) -> bool:
         """Did the exchange trade today? Weekends and holidays are not square-off days.
 
@@ -7924,8 +8623,16 @@ class TradeManager:
             logger.debug(f"Trading-day check unavailable, assuming open: {exc}")
         return True
 
-    def _alert_carrying_through_a_closed_day(self, now: datetime) -> None:
-        """Say once per closed day that positions are sitting through it."""
+    def _alert_carrying_through_a_closed_day(
+        self,
+        now: datetime,
+        headline: str = "MARKET CLOSED",
+        instruction: str = (
+            "Orders would only be rejected today. Square off at the Zerodha terminal, "
+            "or they carry to the next session."
+        ),
+    ) -> None:
+        """Say once per closed day (or closed F&O segment) that positions sit through it."""
         holding = [t for t in self.open_trades.values() if str(getattr(t, "status", "")) == "OPEN"]
         orphans = dict(getattr(self, "orphan_positions", {}) or {})
         if not holding and not orphans:
@@ -7938,11 +8645,10 @@ class TradeManager:
         self._closed_day_alerted.add(stamp)
         names = [str(getattr(t, "trading_symbol", t.id)) for t in holding] + list(orphans)
         message = (
-            f"MARKET CLOSED {stamp}: {len(names)} position(s) still open and the force exit "
+            f"{headline} {stamp}: {len(names)} position(s) still open and the force exit "
             f"cannot run — {', '.join(names[:4])}"
             + (f" +{len(names) - 4} more" if len(names) > 4 else "")
-            + ". Orders would only be rejected today. Square off at the Zerodha terminal, "
-            "or they carry to the next session."
+            + f". {instruction}"
         )
         logger.critical(message)
         self._log_ui(message, "error")
@@ -8088,6 +8794,10 @@ class TradeManager:
         # Whichever cohort comes due first decides when this method starts doing work.
         if now.time() < min(time_exit, late_exit):
             return
+        # Same upper bound as check_session_end, which runs right after this each cycle
+        # and escalates the stuck position; sending here would only be rejected.
+        if self._fno_segment_closed(now) is not None:
+            return
         cutoff = self._parse_time(str(getattr(s, "expiry_day_gamma_cutoff", "13:00") or "13:00"))
         try:
             from engine.expiry_manager import expiry_manager
@@ -8096,6 +8806,9 @@ class TradeManager:
         with self._lock:
             snapshot = list(self.open_trades.items())
         for tid, trade in snapshot:
+            if self._is_utema_trade(trade):
+                continue  # Native Pine management spans sessions and has no time exit.
+
             if str(getattr(trade, "inst_type", "") or "").upper() != "OPT":
                 continue
             et = getattr(trade, "entry_time", None)
@@ -8140,6 +8853,9 @@ class TradeManager:
         marked = 0
         with self._lock:
             for trade in self.open_trades.values():
+                if self._is_utema_trade(trade):
+                    continue  # Native Pine management spans sessions and has no time exit.
+
                 entry_time = trade.entry_time
                 if entry_time.tzinfo is None:
                     entry_time = IST.localize(entry_time)

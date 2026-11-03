@@ -89,18 +89,24 @@ def test_omitting_the_date_still_behaves_exactly_as_before():
 # ── the historical VIX branch is reachable ───────────────────────────────────
 
 def test_a_backtest_no_longer_prices_against_todays_vix():
-    """The lookahead bias: a March signal must use March's VIX, not August's.
+    """Date-only estimates cannot see later March observations or today's VIX.
 
-    Both calls carry a trade_date so the DTE boost is identical and cancels out,
-    isolating the VIX term. Without a date the branch is skipped entirely and the
-    LIVE quote is used -- which is the bug.
+    An explicit decision time may use its as-of resolver value. DTE is identical
+    across calls, isolating the VIX term without restoring future-day averaging.
     """
     sc = _scanner(dte=5, vix_data={"2026-03-04T10:00": 28.0, "2026-03-04T11:00": 32.0},
                   live_vix=12.0)
+    observed = []
+    def as_of_vix(at):
+        observed.append(at)
+        return 28.0 if at == dt.datetime(2026, 3, 4, 10, 1) else 0.0
+    sc._get_historical_vix = as_of_vix
     march = _estimate_opt_premium(24700.0, sc, "NIFTY", dt.date(2026, 3, 4))
     unrecorded = _estimate_opt_premium(24700.0, sc, "NIFTY", dt.date(2026, 7, 1))
-    # March's own mean is 30; a day with no record holds the neutral 15 default.
-    assert march / unrecorded == pytest.approx(30.0 / 15.0, rel=1e-6)
+    known = _estimate_opt_premium(24700.0, sc, "NIFTY", dt.datetime(2026, 3, 4, 10, 1))
+    assert march == unrecorded
+    assert known / unrecorded == pytest.approx(28.0 / 15.0, rel=1e-6)
+    assert observed[0] == dt.datetime(2026, 3, 4, 0, 0)
 
 
 def test_a_dated_call_never_consults_the_live_vix_feed():

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 
 def _cand(instrument="NIFTY", tf="5min", direction="LONG"):
@@ -136,7 +137,7 @@ def test_the_blocked_duplicate_path_offers_the_add():
     import inspect
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._coordinate_and_execute)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExecutionService.coordinate_and_execute)))
     guards = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.If)

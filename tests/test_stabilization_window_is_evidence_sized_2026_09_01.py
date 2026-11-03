@@ -119,11 +119,13 @@ def test_the_requirements_helper_returns_the_configured_window():
     source = inspect.getsource(Scanner._live_signal_stabilization_requirements)
     assert "live_signal_stabilization_seconds_5min" in source
     assert "live_signal_stabilization_seconds_15min" in source
-    # the risky-option floor is a max() against the base and would pin 30s back on
-    assert "max(base_seconds, 30.0)" in source, (
+    # The risky-option floor is a max() against the base. Since 2026-10-09 it is the
+    # setting live_signal_stabilization_risky_floor_seconds (15s), not a literal 30s.
+    assert "max(base_seconds, risky_floor)" in source, (
         "the risky-option floor changed shape; re-check whether the new window is "
         "actually reachable for risky 5min options"
     )
+    assert "live_signal_stabilization_risky_floor_seconds" in source
 
 
 def test_the_distribution_this_was_sized_from_is_recorded():

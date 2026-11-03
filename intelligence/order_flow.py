@@ -51,7 +51,25 @@ class OrderFlowAnalyzer:
             return self._empty_result(market_context)
         try:
             depth_flow = self._depth_flow(market_context)
-            c, h, l, v = df['close'], df['high'], df['low'], df['volume']
+            c, h, l = df['close'], df['high'], df['low']
+            v = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0).clip(lower=0.0)
+            usable_volume = pd.Series(True, index=df.index)
+            if "volume_basis" in df.columns:
+                bases = df["volume_basis"].fillna("").astype(str)
+                active_bases = bases.loc[v > 0]
+                latest_basis = active_bases.iloc[-1] if not active_bases.empty else ""
+                usable_volume &= bases.eq(latest_basis)
+                usable_volume &= ~bases.str.upper().isin({"MIXED", "MIXED_UNITS", "TICK_ACTIVITY", "INDEX_TICK_ACTIVITY", "UNAVAILABLE"})
+            if "volume_complete" in df.columns:
+                usable_volume &= ~df["volume_complete"].eq(False).fillna(False)
+            # Exclude invalid quantities without letting an old partial bar veto
+            # today's valid observations or an independent usable depth snapshot.
+            partial_coverage = bool((~usable_volume & v.gt(0)).any())
+            v = v.where(usable_volume, 0.0)
+            # Candle location without measured volume is price action, not order flow.
+            # A usable depth snapshot remains legitimate flow evidence on its own.
+            if float(v.sum()) <= 0.0 and not depth_flow.get("usable"):
+                return self._empty_result(market_context)
             rng = h - l
             rng = rng.replace(0, np.nan)
             pos = (c - l) / rng
@@ -60,8 +78,17 @@ class OrderFlowAnalyzer:
             sell_vol = (v * (1 - pos)).sum()
             ratio = float(buy_vol / sell_vol) if sell_vol > 0 else 1.0
             cum_delta = float(buy_vol - sell_vol)
-            # Recent momentum (last 5 bars)
-            recent_pos = pos.iloc[-5:].mean()
+            # Recent momentum is only flow when recent bars actually carry measured
+            # volume.  An older active session followed by a dead right edge used to
+            # publish a 95% "buyers" signal from candle geometry alone.
+            recent_v = v.iloc[-5:]
+            if float(recent_v.sum()) <= 0.0 and not depth_flow.get("usable"):
+                return self._empty_result(market_context)
+            recent_pos = (
+                float((pos.iloc[-5:] * recent_v).sum() / recent_v.sum())
+                if float(recent_v.sum()) > 0.0
+                else 0.5
+            )
             if recent_pos > 0.6:
                 signal, aggressor = "BULLISH", "BUYERS"
             elif recent_pos < 0.4:
@@ -74,6 +101,7 @@ class OrderFlowAnalyzer:
                 "buy_pct": round(float(recent_pos * 100), 1),
                 "signal": signal, "aggressor": aggressor,
                 "source": "ohlcv_close_position",
+                "session_volume_complete": not partial_coverage,
                 "true_tick_footprint_available": False,
                 "limitation": "Broker feed does not provide aggressor-side tick footprint; using OHLCV/L1 proxy",
             }
@@ -98,10 +126,7 @@ class OrderFlowAnalyzer:
             result.update(self._source_context(market_context))
             result["options_flow"] = self._options_flow(options_chain, spot_price, strike_interval)
             confirmation = result["signal"]
-            if result["options_flow"]["ce_pe_activity_ratio"] > 1.15:
-                confirmation = "BULLISH"
-            elif result["options_flow"]["ce_pe_activity_ratio"] < 0.85:
-                confirmation = "BEARISH"
+            # CE/PE quantity has no aggressor identity and cannot vote direction.
             result["multi_source_flow"]["confirmation"] = confirmation
             return result
         except Exception as e:
@@ -162,7 +187,13 @@ class OrderFlowAnalyzer:
         if options_chain is None or options_chain.empty:
             return {"top_ce": [], "top_pe": [], "ce_pe_activity_ratio": 1.0}
         try:
-            chain = options_chain.copy()
+            # Only the three columns read below. copy() + sort_values + two nlargest on
+            # the whole chain moved its symbol/token string columns through four
+            # take()s per call; copy only this three-column numeric projection so the
+            # derived distance column never writes through a pandas slice.
+            chain = options_chain[
+                [c for c in ("strike", "call_volume", "put_volume") if c in options_chain.columns]
+            ].copy()
             if spot_price and "strike" in chain.columns:
                 interval = max(float(strike_interval or 0), 1.0)
                 atm = round(float(spot_price) / interval) * interval
@@ -172,12 +203,12 @@ class OrderFlowAnalyzer:
             top_pe = chain.nlargest(4, "put_volume")[["strike", "put_volume"]].to_dict("records")
             ce_activity = float(chain.get("call_volume", pd.Series(dtype=float)).sum() or 0.0)
             pe_activity = float(chain.get("put_volume", pd.Series(dtype=float)).sum() or 0.0)
-            if "call_oi_change" in chain.columns:
-                ce_activity += max(0.0, float(chain["call_oi_change"].sum() or 0.0))
-            if "put_oi_change" in chain.columns:
-                pe_activity += max(0.0, float(chain["put_oi_change"].sum() or 0.0))
             ratio = ce_activity / pe_activity if pe_activity > 0 else (ce_activity if ce_activity > 0 else 1.0)
-            return {"top_ce": top_ce, "top_pe": top_pe, "ce_pe_activity_ratio": round(float(ratio), 3)}
+            return {
+                "top_ce": top_ce, "top_pe": top_pe,
+                "ce_pe_activity_ratio": round(float(ratio), 3),
+                "basis": "cumulative_option_volume_only",
+            }
         except Exception as e:
             logger.error(f"Options flow error: {e}")
             return {"top_ce": [], "top_pe": [], "ce_pe_activity_ratio": 1.0}

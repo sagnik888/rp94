@@ -19,6 +19,7 @@ import hashlib
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -524,6 +525,48 @@ class KiteBroker(Broker):
     @staticmethod
     def _tick_price(value: float) -> float:
         return round(max(0.05, round(float(value) / 0.05) * 0.05), 2)
+
+    @staticmethod
+    def _is_option_symbol(symbol: str) -> bool:
+        return str(symbol or "").upper().endswith(("CE", "PE"))
+
+    @classmethod
+    def _protective_stop_params(
+        cls, symbol: str, side: str, trigger_price: float
+    ) -> Dict[str, Any]:
+        """Broker-valid stop parameters with a bounded worst execution price.
+
+        Exchanges no longer permit SL-M for index options.  For those contracts use
+        an SL order whose limit is buffered by Zerodha's automatic market-protection
+        band (5/3/2/1% by option-premium range).  Futures retain SL-M with automatic
+        market protection.
+        """
+        trigger = cls._tick_price(trigger_price)
+        if not cls._is_option_symbol(symbol):
+            return {
+                "order_type": "SL-M",
+                "trigger_price": trigger,
+                "market_protection": -1,
+            }
+
+        if trigger < 10.0:
+            protection_pct = 5.0
+        elif trigger <= 100.0:
+            protection_pct = 3.0
+        elif trigger <= 500.0:
+            protection_pct = 2.0
+        else:
+            protection_pct = 1.0
+        sell_stop = str(side or "").upper() == "SELL"
+        factor = 1.0 - protection_pct / 100.0 if sell_stop else 1.0 + protection_pct / 100.0
+        limit_price = cls._tick_price(trigger * factor)
+        # Rounding must never invert an SL order's trigger/limit relationship.
+        limit_price = min(limit_price, trigger) if sell_stop else max(limit_price, trigger)
+        return {
+            "order_type": "SL",
+            "trigger_price": trigger,
+            "price": limit_price,
+        }
 
     @staticmethod
     def _entry_limit_confidence_threshold() -> float:
@@ -1118,6 +1161,7 @@ class KiteBroker(Broker):
         api = self._require_api("protective stop")
         _warn_if_above_freeze_limit(symbol, qty)
         trigger = self._tick_price(trigger_price)
+        stop_params = self._protective_stop_params(symbol, side, trigger)
         try:
             order_id = self._api_call(
                 "place protective stop",
@@ -1128,16 +1172,9 @@ class KiteBroker(Broker):
                     transaction_type=str(side).upper(),
                     quantity=int(qty),
                     product=self._product(product_type),
-                    order_type="SL-M",
-                    trigger_price=trigger,
                     validity="DAY",
-                    # SL-M is the OTHER order type the spec's market-protection rule
-                    # names, and this one was missing it (2026-08-16). When this stop
-                    # triggers it becomes a market order into whatever book exists at
-                    # the moment the trade is going against us — the single worst time
-                    # to be unbounded. Same -1 (automatic band) as the market exit.
-                    market_protection=-1,
                     **({"tag": str(tag)[:20]} if tag else {}),
+                    **stop_params,
                 ),
                 client=api,
             )
@@ -1311,6 +1348,7 @@ class KiteBroker(Broker):
         # it would never notice or correct the divergence.
         self._authorize_mutation("protective stop modification")
         api = self._require_api("protective stop modify")
+        stop_params = self._protective_stop_params(symbol, side, trigger_price)
         try:
             self._api_call(
                 "modify protective stop",
@@ -1318,12 +1356,7 @@ class KiteBroker(Broker):
                     variety="regular",
                     order_id=str(order_id),
                     quantity=int(qty),
-                    order_type="SL-M",
-                    trigger_price=self._tick_price(trigger_price),
-                    # Carried on the modify too: Kite replaces the order's parameters
-                    # rather than merging them, so omitting it here would strip the
-                    # protection band off the stop the first time it is tightened.
-                    market_protection=-1,
+                    **stop_params,
                 ),
                 client=api,
             )
@@ -2028,7 +2061,10 @@ class KiteBroker(Broker):
                 return verdict
             reservation_id = ""
             if reserve:
-                reservation_id = f"{symbol}:{time.time():.6f}"
+                # Wall-clock timestamps are not unique IDs. On coarse/frozen clocks,
+                # concurrent reservations overwrote one another and made already
+                # committed cash appear spendable again.
+                reservation_id = f"{symbol}:{uuid.uuid4().hex}"
                 self._margin_reservations[reservation_id] = {
                     "amount": committed, "at": time.time(), "symbol": symbol,
                 }

@@ -1,0 +1,580 @@
+--- scanner.py (before audit)
++++ scanner.py
+@@ -7896,6 +7896,14 @@
+             if not (same_result and valid_status and computed_at > cutoff):
+                 return "UNKNOWN"
+ 
++        if uts_lane_policy.is_uts(candidate, get_settings()):
++            # A populated cache needs the same evidence as an empty one. Native
++            # observation validation is shared with the post-entry repaint worker.
++            probe = copy.copy(candidate)
++            probe.signal_time = sig_timestamp
++            return uts_lane_policy.repaint_signal_status(
++                probe, cached_res, self._session_squareoff_clock(), get_settings(),
++            )
+         signals = list(cached_res.get("signals") or [])
+         if not signals:
+             return "UNKNOWN"
+@@ -29205,13 +29213,17 @@
+             volume_basis = "TRADED"
+         if has_current_volume_context:
+             volume_ratio = 0.0
++            ratio_present = False
+             for ratio_key in ("display_volume_ratio", "relative_volume_ratio", "volume_ratio"):
+                 if volume_ctx.get(ratio_key) is not None:
++                    ratio_present = True
+                     try:
+                         volume_ratio = float(volume_ctx[ratio_key])
+                     except (TypeError, ValueError):
+                         volume_available = False
+                     break
++            if not ratio_present and uts_lane_policy.is_uts(candidate, settings):
++                volume_available = False
+             if not math.isfinite(volume_ratio) or volume_ratio < 0:
+                 volume_available = False
+                 volume_ratio = 0.0
+@@ -30170,7 +30182,8 @@
+                 ).get(f"{previous.instrument}_{previous.timeframe}")
+                 s1_spot = float(self.candles.get_latest_price(previous.instrument) or 0.0)
+                 lane_bookkeeping = (getattr(previous, "s1_peak_premium", None),
+-                                    getattr(previous, "uts_confirmed", False))
++                                    getattr(previous, "uts_confirmed", False),
++                                    getattr(previous, "uts_repaint_exit_required", False))
+                 s1_decision = s1_lane_policy.exit_decision(
+                     previous,
+                     s1_spot,
+@@ -30183,7 +30196,8 @@
+                     market=s1_lane_policy.closed_bar_state(previous, s1_result),
+                 )
+                 if lane_bookkeeping != (getattr(previous, "s1_peak_premium", None),
+-                                        getattr(previous, "uts_confirmed", False)):
++                                        getattr(previous, "uts_confirmed", False),
++                                        getattr(previous, "uts_repaint_exit_required", False)):
+                     changed = True
+                 if s1_decision.target_premium > 0:
+                     lowered = s1_lane_policy.nearer_target(
+@@ -30217,8 +30231,9 @@
+                         checks = (getattr(live_match, "quality_verdict", {}) or {}).get("checks") or {}
+                         row_checks = (getattr(previous, "quality_verdict", {}) or {}).get("checks") or {}
+                         entry = float(getattr(previous, "price", 0.0) or 0.0)
++                        normal_stop_ratio = 1.0 - uts_lane_policy.premium_cap_tiers(previous)[1] / 100.0
+                         if (checks.get("uts_stop_extended") and not row_checks.get("uts_stop_extended")
+-                                and entry > 0 and abs(float(previous.stop) / entry - 0.90) <= 0.001
++                                and entry > 0 and abs(float(previous.stop) / entry - normal_stop_ratio) <= 0.001
+                                 and float(live_match.current_stop) < float(previous.stop)):
+                             previous.stop = float(live_match.current_stop)
+                             previous.quality_verdict = dict(live_match.quality_verdict)
+--- engine\exit_cycle.py (before audit)
++++ engine\exit_cycle.py
+@@ -232,7 +232,8 @@
+                 s1_bookkeeping = (getattr(trade, "s1_best_spot", None),
+                                   getattr(trade, "s1_t1_locked", False),
+                                   getattr(trade, "s1_peak_premium", None),
+-                                  getattr(trade, "uts_confirmed", False))
++                                  getattr(trade, "uts_confirmed", False),
++                                  getattr(trade, "uts_repaint_exit_required", False))
+                 s1_decision = s1_lane_policy.exit_decision(
+                     trade,
+                     float(price or 0.0),
+@@ -276,7 +277,8 @@
+                 if s1_bookkeeping != (getattr(trade, "s1_best_spot", None),
+                                       getattr(trade, "s1_t1_locked", False),
+                                       getattr(trade, "s1_peak_premium", None),
+-                                      getattr(trade, "uts_confirmed", False)):
++                                      getattr(trade, "uts_confirmed", False),
++                                      getattr(trade, "uts_repaint_exit_required", False)):
+                     mark_dirty = getattr(scanner.trades, "_mark_dirty", None)
+                     if callable(mark_dirty):
+                         mark_dirty()
+--- engine\runtime_build.py (before audit)
++++ engine\runtime_build.py
+@@ -14,7 +14,12 @@
+          'trading/trade_manager.py','engine/entry_policy.py','config/settings.py',
+          'engine/pre_candle_predictor.py','engine/entry_data_quality.py',
+          'engine/runtime_build.py','engine/scanner_telemetry.py',
+-         'trading/trade_dashboard.py','dashboard/server.py')
++         'trading/trade_dashboard.py','dashboard/server.py',
++         'engine/uts_lane.py','engine/uts_repaint.py','engine/execution_service.py',
++         'engine/exit_cycle.py','engine/trade_row_adapter.py','engine/ut_smart_engine.py',
++         'engine/s1_lane.py','engine/candidate_selection.py','engine/alt_scanners.py',
++         'engine/risk_manager.py','engine/market_regime.py','engine/scanner_chart_mixin.py',
++         'engine/scanner_dashboard.py','engine/engine_lab.py','data/sqlite_db.py','main.py')
+ 
+ 
+ def capture_build(root):
+--- engine\signal_processor.py (before audit)
++++ engine\signal_processor.py
+@@ -850,6 +850,59 @@
+             "shadow": bool(shadow), "contract_verified": False,
+             "fill_model": "modeled_option_premium_from_index" if basis == "SYNTHETIC_OPTION_ESTIMATE" else "index_ohlc_proxy_not_futures_contract",
+         }]
++
++    @staticmethod
++    def _historical_futures_fill_evidence(window, *, signal, entry_time, exit_time,
++                                         entry_price, exit_price, exit_reason):
++        """Bind completed causal index-proxy fills to their accounting record.
++
++        These are modeled futures outcomes, never observed futures contracts. Only
++        a continuous, valid path through the selected fill can bypass legacy display
++        repairs; malformed or incomplete paths retain ordinary proxy evidence.
++        """
++        import numpy as np
++
++        trace = SignalProcessor._historical_price_evidence(
++            "FUT", signal=signal, entry_time=entry_time,
++        )
++        if window is None or window.empty:
++            return trace
++        try:
++            start, end = _market_naive(entry_time), _market_naive(exit_time)
++            if end < start or not all(math.isfinite(float(value)) and float(value) > 0
++                                      for value in (entry_price, exit_price)):
++                return trace
++            frame = window.copy()
++            frame.index = pd.DatetimeIndex([_market_naive(ts) for ts in frame.index])
++            # A gap fills at its open; retain that opening row as evidence. A fill
++            # at a minute close needs only rows closed by that boundary.
++            at_open = end in frame.index and math.isclose(
++                float(frame.loc[end, "open"]), float(exit_price), rel_tol=0., abs_tol=1e-8,
++            )
++            frame = frame.loc[(frame.index >= start) &
++                              ((frame.index <= end) if at_open else
++                               (frame.index + pd.Timedelta(minutes=1) <= end))]
++            if (frame.empty or not frame.index.is_unique or not frame.index.is_monotonic_increasing
++                    or frame.index[0] - start >= pd.Timedelta(minutes=1)
++                    or (frame.index.to_series().diff().dropna() != pd.Timedelta(minutes=1)).any()
++                    or (not at_open and frame.index[-1] + pd.Timedelta(minutes=1) < end)):
++                return trace
++            values = frame[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
++            if (not np.isfinite(values.to_numpy()).all() or (values <= 0).any().any()
++                    or (values["low"] > values[["open", "close"]].min(axis=1)).any()
++                    or (values["high"] < values[["open", "close"]].max(axis=1)).any()):
++                return trace
++            trace[0].update({
++                "fill_accounting": "CAUSAL_INDEX_PROXY_V1", "complete_path": True,
++                "input_sha256": hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes()).hexdigest(),
++                "rows": len(frame), "entry_time": start.isoformat(), "exit_time": end.isoformat(),
++                "entry_price": float(entry_price), "exit_price": float(exit_price),
++                "exit_reason": str(exit_reason),
++                "fill_model": "confirmed_entry_closed_1m_stop_first_gap_at_open_index_proxy",
++            })
++        except (KeyError, TypeError, ValueError, AttributeError):
++            pass
++        return trace
+ 
+     @staticmethod
+     def _bind_historical_intelligence(probe, source, candle_view):
+@@ -5006,22 +5059,27 @@
+                                 s1.timestamp,
+                                 s1.signal_type,
+                             )
+-                            size_result = resolve_trade_lots(
+-                                settings=settings,
+-                                inst_type=sim_inst,
+-                                requested_lots=requested,
+-                                lot_size=lot_size,
+-                                entry_price=hist_entry_px,
+-                                stop_price=hist_stop_px,
+-                                compression_state=hist_compression_state,
+-                                intel_score=float(hist_intel_score or 0.0),
+-                            )
+-                            hist_lots = int(size_result.lots or 0)
+-                            if hist_lots < 1:
+-                                self._historical_audit_log(
+-                                    f"Skipping {instrument} {tf} {sim_inst}: {size_result.reason}"
++                            if hist_uts and sim_inst == "OPT":
++                                # UTS admission requires the observed contract fill and
++                                # premium cap. A provisional delta estimate cannot size it.
++                                hist_lots = max(1, requested)
++                            else:
++                                size_result = resolve_trade_lots(
++                                    settings=settings,
++                                    inst_type=sim_inst,
++                                    requested_lots=requested,
++                                    lot_size=lot_size,
++                                    entry_price=hist_entry_px,
++                                    stop_price=hist_stop_px,
++                                    compression_state=hist_compression_state,
++                                    intel_score=float(hist_intel_score or 0.0),
+                                 )
+-                                continue
++                                hist_lots = int(size_result.lots or 0)
++                                if hist_lots < 1:
++                                    self._historical_audit_log(
++                                        f"Skipping {instrument} {tf} {sim_inst}: {size_result.reason}"
++                                    )
++                                    continue
+ 
+                             qty = hist_lots * lot_size
+                             
+@@ -5155,6 +5213,25 @@
+                                     exit_premium = raw_exit_premium
+                                     exit_time = actual_option["exit_time"]
+                                     is_sl_hit = actual_option["reason"] == "SL HIT"
++                                    if hist_uts:
++                                        size_result = resolve_trade_lots(
++                                            settings=settings, inst_type="OPT",
++                                            requested_lots=requested, lot_size=lot_size,
++                                            entry_price=entry_premium, stop_price=sl_price,
++                                            compression_state=hist_compression_state,
++                                            intel_score=float(hist_intel_score or 0.0),
++                                        )
++                                        hist_lots = int(size_result.lots or 0)
++                                        if hist_lots < 1:
++                                            record_reject(size_result.reason, "OPT")
++                                            continue
++                                        observed_qty = hist_lots * lot_size
++                                        if observed_qty != qty:
++                                            for sample in actual_option.get("price_path") or []:
++                                                for value in ("pnl", "peak_pnl"):
++                                                    if value in sample:
++                                                        sample[value] *= observed_qty / qty
++                                        qty = observed_qty
+                                 else:
+                                     if hist_uts:
+                                         record_reject("UTS replay lacks a complete observed option path or compatible stop", "OPT")
+@@ -5189,11 +5266,23 @@
+                             exit_time = actual_option["exit_time"] if actual_option else effective_exit_ts
+                             
+                             candles_1min = scanner.candles.get_candles(instrument, "1min")
++                            futures_replay_window = None
+                             
+                             if actual_option is None and candles_1min is not None and not candles_1min.empty:
+                                 try:
+                                     s1_ts = s1.timestamp.replace(tzinfo=None) if s1.timestamp.tzinfo else s1.timestamp
+                                     between_candles = candles_1min.loc[s1_ts:effective_exit_ts]
++                                    if hist_uts and sim_inst == "FUT":
++                                        # Only bars traded after confirmation and fully
++                                        # known by the exit decision may hit a resting stop.
++                                        between_candles = candles_1min.loc[
++                                            (candles_1min.index >= entry_ts)
++                                            & (candles_1min.index + pd.Timedelta(minutes=1) <= effective_exit_ts)
++                                        ]
++                                        futures_replay_window = between_candles
++                                        if not between_candles.empty:
++                                            raw_exit_spot = float(between_candles.iloc[-1]["close"])
++                                            raw_exit_premium = exit_premium = raw_exit_spot
+                                     
+                                     if not between_candles.empty:
+                                         if sim_inst == "FUT":
+@@ -5214,7 +5303,7 @@
+                                             )
+                                             if sim_reason == "SL HIT":
+                                                 is_sl_hit = True
+-                                                exit_premium = sl_price
++                                                exit_premium = float(sim_price) if hist_uts else sl_price
+                                                 exit_time = sim_ts
+                                             elif sim_reason == "TARGET_HIT":
+                                                 fut_target_hit = True
+@@ -5277,6 +5366,8 @@
+                                     "TARGET_HIT" if fut_target_hit
+                                     else ("SESSION_END" if crosses_session else "HISTORICAL")
+                                 )
++                                if hist_uts and sim_inst == "FUT" and not is_sl_hit and not fut_target_hit and hist_chart_reason:
++                                    hist_exit_reason = uts_lane_policy.EXIT_REASONS.get(hist_chart_reason, "UTS_EXIT")
+                             hist_rr = (uts_lane_policy.target_rr(settings) if hist_uts and sim_inst == "OPT"
+                                        else self._dynamic_rr(hist_grade, hist_conf, timeframe=tf))
+                             hist_lane = self._signal_source_lane(s1, scanner_engine_mode)
+@@ -5364,7 +5455,12 @@
+                                 raw_union_entry=bool(getattr(s1, "raw_union_entry", False)),
+                                 initial_stop=float(sl_price or 0.0),
+                                 replay_price_path=list((actual_option or {}).get("price_path") or []),
+-                                replay_exit_trace=list((actual_option or {}).get("exit_trace") or []),
++                                replay_exit_trace=(self._historical_futures_fill_evidence(
++                                    futures_replay_window, signal=s1, entry_time=historical_entry_time,
++                                    exit_time=exit_time, entry_price=entry_premium,
++                                    exit_price=exit_premium, exit_reason=hist_exit_reason,
++                                ) if hist_uts and sim_inst == "FUT" else
++                                    list((actual_option or {}).get("exit_trace") or [])),
+                                 quality_verdict=hist_quality_verdict.to_dict(),
+                             )
+                             
+@@ -6240,6 +6336,26 @@
+                                             for value in ("pnl", "peak_pnl"):
+                                                 if value in sample:
+                                                     sample[value] *= quantity_ratio
++                                if historical_final_uts and sim_inst == "FUT":
++                                    minute_candles = scanner.candles.get_candles(instrument, "1min")
++                                    if minute_candles is None or minute_candles.empty:
++                                        continue
++                                    exit_window = minute_candles.loc[
++                                        (minute_candles.index >= eod_start)
++                                        & (minute_candles.index + pd.Timedelta(minutes=1) <= eod_exit_time)
++                                    ]
++                                    if exit_window.empty:
++                                        continue
++                                    exit_premium = float(exit_window.iloc[-1]["close"])
++                                    sim_price, sim_reason, sim_ts = self._simulate_futures_exit_path(
++                                        exit_window, entry_premium, eod_stop, eod_target, direction,
++                                    )
++                                    if sim_reason:
++                                        exit_premium, eod_exit_reason = float(sim_price), sim_reason
++                                        eod_exit_time = sim_ts
++                                        ex_time = IST.localize(sim_ts) if sim_ts.tzinfo is None else sim_ts
++                                    elif eod_chart_reason:
++                                        eod_exit_reason = uts_lane_policy.EXIT_REASONS.get(eod_chart_reason, "UTS_EXIT")
+                                 sim_charges = estimate_trade_charges(
+                                     last_s.price if sim_inst == "FUT" else entry_premium,
+                                     exit_premium,
+@@ -6248,10 +6364,10 @@
+                                     settings,
+                                 )
+                                 if sim_inst == "FUT":
+-                                    if direction == "LONG" and eod_price <= eod_stop:
++                                    if not historical_final_uts and direction == "LONG" and eod_price <= eod_stop:
+                                         exit_premium = eod_stop
+                                         eod_exit_reason = "SL HIT"
+-                                    elif direction == "SHORT" and eod_price >= eod_stop:
++                                    elif not historical_final_uts and direction == "SHORT" and eod_price >= eod_stop:
+                                         exit_premium = eod_stop
+                                         eod_exit_reason = "SL HIT"
+                                     if direction == "LONG":
+@@ -6297,7 +6413,12 @@
+                                     signal_time=(getattr(last_s, "source_signal_timestamp", None)
+                                                  or last_s.timestamp) if eod_uts else None,
+                                     replay_price_path=list((actual_eod or {}).get("price_path") or []),
+-                                    replay_exit_trace=list((actual_eod or {}).get("exit_trace") or []),
++                                    replay_exit_trace=(self._historical_futures_fill_evidence(
++                                        exit_window, signal=last_s, entry_time=eod_start,
++                                        exit_time=eod_exit_time, entry_price=entry_premium,
++                                        exit_price=exit_premium, exit_reason=eod_exit_reason,
++                                    ) if historical_final_uts and sim_inst == "FUT" else
++                                        list((actual_eod or {}).get("exit_trace") or [])),
+                                 )
+                                 live_session_day_raw = (
+                                     scanner._get_current_session_day()
+--- engine\trade_row_adapter.py (before audit)
++++ engine\trade_row_adapter.py
+@@ -330,10 +330,40 @@
+             for item in evidence
+         )
+     )
+-    if verified_option_replay and math.isfinite(actual_exit) and actual_exit > 0:
++    modeled_futures_replay = False
++    if inst_type == "FUT" and _normalized_text(row.get("data_provenance"), upper=True) == "BACKTEST":
++        for item in evidence:
++            if not isinstance(item, dict):
++                continue
++            digest = str(item.get("input_sha256") or "")
++            if (item.get("guard") != "replay_input" or item.get("state") != "INDEX_PRICE_PROXY"
++                    or item.get("fill_accounting") != "CAUSAL_INDEX_PROXY_V1"
++                    or item.get("complete_path") is not True
++                    or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
++                continue
++            try:
++                prices_match = (math.isclose(float(item["entry_price"]), entry_price, rel_tol=0., abs_tol=1e-8)
++                                and math.isclose(float(item["exit_price"]), actual_exit, rel_tol=0., abs_tol=1e-8))
++                times_match = True
++                for name in ("entry_time", "exit_time"):
++                    def market_time(value):
++                        if isinstance(value, (int, float)):
++                            return datetime.fromtimestamp(value, IST).replace(tzinfo=None)
++                        stamp = datetime.fromisoformat(str(value))
++                        return stamp.astimezone(IST).replace(tzinfo=None) if stamp.tzinfo else stamp
++                    row_time = row.get(name.replace("_time", "_timestamp")) or row.get(name)
++                    times_match = times_match and market_time(item[name]) == market_time(row_time)
++                modeled_futures_replay = prices_match and times_match and item["exit_reason"] == row.get("exit_reason")
++            except (KeyError, TypeError, ValueError, OverflowError):
++                continue
++            if modeled_futures_replay:
++                break
++    if (verified_option_replay or modeled_futures_replay) and math.isfinite(actual_exit) and actual_exit > 0:
+         # The replay already priced the observed option path, including gap fills
+         # and a raised profit stop. Legacy display stops/targets are entry geometry;
+-        # substituting them would rewrite both the verified fill and its accounting.
++        # substituting them would rewrite both the fill and its accounting. Covered
++        # futures index-proxy paths retain the same accounting, without claiming
++        # that their prices came from observed futures contracts.
+         row["exit_price"] = actual_exit
+         row["current_price"] = actual_exit
+         recorded_pnl = _normalized_number(row.get("pnl"))
+@@ -341,10 +371,11 @@
+             return row
+         charges = _normalized_number(row.get("charges"))
+         if charges is None or not math.isfinite(charges) or charges < 0:
+-            charges = max(0.0, float(getattr(get_settings(), "opt_cost", 0.0) or 0.0))
++            charges = max(0.0, float(getattr(get_settings(), "opt_cost" if inst_type == "OPT" else "fut_cost", 0.0) or 0.0))
+         quantity = int(row.get("lots") or 1) * int(row.get("lot_size") or 1)
+         row["charges"] = charges
+-        row["pnl"] = round((actual_exit - entry_price) * quantity - charges, 2)
++        sign = -1 if inst_type == "FUT" and direction == "SHORT" else 1
++        row["pnl"] = round(sign * (actual_exit - entry_price) * quantity - charges, 2)
+         return row
+     if broker_fill_pair and actual_exit > 0:
+         # Repair rows written before exact-fill accounting was fixed.  Never replace an
+--- engine\uts_lane.py (before audit)
++++ engine\uts_lane.py
+@@ -145,15 +145,21 @@
+         rsi_measured = False
+     if not rsi_measured:
+         rsi = 50.0
+-    try:
+-        ratio = number("volume_ratio") if volume_ratio is None else float(volume_ratio)
++    raw_ratio = volume_ratio
++    if raw_ratio is None:
++        raw_ratio = getattr(obj, "volume_ratio", None)
++        if raw_ratio is None:
++            raw_ratio = stored.get("volume_ratio")
++    try:
++        ratio = float(raw_ratio)
++        ratio_measured = math.isfinite(ratio) and ratio >= 0
+     except (TypeError, ValueError):
+-        ratio = 0.0
++        ratio, ratio_measured = 0.0, False
+     basis = str(volume_basis if volume_basis is not None else
+                 getattr(obj, "volume_basis", None) or stored.get("volume_basis", "")).upper()
+     available = (volume_available if volume_available is not None else
+                  getattr(obj, "volume_available", stored.get("volume_available", False))) is True
+-    measured = available and basis not in {"", "UNKNOWN", "UNAVAILABLE", "PROXY", "TICK_ACTIVITY",
++    measured = available and ratio_measured and basis not in {"", "UNKNOWN", "UNAVAILABLE", "PROXY", "TICK_ACTIVITY",
+         "INDEX_TICK_ACTIVITY", "TICK_ROLLING_AVG", "TICK_TIME_OF_DAY", "MIXED", "MIXED_UNITS"}
+     return dict(adx=number("adx_value"), rsi=rsi, rsi_measured=rsi_measured, direction=direction,
+         directional_rsi=rsi_measured and (rsi >= 55 if direction in {"LONG", "BUY"} else
+@@ -434,43 +440,31 @@
+     return stamp.tz_convert("Asia/Kolkata").tz_localize(None) if stamp.tzinfo else stamp
+ 
+ 
+-def repaint_exit(trade: Any, result: Optional[dict], now: Optional[datetime], settings=None, *, force_check=False) -> str:
+-    """'REPAINT' when a trade entered on a forming candle has lost its flip; '' otherwise.
+-
+-    While the signal candle forms, the flip is re-checked every uts_lane_repaint_check_seconds
+-    (10s). After it closes, the closed candle must carry the same flip once; then the trade is
+-    confirmed and never checked again. A closed-candle entry confirms on its first check.
+-    A result still computed on the forming candle after the close is waited for, not read
+-    as a repaint.
+-    """
++def signal_observation(trade: Any, result: Optional[dict], now: Optional[datetime], settings=None):
++    """Read a current, source-matched UTS evaluation without mutating trade state."""
+     import pandas as pd
+ 
+-    if getattr(trade, "uts_confirmed", False) or not isinstance(result, dict) or now is None:
+-        return ""
+-    # A closed candle cannot repaint (trade_manager applies the same rule on restore). A
+-    # closed-candle entry is never re-judged: the flip it entered on can only go missing
+-    # from a result that drifted since (a changed trail, a vendor backfill nudging a bar).
+-    if not bool(getattr(trade, "entered_intracandle", True)):
+-        return ""
++    if not isinstance(result, dict) or now is None:
++        return None
+     ts = getattr(trade, "signal_time", None) or getattr(trade, "signal_timestamp", None)
+     if ts is None:
+-        return ""
++        return None
+     try:
+         want = _market_time(ts)
+         clock = _market_time(now)
+     except Exception:
+-        return ""
++        return None
+     s = _settings(settings)
+     bar_minutes = _tf_minutes(getattr(trade, "timeframe", ""))
+     bar_close = want + pd.Timedelta(minutes=bar_minutes)
+     evidence = result.get('uts_evaluation')
+     if result.get('error') or str(result.get('source_engine') or '').lower() != ENGINE_KEY or not isinstance(evidence, dict):
+-        return ""
++        return None
+     if str(result.get('timeframe') or '') != str(getattr(trade, 'timeframe', '') or ''):
+-        return ''
++        return None
+     instrument = str(getattr(trade, 'instrument', '') or '').split()
+     if not instrument or result.get('instrument') != instrument[0]:
+-        return ''
++        return None
+     try:
+         observed = _market_time(evidence['observed_at'])
+         first = _market_time(evidence['first_bar'])
+@@ -478,20 +472,23 @@
+         forming_bar = _market_time(evidence['forming_bar']) if evidence.get('forming_bar') is not None else None
+         age = (clock - observed).total_seconds()
+         if not (0 <= age <= _g(s, 'uts_lane_result_max_age_seconds', 30.0)) or first > want:
+-            return ''
++            return None
+         if clock >= bar_close and last_closed < want:
+-            return ''
++            return None
+         if clock < bar_close and forming_bar != want:
+-            return ''
++            return None
+     except (KeyError, TypeError, ValueError):
+-        return ''
++        return None
+     side = "BUY" if str(getattr(trade, "direction", "LONG") or "LONG").upper() == "LONG" else "SELL"
+-    closed_hit = forming_hit = False
++    closed_hit = forming_hit = opposite_hit = False
+     for sig in result.get("signals") or []:
+         if str(getattr(sig, "source_engine", "") or "").lower() != ENGINE_KEY:
+             continue
+         try:
+-            if _market_time(getattr(sig, "timestamp", None)) != want or getattr(sig, "signal_type", "") != side:
++            if _market_time(getattr(sig, "timestamp", None)) != want:
++                continue
++            if getattr(sig, "signal_type", "") != side:
++                opposite_hit = opposite_hit or getattr(sig, "signal_type", "") in {"BUY", "SELL"}
+                 continue
+         except Exception:
+             continue
+@@ -499,21 +496,52 @@
+             forming_hit = True
+         else:
+             closed_hit = True
+-    if clock >= bar_close:
+-        if closed_hit:
++    return dict(clock=clock, bar_closed=clock >= bar_close, closed_hit=closed_hit,
++                forming_hit=forming_hit, opposite_hit=opposite_hit)
++
++
++def repaint_signal_status(trade: Any, result: Optional[dict], now: Optional[datetime], settings=None) -> str:
++    """Classify a buffer observation only after its freshness and coverage checks."""
++    observation = signal_observation(trade, result, now, settings)
++    if observation is None:
++        return "UNKNOWN"
++    if observation["bar_closed"] and observation["forming_hit"] and not observation["closed_hit"]:
++        return "UNKNOWN"
++    if observation["closed_hit"] or observation["forming_hit"]:
++        return "PRESENT"
++    return "FLIPPED" if observation["opposite_hit"] else "VANISHED"
++
++
++def repaint_exit(trade: Any, result: Optional[dict], now: Optional[datetime], settings=None, *, force_check=False) -> str:
++    """Latch a proven intrabar repaint until exit completes; confirm closed flips."""
++    if getattr(trade, "uts_repaint_exit_required", False):
++        return "REPAINT"
++    if getattr(trade, "uts_confirmed", False) or not bool(getattr(trade, "entered_intracandle", True)):
++        return ""
++    observation = signal_observation(trade, result, now, settings)
++    if observation is None:
++        return ""
++    clock = observation["clock"]
++    if observation["bar_closed"]:
++        if observation["closed_hit"]:
+             setattr(trade, "uts_confirmed", True)
+             return ""
+-        return "" if forming_hit else "REPAINT"
+-    every = max(1.0, _g(s, "uts_lane_repaint_check_seconds", 10.0))
+-    last = (getattr(trade, "uts_repaint_checked_at", None)
+-            or getattr(trade, "entry_filled_at", None) or getattr(trade, "entry_time", None))
+-    try:
+-        if not force_check and last is not None and (clock - _market_time(last)).total_seconds() < every:
++        if observation["forming_hit"]:
+             return ""
+-    except Exception:
+-        pass
+-    setattr(trade, "uts_repaint_checked_at", clock.to_pydatetime())
+-    return "" if (forming_hit or closed_hit) else "REPAINT"
++    else:
++        every = max(1.0, _g(_settings(settings), "uts_lane_repaint_check_seconds", 10.0))
++        last = (getattr(trade, "uts_repaint_checked_at", None)
++                or getattr(trade, "entry_filled_at", None) or getattr(trade, "entry_time", None))
++        try:
++            if not force_check and last is not None and (clock - _market_time(last)).total_seconds() < every:
++                return ""
++        except Exception:
++            pass
++        setattr(trade, "uts_repaint_checked_at", clock.to_pydatetime())
++        if observation["forming_hit"] or observation["closed_hit"]:
++            return ""
++    setattr(trade, "uts_repaint_exit_required", True)
++    return "REPAINT"
+ 
+ 
+ # Dashboard-editable UT SMART EXIT settings (same shape as s1_lane.S1_SETTING_SPEC).

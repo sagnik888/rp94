@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import time
+import re
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Optional, Set
 from loguru import logger
@@ -510,17 +511,28 @@ class ExpiryManager:
             now_dt = now_dt or datetime.now()
             td = now_dt.date()
             self._ensure_expiry_dates()
-            opt = self.df[(self.df["name"] == name)
-                          & (self.df["instrumenttype"].isin(["OPTIDX"]))
-                          & (self.df["expiry_dt"].dt.date >= td)]
-            exps = sorted(opt["expiry_dt"].dropna().unique())
-            if name in {"BANKNIFTY", "MIDCPNIFTY"}:
-                monthlies = []
-                for e in exps:
-                    same = [d for d in exps if d.month == e.month and d.year == e.year]
-                    if same:
-                        monthlies.append(same[-1])
-                exps = sorted(set(monthlies))
+            # The expiry list depends only on (index, date, instrument master), yet this
+            # filtered all ~168k master rows with pyarrow string compares and a per-row
+            # .dt.date on every call — ~9% of per-index scan wall time (py-spy, live,
+            # 2026-09-23). Cache it per day; a reloaded master is a new object and misses.
+            cache = self.__dict__.setdefault("_gamma_expiry_cache", {})
+            cache_key = (name, td, id(self.df), len(self.df))
+            exps = cache.get(cache_key)
+            if exps is None:
+                opt = self.df[(self.df["name"] == name)
+                              & (self.df["instrumenttype"].isin(["OPTIDX"]))
+                              & (self.df["expiry_dt"].dt.date >= td)]
+                exps = sorted(opt["expiry_dt"].dropna().unique())
+                if name in {"BANKNIFTY", "MIDCPNIFTY"}:
+                    monthlies = []
+                    for e in exps:
+                        same = [d for d in exps if d.month == e.month and d.year == e.year]
+                        if same:
+                            monthlies.append(same[-1])
+                    exps = sorted(set(monthlies))
+                if len(cache) > 32:
+                    cache.clear()
+                cache[cache_key] = exps
             if not exps:
                 return False
             cur = pd.Timestamp(exps[0])
@@ -650,6 +662,14 @@ class ExpiryManager:
         )
         return False
 
+    def effective_expiry(self, name: str, expiry_type: str = "active_weekly"):
+        """One contract-expiry authority for execution and option-chain intelligence."""
+        value = self.expiries.get(name, {}).get(expiry_type)
+        if self.in_gamma_window(name):
+            base_type = "weekly" if "weekly" in str(expiry_type) else "monthly"
+            value = self.expiries.get(name, {}).get(base_type) or value
+        return value
+
     def get_token(self, name: str, strike: float, option_type: str, expiry_type: str = "weekly") -> Optional[Dict]:
         """Find the specific token for an option strike.
 
@@ -659,16 +679,7 @@ class ExpiryManager:
         is correct for live. (Backtest uses get_token_for_date with the bar timestamp.)"""
         if not self._ensure_ready(): return None
 
-        expiry_val = self.expiries.get(name, {}).get(expiry_type)
-        # Gamma override: trade the current (non-rolled) expiry during the gamma window.
-        try:
-            if self.in_gamma_window(name):
-                base_type = "weekly" if "weekly" in str(expiry_type) else "monthly"
-                cur = self.expiries.get(name, {}).get(base_type)
-                if cur:
-                    expiry_val = cur
-        except Exception:
-            pass
+        expiry_val = self.effective_expiry(name, expiry_type)
         if not expiry_val: return None
 
         # Cache keyed on the RESOLVED expiry so gamma (current) and normal (rolled) tokens
@@ -784,5 +795,142 @@ class ExpiryManager:
             return self.analyze_expiries()
         return {}
 
-# Singleton for system-wide use
+def expiry_policy_signature():
+    """Invalidate local expiry answers on rollover, gamma or calendar changes."""
+    from config.settings import get_settings
+    settings = get_settings()
+    keys = ("option_rollover_working_days", "expiry_day_trade_current_week", "expiry_day_include_t1",
+            "expiry_day_gamma_cutoff", "expiry_day_late_window", "expiry_day_late_window_start",
+            "expiry_day_late_window_end", "expiry_day_after_cutoff_mode")
+    holidays, special = ExpiryManager._load_calendar()
+    return tuple(getattr(settings, key, None) for key in keys), frozenset(holidays), frozenset(special)
+
+
+class ArchivedExpiryContext:
+    """Local contract identity for replay; never loads or changes the live master.
+
+    Dated weekly symbols identify an expired contract without a current login.
+    Monthly symbols require explicit expiry metadata. No weekday is invented.
+    """
+
+    def __init__(self, data_dir=Path("data_store")):
+        self.data_dir = Path(data_dir).resolve()
+        self._signature = None
+        self._expiries = {}
+        self._resolution_cache = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _dated_symbol_expiry(name, symbol):
+        suffix = str(symbol).upper()[len(name):]
+        try:
+            # DDMMMYY + strike is ambiguous with Kite's YYMMM + strike
+            # without a separately verified strike. Use master metadata for
+            # those names; only the compact dated Kite form is unambiguous.
+            match = re.fullmatch(r"(\d{2})([1-9OND])(\d{2})\d+(CE|PE)", suffix)
+            if match:
+                month = {"O": 10, "N": 11, "D": 12}.get(match[2])
+                return date(2000 + int(match[1]), month or int(match[2]), int(match[3]))
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    def _load(self):
+        paths = [self.data_dir / "kite_instruments.json", self.data_dir / "instruments.json", self.data_dir / "candles"]
+        signature = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else (str(p), None, None) for p in paths)
+        with self._lock:
+            if signature == self._signature:
+                return
+            names = ("BANKNIFTY", "MIDCPNIFTY", "NIFTY", "SENSEX")
+            symbols = {}
+            parsed_expiries = {}
+            for path in paths[:2]:
+                if not path.exists():
+                    continue
+                try:
+                    rows = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(rows, list):
+                        continue
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        symbol = str(row.get("symbol") or row.get("tradingsymbol") or "").upper()
+                        name = str(row.get("name") or "").upper()
+                        if name not in names or not symbol.startswith(name) or not symbol.endswith(("CE", "PE")):
+                            continue
+                        value = row.get("expiry")
+                        key = str(value)
+                        if key not in parsed_expiries:
+                            expiry = pd.to_datetime(value, format="%d%b%Y", errors="coerce")
+                            if pd.isna(expiry):
+                                expiry = pd.to_datetime(value, errors="coerce")
+                            parsed_expiries[key] = expiry
+                        expiry = parsed_expiries[key]
+                        if not pd.isna(expiry):
+                            symbols[(name, symbol)] = (expiry.date(), "archived_master")
+                except (OSError, ValueError, TypeError):
+                    continue
+            if paths[2].exists():
+                for path in paths[2].glob("*.csv"):
+                    symbol = re.sub(r"_\d+min$", "", path.stem).upper()
+                    name = next((n for n in names if symbol.startswith(n)), None)
+                    if name:
+                        expiry = self._dated_symbol_expiry(name, symbol)
+                        if expiry is not None:
+                            symbols[(name, symbol)] = (expiry, "archived_dated_symbol")
+            expiries = {name: {} for name in names}
+            for (name, _), (expiry, source) in symbols.items():
+                expiries[name][expiry] = source
+            self._expiries = expiries
+            self._signature = signature
+            self._resolution_cache.clear()
+
+    def resolve(self, name, as_of, *, contract_expiry=None, contract_verified=False):
+        unknown = {"available": False, "contract_expiry": None, "days_to_expiry": None,
+                   "source": "unavailable", "is_expiry_day": False, "in_gamma_window": False}
+        try:
+            clock = pd.Timestamp(as_of)
+            if pd.isna(clock):
+                return unknown
+            if clock.tzinfo is not None:
+                clock = clock.tz_convert("Asia/Kolkata").tz_localize(None)
+            day = clock.date()
+            if contract_expiry is not None:
+                expiry = pd.Timestamp(contract_expiry)
+                if not contract_verified or pd.isna(expiry) or expiry.date() < day:
+                    return unknown
+                return {**unknown, "available": True, "contract_expiry": expiry.date().isoformat(),
+                        "days_to_expiry": (expiry.date() - day).days, "source": "verified_option_contract",
+                        "is_expiry_day": expiry.date() == day}
+            self._load()
+            name = str(name or "").upper()
+            key = (name, clock, self._signature, expiry_policy_signature())
+            with self._lock:
+                cached = self._resolution_cache.get(key)
+                if cached is not None:
+                    return dict(cached)
+            sources = self._expiries.get(name, {})
+            expiries = sorted(exp for exp in sources if exp >= day)
+            if not expiries:
+                return unknown
+            resolver = ExpiryManager.__new__(ExpiryManager)
+            resolver.df = pd.DataFrame({"name": [name] * len(expiries), "instrumenttype": ["OPTIDX"] * len(expiries), "expiry_dt": pd.to_datetime(expiries)})
+            selected = resolver._select_option_expiry_for_date(
+                name, day, "active_monthly" if name in {"BANKNIFTY", "MIDCPNIFTY"} else "active_weekly", now_dt=clock)
+            if selected is None:
+                return unknown
+            expiry = selected.date()
+            result = {"available": True, "contract_expiry": expiry.isoformat(), "days_to_expiry": (expiry - day).days,
+                    "source": sources[expiry], "is_expiry_day": day in sources,
+                    "in_gamma_window": resolver.in_gamma_window(name, clock)}
+            with self._lock:
+                if len(self._resolution_cache) >= 256:
+                    self._resolution_cache.clear()
+                self._resolution_cache[key] = dict(result)
+            return result
+        except (ValueError, TypeError, OverflowError):
+            return unknown
+
+
+# Singleton for live execution only; historical callers use ArchivedExpiryContext.
 expiry_manager = ExpiryManager()

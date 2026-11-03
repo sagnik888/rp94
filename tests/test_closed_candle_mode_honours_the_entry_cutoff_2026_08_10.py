@@ -28,6 +28,7 @@ import re
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 
 def _timing_loop_source():
@@ -36,7 +37,7 @@ def _timing_loop_source():
     Fixed char/line windows in this repo have silently drifted as the file grew and then
     asserted against the wrong code.
     """
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     start = src.index("timing_eligible = []")
     end = src.index("Live Anti-Repaint Stabilization Buffer")
     # Comments are stripped: the explanatory comment on this branch names the very
@@ -56,7 +57,7 @@ def test_the_closed_candle_branch_applies_the_cutoff():
     repo has already been caught by twice.
     """
     body = _timing_loop_source()
-    assert "not intrabar_enabled and not self._entry_cutoff_allows_candidate(" in body, (
+    assert "not intrabar_enabled and not scanner._entry_cutoff_allows_candidate(" in body, (
         "CANDLE_CLOSE still admits a candidate whose candle closed past the policy"
     )
 
@@ -73,7 +74,7 @@ def test_the_cutoff_there_is_gated_to_closed_candle_mode():
 
 def test_the_intracandle_call_sites_are_still_present():
     """The three buffer-path checks must survive untouched."""
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     assert src.count("_entry_cutoff_allows_candidate") >= 4, (
         "a pre-existing cutoff call site was lost"
     )
@@ -81,7 +82,7 @@ def test_the_intracandle_call_sites_are_still_present():
 
 def test_the_stabilization_block_is_still_intracandle_only():
     """The premise. If this block ever runs in CANDLE_CLOSE the new check is redundant."""
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     assert 'not is_warmup and intrabar_enabled:' in src
 
 
@@ -93,11 +94,14 @@ def test_the_fire_mode_is_reachable_at_runtime():
     assert "set_signal_fire_mode" in inspect.getsource(Scanner.configure)
 
 
-def test_the_shipped_mode_is_still_intracandle():
-    """Records why this is latent rather than live. If it ever flips, severity rises."""
-    from config.settings import get_settings
+def test_the_shipped_mode_is_intracandle():
+    """UT Smart re-enabled the forming-candle path on 2026-09-26."""
+    from config.settings import Settings
 
-    assert get_settings().get_signal_fire_mode() == "INTRACANDLE"
+    # The user's .env may legitimately select candle-close mode.
+    defaults = {name: Settings.model_fields[name].default for name in
+                ('ut_signal_mode', 'live_intrabar_signal_entries')}
+    assert Settings(_env_file=None, **defaults).get_signal_fire_mode() == "INTRACANDLE"
 
 
 # ── the predicate itself still behaves ───────────────────────────────────────

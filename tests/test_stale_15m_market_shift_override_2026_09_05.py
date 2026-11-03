@@ -8,6 +8,15 @@ from engine.quality_verdict import QualityInputs, evaluate_quality
 from scanner import Scanner
 
 
+def _route_on():
+    """This file tests the confirmed_market_shift MECHANISM. The route ships OFF since
+    2026-09-23 (see tests/test_market_shift_route_switch_2026_09_23.py), so it is switched on
+    here on a fresh Settings object that cannot leak into other tests."""
+    settings = Settings()
+    object.__setattr__(settings, "quality_policy_market_shift_route_enabled", True)
+    return settings
+
+
 @pytest.mark.parametrize("regime", ["UNKNOWN", "RANGING", "VOLATILE"])
 @pytest.mark.parametrize("direction", ["LONG", "SHORT"])
 def test_confirmed_market_shift_is_bidirectional_and_not_vetoed_by_stale_15m(regime, direction):
@@ -16,11 +25,30 @@ def test_confirmed_market_shift_is_bidirectional_and_not_vetoed_by_stale_15m(reg
             timeframe="5min", inst_type="OPT", confidence=0.65, regime=regime,
             adx_value=28.0, trend_15m_agrees=False, direction=direction,
             market_shift_confirmed=True,
+            # Since 2026-09-23 the route also needs measured volume >= 1.05x; without it
+            # the shift is a price pattern with nothing behind it (see
+            # test_the_override_still_needs_measured_volume below).
+            volume_available=True, volume_basis="TRADED", volume_ratio=1.40,
         ),
-        Settings(),
+        _route_on(),
     )
     assert verdict.allowed is True
     assert verdict.reason_code == "CONFIRMED_MARKET_SHIFT"
+
+
+def test_the_override_still_needs_measured_volume():
+    """The 2026-09-18 09:17 shape: same evidence, no measured participation."""
+    verdict = evaluate_quality(
+        QualityInputs(
+            timeframe="5min", inst_type="OPT", confidence=0.65, regime="RANGING",
+            adx_value=28.0, trend_15m_agrees=False, direction="LONG",
+            market_shift_confirmed=True,
+            volume_available=False, volume_basis="UNAVAILABLE", volume_ratio=0.0,
+        ),
+        _route_on(),
+    )
+    assert verdict.allowed is False
+    assert verdict.reason_code == "MARKET_SHIFT_VOLUME_UNCONFIRMED"
 
 
 @pytest.mark.parametrize("regime", ["UNKNOWN", "RANGING"])

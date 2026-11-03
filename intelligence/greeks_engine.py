@@ -1,10 +1,25 @@
 """
 Greeks Engine — Options Greeks Calculator (Black-Scholes)
 """
-import numpy as np
-from scipy.stats import norm
+import math
 from typing import Dict
+
+import numpy as np
 from loguru import logger
+
+_SQRT2 = math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+def _ncdf(x: float) -> float:
+    # Standard normal CDF for one scalar. scipy.stats.norm.cdf on a scalar costs tens of
+    # microseconds of Python overhead per call; the implied-IV solver calls it ~160 times
+    # per index per analysis and it was ~20% of all intelligence CPU (2026-09-25).
+    return 0.5 * math.erfc(-x / _SQRT2)
+
+
+def _npdf(x: float) -> float:
+    return _INV_SQRT_2PI * math.exp(-0.5 * x * x)
 
 
 class GreeksEngine:
@@ -15,21 +30,25 @@ class GreeksEngine:
         try:
             if spot <= 0 or strike <= 0 or iv <= 0:
                 return self._zero()
+            spot, strike, iv = float(spot), float(strike), float(iv)
             raw_days = float(days or 0.0)
             effective_days = max(raw_days, 0.5)
             T = effective_days / 365.0
-            d1 = (np.log(spot / strike) + (self.r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
-            d2 = d1 - iv * np.sqrt(T)
+            sqrt_t = math.sqrt(T)
+            d1 = (math.log(spot / strike) + (self.r + 0.5 * iv**2) * T) / (iv * sqrt_t)
+            d2 = d1 - iv * sqrt_t
+            pdf_d1 = _npdf(d1)
+            discount = math.exp(-self.r * T)
             if opt_type.lower() == "call":
-                delta = norm.cdf(d1)
-                theta = (-(spot * norm.pdf(d1) * iv) / (2 * np.sqrt(T)) - self.r * strike * np.exp(-self.r * T) * norm.cdf(d2))
-                price = spot * norm.cdf(d1) - strike * np.exp(-self.r * T) * norm.cdf(d2)
+                delta = _ncdf(d1)
+                theta = (-(spot * pdf_d1 * iv) / (2 * sqrt_t) - self.r * strike * discount * _ncdf(d2))
+                price = spot * _ncdf(d1) - strike * discount * _ncdf(d2)
             else:
-                delta = norm.cdf(d1) - 1
-                theta = (-(spot * norm.pdf(d1) * iv) / (2 * np.sqrt(T)) + self.r * strike * np.exp(-self.r * T) * norm.cdf(-d2))
-                price = strike * np.exp(-self.r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
-            gamma = norm.pdf(d1) / (spot * iv * np.sqrt(T))
-            vega = spot * norm.pdf(d1) * np.sqrt(T) / 100
+                delta = _ncdf(d1) - 1
+                theta = (-(spot * pdf_d1 * iv) / (2 * sqrt_t) + self.r * strike * discount * _ncdf(-d2))
+                price = strike * discount * _ncdf(-d2) - spot * _ncdf(-d1)
+            gamma = pdf_d1 / (spot * iv * sqrt_t)
+            vega = spot * pdf_d1 * sqrt_t / 100
             mn = "ATM" if abs(spot - strike) / spot < 0.005 else ("ITM" if (spot > strike if opt_type == "call" else spot < strike) else "OTM")
             return {"delta": round(float(delta), 4), "gamma": round(float(gamma), 6), "theta": round(float(theta / 365), 2), "vega": round(float(vega), 2), "price": round(float(max(0, price)), 2), "iv": round(iv * 100, 1), "moneyness": mn, "days_to_expiry": days, "effective_days_to_expiry": round(effective_days, 4)}
         except Exception as e:

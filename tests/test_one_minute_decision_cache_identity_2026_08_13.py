@@ -35,6 +35,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 class _Sig:
@@ -137,7 +138,7 @@ def test_the_decision_key_is_built_from_all_three_lanes():
     """
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     i = src.index("signal_parts = []")
     window = src[i: i + 700]
 

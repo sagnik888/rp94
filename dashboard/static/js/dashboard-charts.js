@@ -144,7 +144,8 @@ function initChart() {
     // solid line series reused across updates so switching the scanner engine swaps
     // the on-chart indicator without churning series.
     state.engineOverlaySeries = [];
-    for (let i = 0; i < 3; i++) {
+    // S1+S2 Dual needs eight independent levels (D1/D2 stop + T1/T2/T3).
+    for (let i = 0; i < 8; i++) {
         state.engineOverlaySeries.push(addChartSeries(chart, LightweightCharts.LineSeries, 'addLineSeries', {
             color: '#888888',
             lineWidth: 2,
@@ -247,6 +248,10 @@ function applyChartSnapshot(snapshot) {
     if (!state.chartStreamEnabled) return;
     const instrument = TICKER_MAP[snapshot.instrument] || snapshot.instrument || state.currentInstrument;
     if (!instrument || instrument !== state.currentInstrument) return;
+    const timeframe = snapshot.tf || state.currentTimeframe;
+    if (timeframe !== state.currentTimeframe) return;
+    const chartForView = snapshot.chart?.[timeframe];
+    if (!Array.isArray(chartForView?.candles) || chartForView.candles.length === 0) return;
 
     const current = state.latestData || {};
     const instruments = { ...(current.instruments || {}) };
@@ -260,6 +265,7 @@ function applyChartSnapshot(snapshot) {
         instruments,
         simulation_id: snapshot.simulation_id || current.simulation_id || 0,
     };
+    state.chartSnapshotPendingId = null;
     state.lastChartId = null;
     state.lastBarTime = null;
     state.lastBarKey = null;
@@ -317,8 +323,11 @@ function applyChartStreamState(enabled, options = {}) {
         clearIntelOverlay();
         setCandleMarkers([]);
         state.lastChartId = null;
+        state.lastChartWindowKey = null;
         state.lastBarTime = null;
         state.lastBarKey = null;
+        state.chartDefaultVisibleRangeId = null;
+        state.chartSnapshotPendingId = null;
 
     } else if (options.requestSnapshot !== false) {
         requestChartSnapshot(state.currentInstrument, state.currentTimeframe, 'chart-stream-enabled');
@@ -333,6 +342,15 @@ function applyChartStreamState(enabled, options = {}) {
 function mergeChartData(currentChart, incomingChart) {
     if (!currentChart || !incomingChart) return incomingChart || currentChart;
 
+    // A raw/Heikin Ashi switch changes every candle; never splice the two histories.
+    if ((currentChart.candle_type || 'standard') !== (incomingChart.candle_type || 'standard') ||
+        (incomingChart.engine && currentChart.engine !== incomingChart.engine)) {
+        if ((incomingChart.candles || []).length <= 1 && typeof requestChartSnapshot === 'function') {
+            requestChartSnapshot(state.currentInstrument, state.currentTimeframe, 'chart-source-changed');
+        }
+        return incomingChart;
+    }
+
     const incomingCandles = incomingChart.candles || [];
     const hasFullCurrent = (currentChart.candles || []).length > 1;
     const isIncremental = incomingCandles.length <= 1 && hasFullCurrent;
@@ -344,7 +362,7 @@ function mergeChartData(currentChart, incomingChart) {
         candles: upsertByTime(currentChart.candles || [], incomingCandles[0]),
         trailing_stop: upsertByTime(currentChart.trailing_stop || [], (incomingChart.trailing_stop || [])[0]),
         indicator_overlays: (incomingChart.indicator_overlays && incomingChart.indicator_overlays.length) ? incomingChart.indicator_overlays : (currentChart.indicator_overlays || []),
-        markers: incomingChart.markers && incomingChart.markers.length ? incomingChart.markers : (currentChart.markers || []),
+        markers: Array.isArray(incomingChart.markers) ? incomingChart.markers : (currentChart.markers || []),
     };
 }
 
@@ -361,20 +379,48 @@ function upsertByTime(series, point) {
     return next;
 }
 
+function chartViewportStillCoversData(range, candles, timeframe) {
+    if (!range || !candles?.length) return false;
+    const from = Number(range.from);
+    const to = Number(range.to);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return false;
+
+    const barSeconds = ({ '1min': 60, '5min': 300, '15min': 900 })[timeframe] || 300;
+    const expectedBars = Math.max(1, (to - from) / barSeconds + 1);
+    let visibleBars = 0;
+    for (const candle of candles) {
+        const time = Number(candle.time);
+        if (Number.isFinite(time) && time >= from && time <= to) visibleBars += 1;
+    }
+
+    // A range parked mostly beyond the loaded candle window is stale (for
+    // example, 998..1047 after a 1,000-bar WS payload becomes a 300-bar REST
+    // payload). Keep a deliberate zoom/pan only while it still covers data.
+    return visibleBars >= Math.min(1, expectedBars * 0.25)
+        && visibleBars / expectedBars >= 0.25;
+}
+
 
 function updateChart(data) {
     if (!state.chartStreamEnabled) return;
     const chartData = data.chart || {};
     const tf = state.currentTimeframe;
     const instName = state.currentInstrument;
+    if (state.chartSnapshotPendingId === `${instName}_${tf}`) return;
     const tfData = chartData[tf];
 
     if (!tfData || !tfData.candles || tfData.candles.length === 0) return;
     document.getElementById('mainChart')?.querySelector('.chart-disabled-placeholder')?.remove();
+    const sourceBadge = document.getElementById('chartCandleSource');
+    if (sourceBadge) {
+        sourceBadge.hidden = tfData.engine !== 's1';
+        sourceBadge.textContent = tfData.candle_type === 'heikin_ashi' ? 'S1 · Heikin Ashi' : 'S1 · Standard';
+    }
 
     // ═══ INCREMENTAL RENDERING OPTIMIZATION ═══
     const lastBar = tfData.candles[tfData.candles.length - 1];
-    const chartId = `${instName}_${tf}_${data.simulation_id || 0}`;
+    const chartId = `${instName}_${tf}_${data.simulation_id || 0}_${tfData.engine || ''}_${tfData.candle_type || 'standard'}`;
+    const chartWindowKey = `${tfData.candles.length}:${tfData.candles[0]?.time ?? ''}`;
     
     const lastBarKey = [
         lastBar.time,
@@ -386,16 +432,30 @@ function updateChart(data) {
         tfData.intel_history?.latest?.time || 0,
         Number(tfData.intel_history?.latest?.primary_pcr || 0).toFixed(3),
         Number(tfData.intel_history?.latest?.net_oi_change || 0),
+        JSON.stringify(tfData.markers || []),
+        JSON.stringify(tfData.trailing_stop?.at(-1) || null),
+        JSON.stringify((tfData.indicator_overlays || []).map(ov => [
+            ov.name, ov.color, ov.data?.length || 0, ov.data?.at(-1),
+        ])),
     ].join('|');
 
     // Same candle timestamp can still move tick-by-tick; only skip if OHLCV is unchanged too.
-    if (state.lastChartId === chartId && state.lastBarKey === lastBarKey) {
+    if (state.lastChartId === chartId
+        && state.lastChartWindowKey === chartWindowKey
+        && state.lastBarKey === lastBarKey) {
         return;
     }
     state.lastBarTime = lastBar.time;
     state.lastBarKey = lastBarKey;
     
-    if (state.lastChartId !== chartId) {
+    const needsFullSync = state.lastChartId !== chartId
+        || state.lastChartWindowKey !== chartWindowKey;
+    if (needsFullSync) {
+        const sameViewport = state.chartDefaultVisibleRangeId === chartId;
+        const timeScale = state.chart.timeScale();
+        const previousVisibleRange = sameViewport && typeof timeScale.getVisibleRange === 'function'
+            ? timeScale.getVisibleRange()
+            : null;
         // Full Reset (Instrument/TF changed or Simulation Reset)
         const candles = tfData.candles.map(c => ({
             time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
@@ -409,9 +469,8 @@ function updateChart(data) {
         state.volumeSeries.setData(volData);
 
         if (tfData.trailing_stop && tfData.trailing_stop.length > 0) {
-            const tsData = tfData.trailing_stop.map(t => ({
-                time: t.time, value: t.value || 0
-            }));
+            const tsData = tfData.trailing_stop.map(t => Number.isFinite(t.value)
+                ? { time: t.time, value: t.value } : { time: t.time });
             state.tsLineSeries.setData(tsData);
         } else {
             state.tsLineSeries.setData([]);
@@ -435,6 +494,32 @@ function updateChart(data) {
         setCandleMarkers(tfData.markers);
         
         state.lastChartId = chartId;
+        state.lastChartWindowKey = chartWindowKey;
+        // The default 28px bar spacing only shows a handful of candles on the
+        // dashboard's narrow chart panel. Recent S1+S2 entries can be dozens of
+        // bars back, which made a populated scanner look empty. Fit the latest
+        // 50 bars once for each instrument/timeframe/engine; later snapshots and
+        // user zooming keep their current viewport.
+        let restoredViewport = false;
+        if (chartViewportStillCoversData(previousVisibleRange, tfData.candles, tf)) {
+            try {
+                timeScale.setVisibleRange(previousVisibleRange);
+                restoredViewport = true;
+            } catch (_) {
+                // The previous range may not map cleanly to the new bar window.
+            }
+        }
+        if (!restoredViewport) {
+            const candleCount = tfData.candles.length;
+            const visibleBars = Math.min(50, candleCount);
+            if (visibleBars > 0) {
+                timeScale.setVisibleLogicalRange({
+                    from: candleCount - visibleBars,
+                    to: candleCount - 1,
+                });
+            }
+        }
+        state.chartDefaultVisibleRangeId = chartId;
         // console.log(`📊 Full Chart Sync: ${chartId}`);
     } else {
         // Incremental Update (The "Fast Path")
@@ -454,12 +539,21 @@ function updateChart(data) {
 
         if (tfData.trailing_stop && tfData.trailing_stop.length > 0) {
             const lastTS = tfData.trailing_stop[tfData.trailing_stop.length - 1];
-            state.tsLineSeries.update({
-                time: lastTS.time,
-                value: lastTS.value
-            });
+            state.tsLineSeries.update(Number.isFinite(lastTS.value)
+                ? { time: lastTS.time, value: lastTS.value } : { time: lastTS.time });
         }
         syncIntelOverlay(tfData, false);
+
+        // S1's EMA/VWAP lines move with the live candles too.
+        (state.engineOverlaySeries || []).forEach((series, i) => {
+            const ov = (tfData.indicator_overlays || [])[i];
+            if (ov && ov.data && ov.data.length) {
+                series.applyOptions({ color: ov.color || '#888888', title: ov.name || '' });
+                series.setData(ov.data.map(p => ({ time: p.time, value: p.value })));
+            } else {
+                series.setData([]);
+            }
+        });
 
         // Always sync markers on incremental update if they exist
         setCandleMarkers(tfData.markers);
@@ -513,24 +607,21 @@ function setupChartEventListeners() {
             document.querySelectorAll('.inst-tab').forEach(t => t.classList.remove('active'));
             tab.classList.add('active');
             state.currentInstrument = tab.dataset.instrument;
+            state.chartSnapshotPendingId = `${state.currentInstrument}_${state.currentTimeframe}`;
             const instEl = document.getElementById('chartInstrument');
             if (instEl) instEl.textContent = state.currentInstrument;
             
-            window.sendCommand({
-                cmd: 'subscribe_chart',
-                instrument: state.currentInstrument,
-                tf: state.currentTimeframe
-            });
-
             // Explicitly Clear Series for Anti-Ghosting
             state.candleSeries.setData([]);
             state.volumeSeries.setData([]);
             state.tsLineSeries.setData([]);
+            (state.engineOverlaySeries || []).forEach(series => series?.setData([]));
             clearIntelOverlay();
             setCandleMarkers([]);
             
             // Force Full Re-render on next updateChart call
             state.lastChartId = null;
+            state.lastChartWindowKey = null;
             state.lastBarTime = null;
             state.lastBarKey = null;
             
@@ -538,10 +629,13 @@ function setupChartEventListeners() {
             if (state.candleSeries) state.candleSeries.setData([]);
             if (state.volumeSeries) state.volumeSeries.setData([]);
             if (state.tsLineSeries) state.tsLineSeries.setData([]);
+            (state.engineOverlaySeries || []).forEach(series => series?.setData([]));
             clearIntelOverlay();
             
-            if (state.latestData.instruments) {
-                updateDashboard(state.latestData);
+            const selectedInstrument = state.latestData?.instruments?.[state.currentInstrument];
+            if (selectedInstrument) {
+                updateInfoPanel(selectedInstrument);
+                updateIntelPanel(selectedInstrument, state.latestData);
             }
             requestChartSnapshot(state.currentInstrument, state.currentTimeframe, 'instrument-tab');
         });
@@ -552,24 +646,21 @@ function setupChartEventListeners() {
             document.querySelectorAll('.tf-tab').forEach(t => t.classList.remove('active'));
             tab.classList.add('active');
             state.currentTimeframe = tab.dataset.tf;
+            state.chartSnapshotPendingId = `${state.currentInstrument}_${state.currentTimeframe}`;
             const tfEl = document.getElementById('chartTimeframe');
             if (tfEl) tfEl.textContent = state.currentTimeframe;
             
-            window.sendCommand({
-                cmd: 'subscribe_chart',
-                instrument: state.currentInstrument,
-                tf: state.currentTimeframe
-            });
-
             // Explicitly Clear Series for Anti-Ghosting
             state.candleSeries.setData([]);
             state.volumeSeries.setData([]);
             state.tsLineSeries.setData([]);
+            (state.engineOverlaySeries || []).forEach(series => series?.setData([]));
             clearIntelOverlay();
             setCandleMarkers([]);
 
             // Force Full Re-render
             state.lastChartId = null;
+            state.lastChartWindowKey = null;
             state.lastBarTime = null;
             state.lastBarKey = null;
 
@@ -577,11 +668,9 @@ function setupChartEventListeners() {
             if (state.candleSeries) state.candleSeries.setData([]);
             if (state.volumeSeries) state.volumeSeries.setData([]);
             if (state.tsLineSeries) state.tsLineSeries.setData([]);
+            (state.engineOverlaySeries || []).forEach(series => series?.setData([]));
             clearIntelOverlay();
 
-            if (state.latestData.instruments) {
-                updateDashboard(state.latestData);
-            }
             requestChartSnapshot(state.currentInstrument, state.currentTimeframe, 'timeframe-tab');
         });
     });

@@ -518,9 +518,9 @@ def test_major_win_guard_opt_call_reversal(monkeypatch):
     tid, exit_val, reason = closed_trades[0]
     assert tid == "trade-opt-mwg"
     assert reason == "MAJOR_WIN_GUARD"
-    # lock_stop = entry + (peak_pnl * ratio) / qty. The raw 0.9125 rung is clamped to the
-    # 0.80 band ceiling: 150 + (3250 * 0.80) / 50 = 202.0
-    assert exit_val == pytest.approx(205.653)
+    # The floor triggers the exit; the request must use the observed premium after
+    # the gap through it, not invent an executable fill at the lock floor.
+    assert exit_val == pytest.approx(198.0)
 
 
 def test_major_win_guard_opt_pe_same_trend_pullback_deferred(monkeypatch):

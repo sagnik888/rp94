@@ -43,9 +43,18 @@ _STATIC_METHODS = ["_normalize_signal_grade_preference", "_setting_enabled",
                    "_is_quad_prime_raw_candidate", "_timeframe_intel_key"]
 
 
-def _stub(regime, tf_regimes=None):
+def _stub(regime, tf_regimes=None, *, trend_agrees=True):
+    import time
     st = SimpleNamespace(mode="REAL", latest_regimes={"NIFTY": regime},
-                         _timeframe_regimes=dict(tf_regimes or {}))
+                         _timeframe_regimes=dict(tf_regimes or {}),
+                         _intel_cache_time={key: time.time() for key in {'NIFTY_5min', *(tf_regimes or {})}})
+    # The matrix's agreement axis represents current market evidence, not a
+    # candidate flag that may have become stale while waiting for admission.
+    st.mtf = SimpleNamespace(engines={
+        "NIFTY_15min": SimpleNamespace(
+            get_state=lambda _key: SimpleNamespace(position=1 if trend_agrees else -1)
+        ),
+    })
     for m in _INST_METHODS:
         setattr(st, m, getattr(Scanner, m).__get__(st, Scanner))
     for m in _STATIC_METHODS:
@@ -86,11 +95,11 @@ def test_live_gate_behavior_parity_golden():
         g = confidence_to_grade(conf)
         tfr = {f"NIFTY_{tf}": reg} if own_tf else {}
         try:
-            gp = _stub(reg, tfr)._passes_candidate_grade_preference(_cand(g, conf, tf, inst, a, adx, im, ex))[0]
+            gp = _stub(reg, tfr, trend_agrees=a)._passes_candidate_grade_preference(_cand(g, conf, tf, inst, a, adx, im, ex))[0]
         except Exception as e:
             gp = "ERR:" + type(e).__name__
         try:
-            lr = _stub(reg, tfr)._passes_live_trade_ready_gate(_cand(g, conf, tf, inst, a, adx, im, ex))
+            lr = _stub(reg, tfr, trend_agrees=a)._passes_live_trade_ready_gate(_cand(g, conf, tf, inst, a, adx, im, ex))
         except Exception as e:
             lr = "ERR:" + type(e).__name__
         rows.append((conf, reg, tf, inst, a, adx, im, ex, pref, pol, own_tf, gp, lr))

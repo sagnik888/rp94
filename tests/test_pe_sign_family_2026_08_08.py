@@ -145,9 +145,9 @@ def test_a_favourable_move_still_locks():
 # ── 3. live unrealised P&L ───────────────────────────────────────────────────
 
 def test_the_unrealised_fallback_branches_on_inst_type():
-    from scanner import Scanner
+    from engine.exit_cycle import ExitCycleService
 
-    src = inspect.getsource(Scanner._update_active_trades)
+    src = inspect.getsource(ExitCycleService.update_active_trades)
     marker = "signed = (mark_px - entry_px)"
     assert marker in src
     window = src[src.index(marker):src.index(marker) + 400]
@@ -157,9 +157,9 @@ def test_the_unrealised_fallback_branches_on_inst_type():
 # ── 4. exit ladders size on the CONFIRMED fill ───────────────────────────────
 
 def test_the_exit_ladder_uses_the_confirmed_fill_quantity():
-    from scanner import Scanner
+    from engine.exit_cycle import ExitCycleService
 
-    src = inspect.getsource(Scanner._update_active_trades)
+    src = inspect.getsource(ExitCycleService.update_active_trades)
     assert "pnl_quantity" in src, (
         "the exit ladders size P&L on the INTENDED quantity, so a partial fill arms the "
         "rupee loss band on money that was never at risk"

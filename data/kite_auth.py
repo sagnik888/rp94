@@ -21,6 +21,7 @@ import os
 import socket
 import tempfile
 import threading
+import time as _time
 from contextlib import contextmanager
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -87,6 +88,13 @@ def kite_proxies() -> Optional[Dict[str, str]]:
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}
+
+
+# KiteConnect already routes every call through one ``reqsession``, but urllib3's
+# default adapter holds 10 connections per host and silently discards the overflow,
+# so a fan-out of index-history and quote calls re-handshakes TLS. Size the pool for
+# the scanner's concurrency without changing retry behaviour.
+KITE_HTTP_POOL = {"pool_connections": 8, "pool_maxsize": 64}
 
 
 def current_egress_ip(family: str = "v4", timeout: float = 4.0) -> str:
@@ -189,6 +197,18 @@ def is_kite_auth_failure(exc: Exception, context: str = "") -> bool:
     return any(marker in message for marker in _AMBIGUOUS_TOKEN_MARKERS)
 
 
+def is_kite_permission_refusal(exc: Exception) -> bool:
+    """Kite's HTTP 403 "Insufficient permission for that call".
+
+    Ambiguous on its own: an app without one API add-on gets it for that call only, on
+    a healthy session. It is also what Kite answers for EVERY call, and the ticker's
+    WebSocket upgrade, once a session has been reset (2026-09-25 05:05: a 04:49 login
+    died this way, and a restart kept the dead token "provisionally"). profile() needs
+    no add-on, so a refusal there settles it - see KiteAuth.confirm_dead_session.
+    """
+    return type(exc).__name__ == "PermissionException"
+
+
 def kite_auth_failure_reason(context: str, exc: Exception) -> str:
     return f"{context}: {type(exc).__name__}: {exc}"
 
@@ -261,6 +281,18 @@ class KiteAuth:
         self._auth_reason = "no Kite session yet"
         self._token_issued_at: Optional[datetime] = None
         self._user_id = ""
+        # confirm_dead_session() asks Kite at most once per interval.
+        self._last_session_probe_at = 0.0
+
+    @staticmethod
+    def _http_timeout_seconds() -> float:
+        """One immutable transport deadline shared by every Kite client."""
+        try:
+            from config.settings import get_settings
+
+            return max(1.0, min(30.0, float(getattr(get_settings(), "kite_http_timeout_seconds", 7.0) or 7.0)))
+        except Exception:
+            return 7.0
 
     # ── credentials ──────────────────────────────────────────────────────────
     @staticmethod
@@ -363,7 +395,12 @@ class KiteAuth:
             raise ValueError(message)
         from kiteconnect import KiteConnect
 
-        return KiteConnect(api_key=self.api_key, proxies=kite_proxies()).login_url()
+        return KiteConnect(
+            api_key=self.api_key,
+            timeout=self._http_timeout_seconds(),
+            proxies=kite_proxies(),
+            pool=KITE_HTTP_POOL,
+        ).login_url()
 
     def complete_login(self, request_token: str) -> Dict[str, Any]:
         """Exchange a browser-issued request_token for a daily access token."""
@@ -376,7 +413,12 @@ class KiteAuth:
 
         from kiteconnect import KiteConnect
 
-        client = KiteConnect(api_key=self.api_key, proxies=kite_proxies())
+        client = KiteConnect(
+            api_key=self.api_key,
+            timeout=self._http_timeout_seconds(),
+            proxies=kite_proxies(),
+            pool=KITE_HTTP_POOL,
+        )
         # generate_session computes the SHA-256 checksum internally; the api_secret
         # never leaves this process and is never written to the token cache.
         session = client.generate_session(request_token, api_secret=self._api_secret)
@@ -478,7 +520,12 @@ class KiteAuth:
 
         from kiteconnect import KiteConnect
 
-        client = KiteConnect(api_key=self.api_key, proxies=kite_proxies())
+        client = KiteConnect(
+            api_key=self.api_key,
+            timeout=self._http_timeout_seconds(),
+            proxies=kite_proxies(),
+            pool=KITE_HTTP_POOL,
+        )
         client.set_access_token(access_token)
 
         # Ask Kite whether the token is alive rather than inferring it from the clock.
@@ -527,6 +574,10 @@ class KiteAuth:
         except Exception as exc:
             if is_kite_auth_failure(exc):
                 return False, f"Kite rejected the cached token: {exc}"
+            if is_kite_permission_refusal(exc):
+                # profile() needs no API add-on: a permission refusal here is Kite
+                # refusing the session itself, not a plan limit.
+                return False, f"Kite rejected the cached token: {type(exc).__name__}: {exc}"
             # A network blip must not force a browser login the operator cannot do
             # from a headless start.
             return None, f"{type(exc).__name__}: {exc}"
@@ -581,6 +632,28 @@ class KiteAuth:
             # reconnect/restart path and be accepted provisionally on network doubt.
             self._discard_cached_token_locked()
             return True
+
+    def confirm_dead_session(self, context: str, failed_client=None, min_interval: float = 60.0) -> bool:
+        """Settle an ambiguous refusal (HTTP 403 permission, a 403 on the ticker upgrade).
+
+        Asks profile() - which every live session may call - at most once per
+        ``min_interval``. When Kite refuses that too, the session is invalidated (login
+        required, cached token discarded) and True is returned. A healthy session that
+        merely lacks one API permission keeps running.
+        """
+        with self._auth_lock:
+            client = failed_client if failed_client is not None else self._kite
+            if client is None or self._auth_failure_latched:
+                return False
+            now = _time.monotonic()
+            last = float(getattr(self, "_last_session_probe_at", 0.0) or 0.0)
+            if last and now - last < float(min_interval):
+                return False
+            self._last_session_probe_at = now
+        verdict, reason = self._verify_live(client)
+        if verdict is False:
+            return self.invalidate(f"{context}; {reason}", failed_client=client)
+        return False
 
     def status(self) -> Dict[str, Any]:
         with self._auth_lock:

@@ -18,6 +18,7 @@ import pytz
 
 from trading import trade_manager as tm_module
 from trading.trade_manager import TradeManager
+from engine.exit_cycle import ExitCycleService
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -91,6 +92,6 @@ def test_active_trade_loop_skips_recovery_required():
     """The scanner never re-fires strategy exits on RECOVERY_REQUIRED rows."""
     from scanner import Scanner
 
-    src = inspect.getsource(Scanner._update_active_trades)
+    src = inspect.getsource(ExitCycleService.update_active_trades)
     skip_block = src.split("continue")[1] if "continue" in src else src
     assert "RECOVERY_REQUIRED" in src.split("price = self.candles")[0]

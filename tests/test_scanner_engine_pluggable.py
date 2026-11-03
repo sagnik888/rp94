@@ -1,3 +1,4 @@
+import time
 """Pluggable signal engine: utbot / ema / consensus / combo unions.
 
 The alternative engines are drop-ins for UTBotEngine — same .process() interface
@@ -9,6 +10,7 @@ is "utbot_consensus"; pure "utbot" remains available as the unchanged baseline.
 import numpy as np
 import pandas as pd
 import pytest
+from tests.source_views import scanner_runtime_source, signal_pipeline_source
 
 from config.settings import Settings, get_settings
 import engine.alt_scanners as alt_scanners
@@ -425,7 +427,9 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
     sc = Scanner.__new__(Scanner)
     sc.mode = "REAL"
     sc.latest_regimes = {"NIFTY": "VOLATILE"}
+    sc._intel_cache_time = {**getattr(sc, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in sc.latest_regimes}}
     sc._timeframe_regimes = {"NIFTY_15min": "VOLATILE"}
+    sc._intel_cache_time = {**getattr(sc, "_intel_cache_time", {}), **{name: time.time() for name in sc._timeframe_regimes}}
     sc._candidate_15m_trend_agrees = lambda candidate: bool(
         getattr(candidate, "trend_15m_agrees", False)
     )
@@ -451,6 +455,9 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
         source_engines=["utbot"],
         quad_union_entry=True,
         raw_union_entry=True,
+        strike_oi_available=True,
+        strike_volume_available=True,
+        strike_liquidity_available=True,
     )
     assert sc._passes_candidate_grade_preference(candidate) == (
         True,
@@ -464,6 +471,11 @@ def test_raw_union_candidate_bypasses_soft_grade_pref_but_not_live_quality_floor
     candidate.source_engines = ["utbot", "ema"]
     candidate.trend_15m_agrees = True
     candidate.adx_value = 28.0
+
+    # 2026-10-07: in a risky regime the union's own two-engine agreement is not the
+    # independent leg (engine/quality_verdict.py, quality_verdict.v9).
+    assert sc._passes_live_trade_ready_gate(candidate) is False
+    candidate.impulse_confirmed = True
 
     assert sc._passes_live_trade_ready_gate(candidate) is True
     assert candidate.scalp_lock_mode is False
@@ -496,9 +508,17 @@ def _quad_prime_raw_candidate(**overrides):
         source_engines=["utbot", "ema"],
         quad_union_entry=True,
         raw_union_entry=True,
+        strike_oi_available=True,
+        strike_volume_available=True,
+        strike_liquidity_available=True,
     )
     base.update(overrides)
     candidate = TradeCandidate(**base)
+    candidate.chain_quality = {
+        "intelligence_usable": True,
+        "stale": False,
+        "fallback": False,
+    }
     return candidate
 
 
@@ -507,7 +527,14 @@ def _quad_prime_gate_scanner(regime):
 
     sc = Scanner.__new__(Scanner)
     sc.mode = "REAL"
+    sc._fresh_exact_trade_intel = lambda *a, **k: {"volume": {"available": True, "measurement_basis": "TRADED", "relative_volume_ratio": 1.30}}
+    sc._prediction_volume_context = lambda *_args: {
+        "volume_available": True,
+        "volume_reliable": True,
+        "volume_comparable": True,
+    }
     sc.latest_regimes = {"NIFTY": regime}
+    sc._intel_cache_time = {**getattr(sc, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in sc.latest_regimes}}
     sc._candidate_15m_trend_agrees = lambda candidate: bool(
         getattr(candidate, "trend_15m_agrees", False)
     )
@@ -569,11 +596,11 @@ def test_quad_union_raw_entry_bypass_is_mirrored_in_historical_replay(settings_e
 
     from engine.signal_processor import SignalProcessor
 
-    source = " ".join(inspect.getsource(SignalProcessor.process_best_signal).split())
+    source = " ".join(signal_pipeline_source().split())
     assert "quad_union_entry" in source
     assert "quality_hybrid" in source
-    scanner_file = Path("scanner.py").read_text(encoding="utf-8")
-    assert "self.signal_processor.process_best_signal" in scanner_file
+    scanner_file = scanner_runtime_source()
+    assert "scanner.signal_processor.process_best_signal" in scanner_file
     assert "def _process_best_signal" not in scanner_file
 
 
@@ -749,8 +776,15 @@ def test_quad_prime_raw_entry_bypasses_15m_policy_but_obeys_quality_floor(settin
     settings_engine.ut_regime_adaptation = True
 
     sc = Scanner.__new__(Scanner)
+    sc._fresh_exact_trade_intel = lambda *a, **k: {"volume": {"available": True, "measurement_basis": "TRADED", "relative_volume_ratio": 1.30}}
+    sc._prediction_volume_context = lambda *_args: {
+        "volume_available": True,
+        "volume_reliable": True,
+        "volume_comparable": True,
+    }
     sc.mode = "REAL"
     sc.latest_regimes = {"NIFTY": "VOLATILE"}
+    sc._intel_cache_time = {**getattr(sc, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in sc.latest_regimes}}
     sc._candidate_15m_trend_agrees = lambda candidate: bool(
         getattr(candidate, "trend_15m_agrees", False)
     )
@@ -776,7 +810,15 @@ def test_quad_prime_raw_entry_bypasses_15m_policy_but_obeys_quality_floor(settin
         source_engines=["ema"],
         quad_union_entry=True,
         raw_union_entry=True,
+        strike_oi_available=True,
+        strike_volume_available=True,
+        strike_liquidity_available=True,
     )
+    candidate.chain_quality = {
+        "intelligence_usable": True,
+        "stale": False,
+        "fallback": False,
+    }
 
     try:
         assert sc._passes_timeframe_entry_policy(candidate) is True
@@ -1022,6 +1064,7 @@ def test_all_12_engines_share_toggles_but_keep_engine_specific_exceptions(settin
             sc = Scanner.__new__(Scanner)
             sc.mode = "REAL"
             sc.latest_regimes = {"NIFTY": "VOLATILE"}
+            sc._intel_cache_time = {**getattr(sc, "_intel_cache_time", {}), **{f"{name}_5min": time.time() for name in sc.latest_regimes}}
             sc.log_signal_decision_once = lambda *args, **kwargs: None
 
             # 1min scalp/spike hygiene is global: non-spike 1min rows never compete
@@ -1103,7 +1146,7 @@ def test_adaptive_hybrid_v2_signals_are_never_raw_flagged(settings_engine):
     from engine.signal_processor import SignalProcessor
     from scanner import Scanner
 
-    live = inspect.getsource(SignalProcessor.process_best_signal)
+    live = signal_pipeline_source()
     assert 'quad_union_entry = scanner_engine_mode in {"quad_union", "quad_prime"}' in live
     assert 'quad_prime_entry = scanner_engine_mode == "quad_prime"' in live
 

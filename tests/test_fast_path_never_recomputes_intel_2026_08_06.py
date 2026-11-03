@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from engine.exit_cycle import ExitCycleService
+from tests.source_views import scanner_runtime_source
 
 
 class _Recorder:
@@ -63,7 +65,7 @@ def test_the_source_actually_branches_on_allow_blocking():
     import inspect
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner._update_active_trades)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ExitCycleService.update_active_trades)))
     ternaries = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.IfExp)
@@ -116,7 +118,7 @@ def test_the_hft_worker_still_calls_with_allow_blocking_false():
     """The whole fix rests on this call site keeping its flag."""
     import inspect
 
-    src = inspect.getsource(Scanner)
-    assert "_update_active_trades(allow_blocking=False)" in src, (
+    src = inspect.getsource(ExitCycleService.run_tick)
+    assert "update_active_trades(allow_blocking=False)" in src, (
         "the 100ms worker no longer marks itself as the fast path"
     )

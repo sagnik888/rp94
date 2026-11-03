@@ -17,6 +17,22 @@ def test_dashboard_index_does_not_inject_mock_trading_events():
         assert marker not in html
 
 
+def test_intelligence_tiles_never_invent_missing_volume_or_option_values():
+    html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
+    js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
+
+    assert 'id="intelVolRatio">--<' in html
+    assert "const volAvailable = vol.available === true" in js
+    assert "volAvailable && Number.isFinite(volRatio)" in js
+    assert "const oiAvailable = oi.available === true" in js
+    assert "const pcrAvailable = pcr.available === true" in js
+    assert "pcr.primary_pcr ?? pcr.pcr_value ?? pcr.pcr_oi" in js
+    assert "const flowAvailable = flow.available === true" in js
+    assert "volBar.style.width = volAvailable" in js
+    assert "const atrAvailable = Number.isFinite(atrValue) && atrValue > 0;" in js
+    assert "ATR unavailable:" in js
+
+
 def test_dashboard_recovers_immediately_and_periodically_from_omitted_ws_state():
     js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
     html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
@@ -25,7 +41,10 @@ def test_dashboard_recovers_immediately_and_periodically_from_omitted_ws_state()
     assert "refreshDashboardSnapshot('websocket-payload-omitted', { force: true })" in js
     assert "state.wsPayloadOmitted || wsIsStale || !hasState" in js
     assert "state.wsPayloadOmitted = false" in js
-    assert "app.js?v=sep2026-v46-angelone-refresh" in html
+    # Cache-bust must exist; the exact version is deliberately not pinned. It bumps
+    # with every app.js change, and a duplicated literal pin here fails the suite for
+    # a correct bump (same reason as the note in the pre-open test below).
+    assert "app.js?v=" in html
 
 
 def test_index_cards_render_preopen_settlement_quote_label():
@@ -249,12 +268,15 @@ def test_topbar_exposes_quad_prime_engine_option():
     assert "scanner_engine || 'quad_prime'" in app_js or "scanner_engine || \"quad_prime\"" in app_js
 
 
-def test_topbar_exposes_adaptive_dual_engine_option():
+def test_topbar_offers_ut_smart_exit_in_place_of_adaptive_dual():
+    """2026-09-25: UT SMART EXIT replaced ADAPTIVE DUAL in the engine selector. The
+    adaptive_dual label stays in app.js so old trade rows and the engine lab still read."""
     html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
     app_js = Path("dashboard/static/js/app.js").read_text(encoding="utf-8")
 
-    assert 'value="adaptive_dual"' in html
-    assert "ADAPTIVE DUAL" in html
+    assert '<option value="ut_smart">UT SMART EXIT</option>' in html
+    assert 'value="adaptive_dual"' not in html
+    assert "ut_smart: 'UT Smart Exit" in app_js
     assert "adaptive_dual: 'Adaptive Dual" in app_js
     assert "12-Engine Lab" in app_js
 

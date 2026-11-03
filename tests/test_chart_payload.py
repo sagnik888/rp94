@@ -1,10 +1,21 @@
 from types import SimpleNamespace
 
+import pytest
+
 import pandas as pd
 
 from config.settings import get_settings
 from engine.ut_bot_core import UTBotSignal
 from scanner import Scanner
+
+
+@pytest.fixture(autouse=True)
+def _non_s1_chart_engine(monkeypatch):
+    """These tests cover the UT/dummy-engine chart path. The S1 chart path discards
+    non-S1 results by design, so the operator's SCANNER_ENGINE in .env must not leak in."""
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "scanner_engine", "quad_prime")
 
 
 class _DummyCandles:

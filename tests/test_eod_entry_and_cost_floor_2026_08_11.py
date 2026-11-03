@@ -33,6 +33,7 @@ import pytest
 import pytz
 
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -163,7 +164,7 @@ def test_the_manual_gate_actually_calls_it():
     reachable from there or it protects nothing."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     assert "_candidate_entry_mark_refusal(sig)" in src
     # Asserted by ORDER, not a character window — a fixed slice passes or fails on
     # unrelated edits and truncated this very assertion on the first run.
@@ -179,8 +180,8 @@ def test_the_manual_gate_actually_calls_it():
 
 # ── 2. entries into the EOD window ───────────────────────────────────────────
 
-OPERATOR_SCHEDULE = {          # set by the operator on 2026-08-11
-    "15min": dtime(14, 55),
+OPERATOR_SCHEDULE = {          # set by the operator on 2026-08-11; 15m 14:50 since 2026-09-26
+    "15min": dtime(14, 50),     # (5m/1m last entries 15:10/15:14 stay capped at the 15:01 EOD start)
     "5min": dtime(15, 1),
     "1min": dtime(15, 1),
     "force_exit": dtime(15, 15),
@@ -379,6 +380,6 @@ def test_the_loss_side_already_had_this_and_still_does():
     disappears the two sides have drifted apart again."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     assert "peak_threat_exit_loss_min_cost_multiple" in src
     assert "_round_trip_cost_rs" in src

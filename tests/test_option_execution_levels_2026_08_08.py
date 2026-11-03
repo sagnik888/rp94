@@ -109,7 +109,7 @@ def test_the_flat_cap_no_longer_widens_a_graded_stop():
 def test_a_candidate_stop_wider_than_the_cap_is_still_capped():
     """The cap is a ceiling on risk; the candidate cannot loosen past it."""
     _, stop, _ = _scanner()._execution_levels(_opt_candidate(stop=70.0))
-    assert stop == pytest.approx(85.0)
+    assert stop == pytest.approx(90.0)  # ordinary/unknown setups now cap at 10%
 
 
 def test_the_stop_scales_to_the_live_premium_not_the_candidate_premium():
@@ -121,7 +121,7 @@ def test_the_stop_scales_to_the_live_premium_not_the_candidate_premium():
 @pytest.mark.parametrize("bad_stop", [0.0, -5.0, 100.0, 140.0])
 def test_an_unusable_candidate_stop_falls_back_to_the_cap(bad_stop):
     _, stop, _ = _scanner()._execution_levels(_opt_candidate(stop=bad_stop))
-    assert stop == pytest.approx(85.0)
+    assert stop == pytest.approx(90.0)
 
 
 # ── what must NOT change ─────────────────────────────────────────────────────

@@ -1,0 +1,45 @@
+{
+ "summary": {
+  "trades": 0,
+  "net": 0,
+  "wins": 0,
+  "by_tf": {},
+  "by_reason": {},
+  "by_lane": {},
+  "by_index": {
+   "NIFTY": 0,
+   "BANKNIFTY": 0,
+   "SENSEX": 0,
+   "MIDCPNIFTY": 0
+  },
+  "network_attempts": 0,
+  "diagnostics_option_history": {
+   "attempts": 33,
+   "hits": 2,
+   "misses": 58,
+   "synthetic": 0,
+   "fallback_to_fut": 0,
+   "archived_hits": 40
+  },
+  "rejects": {
+   "UTS replay lacks a complete observed option path or compatible stop": 42,
+   "UTS replay requires observed option prices": 58,
+   "After no-entry gate 14:50": 4
+  },
+  "rejected_rows": [],
+  "scope": "Observed option OHLC only; conservative ordering; no live orders; no profit claim",
+  "all_option_prices_observed": true,
+  "all_quality_allowed": true,
+  "no_uts_fixed_targets": true,
+  "checks_vacuous_without_trades": true
+ },
+ "source_sha256": {
+  "engine/ut_smart_engine.py": "de378cbeb395ac558b98cfda33d259708277d8a02b43e17d3fd6d86822af5e2e",
+  "engine/uts_lane.py": "487fd04dd4441b29f6e3d6e42872630a4f2d57052b10d75403d304e097006d7b",
+  "engine/signal_processor.py": "df2a56fb63caeaddb4719513ded9147f122d7463709e13aca0277b67071cfef6",
+  "engine/entry_policy.py": "aadd0bff12de0669a3d94da4228afa827b1106284aaea3f041bd32de6157b69d",
+  "scanner.py": "b77cc62a3b8e48896726153940028737c799b6d984f66e46c70a2ce6098f7369",
+  "config/settings.py": "45574859946aa4e9b029abc0084a0cc6a0ffa8e619289ff17524490a72bfda18"
+ },
+ "trades": []
+}

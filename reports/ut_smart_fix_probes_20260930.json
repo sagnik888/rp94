@@ -1,0 +1,41 @@
+{
+  "actual_fill_rejected": true,
+  "delta_mapped_risk": 55.4351198471043,
+  "actual_premium_risk": 20.25,
+  "recovery_exposure_preserved": true,
+  "verdict": {
+    "allowed": false,
+    "phase": "audit_actual_fill",
+    "checked_at": "2026-09-30T10:15:19.002675",
+    "actual_rr": 3.0,
+    "underlying_stop_pct": 0.45318973306625954,
+    "expected_move_pct": 0.0,
+    "expected_move_floor_pct": 0.2,
+    "min_rr": 0.5,
+    "max_underlying_stop_pct": 1.0,
+    "reasons": [
+      "execution geometry provenance is not an approved internal source",
+      "UTS option stop cannot cover the delta-mapped underlying stop"
+    ],
+    "checks": {
+      "policy_parameters": true,
+      "supported_instrument": true,
+      "execution_identity": true,
+      "finite_verified_geometry": true,
+      "geometry_source": false,
+      "geometry_fresh": true,
+      "underlying_directional_order": true,
+      "premium_contract_consistency": true,
+      "option_cross_geometry": true,
+      "option_stop_coverage": false,
+      "execution_rr": true,
+      "underlying_stop_cap": true,
+      "forecast_evidence_advisory": false,
+      "forecast_fresh_advisory": false,
+      "expected_move_floor_advisory": false
+    },
+    "lane": "UTS",
+    "policy_version": "final_entry_policy.v1"
+  },
+  "scope": "Archived fill prices and delta; nominal targets reconstructed only to isolate stop coverage. No orders or runtime writes."
+}

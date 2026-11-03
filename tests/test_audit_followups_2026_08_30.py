@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 # ── 1. a missing 15m state must be distinguishable, and audible ──────────────
@@ -155,7 +156,7 @@ def test_the_unreachable_low_gain_disjunct_is_gone():
     decide: peak*0.40 is never below 4.0, so {current<2.0} is a strict subset of
     {current<4.0}. Verified exhaustively over 39.8M (peak, current) pairs -- zero cases
     where it fired alone."""
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     code = "\n".join(
         line for line in src.splitlines() if not line.strip().startswith("#")
     )
@@ -180,6 +181,19 @@ def _ladder(method):
     """The exit reasons a ladder emits, in order. Literal names only -- the live lane
     also emits some via a variable (cap_rule), which this deliberately does not chase."""
     src = inspect.getsource(method)
+    # The S1 lane (2026-09-23/24; since 2026-09-25 also UT SMART EXIT, via is_lane) is its
+    # own exit set placed ahead of the ladder in both loops and ends where the ladder
+    # starts; this test pins the other engines' ladder. Since 2026-10-07 the gate reads the
+    # frozen exit owner (is_managed_lane) instead of the admission switch (is_lane).
+    start = src.find("if s1_lane_policy.is_managed_lane(")
+    if start < 0:
+        start = src.find("if s1_lane_policy.is_lane(")
+    if start >= 0:
+        end = src.find("fast_exit, fast_exit_reason = self._fifteen_min_one_min_support_exit_decision(", start)
+        if end < 0:
+            end = src.find("fast_exit, fast_exit_reason = scanner._fifteen_min_one_min_support_exit_decision(", start)
+        assert end > start, "S1 lane block no longer sits directly before the ladder"
+        src = src[:start] + src[end:]
     out = []
     pattern = r'(?:create_exit\(\s*[^,]+,\s*[^,]+,\s*|_close_and_record\(\s*[^,]+,\s*[^,]+,\s*)"([A-Z_]+)"'
     for match in re.finditer(pattern, src):
@@ -200,7 +214,9 @@ def test_the_two_ladders_disagree_and_that_is_pinned():
     priced differently depending on which lane closed it.
     """
     session = _ladder(Scanner._check_session_candidates_breaches_locked)
-    live = _ladder(Scanner._update_active_trades)
+    from engine.exit_cycle import ExitCycleService
+
+    live = _ladder(ExitCycleService.update_active_trades)
 
     assert session.index("LOW_GAIN_PROTECT") < session.index("SMART_PROFIT_LOCK")
     assert live.index("SMART_PROFIT_LOCK") < live.index("LOW_GAIN_PROTECT")

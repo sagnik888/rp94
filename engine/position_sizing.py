@@ -211,7 +211,7 @@ def resolve_trade_lots(
         high_conviction=high_conviction,
         compression_state=compression_state,
     )
-    if result.lots < 1 or result.mode == "compression_cap":
+    if result.lots < 1 or result.mode in {"compression_cap", "equal_risk"}:
         return result
     mult = _market_lot_multiplier(settings, inst_type, intel_score)
     if mult <= 1.0:
@@ -283,6 +283,7 @@ def _resolve_trade_lots_core(
 
     if base < 1:
         return PositionSizeResult(0, "No lots requested", risk_per_lot, 0.0, "fixed")
+
 
     def _apply_scale(
         lots_in: int,
@@ -367,6 +368,44 @@ def _resolve_trade_lots_core(
             0.0,
             "fixed",
         )
+
+    # ── Equal-rupee-risk option sizing (2026-10-08 user) ────────────
+    # Fixed 1-lot sizing gave BANKNIFTY 1-lot premium risk Rs.1,500-2,340 against
+    # Rs.420-1,070 on NIFTY/SENSEX, so BANKNIFTY losses dominated (62% of the Oct 5-7
+    # S1 loss). The base unit becomes about risk_per_trade_rs of premium risk:
+    # floor(budget / ((entry - stop) x lot_size)), 1..risk_based_lots_max. One lot
+    # already over budget is kept ('allow_one') or refused beyond the tolerance
+    # ('refuse'). Cascade / heavy-trend multipliers still scale that base unit.
+    if (str(inst_type or "").upper() == "OPT" and risk_per_lot > 0
+            and _setting_enabled(getattr(settings, "risk_based_lots_enabled", False), False)):
+        target = float(getattr(settings, "risk_per_trade_rs", 2000.0) or 0.0)
+        if target > 0:
+            max_lots = max(1, int(getattr(settings, "risk_based_lots_max", 3) or 3))
+            lots_eq = int(math.floor(target / risk_per_lot))
+            if lots_eq < 1:
+                action = str(getattr(settings, "risk_based_lots_over_budget_action", "allow_one") or "allow_one").lower()
+                tolerance = max(0.0, float(getattr(settings, "risk_based_lots_over_budget_tolerance", 0.5) or 0.0))
+                if action == "refuse" and risk_per_lot > target * (1.0 + tolerance):
+                    return PositionSizeResult(
+                        0, f"Equal-risk: one lot risks Rs.{risk_per_lot:.0f} > Rs.{target:.0f} budget",
+                        risk_per_lot, target, "equal_risk")
+                lots_eq = 1
+            lots_eq = min(lots_eq, max_lots)
+            if cap_lots is not None:
+                lots_eq = min(lots_eq, max(1, int(cap_lots)))
+            note = f"Equal-risk: Rs.{target:.0f} / Rs.{risk_per_lot:.0f} per lot -> {lots_eq} lots"
+            # Cascade / heavy-trend conviction scales the rupee budget, never past the hard
+            # lot cap: multiplying already risk-sized lots reached 9 lots in tests.
+            scaled = _maybe_scale(1)
+            if scaled.mode != "fixed" and scaled.lots > 1:
+                grown = max(lots_eq, int(math.floor(target * scaled.lots / risk_per_lot)))
+                grown = min(grown, max_lots)
+                if cap_lots is not None:
+                    grown = min(grown, max(1, int(cap_lots)))
+                if grown > lots_eq:
+                    return PositionSizeResult(grown, f"{note}; {scaled.mode} x{scaled.lots} budget -> {grown} lots",
+                                              risk_per_lot, target * scaled.lots, scaled.mode)
+            return PositionSizeResult(lots_eq, note, risk_per_lot, target, "equal_risk")
 
     # ── Fixed-lot policy (default) ──────────────────────────────────
     if not _setting_enabled(getattr(settings, "auto_risk_sizing_enabled", False), False):

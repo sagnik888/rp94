@@ -63,6 +63,8 @@ def test_r3_same_wave_vote_registry_aligns_without_open_trades():
     sc = _scanner()
     # No open trades, empty cache — only wave votes
     sc._register_heavy_trend_vote("BANKNIFTY", "LONG", "15min")
+    assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is False   # 2 of 4 (3 needed)
+    sc._register_heavy_trend_vote("SENSEX", "LONG", "15min")
     assert sc._heavy_trend_lot_scale_eligible("NIFTY", "LONG", "15min") is True
 
 

@@ -260,6 +260,34 @@ def test_concurrency_guard_on_blocks_same_index_same_timeframe(guard_setting):
     assert sc._prepare_candidate_for_concurrency(_cand("NIFTY", "5min")) is False
 
 
+def test_concurrency_block_reports_open_broker_position_and_policy_reason(guard_setting):
+    guard_setting.ut_concurrency_guard = True
+    sc = _scanner()
+    sc._active_session_entry_candidates = lambda *a, **k: []
+    open_trade = _open_trade_obj("NIFTY", "5min")
+    open_trade.broker_quantity = 75
+    sc.trades.open_trades = {"a": open_trade}
+
+    candidate = _cand("NIFTY", "5min")
+    assert sc._prepare_candidate_for_concurrency(candidate) is False
+    assert candidate.concurrency_block_kind == "open broker position"
+    assert "same timeframe" in candidate.concurrency_block_reason
+
+
+def test_concurrency_block_reports_pending_manual_signal(guard_setting):
+    guard_setting.ut_concurrency_guard = True
+    sc = _scanner()
+    pending = _cand("NIFTY", "5min")
+    pending.execution_status = "SIGNAL_ONLY"
+    pending.execution_state = "NOT_PLACED"
+    sc._active_session_entry_candidates = lambda *a, **k: [pending]
+
+    candidate = _cand("NIFTY", "5min")
+    assert sc._prepare_candidate_for_concurrency(candidate) is False
+    assert candidate.concurrency_block_kind == "pending manual signal"
+    assert "same timeframe" in candidate.concurrency_block_reason
+
+
 def test_concurrency_guard_on_blocks_third_trade_per_index(guard_setting):
     guard_setting.ut_concurrency_guard = True
     sc = _scanner()

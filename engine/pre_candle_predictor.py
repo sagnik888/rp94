@@ -14,6 +14,7 @@ from typing import Any, Dict, Mapping, Optional
 import pandas as pd
 
 from engine.intelligence_score import aggregate_intelligence_score, normalize_intelligence_score
+from engine.entry_data_quality import evaluate_entry_data_quality
 
 
 PULLBACK_NOISE = "PULLBACK_NOISE"
@@ -89,6 +90,14 @@ def _slice_from(df: Optional[pd.DataFrame], start: Any) -> pd.DataFrame:
     if df is None or df.empty or start is None:
         return pd.DataFrame()
     try:
+        idx = df.index
+        # Sorted index: a binary search replaces the boolean mask, which on pyarrow-backed
+        # string columns cost a full take per call (2% of per-index scan wall time).
+        if isinstance(idx, pd.DatetimeIndex) and idx.is_monotonic_increasing:
+            try:
+                return df.iloc[int(idx.searchsorted(start, side="left")):].copy()
+            except (TypeError, ValueError):
+                pass
         return df[df.index >= start].copy()
     except Exception:
         return pd.DataFrame()
@@ -302,6 +311,7 @@ def build_pre_candle_prediction(
     trade_context: Optional[Mapping[str, Any]] = None,
     option_context: Optional[Mapping[str, Any]] = None,
     volume_context: Optional[Mapping[str, Any]] = None,
+    data_quality: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Classify the current forming 5min/15min candle from lower-TF evidence."""
     tf = str(timeframe or "5min").lower()
@@ -468,6 +478,26 @@ def build_pre_candle_prediction(
     else:
         state = PULLBACK_NOISE
 
+    supplied_quality = data_quality if isinstance(data_quality, Mapping) else {}
+    # A pre-candle read remains useful for an operator, but proxy/tick evidence must
+    # never be visually indistinguishable from an entry-ready forecast.
+    if not supplied_quality:
+        supplied_quality = evaluate_entry_data_quality(
+            live=True,
+            special_entry=True,
+            one_minute_volume=volume_context,
+            chain_quality=(intel_result.get("data_quality") if isinstance(intel_result, Mapping) else {}),
+        )
+    # Forming-candle output is intentionally never executable.  With incomplete
+    # evidence this communicates the concrete blocker; with healthy evidence it
+    # still tells the operator to wait for the completed-candidate gate.
+    advisory_only = True
+    advisory_reason = str(supplied_quality.get("reason") or "")
+    if not bool(supplied_quality.get("allowed", False)):
+        reasons.append(f"advisory only: {advisory_reason or 'live entry evidence unavailable'}")
+    else:
+        reasons.append("advisory only: forming-candle forecast; await final entry gate")
+
     return {
         "instrument": str(instrument or "").upper(),
         "timeframe": tf,
@@ -477,6 +507,9 @@ def build_pre_candle_prediction(
         "forming_start": _iso_ts(start),
         "progress": round(progress, 4),
         "reason": "; ".join(reasons) if reasons else "no decisive lower-timeframe evidence",
+        "entry_eligible": False,
+        "advisory_only": advisory_only,
+        "data_quality": dict(supplied_quality),
         "evidence": {
             "tf_direction": tf_direction,
             "one_min_direction": one_min_direction,

@@ -32,6 +32,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import Scanner
+from engine.execution_service import ExecutionService
 
 TS = datetime(2026, 8, 10, 12, 50, 2)
 INDICES = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"]
@@ -121,7 +122,7 @@ def test_a_raising_history_key_does_not_propagate():
 # ── the wiring at the discard site ───────────────────────────────────────────
 
 def test_the_stabilization_discard_withdraws_the_seed():
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     marker = "stabilization_repaint_gate"
     assert marker in src, "the repaint discard branch moved"
     window = src[src.index(marker): src.index(marker) + 900]
@@ -132,7 +133,7 @@ def test_the_stabilization_discard_withdraws_the_seed():
 
 
 def test_both_discard_reasons_are_distinguished():
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     window = src[src.index("stabilization_repaint_gate"):]
     window = window[:window.index("keys_to_remove.append(key)")]
     assert "flipped to the opposite side" in window
@@ -148,7 +149,7 @@ def test_the_existing_hard_block_still_lists_repaint():
 
 def test_the_discard_still_cleans_its_other_caches():
     """The seed withdrawal is an ADDITION to that cleanup, not a replacement."""
-    src = inspect.getsource(Scanner._coordinate_and_execute)
+    src = inspect.getsource(ExecutionService.coordinate_and_execute)
     window = src[src.index("stabilization_repaint_gate"):]
     window = window[:window.index("keys_to_remove.append(key)")]
     assert "_forget_signal_display_rows" in window

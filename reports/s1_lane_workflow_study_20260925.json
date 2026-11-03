@@ -1,0 +1,383 @@
+{
+  "sessions": 43,
+  "signals_raw": {
+    "BANKNIFTY|15min|BUY": 19,
+    "BANKNIFTY|15min|SELL": 18,
+    "BANKNIFTY|1min|BUY": 37,
+    "BANKNIFTY|1min|SELL": 56,
+    "BANKNIFTY|5min|BUY": 26,
+    "BANKNIFTY|5min|SELL": 32,
+    "MIDCPNIFTY|15min|BUY": 22,
+    "MIDCPNIFTY|15min|SELL": 29,
+    "MIDCPNIFTY|1min|BUY": 50,
+    "MIDCPNIFTY|1min|SELL": 53,
+    "MIDCPNIFTY|5min|BUY": 28,
+    "MIDCPNIFTY|5min|SELL": 38,
+    "NIFTY|15min|BUY": 9,
+    "NIFTY|15min|SELL": 27,
+    "NIFTY|1min|BUY": 37,
+    "NIFTY|1min|SELL": 51,
+    "NIFTY|5min|BUY": 20,
+    "NIFTY|5min|SELL": 33,
+    "SENSEX|15min|BUY": 13,
+    "SENSEX|15min|SELL": 29,
+    "SENSEX|1min|BUY": 40,
+    "SENSEX|1min|SELL": 58,
+    "SENSEX|5min|BUY": 22,
+    "SENSEX|5min|SELL": 42
+  },
+  "variants": {
+    "fixed_1_5r": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.023,
+      "net_r": -57.57,
+      "net_avg_r": -0.093
+    },
+    "fixed_1r": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.28,
+      "net_avg_r": -0.091
+    },
+    "lock_0_5r_no_runner": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.013,
+      "net_r": -51.32,
+      "net_avg_r": -0.083
+    },
+    "lock_0_5r_runner": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.27,
+      "net_avg_r": -0.091
+    },
+    "lock_0_7r": {
+      "trades": 616,
+      "win_pct": 48.7,
+      "avg_r": -0.045,
+      "net_r": -70.74,
+      "net_avg_r": -0.115
+    },
+    "lock_1r_old": {
+      "trades": 616,
+      "win_pct": 43.2,
+      "avg_r": -0.062,
+      "net_r": -81.59,
+      "net_avg_r": -0.132
+    },
+    "lock_arm_0_5r": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.27,
+      "net_avg_r": -0.091
+    },
+    "no_chart_exit": {
+      "trades": 616,
+      "win_pct": 59.1,
+      "avg_r": -0.025,
+      "net_r": -58.48,
+      "net_avg_r": -0.095
+    },
+    "no_profit_lock": {
+      "trades": 616,
+      "win_pct": 39.1,
+      "avg_r": -0.075,
+      "net_r": -89.2,
+      "net_avg_r": -0.145
+    },
+    "no_runner": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.013,
+      "net_r": -51.32,
+      "net_avg_r": -0.083
+    },
+    "no_runner_no_chart_exit": {
+      "trades": 616,
+      "win_pct": 59.1,
+      "avg_r": -0.02,
+      "net_r": -55.63,
+      "net_avg_r": -0.09
+    },
+    "no_trail": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.27,
+      "net_avg_r": -0.091
+    },
+    "no_trend_cut": {
+      "trades": 616,
+      "win_pct": 56.3,
+      "avg_r": -0.027,
+      "net_r": -59.99,
+      "net_avg_r": -0.097
+    },
+    "no_weak_0_7r": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.28,
+      "net_avg_r": -0.091
+    },
+    "runner_always_30r": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.27,
+      "net_avg_r": -0.091
+    },
+    "shipped": {
+      "trades": 616,
+      "win_pct": 56.2,
+      "avg_r": -0.021,
+      "net_r": -56.27,
+      "net_avg_r": -0.091
+    },
+    "stop_x0_8": {
+      "trades": 616,
+      "win_pct": 60.4,
+      "avg_r": 0.008,
+      "net_r": -37.98,
+      "net_avg_r": -0.062
+    },
+    "stop_x1_3": {
+      "trades": 616,
+      "win_pct": 51.8,
+      "avg_r": -0.043,
+      "net_r": -69.8,
+      "net_avg_r": -0.113
+    }
+  },
+  "shipped_by_side": {
+    "BUY": {
+      "trades": 241,
+      "win_pct": 51.9,
+      "avg_r": -0.075,
+      "net_r": -34.98,
+      "net_avg_r": -0.145
+    },
+    "SELL": {
+      "trades": 375,
+      "win_pct": 58.9,
+      "avg_r": 0.013,
+      "net_r": -21.29,
+      "net_avg_r": -0.057
+    }
+  },
+  "shipped_by_tf": {
+    "15min": {
+      "trades": 143,
+      "win_pct": 64.3,
+      "avg_r": 0.044,
+      "net_r": -3.78,
+      "net_avg_r": -0.026
+    },
+    "1min": {
+      "trades": 234,
+      "win_pct": 49.1,
+      "avg_r": -0.056,
+      "net_r": -29.48,
+      "net_avg_r": -0.126
+    },
+    "5min": {
+      "trades": 239,
+      "win_pct": 58.2,
+      "avg_r": -0.026,
+      "net_r": -23.01,
+      "net_avg_r": -0.096
+    }
+  },
+  "shipped_by_index": {
+    "BANKNIFTY": {
+      "trades": 141,
+      "win_pct": 49.6,
+      "avg_r": -0.115,
+      "net_r": -26.09,
+      "net_avg_r": -0.185
+    },
+    "MIDCPNIFTY": {
+      "trades": 178,
+      "win_pct": 62.4,
+      "avg_r": 0.042,
+      "net_r": -4.96,
+      "net_avg_r": -0.028
+    },
+    "NIFTY": {
+      "trades": 127,
+      "win_pct": 55.9,
+      "avg_r": 0.016,
+      "net_r": -6.89,
+      "net_avg_r": -0.054
+    },
+    "SENSEX": {
+      "trades": 170,
+      "win_pct": 55.3,
+      "avg_r": -0.038,
+      "net_r": -18.33,
+      "net_avg_r": -0.108
+    }
+  },
+  "shipped_by_day_kind": {
+    "RANGE": {
+      "trades": 283,
+      "win_pct": 52.3,
+      "avg_r": -0.079,
+      "net_r": -42.29,
+      "net_avg_r": -0.149
+    },
+    "TREND_DOWN": {
+      "trades": 242,
+      "win_pct": 62.8,
+      "avg_r": 0.069,
+      "net_r": -0.25,
+      "net_avg_r": -0.001
+    },
+    "TREND_UP": {
+      "trades": 91,
+      "win_pct": 50.5,
+      "avg_r": -0.081,
+      "net_r": -13.74,
+      "net_avg_r": -0.151
+    }
+  },
+  "shipped_by_side_and_day_kind": {
+    "BUY|RANGE": {
+      "trades": 128,
+      "win_pct": 53.9,
+      "avg_r": -0.052,
+      "net_r": -15.59,
+      "net_avg_r": -0.122
+    },
+    "BUY|TREND_DOWN": {
+      "trades": 45,
+      "win_pct": 35.6,
+      "avg_r": -0.315,
+      "net_r": -17.34,
+      "net_avg_r": -0.385
+    },
+    "BUY|TREND_UP": {
+      "trades": 68,
+      "win_pct": 58.8,
+      "avg_r": 0.04,
+      "net_r": -2.06,
+      "net_avg_r": -0.03
+    },
+    "SELL|RANGE": {
+      "trades": 155,
+      "win_pct": 51.0,
+      "avg_r": -0.102,
+      "net_r": -26.7,
+      "net_avg_r": -0.172
+    },
+    "SELL|TREND_DOWN": {
+      "trades": 197,
+      "win_pct": 69.0,
+      "avg_r": 0.157,
+      "net_r": 17.09,
+      "net_avg_r": 0.087
+    },
+    "SELL|TREND_UP": {
+      "trades": 23,
+      "win_pct": 26.1,
+      "avg_r": -0.438,
+      "net_r": -11.67,
+      "net_avg_r": -0.508
+    }
+  },
+  "shipped_with_vs_against_day": {
+    "with": {
+      "trades": 265,
+      "win_pct": 66.4,
+      "avg_r": 0.127,
+      "net_r": 15.03,
+      "net_avg_r": 0.057
+    },
+    "against": {
+      "trades": 68,
+      "win_pct": 32.4,
+      "avg_r": -0.357,
+      "net_r": -29.01,
+      "net_avg_r": -0.427
+    },
+    "range_day": {
+      "trades": 283,
+      "win_pct": 52.3,
+      "avg_r": -0.079,
+      "net_r": -42.29,
+      "net_avg_r": -0.149
+    }
+  },
+  "shipped_by_volatility": {
+    "HIGH": {
+      "trades": 245,
+      "win_pct": 62.0,
+      "avg_r": 0.054,
+      "net_r": -3.98,
+      "net_avg_r": -0.016
+    },
+    "LOW": {
+      "trades": 160,
+      "win_pct": 49.4,
+      "avg_r": -0.051,
+      "net_r": -19.39,
+      "net_avg_r": -0.121
+    },
+    "MID": {
+      "trades": 211,
+      "win_pct": 54.5,
+      "avg_r": -0.086,
+      "net_r": -32.89,
+      "net_avg_r": -0.156
+    }
+  },
+  "shipped_exit_reasons": {
+    "PROFIT_LOCK": 328,
+    "SL1": 116,
+    "S1_EXIT": 103,
+    "TREND_AGAINST": 33,
+    "EOD": 25,
+    "TARGET": 11
+  },
+  "shipped_score_buckets": {
+    "(0, 70]": {
+      "trades": 78,
+      "win_pct": 51.3,
+      "avg_r": -0.092,
+      "net_r": -12.63,
+      "net_avg_r": -0.162
+    },
+    "(70, 80]": {
+      "trades": 124,
+      "win_pct": 58.9,
+      "avg_r": 0.055,
+      "net_r": -1.83,
+      "net_avg_r": -0.015
+    },
+    "(80, 90]": {
+      "trades": 169,
+      "win_pct": 53.8,
+      "avg_r": -0.072,
+      "net_r": -23.93,
+      "net_avg_r": -0.142
+    },
+    "(90, 101]": {
+      "trades": 245,
+      "win_pct": 58.0,
+      "avg_r": -0.003,
+      "net_r": -17.89,
+      "net_avg_r": -0.073
+    }
+  },
+  "runner_peaks": {
+    "trades_reaching_3r": 0,
+    "trades_reaching_5r": 0,
+    "trades_reaching_10r": 0,
+    "max_peak_r": 2.3
+  }
+}

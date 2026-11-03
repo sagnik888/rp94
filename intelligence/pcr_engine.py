@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List
 import threading
+import hashlib
 from collections import deque
 from loguru import logger
 
@@ -21,6 +22,7 @@ class PCREngine:
 
     def __init__(self, history_size: int = 50):
         self._pcr_history: Dict[str, deque] = {}
+        self._pcr_last_observation: Dict[str, str] = {}
         self.history_size = history_size
         self._lock = threading.RLock()
         self.thresholds = {
@@ -118,15 +120,36 @@ class PCREngine:
                 else ("UNKNOWN", "NEUTRAL")
             )
 
-            # ── Track History ──
+            # ── Track distinct source observations ──
+            # The aggregator can request 1/5/15m intelligence against one option-chain
+            # snapshot.  Scan count is not time, so repeated reads must not change PCR
+            # trend.  Prefer the provider observation id; derive a stable fingerprint
+            # for legacy chain frames that do not yet carry one.
+            expiry = str(options_chain.attrs.get("expiry") or "")
+            observation_id = str(options_chain.attrs.get("observation_id") or "")
+            if not observation_id:
+                fingerprint = "|".join((
+                    str(round(total_put_oi, 4)), str(round(total_call_oi, 4)),
+                    str(round(total_put_vol, 4)), str(round(total_call_vol, 4)),
+                    str(len(options_chain)), expiry,
+                ))
+                observation_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+            provider = str(options_chain.attrs.get("oi_provider") or options_chain.attrs.get("provider") or "UNKNOWN")
+            covered_chain = options_chain.loc[(broad_call_oi > 0) & (broad_put_oi > 0)]
+            universe = ",".join(sorted(str(v) for v in covered_chain.get("strike", [])))
+            # Near-money selection may change as spot moves even on one unchanged
+            # broad chain; it is a different PCR population, not a trend observation.
+            near_identity = str(round(float(spot_price) / max(float(strike_interval), 1))) if spot_price else ""
+            history_key = f"{str(instrument).upper()}|{expiry or 'ACTIVE'}|{provider}|{universe}|{pcr_basis}|{near_identity}"
             with self._lock:
-                if instrument not in self._pcr_history:
-                    self._pcr_history[instrument] = deque(maxlen=self.history_size)
-                if available:
-                    self._pcr_history[instrument].append(primary_pcr)
+                if history_key not in self._pcr_history:
+                    self._pcr_history[history_key] = deque(maxlen=self.history_size)
+                if available and self._pcr_last_observation.get(history_key) != observation_id:
+                    self._pcr_history[history_key].append(primary_pcr)
+                    self._pcr_last_observation[history_key] = observation_id
     
                 # ── PCR Trend ──
-                history = list(self._pcr_history[instrument])
+                history = list(self._pcr_history[history_key])
                 
             trend = "STABLE"
             if len(history) >= 5:
@@ -168,6 +191,7 @@ class PCREngine:
                 "interpretation_model": "CONTRARIAN",
                 "trend": trend,
                 "pcr_history": history[-10:] if len(history) > 0 else [],
+                "observation_id": observation_id,
                 "interpretation": self._get_interpretation(primary_pcr, sentiment, signal, trend),
             }
 

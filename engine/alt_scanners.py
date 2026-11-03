@@ -22,6 +22,7 @@ from numba import njit
 from loguru import logger
 
 from engine.ut_bot_core import UTBotEngine, UTBotSignal
+from engine.s1_engine import compute_features, drop_off_session_bars, get_s1_signals, params_from_settings
 
 
 @njit
@@ -111,12 +112,11 @@ class AltSignalEngine(UTBotEngine):
         return out
 
     def _quad_union_consensus_positions(self, ema: np.ndarray, st: np.ndarray, utbot_pos: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Quad-Union: Exit only on consensus or losing. At least 2/3 (2 out of 4?) Wait no, let's clarify:
-            1. For a per-tf quad-union (EMA, Supertrend, Consensus, UTBot):
-            - Entry on any qualified signal
-            - Exit only on:
-                a) At least 2/4 of sources agree on opposite direction, OR
-                b) We are losing
+        """Vote only independent EMA, Supertrend and UTBot states.
+
+        EMA/Supertrend consensus is a derived display/state helper.  Counting it beside
+        its ingredients turned a held stale consensus into a fourth vote and could erase
+        a 2:1 primitive reversal.
         """
         n = len(ema)
         positions = np.zeros(n, dtype=int)
@@ -134,8 +134,6 @@ class AltSignalEngine(UTBotEngine):
                 sources.append(("ema", int(ema[i])))
             if 0 <= i < len(st):
                 sources.append(("supertrend", int(st[i])))
-            if 0 <= i < len(consensus_positions):
-                sources.append(("consensus", int(consensus_positions[i])))
             if 0 <= i < len(utbot_pos):
                 sources.append(("utbot", int(utbot_pos[i])))
             
@@ -152,11 +150,11 @@ class AltSignalEngine(UTBotEngine):
             elif votes[-1] > votes[1]:
                 want = -1
 
-            # Only flip on at least 2/4 sources for opposite direction
+            # Only flip on at least two independent primitive sources.
             active = len([v for v in sources if v[1] != 0])
             if last != 0:
                 opposite_votes = votes.get(-last, 0)
-                if opposite_votes >= max(2, active * 2 // 4):
+                if opposite_votes >= min(2, active):
                     last = want
             else:
                 if want != 0:
@@ -922,7 +920,314 @@ class AltSignalEngine(UTBotEngine):
             positions[i] = last
         return accepted, positions
 
+    def _process_s1(self, df, instrument, timeframe, df_5min=None, df_15min=None, **kw):
+        """Publish S1's own state/indicators; an S1 failure must never become UT1.
+
+        S1 computes on the session bars TradingView shows: bars starting at or after
+        15:15 (frozen feed, then the post-close price with bulk volume) are dropped first,
+        and every per-bar output is mapped back onto the caller's candles afterwards.
+        """
+        if len(df) < 15:
+            return {"error": "Insufficient S1 data", "signals": [], "state": None}
+        p = params_from_settings(instrument=instrument)
+        full = df
+        n_full = len(full)
+        confirmed_full = full.iloc[:n_full - 1] if self.signal_mode == "confirmed" and n_full > 1 else full
+        df = drop_off_session_bars(full, p.session_end)
+        closed = drop_off_session_bars(confirmed_full, p.session_end)
+        df_5min = drop_off_session_bars(df_5min, p.session_end)
+        df_15min = drop_off_session_bars(df_15min, p.session_end)
+        if len(closed) < 15:
+            return {"error": "Insufficient S1 data", "signals": [], "state": None}
+        f = compute_features(df, timeframe, p, df_5min=df_5min, df_15min=df_15min)
+        n = len(df)
+        count = len(closed)   # the closed session bars are a prefix of df
+        signals, positions, stops = get_s1_signals(
+            df.iloc[:count], instrument, timeframe, p,
+            features={key: value[:count] for key, value in f.items()},
+        )
+        # Keep arrays aligned to chart candles, carrying the last confirmed state.
+        if count < n:
+            positions = np.append(positions, positions[-1])
+            stops = np.append(stops, stops[-1])
+        state_idx = count - 1
+        state_bar_time = df.index[state_idx]
+        if n != n_full:
+            # Back onto the caller's candles: a dropped bar carries the prior bar's values.
+            def to_full(values):
+                series = pd.Series(np.asarray(values, dtype=float), index=df.index)
+                return series.reindex(full.index, method="ffill").to_numpy()
+
+            positions = np.nan_to_num(to_full(positions)).astype(int)
+            stops = to_full(stops)
+            f = {key: to_full(f[key]) for key in ("ema9", "ema21", "ema50", "ema200", "vwap", "atr", "adx",
+                                                  "di_plus", "di_minus", "bull_score", "bear_score",
+                                                  "rel_vol", "atr_exp")}
+            loc = full.index.get_indexer(pd.DatetimeIndex([sig.timestamp for sig in signals]))
+            for sig, j in zip(signals, loc):
+                if j >= 0:
+                    sig.bar_index = int(j)
+            state_idx = int(full.index.get_indexer([state_bar_time])[0])
+            df = full
+            n = n_full
+        state = self.get_state(f"{instrument}_{timeframe}")
+        state.position = int(positions[state_idx])
+        state.trailing_stop = float(stops[state_idx]) if np.isfinite(stops[state_idx]) else 0.0
+        state.bar_count = n
+        state.last_signal = signals[-1] if signals else None
+        state.signals_history = signals[-200:]
+        state.last_entry_price = signals[-1].s1_chart_entry if signals else 0.0
+        closed = [sig for sig in signals if sig.s1_exit_time is not None]
+        state.last_exit_price = closed[-1].s1_exit_price if closed else 0.0
+        price = float(df["close"].iloc[-1])
+        distance = abs(price - state.trailing_stop) if state.position else 0.0
+        cap = float(kw.get("capital") or self.capital)
+        risk_pct = float(kw.get("risk_pct") or self.risk_pct)
+
+        def vals(values):
+            # Vectorized (2026-09-25): the per-element comprehension over 10 series x
+            # 900 bars x 12 charts was 6% of main.py CPU on its own at the open.
+            arr = np.asarray(values, dtype=float)
+            out = arr.astype(object)
+            out[~np.isfinite(arr)] = None
+            return out.tolist()
+
+        overlays = [
+            {"name": name, "color": color, "values": vals(f[key])}
+            for key, name, color in (
+                ("ema9", "S1 EMA 9", "#ffff00"),
+                ("ema21", "S1 EMA 21", "#00ccff"),
+                ("ema50", "S1 EMA 50", "#ff9900"),
+                ("ema200", "S1 EMA 200", "#808080"),
+                ("vwap", "S1 VWAP", "#00cc66"),
+            )
+        ]
+        return {
+            "instrument": instrument, "timeframe": timeframe, "candles": n,
+            "source_engine": "s1", "signals": signals, "positions": positions.tolist(),
+            "candle_type": p.candle_type,
+            "trailing_stop": vals(stops),
+            "trailing_stop_colors": ["green" if v == 1 else "red" if v == -1 else "gray" for v in positions],
+            **{key: vals(f[key]) for key in ("atr", "adx", "di_plus", "di_minus")},
+            "indicator_overlays": overlays,
+            "state": {
+                "position": state.position,
+                "position_label": "LONG" if state.position == 1 else "SHORT" if state.position == -1 else "FLAT",
+                "trailing_stop": state.trailing_stop, "last_entry_price": state.last_entry_price,
+                "last_exit_price": state.last_exit_price, "stop_distance": distance,
+                "suggested_qty": int(cap * risk_pct / 100.0 / distance) if distance > 0 else 0,
+                "current_price": price,
+                "atr_value": float(np.nan_to_num(f["atr"][state_idx])),
+                "adx_value": float(np.nan_to_num(f["adx"][state_idx])),
+                "is_trending": bool(f["adx"][state_idx] >= p.min_adx),
+                "s1_bull_score": float(f["bull_score"][state_idx]),
+                "s1_bear_score": float(f["bear_score"][state_idx]),
+                "s1_rel_volume": float(np.nan_to_num(f["rel_vol"][state_idx], nan=1.0)),
+                "s1_atr_expansion": float(np.nan_to_num(f["atr_exp"][state_idx], nan=1.0)),
+                # The closed bar these scores describe; S1 lane trend exits only read
+                # bars after a trade's signal bar.
+                "s1_state_bar_time": state_bar_time,
+            },
+        }
+
+    def _process_ut_smart(self, df, instrument, timeframe, **kw):
+        """UT SMART EXIT: publish the engine's closed-candle signals, each carrying the
+        exit the chart gave it (uts_exit_*), so a live position follows the chart.
+
+        Session bars only (as S1). Bar timestamps denote their opens, so the
+        evaluation clock decides whether the terminal candle is closed. Per-bar
+        outputs are mapped back onto the caller's candles.
+        """
+        from engine import ut_smart_engine as uts
+
+        from engine import uts_lane
+
+        p = uts.params_from_settings(timeframe=timeframe)
+        full = df
+        n_full = len(full)
+        session = uts.drop_off_session_bars(full, p.session_end)
+        clock = uts.evaluation_clock(kw.get('as_of'))
+        closed = session.loc[uts.closed_bar_mask(session, timeframe, clock)]
+        # Intra-candle mode: the forming candle may also fire a flip (the script with
+        # confirmClose off). Only a candle still forming by the clock counts; a replay or
+        # an after-hours frame ends on closed candles and keeps the closed-candle answer.
+        forming = None
+        display_forming = None
+        if len(closed) < len(session):
+            stamps = session.index
+            if stamps.tz is not None:
+                stamps = stamps.tz_convert('Asia/Kolkata').tz_localize(None)
+            visible = session.loc[stamps <= clock]
+            if len(visible) > len(closed):
+                display_forming = visible
+                if kw.get('uts_intrabar_entries', uts_lane.intrabar_enabled()):
+                    forming = visible
+        if len(closed) < max(15, int(p.atr_period) + 2):
+            return {"error": "Insufficient UT SMART EXIT data", "signals": [], "state": None}
+        ind = uts.indicators(closed, p)
+        out = uts.run(ind, p)
+        # Pine plots the current source/trail/EMA while its entry conditions
+        # remain confirmed. Display values must not change closed trade state.
+        f_ind = uts.indicators(display_forming, p) if display_forming is not None else None
+        adx = self.calculate_adx(closed, self.adx_period)[2].to_numpy(dtype=float)
+        index = closed.index
+        signals = []
+        for row in uts.trades(index, ind, out):
+            i = int(row["bar"])
+            direction = int(row["direction"])
+            price = float(row["price"])
+            trail = float(row["trail"])
+            sig = UTBotSignal(
+                timestamp=index[i].to_pydatetime() if hasattr(index[i], "to_pydatetime") else index[i],
+                signal_type="BUY" if direction == 1 else "SELL",
+                price=price,
+                trailing_stop=trail,
+                stop_distance=abs(price - trail),
+                atr_value=float(np.nan_to_num(ind["atr"][i])),
+                adx_value=float(np.nan_to_num(adx[i])),
+                position_state=direction,
+                bar_index=int(full.index.get_indexer([index[i]])[0]),
+                instrument=instrument,
+                timeframe=timeframe,
+                source_engine=uts.ENGINE_KEY,
+                source_lane=uts.LANE_TAG,
+            )
+            exit_time = row["exit_time"]
+            for key, value in {
+                "source_engines": [uts.ENGINE_KEY],
+                "uts_forming": False,
+                "uts_trail": trail,
+                "uts_atr": float(row["atr"]),
+                "uts_setup": {"adx_value": float(np.nan_to_num(adx[i])),
+                              "rsi_value": float(np.nan_to_num(ind["rsi"][i], nan=50.0))},
+                "uts_exit_reason": row["exit_reason"] or "",
+                "uts_exit_time": exit_time.to_pydatetime() if hasattr(exit_time, "to_pydatetime") else exit_time,
+                "uts_exit_price": row["exit_price"],
+            }.items():
+                setattr(sig, key, value)
+            signals.append(sig)
+
+        if forming is not None and len(forming) > len(closed):
+            f_out = uts.run(f_ind, p)
+            j = len(forming) - 1
+            direction = int(f_out["signal"][j])
+            if direction != 0:
+                price = float(f_ind["close"][j])
+                trail = float(f_ind["trail"][j])
+                sig = UTBotSignal(
+                    timestamp=forming.index[j].to_pydatetime(),
+                    signal_type="BUY" if direction == 1 else "SELL",
+                    price=price,
+                    trailing_stop=trail,
+                    stop_distance=abs(price - trail),
+                    atr_value=float(np.nan_to_num(f_ind["atr"][j])),
+                    adx_value=float(np.nan_to_num(adx[-1])) if len(adx) else 0.0,
+                    position_state=direction,
+                    bar_index=int(full.index.get_indexer([forming.index[j]])[0]),
+                    instrument=instrument,
+                    timeframe=timeframe,
+                    source_engine=uts.ENGINE_KEY,
+                    source_lane=uts.LANE_TAG,
+                )
+                for key, value in {
+                    "source_engines": [uts.ENGINE_KEY], "uts_forming": True, "uts_trail": trail,
+                    "uts_atr": float(np.nan_to_num(f_ind["atr"][j])), "uts_exit_reason": "",
+                    "uts_setup": {"adx_value": float(np.nan_to_num(adx[-1])),
+                                  "rsi_value": float(np.nan_to_num(f_ind["rsi"][j], nan=50.0))},
+                    "uts_exit_time": None, "uts_exit_price": None,
+                }.items():
+                    setattr(sig, key, value)
+                signals.append(sig)
+
+        # Map confirmed arrays onto the caller's candles. Chart-only source,
+        # trail and EMA values below may preview the current forming candle.
+        def to_full(values):
+            series = pd.Series(np.asarray(values, dtype=float), index=index)
+            return series.reindex(full.index, method="ffill").to_numpy(copy=True)
+
+        position = np.nan_to_num(to_full(out["state"])).astype(int)
+        trail_full = to_full(ind["trail"])
+        source_full = to_full(ind["src"])
+        atr_full = to_full(ind["atr"])
+        adx_full = to_full(adx)
+        ema_full = to_full(ind["ema_exit"])
+        if f_ind is not None:
+            display_idx = int(full.index.get_indexer([display_forming.index[-1]])[0])
+            if display_idx >= 0:
+                trail_full[display_idx] = f_ind["trail"][-1]
+                source_full[display_idx] = f_ind["src"][-1]
+                ema_full[display_idx] = f_ind["ema_exit"][-1]
+        full_stamps = full.index
+        if full_stamps.tz is not None:
+            full_stamps = full_stamps.tz_convert('Asia/Kolkata').tz_localize(None)
+        observed_mask = full_stamps <= clock
+        # An explicit replay clock may receive a frame containing later bars.
+        # Never plot their values or use them as the current displayed price.
+        for display_values in (trail_full, source_full, ema_full, atr_full, adx_full):
+            display_values[~observed_mask] = np.nan
+        last = len(closed) - 1
+        state_pos = int(out["state"][last])
+        state_trail = float(ind["trail"][last]) if np.isfinite(ind["trail"][last]) else 0.0
+        price_now = float(full.loc[observed_mask, "close"].iloc[-1])
+        distance = abs(price_now - state_trail) if state_pos else 0.0
+        cap = float(kw.get("capital") or self.capital)
+        risk_pct = float(kw.get("risk_pct") or self.risk_pct)
+        st = self.get_state(f"{instrument}_{timeframe}")
+        st.position = state_pos
+        st.trailing_stop = state_trail
+        st.bar_count = n_full
+        st.last_signal = signals[-1] if signals else None
+        st.signals_history = signals[-200:]
+        st.last_entry_price = signals[-1].price if signals else 0.0
+
+        def vals(values):
+            arr = np.asarray(values, dtype=float)
+            res = arr.astype(object)
+            res[~np.isfinite(arr)] = None
+            return res.tolist()
+
+        return {
+            "instrument": instrument, "timeframe": timeframe, "candles": n_full,
+            "source_engine": uts.ENGINE_KEY, "signals": signals, "positions": position.tolist(),
+            "uts_evaluation": {
+                "observed_at": clock.to_pydatetime(),
+                "first_bar": index[0],
+                "last_closed_bar": index[-1],
+                "forming_bar": forming.index[-1] if forming is not None and len(forming) > len(closed) else None,
+            },
+            "trailing_stop": vals(trail_full),
+            "trailing_stop_colors": ["green" if src > trail else "red"
+                                     for src, trail in zip(source_full, trail_full)],
+            "atr": vals(atr_full), "adx": vals(adx_full),
+            "indicator_overlays": [{"name": f"Smart Exit EMA {p.exit_ema}", "color": "#ffff00", "values": vals(ema_full)}],
+            "state": {
+                "position": state_pos,
+                "position_label": "LONG" if state_pos == 1 else "SHORT" if state_pos == -1 else "FLAT",
+                "trailing_stop": state_trail,
+                "last_entry_price": st.last_entry_price,
+                "last_exit_price": 0.0,
+                "stop_distance": distance,
+                "suggested_qty": int(cap * risk_pct / 100.0 / distance) if distance > 0 else 0,
+                "current_price": price_now,
+                "atr_value": float(np.nan_to_num(ind["atr"][last])),
+                "adx_value": float(np.nan_to_num(adx[last])),
+                "rsi_value": float(np.nan_to_num(ind["rsi"][last], nan=50.0)),
+                "is_trending": bool(np.nan_to_num(adx[last]) >= self.adx_threshold),
+                "uts_runup_atr": float(out["runup_atr"][last]),
+                "uts_retrace_atr": float(out["retrace_atr"][last]),
+                "uts_state_bar_time": index[last],
+            },
+        }
+
     def process(self, df: pd.DataFrame, instrument: str = "", timeframe: str = "", **kw):
+        # S1 builds the requested candle type independently at each native timeframe.
+        df_5min = kw.pop("df_5min", None)
+        df_15min = kw.pop("df_15min", None)
+        if self.signal_source == "ut_smart":
+            return self._process_ut_smart(df, instrument, timeframe, **kw)
+        if self.signal_source == "s1":
+            # Let the caller invalidate failed results instead of returning UT arrows.
+            return self._process_s1(df, instrument, timeframe, df_5min=df_5min, df_15min=df_15min, **kw)
         result = super().process(df=df, instrument=instrument, timeframe=timeframe, **kw)
         if not isinstance(result, dict) or result.get("error"):
             return result
@@ -1082,6 +1387,178 @@ class AltSignalEngine(UTBotEngine):
             return result
 
 
+class UTEmaSignalEngine:
+    """Host adapter for the uploaded UT/EMA engine's own timing and parameters."""
+
+    signal_source = "ut_ema"
+    signal_mode = "realtime"
+    min_bars = 2
+
+    def __init__(self, *, synchronous: bool = False, **params):
+        from engine.ut_ema_engine import UTEmaEngine
+
+        # Generic UT presets/ADX/session filters must not alter the uploaded Pine.
+        import threading
+        self._utema_lock = threading.RLock()
+        self._utema_stream_owned = False
+        self._stream_result = None
+        self.synchronous = bool(synchronous)
+        self._native = UTEmaEngine()
+        self._last_result = {}
+
+    def process(self, df: pd.DataFrame, instrument: str = "", timeframe: str = "", **kwargs):
+        synchronous = self.synchronous or bool(kwargs.pop("synchronous", False))
+        if synchronous:
+            kwargs["realtime"] = False
+        with self._utema_lock:
+            self.sync_entry_timing()
+            from config.settings import get_settings
+            requested_live = kwargs.get("realtime", str(getattr(get_settings(), "trading_mode", "HISTORICAL")).upper() == "REAL")
+            if self._utema_stream_owned and not synchronous and requested_live:
+                import copy
+                snapshot = self.stream_snapshot()
+                if snapshot is not None:
+                    return snapshot
+                from engine.ut_ema_engine import UTEmaEngine
+                replay = self._native.process(df, instrument, timeframe,
+                    as_of=kwargs.get("as_of"), realtime=False)
+                replay["utema_entry_eligible"] = False
+                replay["utema_stream_waiting"] = True
+                return replay
+            result = self._native.process(df=df, instrument=instrument, timeframe=timeframe, **kwargs)
+            if isinstance(result, dict):
+                self._last_result = result
+            return result
+
+    def sync_entry_timing(self):
+        from engine.ut_ema_engine import signal_fire_mode
+        if self._native.set_signal_fire_mode(signal_fire_mode()):
+            self._utema_executable_event_ids = set()
+            self._stream_result = None
+            self._utema_stream_dirty = self._native._stream_ready
+
+    def stream_snapshot(self, deep: bool = True):
+        """Materialize only when a consumer needs the latest native state.
+
+        ``deep=True`` hands back a detached graph. Consumers that keep or mutate
+        the result need that. The live delivery path only replaces the top-level
+        ``signals`` key on a copy of its own, so it asks for ``deep=False``: the
+        full-graph traversal alone cost 241 of 2,995 GIL samples per window, on
+        the scanner's own event loop, on 2026-10-30.
+        """
+        from engine.ut_ema_engine import _copy_output
+        with self._utema_lock:
+            if getattr(self, "_utema_stream_dirty", False):
+                result = self._native.stream_result(copy_result=False)
+                if isinstance(result, dict):
+                    result.update(utema_stream_owned=True, utema_entry_eligible=True,
+                        utema_last_observed_at=getattr(self, "_utema_last_observed_at", ""),
+                        utema_executable_event_ids=sorted(getattr(self, "_utema_executable_event_ids", set())))
+                    self._stream_result = self._last_result = result
+                    self._utema_stream_dirty = False
+            if self._stream_result is None:
+                return None
+            return _copy_output(self._stream_result) if deep else dict(self._stream_result)
+
+    def chart_result(self, df: pd.DataFrame, instrument: str = "", timeframe: str = "", **kwargs):
+        """Chart replay must never consume the live engine's intrabar state."""
+        with self._utema_lock:
+            self.sync_entry_timing()
+            return self._native.chart_result(df=df, instrument=instrument, timeframe=timeframe, **kwargs)
+
+    def monitor_snapshot(self, lifecycle_id, entry_time=None):
+        """Copy only a held owner's protection, not every historical chart event."""
+        import copy
+        from engine.ut_ema_engine import market_stamp
+        with self._utema_lock:
+            core = self._native
+            if not core._stream_ready or core._timeline is None:
+                return None
+            timeline = core._timeline
+            record = timeline.records.get(lifecycle_id)
+            events = []
+            if record is None and entry_time:
+                entered = market_stamp(entry_time)
+                for event in reversed(timeline.marks):
+                    if market_stamp(event["observed_at"]) < entered:
+                        break
+                    if not event["entry"] and (event.get("realtime") or event.get("confirmed")):
+                        events.append(copy.deepcopy(event))
+            return {"source_engine": "ut_ema", "utema_records":
+                    {lifecycle_id: copy.deepcopy(record)} if record is not None else {},
+                    "utema_events": events,
+                    "utema_executable_event_ids": sorted(getattr(self, "_utema_executable_event_ids", set())),
+                    "state": {"current_price": core._stream_rows[-1][3] if core._stream_rows else 0.}}
+
+    def get_state(self, key: str = ""):
+        from types import SimpleNamespace
+
+        state = self._last_result.get("state") or {}
+        return SimpleNamespace(
+            position=int(state.get("position", 0) or 0),
+            trailing_stop=float(state.get("trailing_stop", 0.0) or 0.0),
+            last_entry_price=float(state.get("last_entry_price", 0.0) or 0.0),
+            last_exit_price=float(state.get("last_exit_price", 0.0) or 0.0),
+            bar_count=int(state.get("bar_count", 0) or 0),
+        )
+
+
+class S12SignalEngine:
+    """Host adapter for the native, two-lane S1+S2 scanner.
+
+    The package owns signal construction. Live processing submits closed bars to its
+    dedicated worker; historical and engine-lab callers use synchronous snapshots.
+    """
+
+    signal_source = "s1s2_dual"
+    signal_mode = "confirmed"
+
+    def __init__(self, *, synchronous: bool = False, **params):
+        self.synchronous = bool(synchronous)
+        self.adx_threshold = float(params.get("adx_threshold", 25.0) or 25.0)
+        self.min_bars = max(15, int(params.get("min_bars", 15) or 15))
+
+    def process(self, df: pd.DataFrame, instrument: str = "", timeframe: str = "", **kwargs):
+        from config.settings import get_settings
+        from engine import s12_engine, s12_lane
+
+        settings = get_settings()
+        if not s12_lane.timeframe_enabled(timeframe, settings):
+            return {
+                "instrument": instrument,
+                "timeframe": timeframe,
+                "source_engine": s12_engine.ENGINE_KEY,
+                "signals": [],
+                "positions": [0] * len(df),
+                "state": {"position": 0, "position_label": "FLAT", "current_price": 0.0},
+                "s12_disabled": True,
+            }
+        result = s12_engine.process(
+            df=df,
+            instrument=instrument,
+            timeframe=timeframe,
+            df_5min=kwargs.get("df_5min"),
+            settings=settings,
+            as_of=kwargs.get("as_of"),
+            synchronous=self.synchronous or bool(kwargs.get("synchronous", False)),
+            capital=float(kwargs.get("capital", 100000.0) or 100000.0),
+            risk_pct=float(kwargs.get("risk_pct", 1.0) or 1.0),
+            adx_threshold=self.adx_threshold,
+            min_bars=self.min_bars,
+        )
+        # Async live processing may return the previous snapshot while the worker
+        # catches up. Keep its chart diagnostics, but never let its old signals enter
+        # the shared candidate collector as if they were current.
+        if isinstance(result, dict):
+            evaluation = result.get("s12_evaluation")
+            if result.get("s12_pending") or (
+                isinstance(evaluation, dict) and evaluation.get("current") is False
+            ):
+                result = dict(result)
+                result["signals"] = []
+        return result
+
+
 def build_scanner_engine(tf_params: dict):
     """Factory: return the signal engine for the active `scanner_engine` setting.
 
@@ -1097,6 +1574,14 @@ def build_scanner_engine(tf_params: dict):
         auto_adx = float(getattr(_s, "scanner_auto_trend_adx", 25.0) or 25.0)
     except Exception:
         mode = "utbot"
-    if mode in {"consensus", "ema", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual"}:
+    if mode == "ut_ema":
+        return UTEmaSignalEngine(**tf_params)
+    if mode == "s1s2_dual":
+        return S12SignalEngine(**tf_params)
+    from engine.scanner_modes import COMBINED_MODES
+    if mode in COMBINED_MODES:
+        from engine.combined_scanner import CombinedSignalEngine
+        return CombinedSignalEngine(mode, auto_trend_adx=auto_adx, **tf_params)
+    if mode in {"consensus", "ema", "utbot_consensus", "quad_union", "quad_prime", "adaptive_dual", "s1", "ut_smart"}:
         return AltSignalEngine(signal_source=mode, auto_trend_adx=auto_adx, **tf_params)
     return UTBotEngine(**tf_params)

@@ -68,7 +68,7 @@ def test_a_quiet_cash_feed_still_names_the_futures_fallback():
     assert health["degraded"] == ["NIFTY"]
     assert row["degraded"] is True
     assert row["source"] == "kite_index_futures"
-    assert row["unit"] == "contracts"
+    assert row["unit"] == "broker_reported_quantity"
     assert row["comparable_to_thresholds"] is False
     assert row["fyers_online"] is False
     assert row["futures_available"] is True

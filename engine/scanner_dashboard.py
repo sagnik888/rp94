@@ -38,18 +38,26 @@ class ScannerDashboardCache:
         self._diagnostics: Dict[str, Any] = {}
         self._updated_at = 0.0
 
-    def update(self, results: Dict[str, Any] | None) -> None:
+    def update(self, results: Dict[str, Any] | None, *, detached: bool = False) -> None:
         if not isinstance(results, dict):
             return
         # Freeze scanner-owned mutable dictionaries/deques before publishing
         # across the ScannerEventLoop ↔ Uvicorn thread boundary.  The dashboard
         # only ever sees this detached generation, never a partially mutated
         # live object graph.
-        try:
-            snapshot = copy.deepcopy(results)
-        except Exception as exc:
-            logger.warning(f"Dashboard snapshot freeze skipped; retaining prior generation: {exc}")
-            return
+        #
+        # ``detached`` is for a caller that already rebuilt every container itself
+        # (dashboard.server's trades refresh runs make_serializable over the whole
+        # state). Deep-copying that again on the scanner loop was 17% of all GIL time
+        # on 2026-09-17 and timed out the trades updater every few seconds.
+        if detached:
+            snapshot = results
+        else:
+            try:
+                snapshot = copy.deepcopy(results)
+            except Exception as exc:
+                logger.warning(f"Dashboard snapshot freeze skipped; retaining prior generation: {exc}")
+                return
         with self._lock:
             self._state = snapshot
             if isinstance(snapshot.get("trades"), dict):
@@ -57,6 +65,34 @@ class ScannerDashboardCache:
             if isinstance(snapshot.get("diagnostics"), dict):
                 self._diagnostics = snapshot["diagnostics"]
             self._updated_at = time.time()
+
+    def update_trades(
+        self,
+        trades: Dict[str, Any],
+        prepare: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> bool:
+        """Publish fresh, already-detached trades into the current state generation.
+
+        The dashboard trades heartbeat used to rebuild and re-serialize the whole state
+        (diagnostics, config, the trades twice) on the scanner loop every second just to
+        refresh this one key; on 2026-10-06 that held the loop 96% of the time. The new
+        generation is a shallow copy that shares every other part with the previous one,
+        so ``prepare`` must replace, never edit in place, anything it changes. Returns
+        False and publishes nothing when no state exists yet or ``prepare`` declines.
+        """
+        if not isinstance(trades, dict):
+            return False
+        with self._lock:
+            if not self._state:
+                return False
+            state = dict(self._state)
+            state["trades"] = trades
+            if prepare is not None and not prepare(state):
+                return False
+            self._state = state
+            self._trades = trades
+            self._updated_at = time.time()
+        return True
 
     def state(self) -> Dict[str, Any]:
         with self._lock:
@@ -263,6 +299,10 @@ class ScannerTradePayloadBuilder:
             closed_rows, hygiene = hygiene_closed_rows(raw_closed)
             payload["closed"] = closed_rows
             payload["open"] = open_rows
+            # Refused entries stay listed for audit but are not trades: no order filled
+            # and no charge was paid. Every metric below reads the filtered rows.
+            excluded_closed = [row for row in closed_rows if row.get("accounting_excluded")]
+            closed_rows = [row for row in closed_rows if not row.get("accounting_excluded")]
             closed_pnls = [accounting_pnl(row) for row in closed_rows]
             open_pnls = [accounting_pnl(row) for row in open_rows]
             total_pnl = sum(closed_pnls) + sum(open_pnls)
@@ -485,6 +525,7 @@ class ScannerTradePayloadBuilder:
                 "vector_backend": vector_backend,
                 "futures_shadow": dict(hygiene.get("futures_shadow") or {}),
                 "engine_replay": dict(hygiene.get("engine_replay") or {}),
+                "rejected_entries": len(excluded_closed),
             }
             payload["monetary"] = monetary
 
@@ -536,7 +577,9 @@ class ScannerTradePayloadBuilder:
                             if isinstance(getattr(scanner, "config", {}), dict)
                             else {}
                         )
-                        scanner._refresh_trade_candidates(candidates, cfg)
+                        # This build runs on the scanner event loop. A stale
+                        # dashboard mark must not turn its heartbeat into broker I/O.
+                        scanner._refresh_trade_candidates(candidates, cfg, allow_blocking=False)
                     for candidate in candidates:
                         candidate_ts = getattr(candidate, "signal_timestamp", None)
                         candidate_day = candidate_ts.date().isoformat() if candidate_ts else session_day
@@ -544,11 +587,20 @@ class ScannerTradePayloadBuilder:
                             continue
                         if inst_pref_match(candidate):
                             scanner._normalize_loaded_exit_candidate(candidate)
-                            signal_rows.append(
-                                normalize_dashboard_accounting_row(
-                                    scanner._serialize_trade_candidate(candidate)
-                                )
+                            row = normalize_dashboard_accounting_row(
+                                scanner._serialize_trade_candidate(candidate)
                             )
+                            # The session ledger also stores candidates that never
+                            # became positions (including TradeManager pre-submit
+                            # refusals). Only admitted manual/watch lifecycles belong
+                            # in the signal-tracker lane; broker positions come from
+                            # TradeManager's open/closed rows below.
+                            if not (
+                                bool(row.get("accepted_by_gate"))
+                                or bool(row.get("watch_only"))
+                            ):
+                                continue
+                            signal_rows.append(row)
             # A broker-backed TradeManager row is authoritative once a signal has
             # executed.  The session tracker may continue following the hypothetical
             # signal after the real position closes; exposing both creates a phantom
@@ -563,50 +615,102 @@ class ScannerTradePayloadBuilder:
                     row for row in signal_rows
                     if str(row.get("lifecycle_id") or "").strip() not in manager_lifecycles
                 ]
-            # Only a still-actionable manual signal belongs in the trade table.
-            #
-            # A session candidate may be tracked through a virtual exit (for example
-            # REPAINT_ABORT) while Auto Mode is Manual.  It never reached the broker,
-            # so rendering that terminal row beside TradeManager's broker ledger made
-            # it look like a second closed trade and, worse, showed fictional P&L.
-            # Keep the terminal signal in the persisted/RTracker audit trail, but do
-            # not expose it as a trade, closed trade count, or money result.
-            exit_rows = [r for r in signal_rows if r.get("action") == "EXIT"]
-            active_signals = []
-            exit_keys = {r.get("lifecycle_id") for r in exit_rows}
-            for r in signal_rows:
-                if r.get("action") == "ENTRY":
-                    key = r.get("lifecycle_id")
-                    if key not in exit_keys:
-                        active_signals.append(r)
+            # One row per signal lifecycle: its exit once completed, its entry while it
+            # is still open.  02729d7 hid completed lifecycles so a virtual exit could
+            # not read as a second broker trade, which left the panel empty all session
+            # on 2026-09-15 while Diagnostics counted that day's signals and exits.  They
+            # stay visible as signal-tracker rows instead: an executed lifecycle is
+            # dropped above in favour of its broker row, and exit P&L is booked only in
+            # the non-money SIGNAL_TRACKER lane below.
+            def lifecycle_clock(raw: Any) -> Optional[float]:
+                if raw in (None, ""):
+                    return None
+                if isinstance(raw, datetime):
+                    parsed = raw
+                else:
+                    try:
+                        parsed = datetime.fromisoformat(str(raw))
+                    except ValueError:
+                        return None
+                if parsed.tzinfo is None:
+                    parsed = IST.localize(parsed)
+                return parsed.timestamp()
 
-            display_signal_rows = active_signals
-            for row in display_signal_rows:
+            exit_rows = [r for r in signal_rows if r.get("action") == "EXIT"]
+            exit_clocks: Dict[str, List[Optional[float]]] = {}
+            for r in exit_rows:
+                exit_clocks.setdefault(str(r.get("lifecycle_id") or ""), []).append(
+                    lifecycle_clock(r.get("exit_timestamp"))
+                )
+
+            def closed_by_exit(entry: Dict[str, Any]) -> bool:
+                # A re-signal on the same candle and contract shares the lifecycle id of
+                # the signal that exited before it, so an exit only closes an entry
+                # accepted at or before it.  A missing clock counts as closed.
+                entered_at = lifecycle_clock(entry.get("entry_timestamp") or entry.get("timestamp"))
+                return any(
+                    exited_at is None or entered_at is None or exited_at >= entered_at
+                    for exited_at in exit_clocks.get(str(entry.get("lifecycle_id") or ""), [])
+                )
+
+            active_signals = [
+                r for r in signal_rows
+                if r.get("action") == "ENTRY" and not closed_by_exit(r)
+            ]
+            for row in active_signals:
                 # A manual signal is an execution opportunity, not an open position.
                 # Do not let a mark-to-market estimate become apparent broker P&L.
                 row["pnl"] = 0.0
                 row["accounting_pnl"] = 0.0
+            display_signal_rows = exit_rows + active_signals
+            for row in display_signal_rows:
                 row["execution_status"] = "SIGNAL_ONLY"
                 row["execution_state"] = "NOT_PLACED"
             payload["signals"] = display_signal_rows
-            # Explicit session-row contract: these counts are actionable, unfilled
-            # signals only.  Terminal virtual rows remain separately auditable.
+            # Explicit session-row contract: consumers that read only open/closed would
+            # otherwise see zero trades when the session is carried by signal rows.
             payload["session_rows_total"] = len(display_signal_rows)
-            payload["session_closed_total"] = 0
+            payload["session_closed_total"] = len(exit_rows)
             payload["session_open_total"] = len(active_signals)
             payload["meta"] = {
                 **payload.get("meta", {}),
                 "restored_signal_rows": len(display_signal_rows),
                 "session_rows_total": len(display_signal_rows),
-                "session_closed_total": 0,
+                "session_closed_total": len(exit_rows),
                 "session_open_total": len(active_signals),
                 "unexecuted_terminal_signal_rows": len(exit_rows),
                 "source": "restored_session_signals" if display_signal_rows and not (payload.get("open") or payload.get("closed")) else "mixed",
             }
-            has_trade_rows = bool(payload.get("open") or payload.get("closed"))
+            # A refused entry is listed but moved no money, so on its own it must not
+            # switch the headline to the broker lane.
+            has_trade_rows = bool(
+                payload.get("open")
+                or [row for row in payload.get("closed") or [] if not row.get("accounting_excluded")]
+            )
+            if display_signal_rows and has_trade_rows:
+                # Broker trades own the money headline, but signals taken while Auto was
+                # OFF (restart, manual toggle) were silently dropped from it: on
+                # 2026-09-17 seven such signals (+Rs.816 in marks) vanished once one
+                # broker trade existed, and P&L / TRADES looked frozen. Publish them as a
+                # separate, non-money lane instead of either hiding or mixing them.
+                signal_accounting = exit_rows + active_signals
+                signal_pnls = [accounting_pnl(r) for r in signal_accounting]
+                payload["summary"] = {
+                    **(payload.get("summary") or {}),
+                    "signal_lane": {
+                        "pnl_label": "SIGNAL P&L",
+                        "pnl_is_money": False,
+                        "pnl": round(sum(signal_pnls), 2),
+                        "trades": len(signal_accounting),
+                        "open_count": len(active_signals),
+                        "wins": len([p for p in signal_pnls if p > 0]),
+                        "losses": len([p for p in signal_pnls if p < 0]),
+                        "description": "Accepted signals not placed with the broker (Auto Mode OFF); marks only",
+                    },
+                }
             if display_signal_rows and not has_trade_rows:
-                active_rows = display_signal_rows
-                accounting_rows = active_rows
+                active_rows = active_signals
+                accounting_rows = exit_rows + active_rows
                 pnls = [accounting_pnl(r) for r in accounting_rows]
                 wins = len([p for p in pnls if p > 0])
                 losses = len([p for p in pnls if p < 0])
@@ -630,7 +734,7 @@ class ScannerTradePayloadBuilder:
                 original_closed = payload.get("closed", [])
                 try:
                     payload["open"] = active_rows
-                    payload["closed"] = []
+                    payload["closed"] = exit_rows
                     rebuild_display_accounting(accounting_lane="SIGNAL_TRACKER")
                 finally:
                     payload["open"] = original_open

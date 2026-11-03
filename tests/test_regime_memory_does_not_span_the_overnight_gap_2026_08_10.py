@@ -32,6 +32,7 @@ import pytest
 
 from intelligence.regime_detector import RegimeDetector
 from scanner import Scanner
+from tests.source_views import scanner_runtime_source
 
 
 # ── the premise: yesterday's votes really do decide today ────────────────────
@@ -180,11 +181,11 @@ def test_the_scan_path_reset_is_still_historical_only():
     to own this. Scans the OTHER occurrence, not the one added to the rollover."""
     import inspect
 
-    src = inspect.getsource(Scanner)
+    src = scanner_runtime_source()
     sites = [i for i in range(len(src)) if src.startswith('"reset_history"', i)]
     assert len(sites) >= 2, "expected the scan-path site plus the rollover site"
 
-    guarded = [i for i in sites if 'self.mode == "HISTORICAL"' in src[max(0, i - 400):i]]
+    guarded = [i for i in sites if 'scanner.mode == "HISTORICAL"' in src[max(0, i - 400):i]]
     assert guarded, "the scan-path reset is no longer HISTORICAL-gated"
 
 

@@ -1,0 +1,475 @@
+{
+  "params_current": {
+    "key_value": 2.0,
+    "atr_period": 14,
+    "use_heikin_ashi": true,
+    "smart_exit": true,
+    "arm_atr": 2.5,
+    "retrace_atr": 0.7,
+    "hard_retrace_atr": 2.5,
+    "min_bars": 2,
+    "confirmations": 4,
+    "rsi_length": 14,
+    "rsi_ob": 70.0,
+    "rsi_os": 30.0,
+    "rsi_lookback": 5,
+    "exit_ema": 5,
+    "wick_ratio": 0.35,
+    "session_end": "15:15"
+  },
+  "params_pine": {
+    "key_value": 1.0,
+    "atr_period": 10,
+    "use_heikin_ashi": false,
+    "smart_exit": true,
+    "arm_atr": 0.8,
+    "retrace_atr": 0.45,
+    "hard_retrace_atr": 1.1,
+    "min_bars": 2,
+    "confirmations": 2,
+    "rsi_length": 14,
+    "rsi_ob": 70.0,
+    "rsi_os": 30.0,
+    "rsi_lookback": 5,
+    "exit_ema": 5,
+    "wick_ratio": 0.35,
+    "session_end": "15:15"
+  },
+  "runs": [
+    {
+      "frame": "runtime137",
+      "params": "current",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22651.836,
+          "atr": 42.813
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22757.105,
+          "atr": 41.559
+        }
+      ]
+    },
+    {
+      "frame": "runtime137",
+      "params": "current",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22653.235,
+          "atr": 42.114
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22756.708,
+          "atr": 41.36
+        }
+      ]
+    },
+    {
+      "frame": "runtime137",
+      "params": "pine_defaults",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 09:15:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22721.65,
+          "src": 22721.65,
+          "trail": 22678.051,
+          "atr": 43.599
+        },
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22745.383,
+          "atr": 42.633
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.278,
+          "atr": 39.822
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.629,
+          "atr": 36.614
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.437,
+          "atr": 39.187
+        }
+      ]
+    },
+    {
+      "frame": "runtime137",
+      "params": "pine_defaults",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22744.867,
+          "atr": 42.117
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.583,
+          "atr": 39.517
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.829,
+          "atr": 36.452
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.292,
+          "atr": 39.042
+        }
+      ]
+    },
+    {
+      "frame": "merged300",
+      "params": "current",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22651.834,
+          "atr": 42.814
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22757.106,
+          "atr": 41.559
+        }
+      ]
+    },
+    {
+      "frame": "merged300",
+      "params": "current",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22653.233,
+          "atr": 42.115
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22756.709,
+          "atr": 41.361
+        }
+      ]
+    },
+    {
+      "frame": "merged300",
+      "params": "pine_defaults",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 09:15:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22721.65,
+          "src": 22721.65,
+          "trail": 22678.051,
+          "atr": 43.599
+        },
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22745.383,
+          "atr": 42.633
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.278,
+          "atr": 39.822
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.629,
+          "atr": 36.614
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.437,
+          "atr": 39.187
+        }
+      ]
+    },
+    {
+      "frame": "merged300",
+      "params": "pine_defaults",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22744.867,
+          "atr": 42.117
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.583,
+          "atr": 39.517
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.829,
+          "atr": 36.452
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.292,
+          "atr": 39.042
+        }
+      ]
+    },
+    {
+      "frame": "mergedall",
+      "params": "current",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22651.834,
+          "atr": 42.814
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22757.106,
+          "atr": 41.559
+        }
+      ]
+    },
+    {
+      "frame": "mergedall",
+      "params": "current",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:00:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22755.2,
+          "src": 22737.462,
+          "trail": 22653.233,
+          "atr": 42.115
+        },
+        {
+          "time": "2026-09-30 14:15:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22642.75,
+          "src": 22673.987,
+          "trail": 22756.709,
+          "atr": 41.361
+        }
+      ]
+    },
+    {
+      "frame": "mergedall",
+      "params": "pine_defaults",
+      "session_filtered": true,
+      "rows": [
+        {
+          "time": "2026-09-30 09:15:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22721.65,
+          "src": 22721.65,
+          "trail": 22678.051,
+          "atr": 43.599
+        },
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22745.383,
+          "atr": 42.633
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.278,
+          "atr": 39.822
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.629,
+          "atr": 36.614
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.437,
+          "atr": 39.187
+        }
+      ]
+    },
+    {
+      "frame": "mergedall",
+      "params": "pine_defaults",
+      "session_filtered": false,
+      "rows": [
+        {
+          "time": "2026-09-30 10:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22702.75,
+          "src": 22702.75,
+          "trail": 22744.867,
+          "atr": 42.117
+        },
+        {
+          "time": "2026-09-30 11:45:00",
+          "signal": 1,
+          "exit": "",
+          "close": 22737.1,
+          "src": 22737.1,
+          "trail": 22697.583,
+          "atr": 39.517
+        },
+        {
+          "time": "2026-09-30 13:15:00",
+          "signal": 0,
+          "exit": "SMART_EXIT",
+          "close": 22774.75,
+          "src": 22774.75,
+          "trail": 22747.829,
+          "atr": 36.452
+        },
+        {
+          "time": "2026-09-30 13:30:00",
+          "signal": -1,
+          "exit": "",
+          "close": 22726.25,
+          "src": 22726.25,
+          "trail": 22765.292,
+          "atr": 39.042
+        }
+      ]
+    }
+  ]
+}

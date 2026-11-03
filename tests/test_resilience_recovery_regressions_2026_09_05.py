@@ -10,8 +10,10 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from scanner import Scanner
+from engine.entry_analysis_service import EntryAnalysisService
 from trading.kite_broker import KiteBroker
 from trading.trade_manager import IST, Trade, TradeManager
+from tests.source_views import signal_pipeline_source
 
 
 def _future_trade():
@@ -63,7 +65,7 @@ def test_silent_feed_retry_waits_for_health_to_clear_not_one_successful_write():
 
 
 def test_failed_intelligence_cannot_restamp_an_old_snapshot_as_fresh():
-    source = inspect.getsource(Scanner._process_instrument)
+    source = inspect.getsource(EntryAnalysisService.process)
     assert "intel_computed_this_pass = False" in source
     assert "and intel_computed_this_pass" in source
     assert "at=(cached_intel_time if intel_is_fresh else now)" not in source
@@ -74,7 +76,7 @@ def test_failed_intelligence_cannot_restamp_an_old_snapshot_as_fresh():
 def test_held_own_timeframe_signal_is_registered_for_reconsideration():
     from engine.signal_processor import SignalProcessor
 
-    source = inspect.getsource(SignalProcessor.process_best_signal)
+    source = signal_pipeline_source()
     hold = source.index("own-timeframe intelligence; fail-closed grading is active.")
     retry = source.index("_live_signal_recheck_eligible", hold)
     remember = source.index("_remember_live_signal_identity", hold)

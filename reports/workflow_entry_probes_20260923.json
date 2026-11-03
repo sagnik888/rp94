@@ -1,0 +1,85 @@
+{
+  "scope": "Current-source isolated mechanism probes; no live execution or profitability assertion",
+  "reachability": {
+    "buffer": "New CANDLE_CLOSE candidates skip stabilization/regrade (scanner.py:34010-34015); bug applies to INTRACANDLE buffered candidates.",
+    "timeframe_veto": "FUT veto applies only to FUT, enabled regime veto, no thrust/reversion exemption. AUTO can reroute vetoed FUT to OPT. Other later gates may still reject a wrongly unvetoed candidate.",
+    "snapshot": "Stub settings isolate mechanisms; this artifact does not inspect or assert current running application configuration."
+  },
+  "settings": {
+    "ut_dynamic_confidence": true,
+    "ut_confidence_logistic": true,
+    "ut_confidence_logistic_k": 5.0,
+    "ut_exhaustion_confidence_cap": 0.82,
+    "scanner_engine": "quad_prime",
+    "utbot_prime_confidence_per_agreement": 0.03,
+    "utbot_prime_max_confidence_bonus": 0.09,
+    "stabilization_regrade_enabled": true,
+    "range_day_regime_pillar_damp_enabled": true,
+    "regime_veto_enabled": true,
+    "regime_veto_adx_floor": 18.0
+  },
+  "buffer_nonlinear_adjustment": [
+    {
+      "birth": {
+        "grade": "A",
+        "confidence": 0.82
+      },
+      "stored_birth_adjustment": -0.1527,
+      "fresh_direct_grading": {
+        "grade": "B+",
+        "confidence": 0.5926665999540697
+      },
+      "maturity_grading": {
+        "grade": "B",
+        "confidence": 0.43996659995406967
+      }
+    },
+    {
+      "birth": {
+        "grade": "B+",
+        "confidence": 0.5926665999540697
+      },
+      "stored_birth_adjustment": 0.0,
+      "fresh_direct_grading": {
+        "grade": "A",
+        "confidence": 0.82
+      },
+      "maturity_grading": {
+        "grade": "A+",
+        "confidence": 0.972748049229784
+      }
+    }
+  ],
+  "own_timeframe_pre_candidate_veto": [
+    {
+      "candidate_timeframe": "15min",
+      "signal": "BUY",
+      "caller_5m_regime": "TRENDING_DOWN",
+      "graded_15m_regime": "TRENDING_UP",
+      "production_veto": "Regime veto: directional FUT counter to confirmed TRENDING_DOWN trend",
+      "own_timeframe_veto": "",
+      "final_candidate_metadata": [
+        "TRENDING_UP",
+        0.8
+      ]
+    },
+    {
+      "candidate_timeframe": "15min",
+      "signal": "BUY",
+      "caller_5m_regime": "TRENDING_UP",
+      "graded_15m_regime": "TRENDING_DOWN",
+      "production_veto": "",
+      "own_timeframe_veto": "Regime veto: directional FUT counter to confirmed TRENDING_DOWN trend",
+      "final_candidate_metadata": [
+        "TRENDING_DOWN",
+        0.8
+      ]
+    }
+  ],
+  "source_evidence": {
+    "veto_call_line": 7034,
+    "routing_call_line": 7012,
+    "caller_context_reassignments": [],
+    "regrade_line": 20585
+  }
+}

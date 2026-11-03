@@ -1,0 +1,112 @@
+[
+  {
+    "days": 30,
+    "simulation_id": 1788908760669,
+    "diagnostic_days": 30,
+    "is_calculating": false,
+    "scan_count": 2,
+    "closed_rows": 69,
+    "closed_total": 69,
+    "summary": {
+      "daily_pnl": 17276.06,
+      "fut_pnl": 0,
+      "opt_pnl": 17276.06,
+      "total_trades": 69,
+      "win_rate": 49.275362318840585,
+      "profit_factor": 2.0337462280301266,
+      "max_drawdown": 2726.25,
+      "futures_shadow": {
+        "rows": 0,
+        "pnl": 0
+      },
+      "engine_replay": {
+        "raw_rows": 69,
+        "unique_rows": 69,
+        "excess_rows": 0,
+        "excess_pnl": 0.0,
+        "candidate_rows": 69,
+        "distinct_outcomes": 69,
+        "stream_variant_rows": 0,
+        "non_replay_rows": 0
+      }
+    },
+    "row_pnl": 17276.06,
+    "by_type": {
+      "OPT": {
+        "count": 69,
+        "pnl": 17276.06,
+        "wins": 34,
+        "losses": 35,
+        "win_rate": 49.28
+      }
+    },
+    "rejects": {
+      "Quality gate blocked": 1215,
+      "After no-entry gate 15:01": 80,
+      "After no-entry gate 14:55": 25
+    },
+    "scanner_freshness": {
+      "last_scan": "2026-09-09T04:49:50.509022+05:30",
+      "age_seconds": 0.0,
+      "last_progress": "2026-09-09T04:49:50.507145+05:30",
+      "progress_age_seconds": 0.0,
+      "effective_age_seconds": 0.0,
+      "stale_basis": "last_scan",
+      "stale_after_seconds": 5.0,
+      "is_stale": false,
+      "is_calculating": false,
+      "calculation_lock": false,
+      "cache_age_ms": 837155
+    },
+    "sources": {
+      "kite": true,
+      "kite_session_live": true,
+      "kite_tick_age_seconds": 874.18,
+      "kite_stream_stalled": false,
+      "kite_data_fresh": true,
+      "kite_rest_age_seconds": null,
+      "fyers": true,
+      "fyers_tick_age_seconds": 1297.6,
+      "broker_degraded": false,
+      "all_brokers_unavailable": false,
+      "fyers_auth_required": false,
+      "fyers_auth_reason": "",
+      "fyers_refresh_disabled": false,
+      "yahoo": true,
+      "yahoo_mode": "idle_standby",
+      "yahoo_request_count": 0,
+      "yahoo_last_used_at": null,
+      "kite_historical_rest_source": "kite_historical_rest",
+      "kite_historical_rest_available": true,
+      "kite_historical_rest_healthy": false,
+      "kite_historical_rest_fresh": false,
+      "kite_historical_rest_stale": false,
+      "kite_historical_rest_last_call_ok": null,
+      "kite_historical_rest_max_age_seconds": 90.0,
+      "kite_historical_rest_last_attempt_at": null,
+      "kite_historical_rest_last_attempt_age_seconds": null,
+      "kite_historical_rest_last_success_at": null,
+      "kite_historical_rest_age_seconds": null,
+      "kite_historical_rest_last_error_at": null,
+      "kite_historical_rest_last_error_age_seconds": null,
+      "kite_historical_rest_failure": "",
+      "kite_historical_rest_last_error": "",
+      "kite_historical_rest_failures": 0,
+      "angel_rest_backoff_active": false,
+      "angel_rest_backoff_seconds_remaining": 0.0,
+      "angel_rest_backoff_failures": 0,
+      "angelone_index_quotes": {
+        "configured": true,
+        "connected": true,
+        "last_success_age_seconds": 1257.58,
+        "last_error": "",
+        "price_only": false,
+        "index_price_only": true,
+        "option_market_data": true,
+        "index_volume_available": false,
+        "option_master_date": "2026-09-09",
+        "option_master_contracts": 8176
+      }
+    }
+  }
+]

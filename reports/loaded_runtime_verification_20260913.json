@@ -1,0 +1,1238 @@
+{
+  "mode": "HISTORICAL",
+  "auto_mode": false,
+  "runtime_build": {
+    "fingerprint": "f3a8184e5e5654111d7cd867d45f19d880d982c41bf1e286456a8490a4a07887",
+    "pid": 29276,
+    "captured_at": "2026-09-13T14:12:03.375308+00:00",
+    "basis": "source_snapshot_at_scanner_import",
+    "files": {
+      "scanner.py": {
+        "sha256": "eaa6f3bb693fbac01812f8b3dc9a38f8bd00e639b84d68ad69161aaa2e8831a3",
+        "mtime_ns": 1789308287901164100,
+        "size": 1873324
+      },
+      "engine/signal_processor.py": {
+        "sha256": "96569116b904b77092819619f4f87464d4c099c2cdab1e32cd50712b4770aef3",
+        "mtime_ns": 1789308287860285500,
+        "size": 434960
+      },
+      "engine/signal_manager.py": {
+        "sha256": "01402e74934245523a3a96f7215663ec53e4f7103b13bfe1560b6b24f8a50219",
+        "mtime_ns": 1789257797716706100,
+        "size": 21273
+      },
+      "data/market_data.py": {
+        "sha256": "68b8a629fbabd592dc9ff6be2b52c883d8ab8a4c8e8582f9b22e15d611f00d3c",
+        "mtime_ns": 1789284282952856700,
+        "size": 314726
+      },
+      "data/kite_market_data.py": {
+        "sha256": "3e7f8c5c4999b068baab8a967cca7e771cf62ce564a0c3abf49ac540dbcd28da",
+        "mtime_ns": 1789106941709072500,
+        "size": 41037
+      },
+      "data/derivative_participation.py": {
+        "sha256": "125bfb6fb4b18f89fb47f5a7a6b6bede4d81ffdbf3968d8c56eac1ee9f9c74f3",
+        "mtime_ns": 1789284133125323100,
+        "size": 12523
+      },
+      "intelligence/intelligence_aggregator.py": {
+        "sha256": "fadc54e5d9aa7846da83952641800531da1546d067cbcc227a98018fe33b83dc",
+        "mtime_ns": 1789257760099501900,
+        "size": 42679
+      },
+      "intelligence/derivative_context.py": {
+        "sha256": "70c017aeade38e51d06534d3b1cbc0eeb9aa13f71fcc69f67e64781a0c5b828e",
+        "mtime_ns": 1789257627430644300,
+        "size": 6794
+      },
+      "intelligence/regime_detector.py": {
+        "sha256": "be6dee9a2cd4d18c4cfd49314a761a96ca861aeacb1562e0730d238eb3e4d8c4",
+        "mtime_ns": 1789038885471796500,
+        "size": 42053
+      },
+      "intelligence/session_context.py": {
+        "sha256": "29b2b5092a4b9d4ae2470caf7f569d8a58a9ba7c3fa6010c47bb00be71d6ffc5",
+        "mtime_ns": 1789228511131825000,
+        "size": 27954
+      },
+      "intelligence/oi_tracker.py": {
+        "sha256": "82933eddb119fc5b509433a3f60225d47c6547cd21c505e4b99e4940aa4ecc03",
+        "mtime_ns": 1789284282973976400,
+        "size": 16701
+      },
+      "engine/multi_timeframe.py": {
+        "sha256": "b026097c408b35b6897c86d5decdebf99726e447d7b322af45cb4f20f3da264c",
+        "mtime_ns": 1789125507386179600,
+        "size": 23064
+      },
+      "intelligence/confidence_calibration.py": {
+        "sha256": "2849e3d68d55abf2c5d0334e02a98d258504aa1bd8b6bbea7e9a97b09e9b293c",
+        "mtime_ns": 1789257797704213400,
+        "size": 8031
+      },
+      "engine/expiry_manager.py": {
+        "sha256": "a0d16e27bcb7dde7dbf30f01249bcb8eac9d28eb1c5228980b9c6460b83af5e6",
+        "mtime_ns": 1789125131255549000,
+        "size": 38604
+      },
+      "trading/trade_manager.py": {
+        "sha256": "933d01c752f46c21a815ce822f2c0659f2c924004585173d9a87f58d5a356287",
+        "mtime_ns": 1789101563432497900,
+        "size": 462703
+      },
+      "engine/entry_policy.py": {
+        "sha256": "3e34b33bfffc0fc737d837537ad82b1e9806598f1bfab3506e0821fd99fde03c",
+        "mtime_ns": 1789038434920939800,
+        "size": 33264
+      },
+      "config/settings.py": {
+        "sha256": "2ee2b412ef80bc67a61ac072ebce89288857a84011faae181d967d26ec18cc66",
+        "mtime_ns": 1789121960138710900,
+        "size": 215966
+      },
+      "engine/runtime_build.py": {
+        "sha256": "072b2984d4878cc4dd9cfe1ec43cc7e5e4fe9254db1aa15f9ab6a1747b90e574",
+        "mtime_ns": 1789308297128467900,
+        "size": 1942
+      },
+      "engine/scanner_telemetry.py": {
+        "sha256": "f33759d4b6b0f76042eb69aab32925fa20702bb9ed15748f0fa6993724d27f3d",
+        "mtime_ns": 1789308355525853600,
+        "size": 59621
+      },
+      "trading/trade_dashboard.py": {
+        "sha256": "4bdafda4f82649a75aa61c10365190bc0921cbe0d711923a113a7c72259c2d85",
+        "mtime_ns": 1789283827277190200,
+        "size": 11092
+      },
+      "dashboard/server.py": {
+        "sha256": "b66e0036d158772e143d6416d726bcc5b523589239766b84556f889874cf6564",
+        "mtime_ns": 1789308297128467900,
+        "size": 169691
+      }
+    },
+    "source_files_changed_since_import": [],
+    "reload_required": false
+  },
+  "coverage": {
+    "simulation_id": 1789308725,
+    "by_index_timeframe": {
+      "NIFTY_5min": {
+        "evaluations": 55,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "BANKNIFTY_1min": {
+        "evaluations": 49,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "BANKNIFTY_5min": {
+        "evaluations": 51,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "BANKNIFTY_15min": {
+        "evaluations": 5,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "SENSEX_1min": {
+        "evaluations": 64,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "SENSEX_5min": {
+        "evaluations": 78,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "SENSEX_15min": {
+        "evaluations": 44,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "MIDCPNIFTY_1min": {
+        "evaluations": 48,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "MIDCPNIFTY_5min": {
+        "evaluations": 7,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "MIDCPNIFTY_15min": {
+        "evaluations": 12,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "NIFTY_1min": {
+        "evaluations": 65,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      },
+      "NIFTY_15min": {
+        "evaluations": 14,
+        "option_chain_available": 0,
+        "vix_available": 0,
+        "futures_participation_available": 0,
+        "options_participation_available": 0
+      }
+    }
+  },
+  "trade_meta": {
+    "mode": "HISTORICAL",
+    "backtest_days": 1,
+    "simulation_id": 1789308725,
+    "complete": true,
+    "recalculation_status": "idle",
+    "inst_pref": "OPT",
+    "scanner_engine": "quad_prime",
+    "ut_concurrency_guard": false,
+    "futures_shadow_enabled": "False",
+    "grade_preference": "B",
+    "timeframe_entry_policy": "INCLUDE_1MIN_5MIN_15MIN",
+    "open_rows": 0,
+    "closed_rows": 6,
+    "restored_signal_rows": 0,
+    "source": "historical_trade_manager",
+    "accounting_source": "current_engine_replay",
+    "excluded_session_ledger_rows": 1,
+    "excluded_session_ledger_pnl": -509.0,
+    "simulated_signal_rows": 5
+  },
+  "open_count": 0,
+  "trace_endpoint_status": "ok",
+  "example_replay_audit": {
+    "status": "ok",
+    "simulation_id": 1789308725,
+    "runtime_build": {
+      "fingerprint": "f3a8184e5e5654111d7cd867d45f19d880d982c41bf1e286456a8490a4a07887",
+      "pid": 29276,
+      "captured_at": "2026-09-13T14:12:03.375308+00:00",
+      "basis": "source_snapshot_at_scanner_import",
+      "files": {
+        "scanner.py": {
+          "sha256": "eaa6f3bb693fbac01812f8b3dc9a38f8bd00e639b84d68ad69161aaa2e8831a3",
+          "mtime_ns": 1789308287901164100,
+          "size": 1873324
+        },
+        "engine/signal_processor.py": {
+          "sha256": "96569116b904b77092819619f4f87464d4c099c2cdab1e32cd50712b4770aef3",
+          "mtime_ns": 1789308287860285500,
+          "size": 434960
+        },
+        "engine/signal_manager.py": {
+          "sha256": "01402e74934245523a3a96f7215663ec53e4f7103b13bfe1560b6b24f8a50219",
+          "mtime_ns": 1789257797716706100,
+          "size": 21273
+        },
+        "data/market_data.py": {
+          "sha256": "68b8a629fbabd592dc9ff6be2b52c883d8ab8a4c8e8582f9b22e15d611f00d3c",
+          "mtime_ns": 1789284282952856700,
+          "size": 314726
+        },
+        "data/kite_market_data.py": {
+          "sha256": "3e7f8c5c4999b068baab8a967cca7e771cf62ce564a0c3abf49ac540dbcd28da",
+          "mtime_ns": 1789106941709072500,
+          "size": 41037
+        },
+        "data/derivative_participation.py": {
+          "sha256": "125bfb6fb4b18f89fb47f5a7a6b6bede4d81ffdbf3968d8c56eac1ee9f9c74f3",
+          "mtime_ns": 1789284133125323100,
+          "size": 12523
+        },
+        "intelligence/intelligence_aggregator.py": {
+          "sha256": "fadc54e5d9aa7846da83952641800531da1546d067cbcc227a98018fe33b83dc",
+          "mtime_ns": 1789257760099501900,
+          "size": 42679
+        },
+        "intelligence/derivative_context.py": {
+          "sha256": "70c017aeade38e51d06534d3b1cbc0eeb9aa13f71fcc69f67e64781a0c5b828e",
+          "mtime_ns": 1789257627430644300,
+          "size": 6794
+        },
+        "intelligence/regime_detector.py": {
+          "sha256": "be6dee9a2cd4d18c4cfd49314a761a96ca861aeacb1562e0730d238eb3e4d8c4",
+          "mtime_ns": 1789038885471796500,
+          "size": 42053
+        },
+        "intelligence/session_context.py": {
+          "sha256": "29b2b5092a4b9d4ae2470caf7f569d8a58a9ba7c3fa6010c47bb00be71d6ffc5",
+          "mtime_ns": 1789228511131825000,
+          "size": 27954
+        },
+        "intelligence/oi_tracker.py": {
+          "sha256": "82933eddb119fc5b509433a3f60225d47c6547cd21c505e4b99e4940aa4ecc03",
+          "mtime_ns": 1789284282973976400,
+          "size": 16701
+        },
+        "engine/multi_timeframe.py": {
+          "sha256": "b026097c408b35b6897c86d5decdebf99726e447d7b322af45cb4f20f3da264c",
+          "mtime_ns": 1789125507386179600,
+          "size": 23064
+        },
+        "intelligence/confidence_calibration.py": {
+          "sha256": "2849e3d68d55abf2c5d0334e02a98d258504aa1bd8b6bbea7e9a97b09e9b293c",
+          "mtime_ns": 1789257797704213400,
+          "size": 8031
+        },
+        "engine/expiry_manager.py": {
+          "sha256": "a0d16e27bcb7dde7dbf30f01249bcb8eac9d28eb1c5228980b9c6460b83af5e6",
+          "mtime_ns": 1789125131255549000,
+          "size": 38604
+        },
+        "trading/trade_manager.py": {
+          "sha256": "933d01c752f46c21a815ce822f2c0659f2c924004585173d9a87f58d5a356287",
+          "mtime_ns": 1789101563432497900,
+          "size": 462703
+        },
+        "engine/entry_policy.py": {
+          "sha256": "3e34b33bfffc0fc737d837537ad82b1e9806598f1bfab3506e0821fd99fde03c",
+          "mtime_ns": 1789038434920939800,
+          "size": 33264
+        },
+        "config/settings.py": {
+          "sha256": "2ee2b412ef80bc67a61ac072ebce89288857a84011faae181d967d26ec18cc66",
+          "mtime_ns": 1789121960138710900,
+          "size": 215966
+        },
+        "engine/runtime_build.py": {
+          "sha256": "072b2984d4878cc4dd9cfe1ec43cc7e5e4fe9254db1aa15f9ab6a1747b90e574",
+          "mtime_ns": 1789308297128467900,
+          "size": 1942
+        },
+        "engine/scanner_telemetry.py": {
+          "sha256": "f33759d4b6b0f76042eb69aab32925fa20702bb9ed15748f0fa6993724d27f3d",
+          "mtime_ns": 1789308355525853600,
+          "size": 59621
+        },
+        "trading/trade_dashboard.py": {
+          "sha256": "4bdafda4f82649a75aa61c10365190bc0921cbe0d711923a113a7c72259c2d85",
+          "mtime_ns": 1789283827277190200,
+          "size": 11092
+        },
+        "dashboard/server.py": {
+          "sha256": "b66e0036d158772e143d6416d726bcc5b523589239766b84556f889874cf6564",
+          "mtime_ns": 1789308297128467900,
+          "size": 169691
+        }
+      },
+      "source_files_changed_since_import": [],
+      "reload_required": false
+    },
+    "historical_intelligence_coverage": {
+      "simulation_id": 1789308725,
+      "by_index_timeframe": {
+        "NIFTY_5min": {
+          "evaluations": 55,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "BANKNIFTY_1min": {
+          "evaluations": 49,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "BANKNIFTY_5min": {
+          "evaluations": 51,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "BANKNIFTY_15min": {
+          "evaluations": 5,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "SENSEX_1min": {
+          "evaluations": 64,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "SENSEX_5min": {
+          "evaluations": 78,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "SENSEX_15min": {
+          "evaluations": 44,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "MIDCPNIFTY_1min": {
+          "evaluations": 48,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "MIDCPNIFTY_5min": {
+          "evaluations": 7,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "MIDCPNIFTY_15min": {
+          "evaluations": 12,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "NIFTY_1min": {
+          "evaluations": 65,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        },
+        "NIFTY_15min": {
+          "evaluations": 14,
+          "option_chain_available": 0,
+          "vix_available": 0,
+          "futures_participation_available": 0,
+          "options_participation_available": 0
+        }
+      }
+    },
+    "trade": {
+      "id": "H_SENSEX_15min_UTBOT_20260911091500",
+      "status": "CLOSED",
+      "is_ghost": false,
+      "is_recovery": false,
+      "execution_status": "OPEN",
+      "execution_error": "",
+      "pending_execution": false,
+      "signal_time": "2026-09-11T09:15:00",
+      "signal_timestamp": "2026-09-11T09:15:00",
+      "entry_submitted_at": "",
+      "entry_replace_count": 0,
+      "partial_exit_flatten_count": 0,
+      "partial_derisk_done": false,
+      "partial_reduce_order_id": "",
+      "partial_reduce_requested_quantity": 0,
+      "scale_in_count": 0,
+      "scale_in_lots": 0,
+      "frozen_initial_risk_rs": 0.0,
+      "scale_in_order_id": "",
+      "scale_in_requested_quantity": 0,
+      "reversal_watch_required": false,
+      "is_reversion_scalp": false,
+      "pending_exit": false,
+      "broker_order_id": "",
+      "exit_order_id": "",
+      "protective_order_id": "",
+      "protective_trigger": 0.0,
+      "protective_quantity": 0,
+      "gtt_trigger_id": "",
+      "protective_updated_at": "",
+      "recovery_required_since": "",
+      "broker_quantity": 0,
+      "trading_symbol": "SENSEX2691774400PE",
+      "symbol_token": "",
+      "instrument": "SENSEX 74400 PE",
+      "direction": "SHORT",
+      "entry_price": 526.0,
+      "current_price": 0.0,
+      "exit_price": 483.85,
+      "trailing_stop": 447.1,
+      "current_stop": 447.1,
+      "target": 746.131,
+      "pnl": -1006.0,
+      "charges": 163.45,
+      "broker_realised_cumulative": null,
+      "lots": 1,
+      "lot_size": 20,
+      "grade": "A (Hist)",
+      "confidence": 0.72,
+      "rr_ratio": 2.79,
+      "atm_strike": 74400,
+      "option_type": "PE",
+      "inst_type": "OPT",
+      "timeframe": "15min",
+      "entry_time": "11 Sep 09:30:00",
+      "exit_time": "11 Sep 10:13:00",
+      "entry_timestamp": 1789099200.0,
+      "exit_timestamp": "2026-09-11T10:13:00+05:30",
+      "exit_reason": "EARLY_LOSS_CUT",
+      "exec_type": "A",
+      "entry_spot": 74274.95,
+      "spot_stop": 74489.41490131307,
+      "spot_target": 73676.59292533653,
+      "underlying_entry": 0.0,
+      "underlying_stop": 0.0,
+      "underlying_target": 0.0,
+      "premium_entry": 0.0,
+      "premium_stop": 0.0,
+      "premium_target": 0.0,
+      "geometry_observed_at": "",
+      "geometry_source": "",
+      "geometry_verified": false,
+      "geometry_schema": "dual_price_geometry.v1",
+      "expected_move_pct": 0.0,
+      "expected_move_floor_pct": 0.0,
+      "expected_move_uncertainty_pct": 0.0,
+      "expected_move_probability": 0.0,
+      "expected_move_sample_count": 0,
+      "expected_move_horizon_minutes": 0,
+      "expected_move_generated_at": "",
+      "expected_move_data_as_of": "",
+      "expected_move_model_version": "",
+      "expected_move_source": "",
+      "live_expected_move_forecast": {},
+      "entry_policy_allowed": false,
+      "entry_policy_phase": "",
+      "entry_policy_checked_at": "",
+      "entry_policy_reason": "",
+      "entry_policy_actual_rr": 0.0,
+      "entry_policy_underlying_stop_pct": 0.0,
+      "entry_policy_version": "",
+      "quality_verdict": {
+        "allowed": true,
+        "route": "high_confidence_confirmed",
+        "reason_code": "BPLUS_SETUP_CONFIRMED",
+        "reason": "setup confirmed by ADX >= 22 and 1 contemporaneous confirmation(s)",
+        "checks": {
+          "required_adx": 22.0,
+          "required_confirmations": 1,
+          "lane": "HISTORICAL",
+          "timeframe": "15min",
+          "inst_type": "OPT",
+          "regime": "BREAKOUT_DOWN",
+          "confidence": 0.7200688243150425,
+          "confidence_calibrated": false,
+          "confidence_semantics": "heuristic_score",
+          "grade": "A",
+          "canonical_grade": "A",
+          "grade_consistent": true,
+          "adx": 33.19412099752487,
+          "trend_15m_agrees": true,
+          "impulse_confirmed": false,
+          "volume_confirmed": false,
+          "volume_ratio": 0.0,
+          "volume_available": true,
+          "volume_basis": "TRADED",
+          "source_count": 1,
+          "power_move": false,
+          "market_shift_confirmed": false,
+          "market_shift_core_votes": 0,
+          "market_shift_total_votes": 0,
+          "confirmation_legs": {
+            "trend_15m": true,
+            "impulse_or_power": false,
+            "volume": false,
+            "multi_source": false
+          },
+          "confirmation_count": 1,
+          "configuration": {
+            "policy_version": "quality_verdict.v7-confidence-provenance",
+            "bplus_min_confidence": 0.55,
+            "standalone_5min_confidence": 0.7,
+            "bplus_min_adx": 22.0,
+            "risky_bplus_min_adx": 25.0,
+            "min_volume_ratio": 1.2,
+            "unknown_confidence": 0.7,
+            "market_shift_min_confidence": 0.6,
+            "full_core_market_shift_min_confidence": 0.35,
+            "full_core_market_shift_min_adx": 18.0,
+            "confidence_calibration_enabled": true,
+            "confidence_calibration_live_apply_enabled": false
+          }
+        },
+        "policy_version": "quality_verdict.v7-confidence-provenance",
+        "configuration_hash": "5a25574941283e9c"
+      },
+      "entry_intel": {},
+      "decision_intel": {},
+      "calibration_outcome_recorded": false,
+      "instrument_multiplier": -0.5309,
+      "peak_pnl": 0.0,
+      "max_drawdown": 0.0,
+      "pnl_path": [],
+      "replay_price_path": [
+        {
+          "time": "2026-09-11T09:30:00",
+          "open": 526.0,
+          "high": 531.45,
+          "low": 523.25,
+          "close": 528.75,
+          "pnl": 55.0,
+          "peak_pnl": 109.00000000000091,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:31:00",
+          "open": 528.75,
+          "high": 529.8,
+          "low": 505.25,
+          "close": 517.15,
+          "pnl": -177.00000000000045,
+          "peak_pnl": 109.00000000000091,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:32:00",
+          "open": 517.15,
+          "high": 536.0,
+          "low": 516.8,
+          "close": 535.95,
+          "pnl": 199.0000000000009,
+          "peak_pnl": 200.0,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:33:00",
+          "open": 535.95,
+          "high": 537.85,
+          "low": 525.85,
+          "close": 528.8,
+          "pnl": 55.99999999999909,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:34:00",
+          "open": 528.8,
+          "high": 528.8,
+          "low": 513.05,
+          "close": 519.0,
+          "pnl": -140.0,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:35:00",
+          "open": 519.0,
+          "high": 520.0,
+          "low": 512.05,
+          "close": 514.2,
+          "pnl": -235.9999999999991,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:36:00",
+          "open": 514.2,
+          "high": 519.7,
+          "low": 508.1,
+          "close": 512.3,
+          "pnl": -274.0000000000009,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:37:00",
+          "open": 512.3,
+          "high": 522.0,
+          "low": 510.05,
+          "close": 521.55,
+          "pnl": -89.00000000000091,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:38:00",
+          "open": 521.55,
+          "high": 522.55,
+          "low": 511.6,
+          "close": 511.6,
+          "pnl": -287.99999999999955,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:39:00",
+          "open": 511.6,
+          "high": 519.9,
+          "low": 511.6,
+          "close": 519.9,
+          "pnl": -122.00000000000045,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:40:00",
+          "open": 519.9,
+          "high": 526.0,
+          "low": 519.9,
+          "close": 526.0,
+          "pnl": 0.0,
+          "peak_pnl": 237.00000000000045,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:41:00",
+          "open": 526.0,
+          "high": 539.65,
+          "low": 525.9,
+          "close": 533.65,
+          "pnl": 152.99999999999955,
+          "peak_pnl": 272.99999999999955,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:42:00",
+          "open": 535.8,
+          "high": 540.55,
+          "low": 533.7,
+          "close": 538.5,
+          "pnl": 250.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:43:00",
+          "open": 538.5,
+          "high": 538.5,
+          "low": 520.15,
+          "close": 521.8,
+          "pnl": -84.00000000000091,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "BREAKOUT_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:44:00",
+          "open": 521.8,
+          "high": 532.1,
+          "low": 519.3,
+          "close": 527.0,
+          "pnl": 20.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:45:00",
+          "open": 527.0,
+          "high": 533.9,
+          "low": 524.0,
+          "close": 525.1,
+          "pnl": -17.999999999999545,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:46:00",
+          "open": 525.1,
+          "high": 533.85,
+          "low": 524.75,
+          "close": 530.65,
+          "pnl": 92.99999999999955,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:47:00",
+          "open": 530.65,
+          "high": 536.0,
+          "low": 530.0,
+          "close": 536.0,
+          "pnl": 200.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:48:00",
+          "open": 536.0,
+          "high": 538.0,
+          "low": 532.0,
+          "close": 536.2,
+          "pnl": 204.0000000000009,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:49:00",
+          "open": 536.2,
+          "high": 536.2,
+          "low": 526.55,
+          "close": 530.6,
+          "pnl": 92.00000000000045,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:50:00",
+          "open": 530.6,
+          "high": 530.6,
+          "low": 522.9,
+          "close": 525.15,
+          "pnl": -17.000000000000455,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:51:00",
+          "open": 525.15,
+          "high": 537.85,
+          "low": 525.15,
+          "close": 537.55,
+          "pnl": 230.9999999999991,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:52:00",
+          "open": 537.55,
+          "high": 537.55,
+          "low": 528.7,
+          "close": 530.0,
+          "pnl": 80.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:53:00",
+          "open": 530.0,
+          "high": 538.5,
+          "low": 528.85,
+          "close": 538.5,
+          "pnl": 250.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:54:00",
+          "open": 538.5,
+          "high": 538.5,
+          "low": 527.1,
+          "close": 533.15,
+          "pnl": 142.99999999999955,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:55:00",
+          "open": 533.15,
+          "high": 534.75,
+          "low": 518.55,
+          "close": 521.35,
+          "pnl": -92.99999999999955,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:56:00",
+          "open": 521.35,
+          "high": 521.35,
+          "low": 512.45,
+          "close": 520.0,
+          "pnl": -120.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:57:00",
+          "open": 520.0,
+          "high": 523.7,
+          "low": 514.7,
+          "close": 517.9,
+          "pnl": -162.00000000000045,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:58:00",
+          "open": 517.9,
+          "high": 520.75,
+          "low": 511.4,
+          "close": 517.55,
+          "pnl": -169.0000000000009,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T09:59:00",
+          "open": 517.55,
+          "high": 518.5,
+          "low": 513.6,
+          "close": 517.1,
+          "pnl": -177.99999999999955,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:00:00",
+          "open": 517.1,
+          "high": 521.0,
+          "low": 513.2,
+          "close": 520.5,
+          "pnl": -110.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:01:00",
+          "open": 520.5,
+          "high": 523.6,
+          "low": 513.3,
+          "close": 516.4,
+          "pnl": -192.00000000000045,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:02:00",
+          "open": 516.4,
+          "high": 520.55,
+          "low": 514.1,
+          "close": 514.3,
+          "pnl": -234.0000000000009,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:03:00",
+          "open": 514.3,
+          "high": 517.45,
+          "low": 496.9,
+          "close": 501.85,
+          "pnl": -482.99999999999955,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:04:00",
+          "open": 502.35,
+          "high": 506.45,
+          "low": 490.5,
+          "close": 499.3,
+          "pnl": -533.9999999999998,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:05:00",
+          "open": 499.3,
+          "high": 500.05,
+          "low": 491.15,
+          "close": 500.0,
+          "pnl": -520.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:06:00",
+          "open": 500.0,
+          "high": 503.5,
+          "low": 492.25,
+          "close": 503.5,
+          "pnl": -450.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:07:00",
+          "open": 503.5,
+          "high": 503.5,
+          "low": 495.5,
+          "close": 501.8,
+          "pnl": -483.9999999999998,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:08:00",
+          "open": 501.8,
+          "high": 502.6,
+          "low": 482.5,
+          "close": 486.5,
+          "pnl": -790.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:09:00",
+          "open": 486.5,
+          "high": 490.65,
+          "low": 481.45,
+          "close": 485.25,
+          "pnl": -815.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:10:00",
+          "open": 485.25,
+          "high": 493.0,
+          "low": 482.5,
+          "close": 484.5,
+          "pnl": -830.0,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:11:00",
+          "open": 484.5,
+          "high": 488.0,
+          "low": 481.4,
+          "close": 483.15,
+          "pnl": -857.0000000000005,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 447.1
+        },
+        {
+          "time": "2026-09-11T10:12:00",
+          "open": 483.15,
+          "high": 488.45,
+          "low": 479.0,
+          "close": 483.85,
+          "pnl": -842.9999999999995,
+          "peak_pnl": 290.9999999999991,
+          "active_stop": 447.1,
+          "active_target": 746.131,
+          "regime": "TRENDING_DOWN",
+          "next_stop": 483.85
+        }
+      ],
+      "replay_exit_trace": [
+        {
+          "time": "2026-09-11T09:30:00",
+          "guard": "replay_input",
+          "state": "VERIFIED_PRICE_PATH",
+          "input_sha256": "2e609bab6e25d09233188faa1093246d3cb26a4d67e18404b5ac1289b108d001",
+          "eligible_at": "2026-09-11T09:30:00",
+          "entry_time": "2026-09-11T09:30:00",
+          "entry_price": 526.0,
+          "fill_model": "first_available_1m_open;stop_first_when_ohlc_order_unknown;gap_stop_at_open;close_guard_at_close",
+          "contract": {
+            "contract_symbol": "SENSEX2691774400PE",
+            "contract_expiry": "2026-09-17",
+            "contract_strike": 74400,
+            "contract_option_type": "PE",
+            "contract_verified": true
+          },
+          "rows": 105,
+          "last_closed_at": "2026-09-11T11:15:00",
+          "price_basis": "OBSERVED_OPTION_OHLC",
+          "observed_option_prices": true,
+          "actual_futures_prices": false,
+          "synthetic_option_prices": false
+        },
+        {
+          "time": "2026-09-11T10:12:00",
+          "guard": "EARLY_LOSS_CUT",
+          "state": "EXIT",
+          "detail": "EARLY_LOSS_CUT loss=0.53R thr=0.35R class=big_reversal sev=5 BIG_REVERSE [price big_reversal/emergency; trend not supportive; OPT premium melt 8.0% (\u22658%)] thr=0.35R"
+        },
+        {
+          "time": "2026-09-11T10:13:00",
+          "guard": "EARLY_LOSS_CUT",
+          "state": "FILL",
+          "price": 483.85,
+          "detail": "EARLY_LOSS_CUT loss=0.53R thr=0.35R class=big_reversal sev=5 BIG_REVERSE [price big_reversal/emergency; trend not supportive; OPT premium melt 8.0% (\u22658%)] thr=0.35R"
+        }
+      ],
+      "signal_fire_mode": "INTRACANDLE",
+      "entered_intracandle": true,
+      "repaint_guard_checked": false,
+      "gtt_arm_uncertain": false,
+      "market_regime": "BREAKOUT_DOWN",
+      "data_provenance": "BACKTEST",
+      "price_action_verdict": "",
+      "entry_intelligence_score": -0.2933,
+      "intelligence_score": -0.2933,
+      "strategy_revision": "",
+      "strategy_direction_mode": "",
+      "market_wide_reversal_entry": false,
+      "volume_spike_entry": false,
+      "power_move": false,
+      "source_engine": "utbot",
+      "source_engines": [
+        "utbot"
+      ],
+      "source_lane": "",
+      "quad_union_entry": false,
+      "raw_union_entry": false,
+      "initial_stop": 447.1,
+      "scalp_lock_mode": false,
+      "lifecycle_id": "H_SENSEX_15min_UTBOT_20260911091500",
+      "runner_mode": false,
+      "runner_activation_timestamp": "",
+      "runner_activation_reason": "",
+      "runner_stop": 0.0,
+      "runner_stop_basis": "",
+      "stop_provenance": "",
+      "signal_entry_price": 0.0,
+      "entry_slippage": 0.0,
+      "exit_slippage": 0.0,
+      "requested_entry_price": 0.0,
+      "requested_exit_price": 0.0,
+      "entry_filled_at": "",
+      "exit_filled_at": "",
+      "fill_latency_ms": 0.0,
+      "exit_fill_latency_ms": 0.0,
+      "execution_bid_price": 0.0,
+      "execution_ask_price": 0.0,
+      "execution_touch_source": "",
+      "execution_touch_age_seconds": 0.0,
+      "execution_touch_usable": false,
+      "execution_touch_reason": ""
+    }
+  }
+}

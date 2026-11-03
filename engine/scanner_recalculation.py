@@ -55,6 +55,9 @@ class ScannerRecalculationMixin:
 
     def queue_full_recalculation(self, reason: str = "manual") -> None:
         """Request a background recalculation without blocking the caller."""
+        request_recompute = getattr(self, "request_analysis_recompute", None)
+        if callable(request_recompute):
+            request_recompute(reason)
         try:
             queue = getattr(self, "recalculation_queue", None)
             scanner_loop = getattr(self, "_event_loop", None)
@@ -112,12 +115,30 @@ class ScannerRecalculationMixin:
             "indices": indices,
             "timeframes": ["1min", "5min", "15min"],
             "refresh_data": bool(getattr(settings, "backtest_refresh_data_on_recalc", False)),
+            "offline_only": str(getattr(self, "mode", "") or "").upper() == "HISTORICAL",
         }
         loop = asyncio.get_running_loop()
         self._set_recalculation_status("worker_running", "historical-cache-warm")
         return await loop.run_in_executor(None, lambda: worker.run(job))
 
+    def _set_candle_history_capacity(self, days_back_override=None) -> None:
+        """Reserve replay rows only in HISTORICAL; keep the live tick limit."""
+        candles = getattr(self, "candles", None)
+        current_limit = getattr(candles, "max_candles", None)
+        if not isinstance(current_limit, int) or current_limit <= 0:
+            return
+        if not hasattr(self, "_live_candle_capacity"):
+            self._live_candle_capacity = current_limit
+        capacity = self._live_candle_capacity
+        if str(getattr(self, "mode", "") or "").upper() == "HISTORICAL":
+            days = days_back_override if days_back_override is not None else getattr(self, "backtest_days", 1)
+            # One NSE/BSE session has 375 minute bars. Retain indicator warmup
+            # in addition to every requested session; never create missing bars.
+            capacity += max(1, min(30, int(days or 1))) * 375
+        candles.max_candles = capacity
+
     def _load_worker_candles(self, worker_result: Dict[str, Any]) -> int:
+        self._set_candle_history_capacity()
         loaded = 0
         for item in worker_result.get("files", []) or []:
             try:
@@ -140,7 +161,11 @@ class ScannerRecalculationMixin:
                     if "mark_receipt" not in str(exc):
                         raise
                     self.candles.update_candles(instrument, df, timeframe)
-                loaded += len(df)
+                retained = self.candles.get_candles(instrument, timeframe)
+                if retained is not None and not retained.empty:
+                    # CSV duplicates, validation and live retention can all reduce
+                    # the rows actually available to the scan after this update.
+                    loaded += len(df.index.intersection(retained.index))
             except Exception as exc:
                 logger.debug(f"Worker candle load skipped: {exc}")
         return loaded
@@ -374,10 +399,26 @@ class ScannerRecalculationMixin:
 
                     logger.info(f"📊 Converted {trades_created} session candidates to trades for HISTORICAL mode")
 
-            if worker_result.get("status") == "ok" and candle_rows_from_manifest(worker_result.get("files", [])) > 0:
+            if worker_result.get("status") in {"ok", "incomplete"} and candle_rows_from_manifest(worker_result.get("files", [])) > 0:
                 loaded_rows = self._load_worker_candles(worker_result)
                 logger.info(f"Loaded {loaded_rows} candle row(s) from process worker cache.")
             if loaded_rows <= 0:
+                if self.mode == "HISTORICAL":
+                    missing = list(worker_result.get("errors", []) or [])
+                    self._historical_offline_missing = missing or [
+                        "historical candle cache unavailable"
+                    ]
+                    self._set_recalculation_status(
+                        "failed",
+                        "offline-historical-data-unavailable",
+                        worker=worker_result,
+                        missing=self._historical_offline_missing,
+                    )
+                    self.log_event(
+                        "Backtest abstained: offline historical candle cache unavailable",
+                        "error",
+                    )
+                    return False
                 logger.info("Process worker cache unavailable; using in-process history fetch fallback.")
                 await self._fetch_all_data(indices, force=True)
 

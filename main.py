@@ -54,6 +54,7 @@ from scanner import Scanner
 from notifications import send_desktop_notification
 from dashboard.server import app, broadcast
 from engine.safe_mode import validate_real_mode_readiness
+from engine.runtime_mode import RuntimeMode
 import dashboard.server as dashboard_module
 
 # Configure logging
@@ -379,6 +380,107 @@ def _scanner_liveness_alert_due(
     return bool(seen_running or elapsed >= grace)
 
 
+# The two broker-auth alerts that expire on a daily schedule rather than failing at a
+# random moment. Only these are re-raised before the open; a mid-session incident still
+# gets exactly one alert.
+_PREOPEN_AUTH_ALERT_KEYS = ("kite_token", "fyers")
+
+
+def _preopen_auth_realert_due(
+    now: datetime,
+    *,
+    preopen_start: dt_time,
+    session_start: dt_time,
+    last_realert_monotonic: float,
+    now_monotonic: float,
+    every_seconds: float,
+) -> bool:
+    """Whether a latched broker-auth alert should be raised again before the open.
+
+    ``_alert`` fires once per incident, which is right for a mid-session failure and
+    wrong for the daily token expiry. Kite invalidates its access token around 06:00 and
+    the Fyers token expires at roughly the same hour, so on 2026-09-16 the operator's
+    only Kite alert was delivered at 04:30 and the only Fyers alert at 06:05 -- both
+    while they were asleep, and neither repeated. Both logins were finally completed at
+    08:41, 34 minutes before the open, by noticing rather than by being told.
+
+    Inside the pre-open window the latch is released on a bounded cadence so the alert
+    lands at an hour when the login can still be finished before 09:15. Outside that
+    window nothing changes.
+    """
+    if now.weekday() >= 5:
+        return False
+    if not (preopen_start <= now.time() < session_start):
+        return False
+    if last_realert_monotonic <= 0.0:
+        return True
+    return (now_monotonic - last_realert_monotonic) >= max(60.0, float(every_seconds))
+
+
+def _accepted_unexecuted_count(scanner) -> int:
+    """Signals the gates ACCEPTED this session that never reached the broker.
+
+    Reads the live candidate book rather than the database so the watchdog keeps working
+    when the ledger is mid-write. Any failure returns 0, which only costs the count in the
+    alert text; the heartbeat still fires.
+    """
+    total = 0
+    try:
+        for book in (getattr(scanner, "_session_trade_candidates", {}) or {}).values():
+            for candidate in (book or {}).values():
+                if not bool(getattr(candidate, "accepted_by_gate", False)):
+                    continue
+                if getattr(candidate, "broker_order_id", None):
+                    continue
+                total += 1
+    except Exception:
+        return 0
+    return total
+
+
+def _auto_off_realert_due(
+    *,
+    accepted_unexecuted: int,
+    last_count: int,
+    last_realert_monotonic: float,
+    now_monotonic: float,
+    every_seconds: float,
+) -> bool:
+    """Whether the REAL-with-Auto-OFF alert should speak again.
+
+    `_alert` de-duplicates per incident, which on 2026-09-22 meant exactly one CRITICAL at
+    09:15:45 and then silence for the rest of the session. The market fell one-sided that
+    day, the gates ACCEPTED nine signals -- four of them SHORTs during the fall at 11:00,
+    11:35, 12:44 and 13:01 -- and every one was recorded "Accepted and displayed for manual
+    execution" with executed=0. No order ever reached the broker and nothing said so again.
+
+    So the alert repeats on two triggers: a new accepted-but-unexecuted signal (the moment
+    it costs something), and a slow heartbeat while the condition persists.
+    """
+    if accepted_unexecuted > max(0, int(last_count)):
+        return True
+    # The heartbeat is OPT-IN (every_seconds <= 0 disables it). Shipped at 15 minutes on
+    # 2026-09-23 it raised 19 desktop notifications between 09:15 and 13:44 on a session the
+    # operator was running manually on purpose, with zero accepted signals to report —
+    # noise that trains the operator to ignore the one alert that matters.
+    if float(every_seconds) <= 0.0 or last_realert_monotonic <= 0.0:
+        return False
+    return (now_monotonic - last_realert_monotonic) >= max(60.0, float(every_seconds))
+
+
+def _release_preopen_auth_latches(state: dict) -> list:
+    """Drop the de-dup latches for the broker-auth alerts so they can fire again.
+
+    Returns the keys that were actually latched, so a caller can tell a real re-raise
+    from a no-op pass where both brokers were already authenticated.
+    """
+    released = []
+    for key in _PREOPEN_AUTH_ALERT_KEYS:
+        if state.pop(key, None):
+            released.append(key)
+    return released
+
+
 def _apply_runtime_resource_guard(scanner) -> tuple[bool, str]:
     """Latch an entry-only inhibition without changing Auto exit semantics."""
     if (
@@ -405,6 +507,29 @@ def _apply_runtime_resource_guard(scanner) -> tuple[bool, str]:
     return True, "New Auto entries inhibited; " + str(blockers[0])
 
 
+def _runtime_resource_warning(scanner) -> str:
+    """Percentage memory pressure that warns without blocking; '' when there is none.
+
+    The percentages used to block new Auto entries and that block was the operator's
+    only prompt to free memory. They now only warn (auto_resource_pct_blocks_entries),
+    so the prompt has to survive on its own or the machine drifts toward the headroom
+    floor, which does block, with nobody told.
+    """
+    if (
+        str(getattr(scanner, "mode", "") or "").upper() != "REAL"
+        or not bool(getattr(scanner, "auto_mode", False))
+    ):
+        return ""
+    warnings = [str(w) for w in (getattr(scanner, "_auto_resource_pressure_warnings", None) or [])]
+    if not warnings:
+        return ""
+    return (
+        "Host memory pressure: " + "; ".join(warnings)
+        + ". Entries still allowed; they stop only when Windows commit headroom runs out."
+        " Close other trading builds and heavy apps now."
+    )
+
+
 def start_runtime_watchdog(scanner: Scanner, settings) -> None:
     """Alert on the silent failure modes that unattended operation cannot tolerate.
 
@@ -429,6 +554,20 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
     check_every = float(os.getenv("RUNTIME_WATCHDOG_INTERVAL_SECONDS", "60") or 60.0)
     start_at = _parse_hhmm(os.getenv("RUNTIME_WATCHDOG_START", "09:15"), dt_time(9, 15))
     stop_at = _parse_hhmm(os.getenv("RUNTIME_WATCHDOG_UNTIL", "15:30"), dt_time(15, 30))
+    # Pre-open re-raise window for the daily broker-token alerts. Ends at start_at, so
+    # moving RUNTIME_WATCHDOG_START moves the deadline with it.
+    preopen_at = _parse_hhmm(
+        os.getenv("RUNTIME_WATCHDOG_PREOPEN_START", "08:30"), dt_time(8, 30)
+    )
+    preopen_every = float(
+        os.getenv("RUNTIME_WATCHDOG_PREOPEN_REALERT_SECONDS", "600") or 600.0
+    )
+    # Optional heartbeat for REAL-with-Auto-OFF, off by default. Every newly accepted but
+    # unplaced signal re-raises the alert regardless; set this (seconds) only if you also
+    # want reminders while nothing is being accepted.
+    auto_off_every = float(
+        os.getenv("RUNTIME_WATCHDOG_AUTO_OFF_REALERT_SECONDS", "0") or 0.0
+    )
 
     def _alert(key: str, message: str, state: dict) -> None:
         """CRITICAL + desktop notification, de-duplicated per incident."""
@@ -530,14 +669,57 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                     # REAL + in-session + AUTO off is worth saying out loud even on a
                     # deliberately manual day: it costs one alert, and the alternative
                     # is a silent full-day outage. _alert de-duplicates on the state key.
+                    # Repeat while it is still costing entries. One alert per process was
+                    # not enough on 2026-09-22: it spoke at 09:15:45 and never again while
+                    # nine accepted signals went unplaced through a one-sided fall.
+                    accepted_unexecuted = _accepted_unexecuted_count(scanner)
+                    if _auto_off_realert_due(
+                        accepted_unexecuted=accepted_unexecuted,
+                        last_count=int(state.get("auto_off_accepted_count", 0) or 0),
+                        last_realert_monotonic=float(state.get("auto_off_realert_at", 0.0) or 0.0),
+                        now_monotonic=time.monotonic(),
+                        every_seconds=auto_off_every,
+                    ):
+                        state.pop("auto_never_armed", None)
+                    state["auto_off_accepted_count"] = accepted_unexecuted
+                    missed = (
+                        f" {accepted_unexecuted} signal(s) have already been accepted and "
+                        "displayed for manual execution instead of being placed."
+                        if accepted_unexecuted
+                        else ""
+                    )
+                    if not state.get("auto_never_armed"):
+                        state["auto_off_realert_at"] = time.monotonic()
                     _alert(
                         "auto_never_armed",
                         "broker mode is REAL during market hours but Auto Mode is OFF - "
-                        "signals will NOT execute. Auto Mode is not persisted, so a "
-                        "restart always reverts it to manual; re-enable it on the "
-                        "dashboard if this session is meant to trade unattended",
+                        "signals will NOT execute. A restart brings Auto back only if it "
+                        "was ON earlier today (after the day's readiness checks); "
+                        "re-enable it on the dashboard if this session is meant to "
+                        "trade unattended." + missed,
                         state,
                     )
+
+                # 2a. Pre-open re-raise. Both broker tokens expire on a clock, not on
+                # an event, so their alerts are raised hours before anyone is awake to
+                # act. Releasing the latch here lets 2b and 3 below speak again while
+                # there is still time to log in; if both brokers are healthy the pop is
+                # a no-op and nothing is raised.
+                if _preopen_auth_realert_due(
+                    now,
+                    preopen_start=preopen_at,
+                    session_start=start_at,
+                    last_realert_monotonic=float(state.get("preopen_realert_at", 0.0) or 0.0),
+                    now_monotonic=time.monotonic(),
+                    every_seconds=preopen_every,
+                ):
+                    state["preopen_realert_at"] = time.monotonic()
+                    released = _release_preopen_auth_latches(state)
+                    if released:
+                        logger.info(
+                            "Pre-open watchdog re-raising broker auth alert(s): "
+                            + ", ".join(released)
+                        )
 
                 # 2b. Kite session — the token dies every morning, and without it
                 # every order is refused while the scanner still looks perfectly
@@ -621,13 +803,21 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 except Exception:
                     status = {}
                 if status.get("auth_required"):
-                    _alert(
-                        "fyers",
-                        f"Fyers login required ({status.get('reason') or 'token invalid'}) - "
-                        f"option chain/OI/PCR unavailable until you visit "
-                        f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/fyers_login",
-                        state,
-                    )
+                    backup_only = callable(getattr(scanner.data, "_fyers_backup_enabled", None)) and scanner.data._fyers_backup_enabled()
+                    if backup_only:
+                        if not state.get("fyers"):
+                            state["fyers"] = True
+                            message = "Optional FYERS backup login unavailable; Kite/Angel data health is evaluated independently."
+                            logger.warning(f"WATCHDOG: {message}")
+                            scanner.log_event(message, "warning")
+                    else:
+                        _alert(
+                            "fyers",
+                            f"Fyers login required ({status.get('reason') or 'token invalid'}) - "
+                            f"option chain/OI/PCR unavailable until you visit "
+                            f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/fyers_login",
+                            state,
+                        )
                 else:
                     state.pop("fyers", None)
 
@@ -644,6 +834,11 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                     )
                 else:
                     state.pop("resource_pressure", None)
+                warning = "" if pressured else _runtime_resource_warning(scanner)
+                if warning:
+                    _alert("resource_warning", warning, state)
+                else:
+                    state.pop("resource_warning", None)
             except Exception as exc:
                 logger.debug(f"Runtime watchdog iteration failed: {exc}")
             time.sleep(max(15.0, check_every))
@@ -986,6 +1181,32 @@ def _record_session_archive_repair(
             )[:500]
         rows[symbol] = row
 
+    # Contracts the pre-archive back-fill fetched that the manifest does not list. They
+    # never decide the day's state, but their outcome must be kept: unrecorded, an
+    # expired contract's "invalid token" was requested again on every cycle (2026-09-25:
+    # 19 of the 31 contracts fetched for 2026-08-12, every rotation, all night).
+    prior_other = old.get("other_contracts") or {}
+    prior_other = prior_other if isinstance(prior_other, dict) else {}
+    other_rows: dict[str, dict] = {
+        str(symbol): dict(row) for symbol, row in prior_other.items()
+        if isinstance(row, dict) and str(symbol) not in rows
+    }
+    for symbol, outcome in outcomes.items():
+        symbol = str(symbol or "").strip()
+        if not symbol or symbol in rows or not isinstance(outcome, dict):
+            continue
+        row = dict(other_rows.get(symbol) or {})
+        row.update({key: value for key, value in outcome.items() if value not in (None, "")})
+        symbol_attempts = _safe_nonnegative_int(row.get("attempts"))
+        if outcome.get("attempted", True):
+            symbol_attempts += 1
+            made_authenticated_attempt = True
+        row["attempts"] = symbol_attempts
+        row.setdefault("state", "retryable")
+        if row["state"] == "terminal_unfillable" and not bool(row.get("permanent")):
+            row["state"] = "retryable"
+        other_rows[symbol] = row
+
     attempts = old_attempts + (1 if made_authenticated_attempt else 0)
 
     coverage_errors = list(manifest.get("coverage_errors") or [])
@@ -1035,6 +1256,7 @@ def _record_session_archive_repair(
         "last_attempt_at": now_ist.isoformat(),
         "last_error": str(default_reason or "archive incomplete")[:1000],
         "missing_contracts": rows,
+        "other_contracts": other_rows,
         "source_identity": _session_archive_source_identity(root, day, manifest),
         "next_retry_at": (
             (now_ist + timedelta(minutes=backoff_minutes)).isoformat()
@@ -1216,8 +1438,11 @@ def _session_archive_terminal_contracts(root: Path, day: str) -> dict[str, dict]
     ):
         return {}
     rows = status.get("missing_contracts") or {}
-    if not isinstance(rows, dict):
-        return {}
+    rows = dict(rows) if isinstance(rows, dict) else {}
+    other = status.get("other_contracts") or {}
+    if isinstance(other, dict):
+        for symbol, row in other.items():
+            rows.setdefault(symbol, row)
     return {
         str(symbol): dict(row)
         for symbol, row in rows.items()
@@ -1557,7 +1782,9 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
     live_end = _parse_hhmmss(getattr(settings, "real_mode_live_end", "15:30:00"), dt_time(15, 30))
     if now_ist.time() < switch_at:
         return False, "before_switch_time"
-    if now_ist.time() > live_end:
+    # A switch time set after the close is an operator test of the REAL/manual arm
+    # (Auto still needs the day's full readiness, and no entry can pass a closed market).
+    if now_ist.time() > live_end and switch_at <= live_end:
         return False, "after_live_end"
 
     current_mode = str(getattr(scanner, "mode", "") or "").upper()
@@ -1581,13 +1808,19 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
                 )
                 logger.warning(f"Premarket REAL/manual arm blocked: {reason}")
                 return False, reason
+            _keep_operator_auto_on(scanner, now_ist)
         return True, "already_real_manual"
     if current_mode != "HISTORICAL":
         return False, f"unsupported_mode:{current_mode or 'unknown'}"
+    kept = getattr(scanner, "_operator_kept_historical_today", None)
+    if callable(kept) and kept(now_ist, switch_at):
+        # The operator went back to HISTORICAL after today's switch; a restart keeps that.
+        return False, "operator_kept_historical"
 
     # The premarket worker may start while historical Auto Mode is still enabled
     # from a replay.  Disarm it before changing the broker/feed mode so there is no
     # instant in which the REAL singleton can inherit unattended execution.
+    was_auto = bool(getattr(scanner, "auto_mode", False))
     auto_disabled = scanner.configure(auto_mode=False, persist_settings=False)
     if not auto_disabled or bool(getattr(scanner, "auto_mode", False)):
         reason = str(
@@ -1596,6 +1829,8 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
         )
         logger.warning(f"Premarket REAL/manual arm blocked: {reason}")
         return False, reason
+    if was_auto:
+        _keep_operator_auto_on(scanner, now_ist)
 
     configured = scanner.configure(
         mode="REAL",
@@ -1618,11 +1853,32 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
     return False, reason
 
 
-def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
-    """Arm REAL/manual mode at 09:00 without revoking live Auto authority."""
-    if not _setting_enabled(getattr(settings, "auto_real_mode_premarket_enabled", True), True):
-        logger.info("Premarket REAL/manual worker disabled by settings.")
+def _keep_operator_auto_on(scanner, now_ist: datetime) -> None:
+    """The switch enters REAL with Auto held OFF (Auto needs the day's readiness first).
+    The operator's ON is remembered and restored by the scanner's readiness-gated arm, so
+    the mode switch never overrides the Auto toggle (2026-09-25 user)."""
+    carry = getattr(scanner, "_carry_auto_intent", None)
+    if not callable(carry):
         return
+    try:
+        carry(now_ist.date().isoformat())
+        scanner.log_event(
+            "Auto Mode was ON: it comes back ON by itself once today's live readiness "
+            "checks pass (from 09:15).",
+            "system",
+        )
+    except Exception as exc:
+        logger.debug(f"Auto intent not carried over the REAL switch: {exc}")
+
+
+def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
+    """Arm REAL/manual mode at 09:00 without revoking live Auto authority.
+
+    The worker always runs and re-reads the toggle and switch time every pass, so the
+    dashboard can turn it on or off (or move the time) without a restart.
+    """
+    if not _setting_enabled(getattr(settings, "auto_real_mode_premarket_enabled", True), True):
+        logger.info("Premarket REAL/manual worker idle until enabled from the dashboard.")
 
     switch_at = _parse_hhmmss(
         getattr(settings, "auto_real_mode_premarket_switch_time", "09:00:00"),
@@ -1636,9 +1892,20 @@ def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
     last_reason_by_date: dict[str, str] = {}
 
     def _scheduler_loop():
+        nonlocal switch_at
         while True:
             now = datetime.now(IST)
             session_day = now.date().isoformat()
+            if not _setting_enabled(getattr(settings, "auto_real_mode_premarket_enabled", True), True):
+                time.sleep(60.0)
+                continue
+            new_switch = _parse_hhmmss(
+                getattr(settings, "auto_real_mode_premarket_switch_time", "09:00:00"),
+                dt_time(9, 0, 0),
+            )
+            if new_switch != switch_at:
+                switch_at = new_switch
+                completed_dates.discard(session_day)
             today_switch = _ist_at(now.date(), switch_at)
 
             if session_day in completed_dates:
@@ -1651,7 +1918,9 @@ def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
                 if ok:
                     completed_dates.add(session_day)
                     sleep_seconds = 60.0
-                elif reason in {"disabled", "not_trading_day", "after_live_end"}:
+                elif reason == "disabled":
+                    sleep_seconds = 60.0
+                elif reason in {"not_trading_day", "after_live_end", "operator_kept_historical"}:
                     completed_dates.add(session_day)
                     tomorrow_switch = _ist_at(now.date() + timedelta(days=1), switch_at)
                     sleep_seconds = max(60.0, (tomorrow_switch - now).total_seconds())
@@ -1663,9 +1932,10 @@ def start_premarket_real_mode_worker(scanner: Scanner, settings) -> None:
 
             logger.info(
                 "Premarket REAL/manual worker sleeping "
-                f"{sleep_seconds:.0f}s (switch {switch_at.strftime('%H:%M:%S')} IST)."
+                f"{min(sleep_seconds, 60.0):.0f}s (switch {switch_at.strftime('%H:%M:%S')} IST)."
             )
-            time.sleep(sleep_seconds)
+            # Wake at least once a minute so a dashboard toggle or new time applies.
+            time.sleep(min(sleep_seconds, 60.0))
 
     threading.Thread(
         target=_scheduler_loop,
@@ -1679,6 +1949,17 @@ def create_system():
     """Initialize all system components"""
     settings = get_settings()
     instruments = settings.get_instruments()
+    startup_mode_text = str(settings.trading_mode or "").strip().upper()
+
+    def runtime_mode() -> RuntimeMode:
+        return RuntimeMode.parse(settings.trading_mode)
+
+    def replay_fallback() -> str:
+        return (
+            "HISTORICAL"
+            if startup_mode_text in {"HISTORICAL", "PAPER", "REAL"}
+            else RuntimeMode.REPLAY.value
+        )
 
     risk_summary = settings.risk_configuration_summary()
     logger.info(
@@ -1690,12 +1971,12 @@ def create_system():
     )
     for warning in risk_summary["warnings"]:
         logger.warning(f"Risk configuration warning: {warning}")
-    if settings.trading_mode == "REAL" and not risk_summary["ok"]:
+    if runtime_mode().permits_live_orders and not risk_summary["ok"]:
         logger.critical(
             "REAL startup refused by risk configuration: "
             + "; ".join(risk_summary["issues"])
         )
-        settings.trading_mode = "HISTORICAL"
+        settings.trading_mode = replay_fallback()
 
     env_path = Path(__file__).parent / ".env"
     plaintext_secret_keys = set()
@@ -1717,13 +1998,13 @@ def create_system():
             "and restrict file ACLs."
         )
     if (
-        settings.trading_mode == "REAL"
+        runtime_mode().permits_live_orders
         and settings.shared_host_mode
         and plaintext_secret_keys
         and not settings.allow_plaintext_broker_secrets
     ):
         logger.critical("REAL startup refused: plaintext broker secrets are forbidden in shared-host mode.")
-        settings.trading_mode = "HISTORICAL"
+        settings.trading_mode = replay_fallback()
 
     logger.info("═" * 60)
     logger.info("🚀 UT1 Index Trading System v2.0")
@@ -1731,9 +2012,9 @@ def create_system():
 
     # 1. Kite primary, Fyers secondary, AngelOne index-price fallback. Credentials are
     # loaded inside the provider so secrets never travel through startup logs/arguments.
-    data_provider = MarketDataProvider()
+    data_provider = MarketDataProvider(start_streams=runtime_mode().uses_live_market_data)
     data_provider.connect()
-    if settings.trading_mode == "REAL":
+    if runtime_mode().permits_live_orders:
         readiness = validate_real_mode_readiness(settings, data_provider)
         if readiness.get("blockers") == ["all broker sources unavailable"]:
             for _ in range(12):
@@ -1751,7 +2032,7 @@ def create_system():
                 "REAL startup refused by safe mode: "
                 + "; ".join(readiness.get("blockers") or ["readiness failed"])
             )
-            settings.trading_mode = "HISTORICAL"
+            settings.trading_mode = replay_fallback()
             try:
                 settings.save_to_env()
             except Exception as exc:
@@ -1797,14 +2078,14 @@ def create_system():
         # when there is none — so this gate could never fire in exactly the case
         # where single-instance ownership is least establishable. Refuse REAL
         # unless the lease is both establishable and actually held.
-        if settings.trading_mode == "REAL" and not (
+        if runtime_mode().permits_live_orders and not (
             real_broker.execution_lease_established()
             and real_broker.acquire_execution_lease()
         ):
             logger.critical(
                 "REAL startup refused: " + real_broker.execution_lease_block_reason()
             )
-            settings.trading_mode = "HISTORICAL"
+            settings.trading_mode = replay_fallback()
             try:
                 settings.save_to_env()
             except Exception as exc:
@@ -1833,13 +2114,23 @@ def create_system():
             )
 
     # Initial broker selection based on settings
-    active_broker = real_broker if (settings.trading_mode == "REAL" and real_broker) else sim_broker
+    active_broker = real_broker if (runtime_mode().permits_live_orders and real_broker) else sim_broker
     logger.info(f"✅ Active Broker: {'REAL' if active_broker == real_broker else 'SIGNAL SIMULATION (Real Data)'}")
 
     # 2. Candle Builder
     candle_builder = CandleBuilder(
         max_candles=2000,
-        partial_publish_min_interval_seconds=0.1,
+        # 2026-09-25 open: the tick path held the GIL 28% of the time (py-spy, --gil).
+        # Publishing the forming 1m row every 0.1s merged it into a 2000-row frame ~10x
+        # a second per index: 24.6% of one core per index measured offline, 5.2% at
+        # 1.0s/2.0s; one publish still costs ~30ms of pandas on the Kite thread, which
+        # was 23% of all process CPU at 1s (11:18 per-thread measurement), hence 2s/3s.
+        # Exits and the 100ms trade monitor read the latest TICK price, which still
+        # updates on every tick; only the forming candle row and the forming 5m/15m
+        # bucket lag, by at most 2s / 3s, against a 30s stabilization window and a 15s
+        # S1 forming-bar recompute. Closed bars still publish and resample at once.
+        partial_publish_min_interval_seconds=2.0,
+        resample_min_interval_seconds=3.0,
     )
     logger.info("✅ Candle Builder")
 
@@ -1908,6 +2199,8 @@ def create_system():
         risk_opt_pct=settings.risk_opt_pct,
     )
     scanner.max_daily_loss_pct = settings.max_daily_loss_pct
+    from engine.ut_ema_stream import install_tick_service
+    install_tick_service(scanner)
     logger.info("✅ Scanner (exit-before-entry, 30s data cache)")
 
     # Set scanner reference for dashboard API

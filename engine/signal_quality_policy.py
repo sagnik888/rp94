@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Mapping, Optional
 
 from config.settings import get_settings
-from engine.intelligence_score import normalize_intelligence_score
+from engine.intelligence_score import aligned_intelligence_score, normalize_intelligence_score
 from engine.market_regime import is_risky_regime, is_trending_regime
 
 
@@ -356,8 +356,9 @@ def dynamic_rr(
     intel_score: float = 0.0,
     max_rr: Optional[float] = None,
     timeframe: str = "",
+    direction: str = "",
 ) -> float:
-    """Return quality-scaled initial RR; runner mode handles exceptional moves."""
+    """Return quality-scaled initial RR using direction-aligned intelligence."""
     conf = min(max(float(confidence or 0.0), 0.0), 1.0)
     min_rr = 1.5
     settings = None
@@ -380,7 +381,8 @@ def dynamic_rr(
         "Recovered": 0.75,
     }.get(base_grade, 0.0)
     confidence_runway = max(0.0, conf - 0.55) * 3.2
-    intel_adjustment = min(max(normalize_intelligence_score(intel_score) / 1.20, -0.40), 1.25)
+    aligned_intel = aligned_intelligence_score(intel_score, direction)
+    intel_adjustment = min(max(aligned_intel / 1.20, -0.40), 1.25)
     rr = max(min_rr, min(max_rr, min_rr + confidence_runway + grade_bonus + intel_adjustment))
     # Short intraday timeframes can't realistically travel the top of the RR ladder
     # within one bar's horizon before the profit-lock/square-off fires, so cap them.
@@ -470,6 +472,7 @@ def power_move_confirmed(
     intel_score: float,
     trend_15m_agrees: bool,
     settings,
+    signal_type: str = "",
 ) -> bool:
     """Data-confirmed late-session 'power move' detector (all 4 factors required).
 
@@ -494,7 +497,7 @@ def power_move_confirmed(
     strong_vol = float(getattr(settings, "power_move_momentum_volume_mult", 3.5) or 3.5)
     mom_ok = (
         float(adx_value or 0.0) >= adx_floor
-        or abs(normalize_intelligence_score(intel_score)) >= 0.70
+        or aligned_intelligence_score(intel_score, signal_type) >= 0.70
         or vol_ratio >= strong_vol
     )
     # 15m alignment normally mandatory — BUT a sudden spike by definition LEADS
@@ -619,7 +622,7 @@ def volume_spike_entry_confirmed(
                 getattr(settings, "volume_spike_entry_strong_1min_adx_threshold", 25.0)
                 or 25.0
             )
-            or abs(normalize_intelligence_score(intel_score)) >= float(
+            or aligned_intelligence_score(intel_score, signal_type) >= float(
                 getattr(settings, "volume_spike_entry_strong_1min_intel_threshold", 0.70)
                 or 0.70
             )
@@ -772,6 +775,7 @@ def passes_quality_gate(
     impulse_confirmed: bool = False,
     power_move: bool = False,
     return_verdict: bool = False,
+    confidence_calibrated: bool = False,
 ):
     """Compatibility wrapper for the one versioned quality evaluator.
 
@@ -805,6 +809,7 @@ def passes_quality_gate(
             inst_type=inst_type,
             confidence=confidence,
             regime=regime,
+            confidence_calibrated=confidence_calibrated,
             adx_value=adx_value,
             trend_15m_agrees=trend_15m_agrees,
             impulse_confirmed=impulse,

@@ -1,0 +1,78 @@
+{
+  "wrong_expiry_legacy_overlay": {
+    "requested_expiry": "22SEP2026",
+    "returned_expiry": "15SEP2026",
+    "merged_call_oi": 777.0,
+    "legacy_called": true
+  },
+  "borrowed_regime_skips_source_age": {
+    "source_epoch": 1.0,
+    "resolved": "TRENDING_UP"
+  },
+  "missing_regime_timestamp_live": {
+    "own_timeframe": true,
+    "resolved": "TRENDING_UP"
+  },
+  "breadth_stale_legacy_regimes": {
+    "bias": "BULLISH",
+    "aligned_count": 4,
+    "bullish_count": 4,
+    "bearish_count": 0,
+    "neutral_count": 0,
+    "bullish": [
+      "NIFTY",
+      "BANKNIFTY",
+      "SENSEX",
+      "MIDCPNIFTY"
+    ],
+    "bearish": [],
+    "neutral": [],
+    "avg_intel_score": 0.0
+  },
+  "quality_current_proxy_with_old_traded_basis": {
+    "volume_ratio": 3.0,
+    "volume_basis": "TRADED",
+    "volume_available": true,
+    "volume_confirmed": true
+  },
+  "quality_current_traded_with_old_proxy_basis": {
+    "volume_ratio": 3.0,
+    "volume_basis": "TICK_ACTIVITY",
+    "volume_available": true,
+    "volume_confirmed": false
+  },
+  "quality_current_zero_uses_old_ratio": {
+    "volume_ratio": 2.0,
+    "volume_basis": "TRADED",
+    "volume_available": true,
+    "volume_confirmed": true
+  },
+  "unavailable_aggregate_signed_score": -0.8,
+  "futures_partial_bucket_called_reliable": {
+    "true_full_minute_volume": 60,
+    "baseline_volume": 45.0,
+    "current_volume": 45.0,
+    "projected_ratio": 1.3333,
+    "reliable": true,
+    "unit": "contracts"
+  },
+  "fixed_no_clock_only_rollover_spike": true,
+  "candle_boundary_quantity_loss": {
+    "total_increase": 400,
+    "stored_sum": 200.0
+  },
+  "mtf_older_correction_missed": true,
+  "session_full_cache_ignores_asof": {
+    "requested_cutoff": "2026-09-11 10:05:00",
+    "latest_consumed": "2026-09-11 14:10:00"
+  },
+  "source_sha256": {
+    "scanner.py": "15c4727633b2e560877d7c2e906963b63f3e514607b619e11186407fdd7dacdf",
+    "data/market_data.py": "a3904b6e323e7924cb64174f3613f94e1edeab91aa7a279e1cbbe22be46ff8e0",
+    "data/candle_builder.py": "6a252e368792faff8cbb8ad06a1effee88bde6930b2943cdb062cf3523eef382",
+    "engine/multi_timeframe.py": "6711236352a82b9d3c18eb4830d63eb00091d75fb3bcf07ef192fdd1525d17fc",
+    "intelligence/pcr_engine.py": "3d71ed1e2344f4095fe3d21a2f1ed4ff0a966e401bdfb10bc23308c6705a28ed",
+    "intelligence/oi_tracker.py": "569b9d638d461701e5b561ec1f2857d25d9628065e2df2cc8d57280656d25a0c",
+    "engine/quality_verdict.py": "7b29f84426ef1bba2e711764eef30b7f0f037210776341f8ec03b126db4d7b2f"
+  }
+}

@@ -537,18 +537,34 @@ def evaluate_final_entry_policy(
     lane: str = "",
     supported_instruments: Optional[Sequence[str]] = None,
     fresh_exposure: bool = True,
+    underlying_stop_cap_override_pct: Optional[float] = None,
+    require_forecast: bool = True,
+    min_rr_override: Optional[float] = None,
+    require_premium_stop_coverage: bool = False,
 ) -> EntryPolicyVerdict:
-    """Return the one frozen entry-policy decision for measured execution levels."""
+    """Return the one frozen entry-policy decision for measured execution levels.
+
+    The S1 lane passes its own underlying stop ceiling (the user's 0.25% S1 SL cap) in
+    underlying_stop_cap_override_pct, and require_forecast=False because this system's
+    expected-move model is a selection signal S1 does not use; both checks are then
+    recorded as advisory. Geometry, delta bridge, RR and universe checks are unchanged.
+    """
     now = _as_naive_timestamp(checked_at)
     instrument = str(geometry.instrument or "").split()[0].upper()
     configured_min_rr = float(min_rr) if _finite(min_rr) else MIN_EXECUTION_RR
     resolved_min_rr = max(MIN_EXECUTION_RR, configured_min_rr)
+    if min_rr_override is not None and _finite(min_rr_override) and float(min_rr_override) > 0:
+        # The S1 lane's own floor: its targets start at 1R (0.7R on a weak move).
+        resolved_min_rr = float(min_rr_override)
     resolved_expected_floor = effective_expected_move_floor_pct(
         instrument, expected_move_floor_pct
     )
     resolved_stop_cap = effective_underlying_stop_cap_pct(
         instrument, max_underlying_stop_pct
     )
+    if underlying_stop_cap_override_pct is not None and _finite(underlying_stop_cap_override_pct)             and float(underlying_stop_cap_override_pct) > 0:
+        resolved_stop_cap = float(underlying_stop_cap_override_pct)
+    forecast_suffix = "" if require_forecast else "_advisory"
     resolved_forecast_age = _safe_float(max_forecast_age_seconds, -1.0)
     resolved_geometry_age = _safe_float(max_geometry_age_seconds, -1.0)
     checks: list[tuple[str, bool]] = []
@@ -704,6 +720,14 @@ def evaluate_final_entry_policy(
         checks.append(("option_cross_geometry", cross_geometry_ok))
         if not cross_geometry_ok:
             reasons.append("option premium/underlying geometry has no valid delta bridge")
+        if require_premium_stop_coverage:
+            # UTS exits follow the index UT stop. A capped option stop that cannot
+            # cover even its delta-mapped distance is a different, shorter strategy.
+            # Reject that exposure rather than widening the universal premium cap.
+            covered = bool(cross_geometry_ok and premium_risk + 0.05 >= underlying_risk * ratio)
+            checks.append(("option_stop_coverage", covered))
+            if not covered:
+                reasons.append("UTS option stop cannot cover the delta-mapped underlying stop")
 
     actual_rr = actual_execution_rr(geometry)
     rr_ok = bool(_finite(actual_rr) and actual_rr + 1e-9 >= resolved_min_rr)
@@ -751,8 +775,8 @@ def evaluate_final_entry_policy(
         and bool(forecast.generated_at)
         and bool(forecast.data_as_of)
     )
-    checks.append(("forecast_evidence", forecast_core))
-    if not forecast_core:
+    checks.append(("forecast_evidence" + forecast_suffix, forecast_core))
+    if not forecast_core and require_forecast:
         reasons.append(f"expected-move evidence unavailable or incorrectly sourced ({forecast.reason or 'unknown'})")
 
     forecast_fresh = False
@@ -767,8 +791,8 @@ def evaluate_final_entry_policy(
                 -1.0 <= data_age <= limit
                 and -1.0 <= generated_age <= limit
             )
-    checks.append(("forecast_fresh", forecast_fresh))
-    if not forecast_fresh:
+    checks.append(("forecast_fresh" + forecast_suffix, forecast_fresh))
+    if not forecast_fresh and require_forecast:
         reasons.append("expected-move evidence is stale or has no valid clock")
 
     expected_pct = _safe_float(forecast.expected_favorable_move_pct)
@@ -777,15 +801,16 @@ def evaluate_final_entry_policy(
         and _finite(expected_pct)
         and expected_pct + 1e-9 >= resolved_expected_floor
     )
-    checks.append(("expected_move_floor", expected_ok))
-    if not expected_ok:
-        reasons.append(
-            f"directional expected favorable move {expected_pct:.4f}% is below "
-            f"{resolved_expected_floor:.4f}% floor"
-        )
+    # This is an unconditional directional-MFE statistic. It is not conditioned on
+    # this signal, regime, stop-first path, option premium, spread, or actual target.
+    # Retain it for attribution, but do not let it veto verified execution geometry.
+    checks.append(("expected_move_floor_advisory", expected_ok))
 
     return EntryPolicyVerdict(
-        allowed=all(passed for _, passed in checks),
+        allowed=all(
+            passed for name, passed in checks
+            if not name.endswith("_advisory")
+        ),
         phase=str(phase or "entry"),
         checked_at=_iso(checked_at),
         actual_rr=float(actual_rr if _finite(actual_rr) else 0.0),

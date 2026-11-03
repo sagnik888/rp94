@@ -30,6 +30,8 @@ class SessionContextAnalyzer:
 
         try:
             df = candle_df.copy().sort_index()
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("Asia/Kolkata")
             required = {"open", "high", "low", "close"}
             if not required.issubset(set(df.columns)):
                 return self._empty(instrument, "MISSING_OHLC")
@@ -58,18 +60,26 @@ class SessionContextAnalyzer:
             pdc = self._safe_float(previous_close)
             if pdc <= 0 and not prior.empty:
                 pdc = self._safe_float(prior["close"].iloc[-1])
-            pdh = self._safe_float(prior["high"].max()) if not prior.empty else 0.0
-            pdl = self._safe_float(prior["low"].min()) if not prior.empty else 0.0
+            # Previous-day levels mean the immediately preceding trading session, not
+            # extrema across every warmup day in the frame.
+            prior_date = max(prior.index.date) if not prior.empty else None
+            prior_session = prior[pd.Series(prior.index.date, index=prior.index) == prior_date] if prior_date else prior
+            pdh = self._safe_float(prior_session["high"].max()) if not prior_session.empty else 0.0
+            pdl = self._safe_float(prior_session["low"].min()) if not prior_session.empty else 0.0
 
             gap_pct = ((open_price - pdc) / pdc * 100.0) if pdc > 0 and open_price > 0 else 0.0
             gap_state = self._gap_fill_state(gap_pct, pdc, high_price, low_price)
 
-            opening = session.iloc[: min(len(session), 6)]
+            opening_end = pd.Timestamp(session_date) + pd.Timedelta(hours=9, minutes=45)
+            if session.index.tz is not None:
+                opening_end = opening_end.tz_localize(session.index.tz)
+            opening = session.loc[session.index < opening_end]
             opening_high = self._safe_float(opening["high"].max()) if not opening.empty else 0.0
             opening_low = self._safe_float(opening["low"].min()) if not opening.empty else 0.0
             opening_range = max(0.0, opening_high - opening_low)
             opening_status = "FORMING"
-            if len(session) >= 6 and opening_range > 0:
+            bar_minutes = self._infer_bar_minutes(session)
+            if session.index[-1] + pd.Timedelta(minutes=bar_minutes) >= opening_end and opening_range > 0:
                 if close_price > opening_high:
                     opening_status = "BREAK_UP"
                 elif close_price < opening_low:
@@ -78,7 +88,7 @@ class SessionContextAnalyzer:
                     opening_status = "INSIDE"
 
             typical = (session["high"] + session["low"] + session["close"]) / 3.0
-            volume = pd.to_numeric(session.get("volume", pd.Series(0, index=session.index)), errors="coerce").fillna(0.0)
+            volume, _ = self._measured_session_volume(session)
             if float(volume.sum()) > 0:
                 vwap_series = (typical * volume).cumsum() / volume.cumsum().replace(0.0, pd.NA)
                 vwap_source = "volume"
@@ -92,7 +102,8 @@ class SessionContextAnalyzer:
             above_ratio = float(above_vwap.mean()) if len(above_vwap) else 0.5
             vwap_cross_count = int((above_vwap.diff().abs().fillna(0) > 0).sum())
 
-            avg_range = self._average_prior_day_range(df, session_date)
+            complete_ranges = self._complete_prior_ranges(df, session_date)
+            avg_range = float(complete_ranges.mean()) if len(complete_ranges) else 0.0
             range_ratio = (day_range / avg_range) if avg_range > 0 else 0.0
 
             delta_ctx = self._session_cumulative_delta(session)
@@ -208,6 +219,11 @@ class SessionContextAnalyzer:
                     and session_range_pct <= compression_threshold_pct + 1e-9
                 ),
                 "avg_10day_range_points": round(avg_range, 2),
+                "range_reference_sessions": int(
+                    len(complete_ranges)
+                ),
+                "range_reference_available": bool(len(complete_ranges)),
+                "range_reference_complete_10_sessions": len(complete_ranges) >= 10,
                 "range_vs_10day": round(range_ratio, 3),
                 "session_delta": delta_ctx,
                 "vix_value": round(float(vix_value), 3) if vix_value else None,
@@ -242,16 +258,57 @@ class SessionContextAnalyzer:
 
     @staticmethod
     def _average_prior_day_range(df: pd.DataFrame, session_date) -> float:
+        ranges = SessionContextAnalyzer._complete_prior_ranges(df, session_date)
+        return float(ranges.mean()) if len(ranges) else 0.0
+
+    @staticmethod
+    def _complete_prior_ranges(df: pd.DataFrame, session_date) -> pd.Series:
         try:
-            prior = df[pd.Series(df.index.date, index=df.index) < session_date]
+            boundary = pd.Timestamp(session_date)
+            if df.index.tz is not None:
+                boundary = boundary.tz_localize(df.index.tz)
+            prior = df[df.index < boundary]
             if prior.empty:
-                return 0.0
-            daily = prior.groupby(prior.index.date).agg({"high": "max", "low": "min"})
-            ranges = (daily["high"] - daily["low"]).dropna()
-            ranges = ranges[ranges > 0].tail(10)
-            return float(ranges.mean()) if len(ranges) else 0.0
+                return pd.Series(dtype=float)
+            values = []
+            groups = prior.groupby(prior.index.normalize(), sort=True)
+            # Older days cannot affect the result once ten complete sessions
+            # have been found. Do not cache: corrected historical bars must
+            # become visible on the next call.
+            for day in reversed(list(groups.groups)):
+                bars = groups.get_group(day)
+                step = pd.Timedelta(minutes=SessionContextAnalyzer._infer_bar_minutes(bars))
+                start = pd.Timestamp(day.date()) + pd.Timedelta(hours=9, minutes=15)
+                if bars.index.tz is not None:
+                    start = start.tz_localize(bars.index.tz)
+                end = start + pd.Timedelta(minutes=375)
+                expected = pd.date_range(start,end,freq=step,inclusive="left")
+                if not expected.difference(bars.index).empty:
+                    continue
+                measured = bars.loc[expected]
+                value = float(measured.high.max()-measured.low.min())
+                if value > 0:
+                    values.append(value)
+                    if len(values) == 10:
+                        break
+            return pd.Series(values[::-1], dtype=float)
         except Exception:
-            return 0.0
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def _measured_session_volume(session):
+        volume = pd.to_numeric(session.get("volume", pd.Series(0, index=session.index)), errors="coerce").fillna(0.0).clip(lower=0.0)
+        measured = pd.Series(True, index=session.index)
+        if "volume_complete" in session.columns:
+            measured &= ~session["volume_complete"].eq(False).fillna(False)
+        if "volume_basis" in session.columns:
+            basis = session["volume_basis"].fillna("").astype(str).str.upper()
+            measured &= ~basis.isin({"MIXED", "MIXED_UNITS", "TICK_ACTIVITY", "INDEX_TICK_ACTIVITY", "UNAVAILABLE"})
+            units = set(basis.loc[measured & volume.gt(0)]) - {"", "NAN", "NONE"}
+            if len(units) > 1:
+                measured[:] = False
+        complete = not bool((~measured & volume.gt(0)).any())
+        return volume.where(measured, 0.0), complete
 
     def _session_cumulative_delta(self, session: pd.DataFrame) -> Dict[str, Any]:
         try:
@@ -260,10 +317,17 @@ class SessionContextAnalyzer:
             close = pd.to_numeric(session["close"], errors="coerce")
             rng = (high - low).replace(0.0, pd.NA)
             close_pos = ((close - low) / rng).clip(0.0, 1.0).fillna(0.5)
-            volume = pd.to_numeric(session.get("volume", pd.Series(0, index=session.index)), errors="coerce").fillna(0.0)
+            volume, complete = self._measured_session_volume(session)
             if float(volume.sum()) <= 0:
-                volume = pd.Series(1.0, index=session.index)
-                source = "bar_pressure"
+                # OHLC close location is price pressure, not cumulative order-flow.
+                # Preserve that distinction by abstaining from a delta vote when the
+                # source has no measured volume.
+                return {
+                    "source": "unavailable",
+                    "cumulative_delta": 0.0,
+                    "delta_ratio": 0.0,
+                    "bias": "NEUTRAL",
+                }
             else:
                 source = "volume"
             delta = (close_pos - 0.5) * 2.0 * volume
@@ -278,6 +342,7 @@ class SessionContextAnalyzer:
                 bias = "NEUTRAL"
             return {
                 "source": source,
+                "volume_complete": complete,
                 "cumulative_delta": round(cum_delta, 2),
                 "delta_ratio": round(delta_ratio, 3),
                 "bias": bias,

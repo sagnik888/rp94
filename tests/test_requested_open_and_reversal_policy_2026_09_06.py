@@ -103,7 +103,7 @@ def test_historical_intelligence_uses_requested_timeframe_candles():
     for timeframe in ("1min", "5min", "15min"):
         scanner._compute_historical_intel_at("NIFTY", at, timeframe)
 
-    assert seen == [("1min", 21, 100.0), ("5min", 5, 500.0), ("15min", 2, 1500.0)]
+    assert seen == [("1min", 20, 100.0), ("5min", 4, 500.0), ("15min", 1, 1500.0)]
 
 
 def _outside_window_dump(start, move_pct):

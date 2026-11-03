@@ -29,7 +29,7 @@ class _Source:
             self._payload = {"available": False, "reason": "no live contract"}
 
     def index_futures_activity(self, index):
-        return dict(self._payload)
+        return {**self._payload, "exchange_timestamp": time.time()}
 
 
 def _provider(fyers_volume=None, age=0.0, futures=_Source()):

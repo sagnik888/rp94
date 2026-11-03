@@ -1,0 +1,28 @@
+{
+  "engine/signal_processor.py": {
+    "_option_premium_stop_distance": {
+      "unchanged_from_before_fix": true,
+      "sha256": "b8a38271d2b2ea0541c2feaea226fb798f3124000e1b1e713584e81f3332ea22"
+    }
+  },
+  "scanner.py": {
+    "_trade_like_initial_risk_rs": {
+      "unchanged_from_before_fix": true,
+      "sha256": "578db2419186bb7321cf5ccd2490fcfea115c4e057235652cfe8180761d240cb"
+    },
+    "_apply_option_stop_breathing_room": {
+      "unchanged_from_before_fix": true,
+      "sha256": "1b018d5b4dba60827d46fec2a15325113004cc94a6822b41cec703df77303f60"
+    },
+    "_option_premium_stop_distance_for_candidate": {
+      "unchanged_from_before_fix": true,
+      "sha256": "c3b552ae1fa907541a4a4c7e99483bc6105cca71f6c36535ea84ae8d1b75ba9e"
+    }
+  },
+  "trading/trade_manager.py": {
+    "_cap_option_entry_stop": {
+      "unchanged_from_before_fix": true,
+      "sha256": "aa6992bbffa6f643f46ac52995f8fbba13fc84fbec72b3785f6e2d4bb620b827"
+    }
+  }
+}

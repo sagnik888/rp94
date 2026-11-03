@@ -77,24 +77,8 @@ def test_two_bars_of_volume_is_not_enough_to_qualify_a_feed():
 
 
 def test_a_short_stale_edge_is_backfill_lag_not_a_dead_feed():
-    """Relaxed on 2026-08-07 against live evidence. This test used to assert False.
-
-    It assumed a run of empty trailing bars means the feed quit. For indices it does
-    not. Index candles carry NO traded volume on the live tick feed; it arrives only
-    with the periodic Fyers history backfill, which lags the tape by a few bars. So a
-    2-3 bar empty edge is NORMAL operation — it fired 85 times in the first ten minutes
-    of the 2026-08-07 session across all four indices, while real volume sat one bar
-    further back.
-
-    Holding the old expectation meant the volume pillar was either abstaining or
-    scoring a phantom 0.0x essentially all the time. Measuring the last COMPLETE bar
-    is the honest reading.
-
-    The dead-feed case this test was written to protect is still covered, three ways:
-    nonzero_count >= 5 (below), a run longer than the backfill tolerance (below), and
-    a measured bar under a twentieth of its own average (the ratio guard).
-    """
-    assert _available(LIVE + [0.0, 0.0, 0.0])[0] is True
+    """Backfill lag is reported without treating an old measurement as current."""
+    assert _available(LIVE + [0.0, 0.0, 0.0])[0] is False
 
 
 def test_a_run_longer_than_the_backfill_tolerance_is_still_unavailable():

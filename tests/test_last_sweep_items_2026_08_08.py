@@ -21,6 +21,8 @@
 """
 import ast
 import inspect
+from engine.exit_cycle import ExitCycleService
+from tests.source_views import scanner_runtime_source
 import textwrap
 from types import SimpleNamespace
 
@@ -165,14 +167,14 @@ def test_every_hard_three_thousand_check_goes_through_the_helper():
     # Scoped to the four PROFIT-LOCK consumers the finding named. A separate net-P&L
     # floor further up has its own 0.80/0.70/0.60 tiers and its own question about
     # per-lot scaling; banning the string globally would have swept that in unexamined.
-    for fn in (Scanner._check_session_candidates_breaches_locked, Scanner._update_active_trades):
+    for fn in (Scanner._check_session_candidates_breaches_locked, ExitCycleService.update_active_trades):
         code = "\n".join(
             ln for ln in inspect.getsource(fn).splitlines() if not ln.strip().startswith("#")
         )
         assert "peak_pnl >= 3000.0" not in code and "previous_peak >= 3000.0" not in code, (
             f"{fn.__name__} still compares the RAW whole-position peak to 3000"
         )
-    assert inspect.getsource(Scanner).count("_profit_ladder_pnl(") >= 4
+    assert scanner_runtime_source().count("_profit_ladder_pnl(") >= 4
 
 
 def test_a_broken_settings_object_does_not_break_the_ladder():

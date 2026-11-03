@@ -610,6 +610,10 @@ def test_enable_auto_mode_in_real_succeeds_when_ready(monkeypatch):
     scanner.risk_manager = SimpleNamespace(update_settings=lambda *a, **k: None)
     scanner._publish_config_snapshot = lambda *a, **k: None
     scanner.mtf = SimpleNamespace(apply_engine_params=lambda *a, **k: None)
+    # This fixture verifies the readiness/configuration path.  Resource pressure is
+    # host state and is covered by dedicated resource-guard tests; leaving it live
+    # makes this semantic test depend on the machine's RAM/commit usage.
+    scanner._auto_execution_resource_blockers = lambda: []
     monkeypatch.setattr(
         "scanner.validate_real_mode_readiness",
         lambda settings, provider, **kwargs: {"ok": True, "blockers": [], "warnings": []},

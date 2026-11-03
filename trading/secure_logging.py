@@ -16,7 +16,7 @@ _SECRET_FIELD_RE = re.compile(
     r"(?ix)"
     r"((?:['\"])?(?:"
     r"x-privatekey|api[_-]?key|access[_-]?token|"
-    r"refresh[_-]?token|feed[_-]?token|jwt[_-]?token|password|totp"
+    r"refresh[_-]?token|feed[_-]?token|jwt[_-]?token|password|mpin|pin|totp"
     r")(?:['\"])?\s*[:=]\s*(?:['\"])?)([^'\"\s,}\]]+)"
 )
 

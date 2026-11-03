@@ -309,25 +309,35 @@ def test_the_product_map_still_resolves_both():
     assert KiteBroker._product("INTRADAY") == "MIS"
 
 
-# ── D2. market_protection was missing on the SL-M stop ───────────────────────
+# ── D2. index-option SL-M is exchange-disabled ───────────────────────────────
 
-def test_the_protective_stop_carries_market_protection():
-    """SL-M is the other order type the spec's rule names. When this triggers it becomes
-    a market order into whatever book exists while the trade is going against us."""
+def test_index_option_protection_uses_an_exchange_supported_sl_limit():
+    """Index-option SL-M is discontinued; use an SL with a buffered limit instead."""
     b = _broker()
     b._authorize_mutation = lambda *_a, **_kw: None
     b.place_protective_stop("NIFTY2680424350CE", "1", 65, "SELL", 105.75)
-    assert b.api.sent["order_type"] == "SL-M"
-    assert b.api.sent["market_protection"] == -1
+    assert b.api.sent["order_type"] == "SL"
+    assert b.api.sent["trigger_price"] == 105.75
+    assert b.api.sent["price"] == 103.65
+    assert "market_protection" not in b.api.sent
 
 
-def test_tightening_the_stop_keeps_market_protection():
-    """Kite replaces an order's parameters rather than merging them, so omitting it on
-    the modify would strip the band off the first time the stop is tightened."""
+def test_tightening_an_index_option_stop_keeps_the_buffered_limit():
     b = _broker()
     b._authorize_mutation = lambda *_a, **_kw: None
     assert b.modify_protective_stop("OID-1", "NIFTY2680424350CE", "1", 65, "SELL", 110.0) is True
-    assert b.api.modified["market_protection"] == -1
+    assert b.api.modified["order_type"] == "SL"
+    assert b.api.modified["trigger_price"] == 110.0
+    assert b.api.modified["price"] == 107.8
+    assert "market_protection" not in b.api.modified
+
+
+def test_futures_protection_keeps_slm_and_automatic_market_protection():
+    b = _broker()
+    b._authorize_mutation = lambda *_a, **_kw: None
+    b.place_protective_stop("NIFTY26OCTFUT", "1", 65, "SELL", 24000.0)
+    assert b.api.sent["order_type"] == "SL-M"
+    assert b.api.sent["market_protection"] == -1
 
 
 # ── D3. the pacing floor came from the wrong rate-limit row ──────────────────

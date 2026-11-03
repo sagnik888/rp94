@@ -4,6 +4,7 @@ import inspect
 from types import SimpleNamespace
 
 from engine.signal_processor import GRADING_TELEMETRY_ATTRS, SignalProcessor
+from tests.source_views import signal_pipeline_source
 
 
 FIVE_MIN = {
@@ -68,7 +69,7 @@ def test_full_bundle_is_not_duplicated_into_decision_tape_telemetry():
 
 
 def test_both_candidate_context_packaging_sites_use_the_graded_bundle():
-    src = inspect.getsource(SignalProcessor.process_best_signal)
+    src = signal_pipeline_source()
 
     assert 'setattr(sig, "graded_intel_result", _tf_intel_result)' in src
     assert "rejected_intel_result = self._graded_candidate_intel_result(" in src
