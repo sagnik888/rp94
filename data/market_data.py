@@ -2591,6 +2591,23 @@ class MarketDataProvider(KiteAngelMigration):
         """Check each provider independently; Yahoo is an idle emergency source."""
         health = build_source_health(self)
         health["market_data_replacement"] = self._replacement_health()
+
+        from data.upstox_auth import get_upstox_auth_status
+        upstox_auth = get_upstox_auth_status()
+        upstox_client = getattr(self, "upstox", None)
+        upstox_healthy = bool(upstox_auth.get("authenticated")) and (
+            upstox_client.is_healthy() if upstox_client is not None else True
+        )
+        health["upstox"] = {
+            "healthy": upstox_healthy,
+            "authenticated": bool(upstox_auth.get("authenticated")),
+            "status": upstox_auth.get("status", "DISCONNECTED"),
+            "user_id": upstox_auth.get("user_id", "7JATYL"),
+            "failure_seconds": round(upstox_client.failure_duration(), 1) if upstox_client is not None else 0.0,
+        }
+        health["upstox_healthy"] = upstox_healthy
+        health["upstox_session_live"] = upstox_healthy
+        health["upstox_auth"] = upstox_auth
         remaining = max(
             0.0,
             float(getattr(self, "_angel_rest_backoff_until", 0.0) or 0.0) - time.time(),
