@@ -24,6 +24,7 @@ proven safe.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Iterable, Mapping, Optional
 
 
@@ -39,7 +40,7 @@ def _positive_float(value: Any) -> float:
         result = float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
-    return result if result > 0.0 else 0.0
+    return result if math.isfinite(result) and result > 0.0 else 0.0
 
 
 def normalized_instrument_type(item: Any) -> str:
@@ -77,10 +78,23 @@ def projected_stop_risk_rs(
     if entry <= 0.0 or stop <= 0.0:
         return None
 
-    try:
-        lots = max(1, int(_value(item, "lots", 1) or 1))
-        lot_size = max(1, int(_value(item, "lot_size", 1) or 1))
-    except (TypeError, ValueError):
+    # Never turn corrupt or absent quantities into one lot: this gate
+    # promises an exact prospective risk calculation, not an estimate.
+    def positive_integer(field: str) -> Optional[int]:
+        raw = _value(item, field, None)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number <= 0.0 or not number.is_integer():
+            return None
+        return int(number)
+
+    lots = positive_integer("lots")
+    lot_size = positive_integer("lot_size")
+    if lots is None or lot_size is None:
         return None
     quantity = lots * lot_size
     inst_type = normalized_instrument_type(item)
@@ -93,12 +107,23 @@ def projected_stop_risk_rs(
         adverse_distance = (
             max(0.0, stop - entry) if direction == "SHORT" else max(0.0, entry - stop)
         )
-        multiplier = _positive_float(_value(item, "multiplier", 1.0)) or 1.0
+        # Entry candidates use "multiplier", while open/restored Trade objects
+        # carry "instrument_multiplier"; the same price risk must be measured.
+        raw_multiplier = _value(item, "multiplier", None)
+        if raw_multiplier is None:
+            raw_multiplier = _value(item, "instrument_multiplier", 1.0)
+        multiplier = _positive_float(raw_multiplier)
+        if multiplier <= 0.0:
+            return None
 
+    try:
+        slip_rate = float(slippage_bps or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(slip_rate) or slip_rate < 0.0:
+        return None
     price_risk = adverse_distance * quantity * multiplier
-    slip = (
-        entry * quantity * multiplier * max(0.0, float(slippage_bps or 0.0)) / 10_000.0
-    )
+    slip = entry * quantity * multiplier * slip_rate / 10_000.0
     return max(0.0, price_risk + slip)
 
 
