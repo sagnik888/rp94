@@ -7,7 +7,7 @@ from typing import Callable
 
 from engine.market_regime import futures_stop_tolerance_pct
 from engine.signal_processor import TradeCandidate
-from engine.trade_row_adapter import live_signal_exit_mark, trade_row_event_seconds
+from engine.trade_row_adapter import frozen_manual_exit_net_pnl, live_signal_exit_mark, trade_row_event_seconds
 
 
 def _normalize_native_utema(candidate, candidate_net_pnl):
@@ -48,7 +48,9 @@ def _normalize_native_utema(candidate, candidate_net_pnl):
     exited = trade_row_event_seconds({"exit_timestamp": getattr(candidate, "exit_timestamp", None)}, prefer_exit=True)
     if not (math.isfinite(entered) and math.isfinite(exited) and 0 < entered <= exited):
         return False
-    new_pnl = candidate_net_pnl(candidate, observed)
+    new_pnl = frozen_manual_exit_net_pnl(candidate)
+    if new_pnl is None:
+        new_pnl = candidate_net_pnl(candidate, observed)
     if not math.isfinite(float(new_pnl)):
         return False
     changed = (float(getattr(candidate, "current_price", 0.) or 0.) != observed
@@ -75,14 +77,20 @@ def normalize_loaded_exit_candidate(
     if entry <= 0:
         return False
 
-    live_mark = live_signal_exit_mark(candidate)
+    frozen_pnl = frozen_manual_exit_net_pnl(candidate)
+    live_mark = (float(candidate.exit_price) if frozen_pnl is not None
+                 else live_signal_exit_mark(candidate))
     if live_mark is not None:
         # Current manual rows already record the observed exit and entry geometry.
         # Replacing a late stop observation with the ideal stop hides the actual
         # loss; applying today's settings would also rewrite yesterday's geometry.
         # This does not reconstruct rows whose observations were already overwritten.
         reason = str(getattr(candidate, "exit_reason", "") or "").upper()
-        new_pnl = 0.0 if reason == "QUOTE_INVALID" else candidate_net_pnl(candidate, live_mark)
+        new_pnl = frozen_pnl
+        if reason == "QUOTE_INVALID":
+            new_pnl = 0.0
+        elif new_pnl is None:
+            new_pnl = candidate_net_pnl(candidate, live_mark)
         if reason in {"SMART_PROFIT_LOCK", "MAJOR_WIN_GUARD"} and new_pnl <= 0:
             candidate.exit_reason = "LEGACY_LOCK_ERROR"
             changed = True

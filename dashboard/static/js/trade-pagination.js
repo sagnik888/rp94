@@ -20,6 +20,7 @@ function tradePayloadContextKey(data = {}, trades = {}) {
     const totals = tradeHistoryTotals(trades);
     return [
         String(data.mode || data.config?.mode || meta.mode || '').toUpperCase(),
+        String(meta.session_day || ''),
         String(data.simulation_id || meta.simulation_id || ''),
         String(meta.source || ''),
         String(meta.backtest_days || data.config?.backtest_days || ''),

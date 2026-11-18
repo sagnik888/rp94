@@ -1,6 +1,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from scanner import Scanner
 
 
@@ -107,3 +109,30 @@ def test_repaint_to_new_candle_signal_resets_the_timer():
     second = _sig("SELL", ts=datetime(2026, 6, 22, 10, 15, 0))
     assert s._opposite_exit_confirm_ready("NIFTY", second, "15min") is False
     assert all("10:00:00" not in k for k in s._pending_opposite_exit)
+
+
+@pytest.mark.parametrize("verdict,expected", [("confirm", True), ("intel_block", True), ("adverse", False)])
+def test_one_minute_repaint_and_intel_hold_end_at_fifteen_seconds(monkeypatch, verdict, expected):
+    import scanner as module
+    from config.settings import get_settings
+    settings = get_settings()
+    # Even larger operator windows cannot extend a one-minute reversal.
+    monkeypatch.setattr(settings, "opposite_flip_confirm_min_seconds", 30.)
+    monkeypatch.setattr(settings, "opposite_flip_confirm_max_seconds", 120.)
+    monkeypatch.setattr(settings, "repaint_recheck_seconds", 60.)
+    clock = [100.]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    s = _scanner()
+    s._combo_solo_utbot_exit_blocked = lambda signal: False
+    s._has_opposite_exposure = lambda *args: True
+    s._opposite_flip_quality_verdict = lambda *args: verdict
+    events = []
+    s.log_event = lambda message, kind: events.append(message)
+    sig = _sig()
+    assert s._opposite_exit_confirm_ready("NIFTY", sig, "1min") is False
+    assert "15s repaint-confirm" in events[-1]
+    clock[0] = 114.999
+    assert s._opposite_exit_confirm_ready("NIFTY", sig, "1min") is False
+    clock[0] = 115.
+    assert s._opposite_exit_confirm_ready("NIFTY", sig, "1min") is expected
+    assert s._pending_opposite_exit == {}

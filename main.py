@@ -1753,7 +1753,8 @@ def _scanner_trading_day(scanner: Scanner, now_ist: datetime) -> bool:
     return True
 
 
-def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None = None) -> tuple[bool, str]:
+def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None = None,
+                            *, require_running: bool = True) -> tuple[bool, str]:
     """Runtime-only HISTORICAL -> REAL/manual premarket arm.
 
     This intentionally never enables Auto Mode. It only changes the feed/broker
@@ -1769,7 +1770,7 @@ def _auto_real_mode_attempt(scanner: Scanner, settings, now_ist: datetime | None
     else:
         now_ist = now_ist.astimezone(IST)
 
-    if hasattr(scanner, "is_running") and not bool(getattr(scanner, "is_running", False)):
+    if require_running and hasattr(scanner, "is_running") and not bool(getattr(scanner, "is_running", False)):
         return False, "scanner_not_running"
 
     if not _scanner_trading_day(scanner, now_ist):
@@ -2201,6 +2202,10 @@ def create_system():
     scanner.max_daily_loss_pct = settings.max_daily_loss_pct
     from engine.ut_ema_stream import install_tick_service
     install_tick_service(scanner)
+    # Apply the same scheduled/manual policy before any scan or history worker
+    # starts. Waiting for the timer lets a mid-session restart replay history with
+    # sockets disabled, then discard that work on the delayed REAL transition.
+    _auto_real_mode_attempt(scanner, settings, require_running=False)
     logger.info("✅ Scanner (exit-before-entry, 30s data cache)")
 
     # Set scanner reference for dashboard API

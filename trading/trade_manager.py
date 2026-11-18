@@ -6381,6 +6381,21 @@ class TradeManager:
             live.append(record)
         return live
 
+    @staticmethod
+    def _unfilled_replay_record(row):
+        if not str(row.get("id") or "").startswith(("H_", "EOD_")):
+            return False
+        if not str(row.get("data_provenance") or "").upper().startswith(("BACKTEST", "ENGINE_REPLAY")):
+            return False
+        evidence = ("broker_order_id", "exit_order_id", "protective_stop_order_id",
+                    "protective_order_id", "entry_filled_at", "exit_filled_at")
+        if any(str(row.get(key) or "").strip() for key in evidence):
+            return False
+        try:
+            return float(row.get("broker_quantity") or 0) == 0
+        except (TypeError, ValueError):
+            return False
+
     def load_state(self):
         """Load state from SQLite on startup"""
         try:
@@ -6412,9 +6427,16 @@ class TradeManager:
             
             stale_ghosts = 0
             auto_closed_missing_contracts = 0
+            self._restored_replay_open_rows = {}
             for data in open_records:
                 tid = data.get("id", "")
                 if not tid: continue
+                # A persisted engine replay is not a broker position. Keep its
+                # original record for audit without inventing an exit or submitting
+                # reconciliation/flatten requests. Any broker evidence wins.
+                if self._unfilled_replay_record(data):
+                    self._restored_replay_open_rows[tid] = dict(data)
+                    continue
                 t = Trade.from_dict(data)
                 t.status = "OPEN"
                 # A source candle that has already closed cannot repaint, so the guard is
@@ -6495,6 +6517,8 @@ class TradeManager:
                 elif not t.execution_status:
                     t.execution_status = "OPEN"
                 self.open_trades[tid] = t
+            if self._restored_replay_open_rows:
+                logger.info(f"Retained {len(self._restored_replay_open_rows)} unfilled replay row(s) for audit; excluded from broker recovery.")
             if stale_ghosts:
                 logger.info(
                     f"Closed {stale_ghosts} stale previous-session ghost trade(s) as "

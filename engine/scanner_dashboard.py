@@ -198,6 +198,7 @@ class ScannerTradePayloadBuilder:
         )
         payload["meta"] = {
             "mode": scanner.mode,
+            "session_day": str(scanner._get_current_session_day()) if scanner.mode == "REAL" else "",
             "backtest_days": int(getattr(scanner, "backtest_days", 1) or 1),
             "simulation_id": int(getattr(scanner, "simulation_id", 0) or 0),
             "complete": bool(historical_complete),
@@ -583,13 +584,24 @@ class ScannerTradePayloadBuilder:
                     for candidate in candidates:
                         candidate_ts = getattr(candidate, "signal_timestamp", None)
                         candidate_day = candidate_ts.date().isoformat() if candidate_ts else session_day
-                        if candidate_day != session_day:
+                        # Monitoring may retain overnight positions. This dashboard
+                        # is explicitly scoped to entries accepted today.
+                        matches_session = getattr(scanner, "_candidate_matches_live_session_day", None)
+                        if (not matches_session(candidate) if callable(matches_session)
+                                else candidate_day != session_day):
                             continue
                         if inst_pref_match(candidate):
                             scanner._normalize_loaded_exit_candidate(candidate)
                             row = normalize_dashboard_accounting_row(
                                 scanner._serialize_trade_candidate(candidate)
                             )
+                            entry_seconds = trade_row_event_seconds(row)
+                            if entry_seconds:
+                                entry_day = datetime.fromtimestamp(entry_seconds, tz=IST).date().isoformat()
+                                if entry_day != session_day:
+                                    continue
+                            elif candidate_day != session_day:
+                                continue
                             # The session ledger also stores candidates that never
                             # became positions (including TradeManager pre-submit
                             # refusals). Only admitted manual/watch lifecycles belong
@@ -667,6 +679,9 @@ class ScannerTradePayloadBuilder:
                 row["execution_status"] = "SIGNAL_ONLY"
                 row["execution_state"] = "NOT_PLACED"
             payload["signals"] = display_signal_rows
+            # Instrument snapshots can be older than this ledger. The browser must
+            # not reinsert their candidates, even when the current ledger is empty.
+            payload["meta"]["signals_authoritative"] = True
             # Explicit session-row contract: consumers that read only open/closed would
             # otherwise see zero trades when the session is carried by signal rows.
             payload["session_rows_total"] = len(display_signal_rows)

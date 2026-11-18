@@ -393,7 +393,7 @@ class KiteAuth:
             message = f"Missing Kite credentials in .env: {', '.join(missing)}"
             self._mark_auth_required(message)
             raise ValueError(message)
-        from kiteconnect import KiteConnect
+        from data.kite_history_client import make_kite_client as KiteConnect
 
         return KiteConnect(
             api_key=self.api_key,
@@ -411,7 +411,7 @@ class KiteAuth:
         if missing:
             raise ValueError(f"Missing Kite credentials in .env: {', '.join(missing)}")
 
-        from kiteconnect import KiteConnect
+        from data.kite_history_client import make_kite_client as KiteConnect
 
         client = KiteConnect(
             api_key=self.api_key,
@@ -518,7 +518,7 @@ class KiteAuth:
                 discard_cache=True,
             )
 
-        from kiteconnect import KiteConnect
+        from data.kite_history_client import make_kite_client as KiteConnect
 
         client = KiteConnect(
             api_key=self.api_key,

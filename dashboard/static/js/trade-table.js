@@ -215,6 +215,31 @@ function isTrackedSessionSignal(sig = {}) {
     return sig.accepted_by_gate === true || sig.watch_only === true;
 }
 
+function tradeSessionDay(value) {
+    if (value === null || value === undefined || value === '') return '';
+    const text = String(value);
+    // Scanner ISO clocks without an offset are exchange-local, not browser-local.
+    if (/^\d{4}-\d{2}-\d{2}(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$)/.test(text)) return text.slice(0, 10);
+    const ms = parseDashboardTimestamp(value);
+    if (!ms) return '';
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(new Date(ms));
+    const part = type => parts.find(p => p.type === type)?.value || '';
+    return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
+function signalMatchesDisplayedSession(sig = {}) {
+    const data = state.latestData || {};
+    if (String(data.mode || data.trades?.meta?.mode || '').toUpperCase() !== 'REAL') return true;
+    const day = data.trades?.meta?.session_day || tradeSessionDay(data.timestamp);
+    if (!day) return true; // Legacy payload without a session clock.
+    const entered = tradeSessionDay(sig.entry_timestamp || sig.timestamp || sig.signal_timestamp);
+    // This panel is today's entry cohort. An exit today never makes an older
+    // position a new trade today. Carry monitoring remains scanner-owned.
+    return entered === day;
+}
+
 function collectSessionSignalRows(existingRows = [], backendSignals = []) {
     const baseName = value => String(value || '').split(/\s+/)[0];
     const renderedIds = new Set(existingRows.map(row => String(row.id || '')).filter(Boolean));
@@ -250,11 +275,12 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
     const rawRows = [];
     const candidateSignals = [];
     (backendSignals || []).forEach(sig => {
-        if (isTrackedSessionSignal(sig)) candidateSignals.push(sig);
+        if (isTrackedSessionSignal(sig) && signalMatchesDisplayedSession(sig)) candidateSignals.push(sig);
     });
-    Object.values((state.latestData && state.latestData.instruments) || {}).forEach(inst => {
+    const authoritative = state.latestData?.trades?.meta?.signals_authoritative === true;
+    Object.values(authoritative ? {} : (state.latestData && state.latestData.instruments) || {}).forEach(inst => {
         (inst.trade_candidates || []).forEach(sig => {
-            if (isTrackedSessionSignal(sig)) candidateSignals.push(sig);
+            if (isTrackedSessionSignal(sig) && signalMatchesDisplayedSession(sig)) candidateSignals.push(sig);
         });
     });
     // Pair every entry with its exits before the loop, across both sources: an ENTRY that
@@ -310,6 +336,11 @@ function collectSessionSignalRows(existingRows = [], backendSignals = []) {
                 id: key,
                 signal_id: sig.id || '',
                 lifecycle_id: sig.lifecycle_id || '',
+                carried_from_session: sig.carried_from_session || (
+                    String(state.latestData?.mode || '').toUpperCase() === 'REAL' &&
+                    tradeSessionDay(sig.entry_timestamp || sig.timestamp) <
+                    (state.latestData?.trades?.meta?.session_day || tradeSessionDay(state.latestData?.timestamp))
+                        ? tradeSessionDay(sig.entry_timestamp || sig.timestamp) : ''),
                 status: isExit ? 'EXIT_SIGNAL' : (isNoEntry ? 'NO_ENTRY' : 'SIGNAL'),
                 base_instrument: sig.instrument || '',
                 instrument: instrumentName,
@@ -625,6 +656,7 @@ function updateTradesPanel(trades, simId) {
             modeClass = 'trade-data-mode restored';
         }
         modeBadge.textContent = modeText;
+        if (meta.session_day) modeBadge.textContent += ` · ${meta.session_day}`;
         modeBadge.className = modeClass;
     }
     renderTradePagination(trades || {});
@@ -646,8 +678,8 @@ function updateTradesPanel(trades, simId) {
         }
     }
 
-    const open = (trades.open || []).map(row => ({ ...row, row_kind: row.row_kind || 'manager_open' }));
-    const closed = (trades.closed || []).map(row => ({ ...row, row_kind: row.row_kind || 'manager_closed' }));
+    const open = (trades.open || []).filter(signalMatchesDisplayedSession).map(row => ({ ...row, row_kind: row.row_kind || 'manager_open' }));
+    const closed = (trades.closed || []).filter(signalMatchesDisplayedSession).map(row => ({ ...row, row_kind: row.row_kind || 'manager_closed' }));
     const signalRows = collectSessionSignalRows([...open, ...closed], trades.signals || []);
     // Keep the table in reverse-chronological order by actual accepted entry time.
     const all = [...signalRows, ...open, ...closed]
@@ -733,7 +765,7 @@ function updateTradesPanel(trades, simId) {
             const entryClock = normalizeTradeDateTime(t.entry_time, t.entry_date, entryStamp);
             const exitClock = normalizeTradeDateTime(t.exit_time, t.exit_date, exitStamp);
             const eTimeStr = entryClock.timeText
-                ? `<div class="time-col-wrapper"><span>${escHtml(entryClock.timeText)}</span><span style="font-size:0.65rem; opacity:0.5">${escHtml(entryClock.dateText)}</span></div>`
+                ? `<div class="time-col-wrapper"><span>${escHtml(entryClock.timeText)}</span><span style="font-size:0.65rem; opacity:0.5">${escHtml(entryClock.dateText)}</span>${t.carried_from_session ? `<small title="Position entered in a prior session; original entry time retained">CARRY ${escHtml(t.carried_from_session)}</small>` : ''}</div>`
                 : '--:--:--';
             const xTimeStr = exitClock.timeText
                 ? `<div class="time-col-wrapper"><span>${escHtml(exitClock.timeText)}</span><span style="font-size:0.65rem; opacity:0.5">${escHtml(exitClock.dateText)}</span></div>`
@@ -900,6 +932,7 @@ function updateTradesPanel(trades, simId) {
 function updateSignalsFeed(instruments) {
     const tbody = document.getElementById('tradesBody');
     if (!tbody) return;
+    if (state.latestData?.trades?.meta?.signals_authoritative === true) return;
 
     const currentRows = Array.from(tbody.querySelectorAll('tr'));
     const hasRealTradeRows = currentRows.some(row => row.cells.length > 1 && !/No (active )?trades/i.test(row.innerText));
@@ -908,7 +941,7 @@ function updateSignalsFeed(instruments) {
     const candidates = [];
     Object.values(instruments || {}).forEach(inst => {
         (inst.trade_candidates || []).forEach(sig => {
-            if (isTrackedSessionSignal(sig)) candidates.push(sig);
+            if (isTrackedSessionSignal(sig) && signalMatchesDisplayedSession(sig)) candidates.push(sig);
         });
     });
     // Same contract as collectSessionSignalRows and the server payload: a terminal row is

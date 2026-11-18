@@ -3680,6 +3680,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "fut_one_position_per_index": getattr(get_settings(), "fut_one_position_per_index", True),
             "opposite_flip_confirm_min_seconds": getattr(get_settings(), "opposite_flip_confirm_min_seconds", 30.0),
             "opposite_flip_confirm_max_seconds": getattr(get_settings(), "opposite_flip_confirm_max_seconds", 60.0),
+            "opposite_flip_confirm_1min_cap_seconds": 15.0,
             "opposite_flip_intel_filter_enabled": getattr(get_settings(), "opposite_flip_intel_filter_enabled", True),
             "volume_spike_entry_min_volume_ratio": getattr(get_settings(), "volume_spike_entry_min_volume_ratio", 2.5),
             "volume_spike_entry_strong_1min_min_volume_ratio": getattr(get_settings(), "volume_spike_entry_strong_1min_min_volume_ratio", 2.0),
@@ -29468,7 +29469,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
         The flip must persist for the confirm window (repaint_recheck_seconds
         clamped into [opposite_flip_confirm_min_seconds,
-        opposite_flip_confirm_max_seconds], default 30–60s → 30s) AND pass an
+        opposite_flip_confirm_max_seconds], capped at 15s for 1min) AND pass an
         intel/move sanity read (``_opposite_flip_quality_verdict``) before it
         exits the live trade and hands the slot to the reverse entry. A flip
         that repaints (vanishes) never confirms; a flip whose move mean-reverts
@@ -29502,8 +29503,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 self._pending_opposite_exit.pop(stale, None)
             return True
         settings = get_settings()
-        # Uniform confirm window for both 5min and 15min opposite flips:
-        # repaint_recheck_seconds clamped into the 30–60s operator band.
+        # 5min/15min retain the operator band; 1min reversals must not inherit
+        # their slower minimum or their extended intelligence hold.
         min_s = max(
             5.0,
             float(getattr(settings, "opposite_flip_confirm_min_seconds", 30.0) or 30.0),
@@ -29512,6 +29513,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             min_s,
             float(getattr(settings, "opposite_flip_confirm_max_seconds", 60.0) or 60.0),
         )
+        if timeframe == "1min":
+            min_s = min(min_s, 15.0)
+            max_s = min(max_s, 15.0)
         buffer_seconds = min(
             max_s,
             max(min_s, float(getattr(settings, "repaint_recheck_seconds", 20.0) or 20.0)),

@@ -1186,6 +1186,16 @@ class MarketDataProvider(KiteAngelMigration):
         self._prewarm_angelone_fallback()
         started = []
 
+        # Primary streaming cannot depend on FYERS' aggregate connection flag
+        # or wait behind backup socket initialization.
+        try:
+            kite = getattr(self, "kite", None)
+            if bool(getattr(kite, "is_connected", False)):
+                if self.start_kite_ticker():
+                    started.append("Kite")
+        except Exception as exc:
+            logger.error(f"Kite WebSocket activation after live-mode switch failed: {exc}")
+
         try:
             token_data = self._read_fyers_token_file()
             access_token = str(token_data.get("access_token") or "")
@@ -1198,16 +1208,6 @@ class MarketDataProvider(KiteAngelMigration):
                 started.append("Fyers")
         except Exception as exc:
             logger.error(f"Fyers WebSocket activation after live-mode switch failed: {exc}")
-
-        try:
-            kite = getattr(self, "kite", None)
-            if bool(getattr(self, "is_connected", False)) and bool(
-                getattr(kite, "is_connected", False)
-            ):
-                if self.start_kite_ticker():
-                    started.append("Kite")
-        except Exception as exc:
-            logger.error(f"Kite WebSocket activation after live-mode switch failed: {exc}")
 
         logger.info(
             "Live market-data streams enabled after runtime mode switch"

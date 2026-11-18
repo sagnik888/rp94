@@ -4,6 +4,25 @@ from types import SimpleNamespace
 import main
 
 
+def test_startup_applies_manual_mode_before_scan_worker_starts():
+    scanner = _FakeScanner()
+    scanner.is_running = False
+    now = _ist("2026-11-04 10:00:00")
+    assert main._auto_real_mode_attempt(scanner, _settings(), now)[1] == "scanner_not_running"
+    assert main._auto_real_mode_attempt(scanner, _settings(), now, require_running=False) == (True, "switched_real_manual")
+    assert scanner.mode == "REAL"
+    assert scanner.auto_mode is False
+
+
+def test_early_startup_mode_policy_preserves_operator_historical_choice():
+    scanner = _FakeScanner()
+    scanner.is_running = False
+    scanner._operator_kept_historical_today = lambda now, switch: True
+    assert main._auto_real_mode_attempt(scanner, _settings(), _ist("2026-11-04 10:00:00"),
+                                       require_running=False)[1] == "operator_kept_historical"
+    assert scanner.calls == []
+
+
 class _FakeScanner:
     def __init__(self, *, mode="HISTORICAL", auto_mode=True, trading_day=True):
         self.mode = mode

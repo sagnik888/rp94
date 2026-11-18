@@ -1219,12 +1219,31 @@ class AltSignalEngine(UTBotEngine):
             },
         }
 
+    @staticmethod
+    def _analysis_frame(frame):
+        """Keep calculation inputs numeric without copying unrelated feed metadata.
+
+        Broker provenance stays on the caller's frame and in MTF change detection.
+        These engines consume only OHLCV; Arrow string blocks otherwise get copied
+        on every historical signal calculation and session-mask operation.
+        """
+        if frame is None:
+            return None
+        result = pd.DataFrame({key: frame[key].to_numpy(copy=False)
+                               for key in ("open", "high", "low", "close", "volume")
+                               if key in frame}, index=frame.index)
+        result.attrs = frame.attrs.copy()
+        return result
+
     def process(self, df: pd.DataFrame, instrument: str = "", timeframe: str = "", **kw):
         # S1 builds the requested candle type independently at each native timeframe.
         df_5min = kw.pop("df_5min", None)
         df_15min = kw.pop("df_15min", None)
         if self.signal_source == "ut_smart":
             return self._process_ut_smart(df, instrument, timeframe, **kw)
+        df = self._analysis_frame(df)
+        df_5min = self._analysis_frame(df_5min)
+        df_15min = self._analysis_frame(df_15min)
         if self.signal_source == "s1":
             # Let the caller invalidate failed results instead of returning UT arrows.
             return self._process_s1(df, instrument, timeframe, df_5min=df_5min, df_15min=df_15min, **kw)

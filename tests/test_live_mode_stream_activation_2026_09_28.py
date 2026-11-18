@@ -34,7 +34,7 @@ def test_replay_provider_starts_both_sockets_when_live_mode_is_enabled(monkeypat
 
     assert provider.enable_live_streams() is True
     assert provider.start_streams is True
-    assert calls == [("fyers", "fresh-token"), ("kite", None)]
+    assert calls == [("kite", None), ("fyers", "fresh-token")]
 
 
 def test_live_stream_activation_is_idempotent(monkeypatch):
@@ -79,3 +79,14 @@ def test_scanner_live_mode_switch_activates_provider_streams():
 
     assert "if requested_runtime_mode.uses_live_market_data:" in source
     assert 'getattr(self.data, "enable_live_streams", None)' in source
+
+
+def test_primary_stream_starts_when_backup_connection_flag_is_false(monkeypatch):
+    provider = _provider()
+    provider.is_connected = False
+    calls = []
+    monkeypatch.setattr(provider, "_prewarm_angelone_fallback", lambda: None)
+    monkeypatch.setattr(provider, "_read_fyers_token_file", lambda: {})
+    monkeypatch.setattr(provider, "start_kite_ticker", lambda: calls.append("kite") or True)
+    assert provider.enable_live_streams() is True
+    assert calls == ["kite"]

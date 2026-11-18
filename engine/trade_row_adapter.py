@@ -329,6 +329,53 @@ def live_signal_exit_mark(row: Any) -> Optional[float]:
     return price
 
 
+def frozen_manual_exit_net_pnl(row: Any) -> Optional[float]:
+    """Keep a recorded option exit bill only when it matches this observation.
+
+    Current fees must not reprice completed manual lifecycles. Legacy rows with
+    missing or inconsistent evidence retain their existing normalization path.
+    This evidence describes paper accounting, never an actual broker fill.
+    """
+    # Native manual rows predating provenance persistence carry an empty tag.
+    # Accept their explicit manual decision proof without labelling it LIVE;
+    # an explicit replay tag or replay id must never borrow this authority.
+    if (_normalized_text(_row_attr(row, "data_provenance"), upper=True) not in {"", "LIVE"}
+            or is_engine_replay_row(row)
+            or _normalized_text(_row_attr(row, "action"), upper=True) != "EXIT"
+            or not (_row_attr(row, "accepted_by_gate") or _row_attr(row, "watch_only"))
+            or _normalized_text(_row_attr(row, "inst_type"), upper=True) != "OPT"
+            or _row_attr(row, "exit_quote_verified") is not True
+            or _row_attr(row, "broker_order_id") or _row_attr(row, "exit_order_id")):
+        return None
+    record = _row_attr(row, "exit_decision_record", {}) or {}
+    if not isinstance(record, dict) or record.get("schema") != "exit_decision.v1" or record.get("path") != "manual":
+        return None
+    if record.get("controlling_reason") != _row_attr(row, "exit_reason"):
+        return None
+    accounting = record.get("accounting") or {}
+    if not isinstance(accounting, dict) or accounting.get("basis") != "RECORDED_MARK_GROSS_TO_EXECUTABLE_NET":
+        return None
+    try:
+        mark = float(_row_attr(row, "exit_price"))
+        entry = float(_row_attr(row, "entry_price") or _row_attr(row, "price"))
+        quantity = float(_row_attr(row, "lots")) * float(_row_attr(row, "lot_size"))
+        recorded_mark = float(record["mark"])
+        gross, net, cost = (float(accounting[k]) for k in ("gross_pnl", "net_pnl", "round_trip_cost"))
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return None
+    if not all(math.isfinite(v) for v in (mark, entry, quantity, recorded_mark, gross, net, cost)):
+        return None
+    entered = trade_row_event_seconds({"entry_timestamp": _row_attr(row, "entry_timestamp")})
+    exited = trade_row_event_seconds({"exit_timestamp": _row_attr(row, "exit_timestamp")}, prefer_exit=True)
+    if (not (math.isfinite(entered) and math.isfinite(exited) and 0 < entered <= exited)
+            or mark <= 0 or entry <= 0 or quantity <= 0 or cost < 0
+            or not math.isclose(recorded_mark, mark, rel_tol=0., abs_tol=1e-8)
+            or not math.isclose(gross, (mark-entry)*quantity, rel_tol=0., abs_tol=.011)
+            or not math.isclose(gross-cost, net, rel_tol=0., abs_tol=.011)):
+        return None
+    return net
+
+
 def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Apply final accounting guards to persisted rows before dashboard display."""
     row = normalize_dashboard_accounting_row(row)
@@ -447,6 +494,12 @@ def reconcile_legacy_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
             else (entry_price - actual_exit) * quantity
         )
         row["pnl"] = round(gross - charges, 2)
+        return row
+
+    frozen_pnl = frozen_manual_exit_net_pnl(row)
+    if frozen_pnl is not None:
+        row["pnl"] = frozen_pnl
+        row["current_price"] = actual_exit
         return row
 
     stop = float(row.get("current_stop") or row.get("trailing_stop") or row.get("stop") or 0.0)

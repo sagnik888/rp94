@@ -3181,7 +3181,8 @@ class Settings(BaseSettings):
     repaint_close_check_grace_seconds: float = 90.0 # Post-close window in which a repaint may still abort; after this the candle is confirmed and the trade is tracked normally
     repaint_recheck_seconds: float = 20.0 # Post-entry repaint re-check cadence until the source candle closes (same for 5min and 15min)
     # ── Opposite-flip confirm window (2026-07-10) ──
-    # A flip must persist 30–60s (clamped) AND pass an intel/move sanity read
+    # 5min/15min flips persist 30–60s (clamped) AND pass an intel/move sanity read.
+    # 1min reversals cap both the repaint window and extended intel hold at 15s.
     # before it exits a live trade and hands the slot to the reverse entry.
     # Multi-index LTP shock force-exit bypasses this window by design.
     opposite_flip_confirm_min_seconds: float = 30.0
