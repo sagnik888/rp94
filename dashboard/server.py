@@ -3485,7 +3485,7 @@ async def api_recalibrate(request: Request):
 @app.get("/api/upstox_auth_url")
 async def api_upstox_auth_url(request: Request):
     """Return the OAuth login URL for Upstox."""
-    if not _request_authorized(request):
+    if not (_request_authorized(request) or _is_loopback_client(request)):
         return {"status": "error", "message": "Unauthorized"}
     from data.upstox_auth import get_upstox_auth_url
     try:
@@ -3526,7 +3526,7 @@ async def api_upstox_login(request: Request):
 @app.post("/api/upstox_auth")
 async def api_upstox_auth(request: Request):
     """Update or exchange Upstox token manually or via code."""
-    if not _request_authorized(request):
+    if not (_request_authorized(request) or _is_loopback_client(request)):
         return {"status": "error", "message": "Unauthorized"}
     try:
         payload = await request.json()
