@@ -3536,11 +3536,16 @@ async def api_upstox_auth(request: Request):
     token = str(payload.get("token") or payload.get("access_token") or "").strip()
     from data.upstox_auth import exchange_code_for_token, save_upstox_token, get_upstox_auth_status
     if token:
-        save_upstox_token(token)
-        return {"status": "ok", "message": "Upstox token saved", "auth": get_upstox_auth_status()}
+        try:
+            save_upstox_token(token)
+            return {"status": "ok", "message": "Upstox token saved", "auth": get_upstox_auth_status()}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
     if code:
         try:
             res = exchange_code_for_token(code)
+            if res.get("status") == "error":
+                return {"status": "error", "message": res.get("message", "Token exchange failed")}
             return {"status": "ok", "data": res, "auth": get_upstox_auth_status()}
         except Exception as exc:
             return {"status": "error", "message": str(exc)}

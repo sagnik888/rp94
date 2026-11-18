@@ -2185,6 +2185,16 @@ function setupEventListeners() {
         upstoxBadge.title = 'Upstox Primary Broker. Click to log in / refresh.';
     }
 
+    window.addEventListener('message', (event) => {
+        if (event && event.data === 'upstox_auth_complete') {
+            showToast('Upstox login completed. Updating session...', 'success');
+            const modal = document.getElementById('upstoxAuthModal');
+            if (modal) modal.style.display = 'none';
+            if (window.sendCommand) window.sendCommand({ cmd: 'get_state' });
+            refreshDashboardSnapshot('upstox_auth_complete');
+        }
+    });
+
     // Hidden legacy stubs
     const closeFyersAuth = document.getElementById('closeFyersAuth');
     const submitFyersAuth = document.getElementById('submitFyersAuth');
