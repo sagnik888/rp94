@@ -383,7 +383,7 @@ def _scanner_liveness_alert_due(
 # The two broker-auth alerts that expire on a daily schedule rather than failing at a
 # random moment. Only these are re-raised before the open; a mid-session incident still
 # gets exactly one alert.
-_PREOPEN_AUTH_ALERT_KEYS = ("kite_token", "fyers")
+_PREOPEN_AUTH_ALERT_KEYS = ("upstox_token",)
 
 
 def _preopen_auth_realert_due(
@@ -721,105 +721,35 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                             + ", ".join(released)
                         )
 
-                # 2b. Kite session — the token dies every morning, and without it
-                # every order is refused while the scanner still looks perfectly
-                # healthy. This is the Kite equivalent of the AngelOne AG7002 trap.
+                # 2b. Upstox session — daily 24h token check
                 try:
-                    from data.kite_auth import get_kite_auth
-
-                    kite_status = get_kite_auth().status()
+                    from data.upstox_auth import get_upstox_auth_status
+                    upstox_status = get_upstox_auth_status()
                 except Exception as exc:
-                    kite_status = {"auth_required": True, "reason": f"status unavailable: {exc}"}
-                if kite_status.get("auth_required"):
+                    upstox_status = {"authenticated": False, "reason": f"status unavailable: {exc}"}
+                if not upstox_status.get("authenticated"):
                     _alert(
-                        "kite_token",
-                        f"Kite login required ({kite_status.get('reason') or 'no session'}) - "
-                        f"NO order can reach the exchange until you log in at "
-                        f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/kite_login",
+                        "upstox_token",
+                        f"Upstox login required ({upstox_status.get('reason') or 'no session'}) - "
+                        f"Log in at http://{settings.dashboard_host}:{settings.dashboard_port}/api/upstox_login",
                         state,
                     )
                 else:
-                    state.pop("kite_token", None)
+                    state.pop("upstox_token", None)
 
-                # 2c. Kite TICKS — a separate question from the Kite SESSION above. A
-                # socket can stay open and simply stop delivering: on_close/on_error
-                # never fire, so kiteconnect's reconnect never runs and nothing replays
-                # the subscription. 2026-08-21: connected 10:23:05, silent from ~14:35,
-                # no error until 15:30:19 (after the close), kite_ws age reaching 1,672s.
-                #
-                # kite_stream_stalled already existed and was already read twice — a
-                # readiness warning (engine/safe_mode.py:276) and a dashboard issue
-                # (engine/scanner_telemetry.py:757) — but neither writes a CRITICAL nor
-                # attempts recovery, so 28 minutes of a dead feed left no line in the log
-                # of its own. It surfaced only because a signal happened to arrive and hit
-                # the entry gate, which correctly refuses entries without an
-                # order-authority source. That gate is the safety response; this is the
-                # alarm and the repair.
+                # 2c. Broker Failover Check (Upstox primary -> Angel One 30s fallback)
                 try:
-                    health = scanner.data.get_source_health()
-                except Exception:
-                    health = {}
-                if health.get("kite_stream_stalled"):
-                    # A successful socket write does not prove that ticks resumed. Keep
-                    # retrying at a bounded cadence until the health signal itself clears;
-                    # otherwise a one-time write into a wedged websocket silently ends
-                    # recovery forever.
-                    retry_every = max(15.0, float(check_every))
-                    now_monotonic = time.monotonic()
-                    last_attempt = float(state.get("kite_stream_resubscribe_attempt_at", 0.0) or 0.0)
-                    if now_monotonic - last_attempt >= retry_every:
-                        state["kite_stream_resubscribe_attempt_at"] = now_monotonic
-                        try:
-                            # A failed resubscribe is not a recovery.  Latching before
-                            # checking the result left a connected-but-silent socket
-                            # permanently stalled after one transient broker failure.
-                            # The watchdog cadence is already bounded, so a false result
-                            # is safe to retry on the next health pass.
-                            state["kite_stream_resubscribed"] = bool(
-                                scanner.data.resubscribe_kite_tokens()
-                            )
-                        except Exception as exc:
-                            logger.debug(f"Kite resubscribe attempt failed: {exc}")
-                            state["kite_stream_resubscribed"] = False
-                    age = health.get("kite_tick_age_seconds")
-                    _alert(
-                        "kite_stream",
-                        "Kite tick stream is silent while the socket reports connected"
-                        + (f" ({age:.0f}s since the last tick)" if isinstance(age, (int, float)) else " (no ticks yet)")
-                        + (" - REST prices still serving" if health.get("kite_data_fresh")
-                           else " - REST prices are stale too")
-                        + ". Entries are refused while no order-authority source is fresh; "
-                          "a resubscribe has been attempted",
-                        state,
-                    )
-                else:
-                    state.pop("kite_stream", None)
-                    state.pop("kite_stream_resubscribed", None)
-                    state.pop("kite_stream_resubscribe_attempt_at", None)
-
-                # 3. Fyers auth — expires daily and cannot auto-refresh.
-                try:
-                    status = scanner.data.get_fyers_auth_status()
-                except Exception:
-                    status = {}
-                if status.get("auth_required"):
-                    backup_only = callable(getattr(scanner.data, "_fyers_backup_enabled", None)) and scanner.data._fyers_backup_enabled()
-                    if backup_only:
-                        if not state.get("fyers"):
-                            state["fyers"] = True
-                            message = "Optional FYERS backup login unavailable; Kite/Angel data health is evaluated independently."
-                            logger.warning(f"WATCHDOG: {message}")
-                            scanner.log_event(message, "warning")
-                    else:
+                    broker = getattr(getattr(scanner, "trades", None), "real_broker", None)
+                    if broker and hasattr(broker, "is_failover_active") and broker.is_failover_active:
                         _alert(
-                            "fyers",
-                            f"Fyers login required ({status.get('reason') or 'token invalid'}) - "
-                            f"option chain/OI/PCR unavailable until you visit "
-                            f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/fyers_login",
+                            "broker_failover",
+                            "Primary broker Upstox down >30s; Angel One fallback active.",
                             state,
                         )
-                else:
-                    state.pop("fyers", None)
+                    else:
+                        state.pop("broker_failover", None)
+                except Exception:
+                    pass
 
                 # 4. Host memory / Windows commit pressure.  Fail closed only for NEW
                 # exposure. Do not change scanner.auto_mode: that same flag controls
@@ -2050,35 +1980,35 @@ def create_system():
     # log in, see a healthy dashboard, and still place no live orders.
     # KiteBroker holds the shared auth, so the session it gets rebound at login time.
     if True:
-        # Zerodha Kite is the execution broker. The session comes from the shared
-        # KiteAuth so the dashboard login route, the data layer and the broker all
-        # observe one token — a browser re-login must not leave the broker holding a
-        # dead one. The lease is keyed on the Kite user id, since it is Kite positions
-        # that are account-netted now.
-        from data.kite_auth import get_kite_auth
-        from trading.kite_broker import KiteBroker
+        # Upstox API v2 is the PRIMARY execution broker.
+        # Angel One SmartAPI is the 30-SECOND FALLBACK broker if Upstox fails.
+        from trading.upstox_broker import UpstoxBroker
+        from trading.angelone_broker import AngelOneBroker
+        from trading.failover_broker import FailoverBroker
+        from data.upstox_auth import get_upstox_auth_status
 
-        kite_auth = get_kite_auth(settings)
-        real_broker = KiteBroker(
-            kite=kite_auth.kite,
-            auth=kite_auth,
-            account_id=str(getattr(settings, "kite_user_id", "") or "").strip(),
+        upstox_account_id = str(getattr(settings, "upstox_user_id", "") or "7JATYL").strip()
+        upstox_broker = UpstoxBroker(
+            account_id=upstox_account_id,
             instance_id=f"UT1:{settings.dashboard_port}",
         )
-        data_provider.on_kite_reauth = real_broker.replace_api
-        if kite_auth.kite is None:
-            # Not fatal at startup: the operator logs in through the dashboard and the
-            # session is rebound. It IS fatal for placing orders, and KiteBroker
-            # refuses them with that exact instruction until then.
-            logger.critical(
-                "Kite session required: no valid token. Complete the daily login at "
-                f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/kite_login "
-                f"({kite_auth.status().get('reason')})"
+        angel_broker = AngelOneBroker()
+        real_broker = FailoverBroker(
+            primary=upstox_broker,
+            fallback=angel_broker,
+            failover_threshold_seconds=float(getattr(settings, "upstox_failover_threshold_seconds", 30.0) or 30.0),
+        )
+
+        auth_st = get_upstox_auth_status()
+        if not auth_st.get("authenticated"):
+            logger.warning(
+                "Upstox session required: no valid token. Complete daily login at "
+                f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/upstox_login "
+                f"({auth_st.get('reason')})"
             )
-        # A blank account id builds no lease, and the lease accessors answer True
-        # when there is none — so this gate could never fire in exactly the case
-        # where single-instance ownership is least establishable. Refuse REAL
-        # unless the lease is both establishable and actually held.
+        else:
+            logger.info("✅ Broker (Upstox API v2 LIVE Ready; Angel One 30s Fallback Armed)")
+
         if runtime_mode().permits_live_orders and not (
             real_broker.execution_lease_established()
             and real_broker.acquire_execution_lease()
@@ -2092,27 +2022,6 @@ def create_system():
             except Exception as exc:
                 logger.error(f"Failed to persist lease safe-mode fallback: {exc}")
         data_provider.fetch_instruments()
-        if kite_auth.kite is not None:
-            logger.info("✅ Broker (Zerodha Kite LIVE Ready)")
-        else:
-            logger.warning(
-                "⚠️ Broker built but IDLE — Kite login pending; orders are refused until then"
-            )
-
-        # The Kite app's registered redirect must match the port this dashboard
-        # actually serves, or Zerodha bounces the browser to a dead address and the
-        # login silently never completes.
-        redirect = str(getattr(settings, "kite_redirect_uri", "") or "").strip()
-        expected = f"/api/kite_login"
-        if redirect and (
-            str(settings.dashboard_port) not in redirect or expected not in redirect
-        ):
-            logger.critical(
-                f"KITE REDIRECT MISMATCH: the app is registered to {redirect} but this "
-                f"dashboard serves http://{settings.dashboard_host}:{settings.dashboard_port}"
-                f"{expected}. Update the redirect URL at developers.kite.trade or the "
-                f"login will never complete."
-            )
 
     # Initial broker selection based on settings
     active_broker = real_broker if (runtime_mode().permits_live_orders and real_broker) else sim_broker

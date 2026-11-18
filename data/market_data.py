@@ -324,6 +324,8 @@ class MarketDataProvider(KiteAngelMigration):
             totp_secret=_angel_totp,
         )
         self._angel_prewarm_lock = threading.Lock()
+        from data.upstox_market_data import UpstoxMarketDataClient
+        self.upstox = UpstoxMarketDataClient()
         self._angel_prewarm_started = False
         self.kite = KiteDataSource(auth=None)
         self.on_kite_reauth = None
@@ -4113,91 +4115,34 @@ class MarketDataProvider(KiteAngelMigration):
         # The broker's price is the one orders actually fill against, so it outranks
         # every other feed. Fyers used to be consulted first and on 2026-08-01 it
         # returned NIFTY at 25,965.35 against a true 24,383.60 — a 6.49% error that
-        # the dashboard displayed and the engine would have traded on.
-        kite_ltp = 0.0
-        kite_received_at = 0.0
-        kite_source = getattr(self, "kite", None)
-        if kite_source is not None and kite_source.is_connected:
+        # 2. TIER 1 — THE PRIMARY BROKER (Upstox API v2).
+        upstox_ltp = 0.0
+        upstox_received_at = 0.0
+        upstox_client = getattr(self, "upstox", None)
+        if upstox_client is not None and (upstox_client.is_healthy(threshold_seconds=30.0) or upstox_client.failure_duration() < 30.0):
             try:
-                kite_symbol, kite_exchange = self._kite_quote_target(symbol, token, exchange)
-                if kite_symbol:
-                    kite_ltp = float(kite_source.get_ltp(kite_exchange, kite_symbol) or 0.0)
-                    kite_received_at = time.time()
+                ltp = float(upstox_client.get_index_ltp(symbol) or 0.0)
+                if ltp > 0:
+                    upstox_ltp = ltp
+                    upstox_received_at = time.time()
             except Exception as exc:
-                logger.debug(f"Kite REST quote failed for {symbol}: {exc}")
+                logger.debug(f"Upstox REST quote failed for {symbol}: {exc}")
 
-        if self._fyers_backup_enabled() and kite_ltp <= 0:
-            angel_quote = self._angel_supplementary_quote(symbol)
-            if angel_quote is not None:
-                return _remember_ltp_time(angel_quote)
-
-        # 3. TIER 2 — FYERS, used as a cross-check when the broker answered, and as a
-        # fallback when it did not.
-        fyers_ltp = 0.0
-        fyers_values: Dict[str, Any] = {}
-        fyers_received_at = 0.0
-        fyers_exchange_at = None
-        if getattr(self, 'fyers', None) and (not self._fyers_backup_enabled() or kite_ltp <= 0):
-            try:
-                f_sym = fyers_quote_symbol(symbol)
-                if f_sym:
-                    ok, f_resp = self._call_fyers_bounded(
-                        "quotes",
-                        {"symbols": f_sym},
-                        label=f"Fyers price quote {f_sym}",
-                        timeout_seconds=2.0,
-                        wait_if_busy=False,
-                    )
-                    if not ok:
-                        f_resp = None
-                    if f_resp and f_resp.get('s') == 'ok':
-                        fyers_values = dict(
-                            f_resp.get('d', [{}])[0].get('v', {}) or {}
-                        )
-                        fyers_ltp = float(fyers_values.get('lp', 0) or 0.0)
-                        fyers_received_at = time.time()
-                        fyers_exchange_at = self._exchange_timestamp_from_payload(fyers_values)
-            except Exception as exc:
-                logger.debug(f"Fyers REST quote fallback failed for {symbol}: {exc}")
-
-        fyers_previous_close = self._quote_float(fyers_values, *PREVIOUS_CLOSE_KEYS)
-        if fyers_previous_close > 0:
-            self._remember_previous_close(symbol, fyers_previous_close, "fyers_rest")
-
-        if kite_ltp > 0:
-            if fyers_ltp > 0:
-                self._flag_quote_divergence(symbol, "kite", kite_ltp, "fyers", fyers_ltp)
-            received_at = kite_received_at or time.time()
+        if upstox_ltp > 0:
+            received_at = upstox_received_at or time.time()
             self._last_ltp_time = received_at
             cache_entry = {
-                "ltp": kite_ltp,
+                "ltp": upstox_ltp,
                 "time": datetime.fromtimestamp(received_at),
                 "received_at": received_at,
                 "exchange_at": None,
-                "source": "kite",
+                "source": "upstox",
             }
             with self._index_quote_guard():
                 self._ltp_cache[symbol] = cache_entry
-            return kite_ltp
-        if fyers_ltp > 0:
-            # No broker price to check it against. Accept it, but say so — an
-            # unverified quote is how the wrong number reached the screen.
-            logger.debug(f"{symbol} quote from Fyers only (no broker price to cross-check)")
-            received_at = fyers_received_at or time.time()
-            self._last_ltp_time = received_at
-            cache_entry = {
-                "ltp": fyers_ltp,
-                "change": float(fyers_values.get("ch", 0.0) or 0.0),
-                "change_pct": float(fyers_values.get("chp", 0.0) or 0.0),
-                "previous_close": fyers_previous_close,
-                "time": datetime.fromtimestamp(received_at),
-                "received_at": received_at,
-                "exchange_at": fyers_exchange_at,
-                "source": "fyers",
-            }
-            with self._index_quote_guard():
-                self._ltp_cache[symbol] = cache_entry
-            return fyers_ltp
+            return upstox_ltp
+
+        # If Upstox is down >30s or returns 0, fall through to Angel One fallback below
 
         # 3. TIER 3 — ANGELONE SMARTAPI INDEX QUOTE.
         # This replaces Yahoo as the normal broker fallback. A short local cache keeps
@@ -6386,668 +6331,51 @@ class MarketDataProvider(KiteAngelMigration):
         return chain
 
     def get_option_chain(self, index_symbol: str, exchange: str = "NFO") -> Optional[pd.DataFrame]:
-        """Fetch preferred Kite/Angel chains, retaining FYERS backup and legacy routes."""
+        """Fetch Upstox option chain natively with Greeks, IV, PCR, volume; 30s Angel One fallback."""
         now = time.time()
         cache_key = f"opt_chain_{index_symbol}"
         if not hasattr(self, "_opt_chain_cache"): self._opt_chain_cache = {}
         if not hasattr(self, "_last_opt_chain_fetch"): self._last_opt_chain_fetch = {}
-        if not hasattr(self, "_last_opt_chain_error"): self._last_opt_chain_error = {}
 
         cached_chain = self._opt_chain_cache.get(cache_key)
         if cached_chain is not None and not self.chain_matches_execution_expiry(index_symbol, cached_chain):
             self._opt_chain_cache.pop(cache_key, None)
             self._last_opt_chain_fetch.pop(cache_key, None)
-            self._last_opt_chain_error.pop(cache_key, None)
-        
+
         from config.settings import get_settings
-        chain_ttl = max(90.0, float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 90.0)))
-        error_cooldown = max(chain_ttl, 180.0)
+        chain_ttl = max(10.0, float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 30.0)))
 
-        def preferred_probe():
-            # Probe preferred brokers independently of a FYERS cache/cooldown.
-            # One in-flight call and a short retry interval prevent scan storms.
-            with self._replacement_lock:
-                attempts = self.__dict__.setdefault("_preferred_chain_attempts", {})
-                pending = self.__dict__.setdefault("_preferred_chain_pending", set())
-                if cache_key in pending or now-attempts.get(cache_key, 0.0) < 5.0:
-                    return None, {}, False
-                attempts[cache_key] = now
-                pending.add(cache_key)
-            try:
-                try:
-                    chain = self._get_replacement_option_chain(index_symbol, now)
-                except Exception:
-                    chain = pd.DataFrame()
-                return chain, dict(self._option_chain_meta.get(index_symbol, {})), True
-            finally:
-                with self._replacement_lock:
-                    pending.discard(cache_key)
-
+        # Cache check
         last_fetch = self._last_opt_chain_fetch.get(cache_key, 0)
-        last_error = self._last_opt_chain_error.get(cache_key, 0)
-        cached_meta = dict((getattr(self, "_option_chain_meta", {}) or {}).get(index_symbol, {}))
-        preferred_cached = bool(cached_meta.get("auto_certified")
-                                and cached_meta.get("source") in {"kite", "angelone"})
-        gated = now-last_fetch < chain_ttl or now-last_error < error_cooldown
-        if self._fyers_backup_enabled() and gated and not preferred_cached:
-            preferred, meta, attempted = preferred_probe()
-            if (preferred is not None and not preferred.empty and meta.get("auto_certified")
-                    and meta.get("source") in {"kite", "angelone"}):
-                return preferred
-            if attempted:
-                # A failed preferred probe must neither extend the backup's
-                # cooldown nor replace a usable backup with a partial chain.
-                if cached_chain is None:
-                    self._opt_chain_cache.pop(cache_key, None)
-                else:
-                    self._opt_chain_cache[cache_key] = cached_chain
-                self._option_chain_meta[index_symbol] = cached_meta
-                if last_fetch:
-                    self._last_opt_chain_fetch[cache_key] = last_fetch
-                else:
-                    self._last_opt_chain_fetch.pop(cache_key, None)
-                if last_error:
-                    self._last_opt_chain_error[cache_key] = last_error
-                else:
-                    self._last_opt_chain_error.pop(cache_key, None)
+        if now - last_fetch < chain_ttl and cached_chain is not None and not cached_chain.empty:
+            return cached_chain
 
-        # Cache option chain aggressively during live scans to prevent API spam.
-        last_fetch = self._last_opt_chain_fetch.get(cache_key, 0)
-        if now - last_fetch < chain_ttl:
-            cached_data = self._opt_chain_cache.get(cache_key)
-            if cached_data is not None:
-                logger.debug(f"Using cached option chain for {index_symbol}")
-                return cached_data
-            else:
-                # In-flight fetch by another thread, return empty to prevent queueing
-                return pd.DataFrame()
-
-        last_error = self._last_opt_chain_error.get(cache_key, 0)
-        if now - last_error < error_cooldown:
-            cached_data = self._opt_chain_cache.get(cache_key)
-            if cached_data is not None:
-                logger.info(f"Using stale option chain for {index_symbol} during error cooldown")
-                return cached_data
-            return pd.DataFrame()
-
-        # Mark as in-flight immediately to prevent concurrent threads from piling up
-        self._last_opt_chain_fetch[cache_key] = now
-
-        replacement_chain = None
-        replacement_meta = {}
-        if self._replacement_enabled():
-            if self._fyers_backup_enabled():
-                replacement_chain, meta, _ = preferred_probe()
-                if replacement_chain is None:
-                    replacement_chain = pd.DataFrame()
-            else:
-                try:
-                    replacement_chain = self._get_replacement_option_chain(index_symbol, now)
-                except Exception:
-                    replacement_chain = pd.DataFrame()
-                meta = self._option_chain_meta.get(index_symbol, {})
-            replacement_meta = dict(meta)
-            if not self._fyers_backup_enabled() or (replacement_chain is not None and not replacement_chain.empty
-                    and meta.get("auto_certified") and meta.get("source") in {"kite", "angelone"}):
-                return replacement_chain
-
-        # FYERS backs up the preferred route, or owns the explicit legacy route.
-        if self.fyers:
-            fyers_symbol = FYERS_INDEX_SYMBOLS.get(index_symbol)
-            
-            if fyers_symbol:
-                try:
-                    logger.info(
-                        "Fetching Fyers option chain for {}: preferred_source={}, strikes={}/{}, "
-                        "coverage_complete={}, exchange_clocks_fresh={}, volume_complete={}, certified={}",
-                        fyers_symbol, replacement_meta.get("source", "unavailable"),
-                        replacement_meta.get("strike_count", 0), replacement_meta.get("requested_strike_count", 0),
-                        replacement_meta.get("coverage_complete", False), replacement_meta.get("exchange_clocks_fresh", False),
-                        replacement_meta.get("volume_complete", False), replacement_meta.get("auto_certified", False),
-                    )
-                    
-                    # Try to center around ATM strike if we have spot price
-                    spot = self.get_latest_price(index_symbol)
-                    data = {"symbol": fyers_symbol, "strikecount": 30, "timestamp": ""}
-                    
-                    if spot > 0:
-                        strike_interval = INDEX_STRIKE_INTERVALS.get(index_symbol, 50)
-                        atm_strike = round(spot / strike_interval) * strike_interval
-                        logger.info(f"Fyers option chain requested for {fyers_symbol} (ATM: {atm_strike})")
-                    
-                    ok, response = self._call_fyers_bounded(
-                        "optionchain",
-                        data=data,
-                        label=f"Fyers option chain {fyers_symbol}",
-                    )
-                    if not ok:
-                        response = None
-                    logger.info(f"Fyers optionchain response status: {response.get('s') if response else 'None'}")
-
-                    # Align intelligence with the exact active expiry used by execution.
-                    active_label = ""
-                    active_timestamp = ""
-                    expiry_aligned = False
-                    alignment_failure = ""
-                    if response and response.get("s") == "ok":
-                        from engine.expiry_manager import expiry_manager
-                        if not expiry_manager.expiries:
-                            expiry_manager.pre_market_check()
-                        expiry_key = (
-                            "active_monthly"
-                            if index_symbol in {"BANKNIFTY", "MIDCPNIFTY"}
-                            else "active_weekly"
-                        )
-                        active_label = expiry_manager.effective_expiry(index_symbol, expiry_key)
-                        expiry_rows = response.get("data", {}).get("expiryData", []) or []
-                        active_date = ""
-                        if active_label:
-                            try:
-                                active_date = datetime.strptime(
-                                    active_label, "%d%b%Y"
-                                ).strftime("%d-%m-%Y")
-                            except ValueError:
-                                active_date = ""
-                        for expiry_row in expiry_rows:
-                            if str(expiry_row.get("date") or "") == active_date:
-                                active_timestamp = str(expiry_row.get("expiry") or "")
-                                break
-                        if active_timestamp:
-                            default_expiry_date = (
-                                str(expiry_rows[0].get("date") or "")
-                                if expiry_rows
-                                else ""
-                            )
-                            if default_expiry_date == active_date:
-                                # Fyers returns the first expiryData contract when the
-                                # timestamp is omitted. Re-requesting that same chain
-                                # adds a failure point and previously discarded a valid
-                                # response when the redundant request transiently failed.
-                                expiry_aligned = True
-                                logger.info(
-                                    f"Fyers default option chain is already aligned to "
-                                    f"active expiry {active_label} for {index_symbol}."
-                                )
-                            else:
-                                aligned_request = {**data, "timestamp": active_timestamp}
-                                aligned_ok, aligned_response = self._call_fyers_bounded(
-                                    "optionchain",
-                                    data=aligned_request,
-                                    label=f"Fyers option chain {fyers_symbol} {active_timestamp}",
-                                )
-                                if not aligned_ok:
-                                    aligned_response = None
-                                aligned_rows = (
-                                    aligned_response.get("data", {}).get("optionsChain", [])
-                                    if isinstance(aligned_response, dict)
-                                    and aligned_response.get("s") == "ok"
-                                    else []
-                                )
-                                if aligned_rows:
-                                    response = aligned_response
-                                    expiry_aligned = True
-                                    logger.info(
-                                        f"Fyers option chain aligned to active expiry "
-                                        f"{active_label} for {index_symbol}."
-                                    )
-                                else:
-                                    status = (
-                                        aligned_response.get("s")
-                                        if isinstance(aligned_response, dict)
-                                        else "no response"
-                                    )
-                                    alignment_failure = (
-                                        f"active-expiry refetch failed (status={status})"
-                                    )
-                        elif active_label:
-                            alignment_failure = (
-                                f"active expiry {active_label} is absent from the Fyers response"
-                            )
-                        else:
-                            alignment_failure = "execution active expiry is unavailable"
-
-                    if alignment_failure:
-                        # A generic Fyers chain can belong to a different expiry than
-                        # execution. Never let it—or a cache from the prior rollover—
-                        # become fresh-entry intelligence merely because it has depth.
-                        self._opt_chain_cache.pop(cache_key, None)
-                        self._last_opt_chain_fetch[cache_key] = now
-                        self._last_opt_chain_error[cache_key] = now
-                        self._option_chain_meta[index_symbol] = {
-                            "source": "fyers",
-                            "fetched_at": now,
-                            "strike_count": 0,
-                            "fallback": False,
-                            "active_expiry": active_label,
-                            "expiry_aligned": False,
-                            "oi_change_source": "none",
-                            "unavailable_reason": alignment_failure,
-                        }
-                        logger.warning(
-                            f"Fyers option chain rejected for {index_symbol}: "
-                            f"{alignment_failure}; trying AngelOne verified fallback."
-                        )
-                        response = None
-                    
-                    if response and response.get('s') == 'ok':
-                        chain_data = response.get('data', {}).get('optionsChain', [])
-                        logger.info(f"Fyers optionsChain length: {len(chain_data)}")
-                        df = pd.DataFrame(chain_data)
-                        # Filter out index row
-                        df = df[df['strike_price'] > 0]
-                        
-                        ce_df = df[df['option_type'] == 'CE'].rename(columns={
-                            'oi': 'call_oi', 'volume': 'call_volume', 'strike_price': 'strike',
-                            'oich': 'call_oi_change', 'ltp': 'call_ltp',
-                            'symbol': 'call_symbol', 'fyToken': 'call_token',
-                        })
-                        pe_df = df[df['option_type'] == 'PE'].rename(columns={
-                            'oi': 'put_oi', 'volume': 'put_volume', 'strike_price': 'strike',
-                            'oich': 'put_oi_change', 'ltp': 'put_ltp',
-                            'symbol': 'put_symbol', 'fyToken': 'put_token',
-                        })
-                        
-                        # Merge on strike
-                        ce_cols = [
-                            col for col in (
-                                'strike', 'call_oi', 'call_volume', 'call_oi_change',
-                                'call_ltp', 'call_symbol', 'call_token',
-                            ) if col in ce_df.columns
-                        ]
-                        pe_cols = [
-                            col for col in (
-                                'strike', 'put_oi', 'put_volume', 'put_oi_change',
-                                'put_ltp', 'put_symbol', 'put_token',
-                            ) if col in pe_df.columns
-                        ]
-                        chain = pd.merge(ce_df[ce_cols], pe_df[pe_cols], on='strike', how='outer')
-                        # Other legacy fields use zero defaults. Volume must preserve
-                        # missing legs/values as unavailable rather than inactivity.
-                        volumes = {}
-                        for side in ("call", "put"):
-                            column = side + "_volume"
-                            values = pd.to_numeric(chain.get(column, pd.Series(float("nan"), index=chain.index)), errors="coerce")
-                            volumes[column] = values.where(np.isfinite(values) & values.ge(0))
-                        chain = chain.fillna(0)
-                        for column, values in volumes.items():
-                            chain[column] = values
-                            chain[column + "_available"] = values.notna()
-                        if self._fyers_backup_enabled():
-                            for prefix in ("call", "put"):
-                                chain[prefix+"_day_oi_change"] = chain.get(prefix+"_oi_change", float("nan"))
-                            chain["day_oi_change_provider"] = "fyers"
-                            chain["day_oi_change_received_at"] = now
-                        try:
-                            chain = self._augment_chain_oi_from_kite(
-                                index_symbol, chain, expiry=str(active_label or "")
-                            )
-                        except TypeError as exc:
-                            # Legacy overlay adapters cannot prove contract identity.
-                            if "expiry" not in str(exc).lower():
-                                raise
-                            pass  # No unpinned legacy overlay; preserve primary data.
-                        chain.attrs["provider"] = "fyers"
-                        chain = self._apply_option_oi_snapshot_deltas(
-                            index_symbol,
-                            chain,
-                            provider=str(chain.attrs.get("oi_provider") or "fyers"),
-                            expiry=str(active_label or "") if "active_label" in locals() else "",
-                        )
-                        chain.attrs["expiry"] = str(active_label or "")
-                        chain.attrs["provider"] = "fyers"
-                        chain.attrs["observation_id"] = (
-                            f"fyers|{str(active_label or 'ACTIVE')}|{int(now * 1000)}"
-                        )
-                        chain.attrs.setdefault("observed_at", now)
-                        volume_complete = self._chain_volume_is_usable(chain)
-                        chain.attrs["volume_complete"] = volume_complete
-                        self._option_chain_meta[index_symbol] = {
-                            "source": "fyers",
-                            "fetched_at": now,
-                            "strike_count": int(len(chain)),
-                            "fallback": False,
-                            "active_expiry": active_label,
-                            "expiry_aligned": expiry_aligned,
-                            "volume_complete": volume_complete,
-                            "oi_change_source": str(chain["oi_change_source"].iloc[0]) if not chain.empty else "none",
-                        }
-                        if self._fyers_backup_enabled():
-                            self._option_chain_meta[index_symbol].update(
-                                role="backup", fallback=True,
-                                auto_certified=bool(len(chain) >= 3 and expiry_aligned and self._chain_oi_is_usable(chain) and volume_complete),
-                                reported_day_oi_available=bool(chain[["call_day_oi_change", "put_day_oi_change"]].notna().all().all()),
-                                backup_reason="preferred_chain_unavailable_or_incomplete")
-                        self._archive_option_chain(index_symbol, chain, now, self._option_chain_meta[index_symbol])
-                        
-                        logger.info(f"✅ Fyers Option Chain fetched successfully for {index_symbol}")
-                        self._opt_chain_cache[cache_key] = chain
-                        self._last_opt_chain_fetch[cache_key] = now
-                        # A successful backup satisfies this request. A failed preferred
-                        # provider must not delay the next healthy backup refresh.
-                        self._last_opt_chain_error.pop(cache_key, None)
-                        self._fyers_chain_failure_streak = 0
-                        return chain
-                    self._last_opt_chain_fetch[cache_key] = now
-                    self._last_opt_chain_error[cache_key] = now
-                    self._maybe_self_heal_fyers(f"optionchain error status for {index_symbol}")
-                except Exception as e:
-                    self._last_opt_chain_fetch[cache_key] = now
-                    self._last_opt_chain_error[cache_key] = now
-                    self._maybe_self_heal_fyers(f"optionchain exception for {index_symbol}")
-                    logger.warning(f"⚠️ Fyers Option Chain fetch failed: {e}. Falling back to AngelOne...")
-
-        if self._fyers_backup_enabled():
-            # Preserve the broad result and its refusal metadata; never replace it
-            # with a second, narrower five-pair request after all three routes fail.
-            if replacement_chain is not None and not replacement_chain.empty:
-                self._option_chain_meta[index_symbol] = replacement_meta
-                self._opt_chain_cache[cache_key] = replacement_chain
-                return replacement_chain
-            self._option_chain_meta[index_symbol] = {
-                "source": "unavailable", "fetched_at": now, "strike_count": 0,
-                "fallback": True, "auto_certified": False, "expiry_aligned": False,
-                "unavailable_reason": "kite_angelone_fyers_chain_unavailable"}
-            return pd.DataFrame()
-
-        # ══ FALLBACK TO ANGELONE (five nearest complete real CE/PE pairs) ══
-        spot = self.get_latest_price(index_symbol)
-        if spot <= 0:
-            self._last_opt_chain_error[cache_key] = now
-            return pd.DataFrame()
-        
-        interval = INDEX_STRIKE_INTERVALS.get(index_symbol, 50)
-        atm = round(spot / interval) * interval
-        
-        angel_source = getattr(self, "angel_index", None)
-        contract_pairs = []
-        # Resolve each strike from execution's active-expiry contract master first.
-        # AngelOne then maps those exact identities to its own tokens and quotes all
-        # ten legs in one FULL market-data request.
-        candidate_strikes = (
-            atm,
-            atm - interval,
-            atm + interval,
-            atm - (2 * interval),
-            atm + (2 * interval),
-        )
-        if angel_source is not None and hasattr(angel_source, "get_option_pairs"):
-            for candidate_strike in candidate_strikes:
-                ce_candidate = self.get_option_token(index_symbol, candidate_strike, "CE")
-                pe_candidate = self.get_option_token(index_symbol, candidate_strike, "PE")
-                if not ce_candidate or not pe_candidate:
-                    continue
-                contract_pairs.append((ce_candidate, pe_candidate))
-        option_pairs = (
-            angel_source.get_option_pairs(index_symbol, contract_pairs)
-            if angel_source is not None and hasattr(angel_source, "get_option_pairs")
-            else []
-        )
-        if not option_pairs:
-            reason = str(getattr(angel_source, "last_error", "") or "unavailable")
-            self._last_opt_chain_error[cache_key] = now
-            self._option_chain_meta[index_symbol] = {
-                "source": "angelone",
-                "fetched_at": now,
-                "strike_count": 0,
-                "fallback": True,
-                "auto_certified": False,
-                "expiry_aligned": False,
-                "unavailable_reason": reason,
-                "oi_change_source": "none",
-            }
-            logger.warning(
-                f"AngelOne option-pair fallback unavailable for {index_symbol}: {reason}."
-            )
-            return pd.DataFrame()
-
-        rows = []
-        for option_pair in option_pairs:
-            ce_data = option_pair["CE"]
-            pe_data = option_pair["PE"]
-            strike = float(option_pair.get("strike") or 0.0)
-            if strike <= 0:
-                continue
-            rows.append({
-                'strike': strike,
-                'call_oi': ce_data['oi'],
-                'call_oi_change': 0,
-                'call_volume': ce_data['volume'],
-                'call_volume_available': ce_data.get('volume_available', pd.notna(ce_data['volume'])),
-                'call_ltp': ce_data['ltp'],
-                'put_oi': pe_data['oi'],
-                'put_oi_change': 0,
-                'put_volume': pe_data['volume'],
-                'put_volume_available': pe_data.get('volume_available', pd.notna(pe_data['volume'])),
-                'put_ltp': pe_data['ltp'],
-                'call_symbol': ce_data['symbol'], 'put_symbol': pe_data['symbol'],
-                'call_token': ce_data['token'], 'put_token': pe_data['token'],
-                # Angel FULL has no broker IV/Greeks. Do not add placeholders;
-                # intelligence may derive IV later from these genuine premiums.
-                'is_atm': bool(abs(strike - atm) < 1e-9),
-            })
-        if not rows:
-            self._last_opt_chain_error[cache_key] = now
-            return pd.DataFrame()
-        active_expiry = str(option_pairs[0].get("expiry") or "")
-        df = self._apply_option_oi_snapshot_deltas(
-            index_symbol,
-            pd.DataFrame(rows),
-            provider="angelone",
-            expiry=active_expiry,
-        )
-        expiry_values = {
-            str(item.get("expiry") or "") for item in option_pairs
-            if str(item.get("expiry") or "")
-        }
-        expiry_aligned = bool(active_expiry and len(expiry_values) == 1)
-        paired_oi_rows = int(
-            (
-                (pd.to_numeric(df['call_oi'], errors='coerce').fillna(0) > 0)
-                & (pd.to_numeric(df['put_oi'], errors='coerce').fillna(0) > 0)
-            ).sum()
-        )
-        volume_complete = self._chain_volume_is_usable(df)
-        df.attrs["volume_complete"] = volume_complete
-        auto_certified = bool(len(df) >= 3 and paired_oi_rows >= 3 and expiry_aligned and volume_complete)
-        self._option_chain_meta[index_symbol] = {
-            "source": "angelone_near_atm_realtime",
-            "fetched_at": now,
-            "strike_count": int(len(df)),
-            "fallback": True,
-            "auto_certified": auto_certified,
-            "volume_complete": volume_complete,
-            "active_expiry": active_expiry,
-            "expiry_aligned": expiry_aligned,
-            "usable_pair_rows": paired_oi_rows,
-            "requested_atm": atm,
-            "resolved_strikes": [float(value) for value in df['strike'].tolist()],
-            "oi_change_source": str(df["oi_change_source"].iloc[0]) if not df.empty else "none",
-        }
-        self._archive_option_chain(index_symbol, df, now, self._option_chain_meta[index_symbol])
-        
-        # Cache the result so we don't REST-fetch again within 60s
-        self._opt_chain_cache[cache_key] = df
-        self._last_opt_chain_fetch[cache_key] = now
-        
-        logger.info(
-            f"AngelOne real option market data fetched for {index_symbol} "
-            f"({len(df)} complete near-ATM strike pairs; requested ATM={atm})"
-        )
-        return df
-
-    def _option_oi_snapshot_guard(self) -> Any:
-        lock = getattr(self, "_option_oi_snapshot_lock", None)
-        if lock is None:
-            lock = self._option_oi_snapshot_file_lock
-            self._option_oi_snapshot_lock = lock
-        return lock
-
-    def _load_option_oi_snapshots(self) -> Dict[str, Any]:
-        with self._option_oi_snapshot_guard():
-            snapshots = getattr(self, "_option_oi_snapshots", None)
-            if isinstance(snapshots, dict):
-                return snapshots
-            path = Path("data_store/option_oi_snapshots.json")
+        # 1. Primary: Upstox option chain
+        upstox_client = getattr(self, "upstox", None)
+        if upstox_client is not None and (upstox_client.is_healthy(threshold_seconds=30.0) or upstox_client.failure_duration() < 30.0):
             try:
-                snapshots = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                chain = upstox_client.get_option_chain_df(index_symbol)
+                if chain is not None and not chain.empty:
+                    self._opt_chain_cache[cache_key] = chain
+                    self._last_opt_chain_fetch[cache_key] = now
+                    return chain
             except Exception as exc:
-                logger.warning(f"Option OI snapshot history could not be loaded: {exc}")
-                snapshots = {}
-            self._option_oi_snapshots = snapshots if isinstance(snapshots, dict) else {}
-            return self._option_oi_snapshots
+                logger.warning(f"Upstox option chain fetch failed for {index_symbol}: {exc}")
 
-    def _save_option_oi_snapshots(self) -> None:
-        with self._option_oi_snapshot_guard():
-            path = Path("data_store/option_oi_snapshots.json")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp = path.with_name(
-                f"{path.name}.{threading.get_ident()}.{time.time_ns()}.tmp"
-            )
-            try:
-                temp.write_text(
-                    json.dumps(self._option_oi_snapshots, separators=(",", ":")),
-                    encoding="utf-8",
-                )
-                # Windows raises PermissionError (WinError 32) on os.replace when a
-                # reader (another thread or a concurrent process such as an audit/
-                # replay run) still holds the destination open. Retry with capped
-                # exponential backoff so the brief lock window is absorbed rather
-                # than dropping the snapshot tick. Non-order-path.
-                attempts = 6
-                for attempt in range(attempts):
-                    try:
-                        temp.replace(path)
-                        break
-                    except OSError:
-                        if attempt == attempts - 1:
-                            raise
-                        time.sleep(min(0.4, 0.05 * (2 ** attempt)))
-            except Exception as exc:
-                logger.warning(f"Option OI snapshot history could not be saved: {exc}")
-                try:
-                    temp.unlink(missing_ok=True)
-                except Exception as cleanup_exc:
-                    logger.debug(f"Option OI temp cleanup failed for {temp}: {cleanup_exc}")
+        # 2. Fallback: Angel One option chain if Upstox fails > 30s
+        logger.info(f"Using Angel One option chain fallback for {index_symbol}")
+        try:
+            fallback_chain = self._get_replacement_option_chain(index_symbol, now)
+            if fallback_chain is not None and not fallback_chain.empty:
+                self._opt_chain_cache[cache_key] = fallback_chain
+                self._last_opt_chain_fetch[cache_key] = now
+                return fallback_chain
+        except Exception as exc:
+            logger.warning(f"Angel One option chain fallback failed for {index_symbol}: {exc}")
 
-    def _apply_option_oi_snapshot_deltas(
-        self,
-        index_symbol: str,
-        chain: pd.DataFrame,
-        provider: str,
-        expiry: str = "",
-    ) -> pd.DataFrame:
-        with self._option_oi_snapshot_guard():
-            return self._apply_option_oi_snapshot_deltas_locked(
-                index_symbol,
-                chain,
-                provider,
-                expiry=expiry,
-            )
-
-    def _apply_option_oi_snapshot_deltas_locked(
-        self,
-        index_symbol: str,
-        chain: pd.DataFrame,
-        provider: str,
-        expiry: str = "",
-    ) -> pd.DataFrame:
-        """Use provider OI-change when real; otherwise derive it from snapshots."""
-        if chain is None or chain.empty:
-            return chain
-        normalized = chain.copy()
-        for column in ("strike", "call_oi", "put_oi", "call_oi_change", "put_oi_change"):
-            if column not in normalized.columns:
-                normalized[column] = 0
-            normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0)
-
-        reported_abs = float(
-            normalized["call_oi_change"].abs().sum()
-            + normalized["put_oi_change"].abs().sum()
-        )
-        session_key = datetime.now().date().isoformat()
-        captured_now = time.time()
-        # Key by instrument+expiry only (no session): the most recent snapshot is
-        # the baseline for the next poll regardless of session boundary. OI is
-        # cumulative and carries overnight, so the first poll of a new session
-        # deltas against the prior session's close (day-over-day OI change)
-        # instead of producing a neutral warmup. A staleness window guards
-        # against deltas across long downtime (system off > a weekend/holiday).
-        snapshot_key = f"{str(index_symbol).upper()}|{str(expiry or 'ACTIVE').upper()}"
-        snapshots = self._load_option_oi_snapshots()
-        previous = snapshots.get(snapshot_key, {})
-        previous_rows = previous.get("rows", {}) if isinstance(previous, dict) else {}
-        previous_provider = str(previous.get("provider", "")) if isinstance(previous, dict) else ""
-        previous_session = str(previous.get("session", "")) if isinstance(previous, dict) else ""
-        previous_captured = (
-            float(previous.get("captured_at", 0.0) or 0.0) if isinstance(previous, dict) else 0.0
-        )
-        max_age = float(getattr(self, "_oi_snapshot_max_age_seconds", 4 * 86400))
-        snapshot_fresh = bool(previous_rows) and (captured_now - previous_captured) <= max_age
-        provider_matches = bool(previous_provider and previous_provider == str(provider))
-        snapshot_horizon = max(0.0, captured_now - previous_captured) if previous_captured else None
-
-        if reported_abs > 0:
-            source = f"{provider}_reported"
-        elif snapshot_fresh and provider_matches:
-            call_changes = []
-            put_changes = []
-            for _, row in normalized.iterrows():
-                strike_key = str(float(row["strike"]))
-                prior = previous_rows.get(strike_key, {})
-                call_changes.append(float(row["call_oi"]) - float(prior.get("call_oi", row["call_oi"])))
-                put_changes.append(float(row["put_oi"]) - float(prior.get("put_oi", row["put_oi"])))
-            normalized["call_oi_change"] = call_changes
-            normalized["put_oi_change"] = put_changes
-            if previous_session and previous_session != session_key:
-                source = f"{provider}_overnight_delta"
-            else:
-                source = f"{provider}_snapshot_delta"
-        else:
-            normalized["call_oi_change"] = 0
-            normalized["put_oi_change"] = 0
-            source = (
-                f"{provider}_provider_switch_warmup"
-                if snapshot_fresh and previous_provider and not provider_matches
-                else f"{provider}_snapshot_warmup"
-            )
-
-        normalized["oi_change_source"] = source
-        normalized["oi_change_horizon_seconds"] = (
-            86400.0 if source.endswith("_reported") else (snapshot_horizon or 0.0)
-        )
-        snapshots[snapshot_key] = {
-            "provider": provider,
-            "expiry": expiry,
-            "session": session_key,
-            "captured_at": captured_now,
-            "rows": {
-                str(float(row["strike"])): {
-                    "call_oi": float(row["call_oi"]),
-                    "put_oi": float(row["put_oi"]),
-                }
-                for _, row in normalized.iterrows()
-            },
-        }
-        self._option_oi_snapshots = snapshots
-        self._save_option_oi_snapshots()
-        normalized.attrs["oi_change_source"] = source
-        quote_provider = str(chain.attrs.get("provider") or provider)
-        normalized.attrs.update(instrument=index_symbol, expiry=str(expiry), provider=quote_provider, oi_provider=str(provider),
-                                observation_id=f"{provider}|{expiry}|{captured_now}",
-                                observed_at=captured_now)
-        for _, row in normalized.iterrows():
-            for side in ("call", "put"):
-                contract = str(row.get(f"{side}_symbol") or f"{index_symbol}|{expiry}|{row['strike']}|{side}")
-                participation_provider = quote_provider if quote_provider == provider else f"{quote_provider}|oi:{provider}"
-                self._participation_store().observe(index_symbol, "options", participation_provider, contract,
-                    captured_now, float(row.get(f"{side}_volume") or 0),
-                    oi=float(row.get(f"{side}_oi") or 0), price=float(row.get(f"{side}_ltp") or 0),
-                    clock="receipt", expiry=str(expiry), option_type="CE" if side == "call" else "PE",
-                    strike=float(row["strike"]))
-        normalized.attrs["oi_change_horizon_seconds"] = float(
-            normalized["oi_change_horizon_seconds"].iloc[0]
-        )
-        return normalized
+        if cached_chain is not None and not cached_chain.empty:
+            return cached_chain
+        return pd.DataFrame()
 
     def fetch_instruments(self):
         from engine.expiry_manager import expiry_manager

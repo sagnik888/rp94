@@ -101,7 +101,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupChartEventListeners();
     setupSettingsEventListeners();
     setupEventListeners();
-    completeFyersRedirectIfPresent();
+    completeUpstoxRedirectIfPresent();
     updateMarketTime();
     setInterval(updateMarketTime, 1000);
 });
@@ -2147,51 +2147,50 @@ function setupEventListeners() {
     });
 
 
-    // ═══ FYERS AUTH MODAL LISTENERS ═══
-    const closeFyersAuth = document.getElementById('closeFyersAuth');
-    if (closeFyersAuth) {
-        closeFyersAuth.addEventListener('click', () => {
-            document.getElementById('fyersAuthModal').style.display = 'none';
+    // ═══ UPSTOX AUTH MODAL LISTENERS ═══
+    const closeUpstoxAuth = document.getElementById('closeUpstoxAuth');
+    if (closeUpstoxAuth) {
+        closeUpstoxAuth.addEventListener('click', () => {
+            const modal = document.getElementById('upstoxAuthModal');
+            if (modal) modal.style.display = 'none';
         });
     }
 
-    const submitFyersAuth = document.getElementById('submitFyersAuth');
-    if (submitFyersAuth) {
-        submitFyersAuth.addEventListener('click', () => {
-            const input = document.getElementById('fyersAuthInput');
+    const submitUpstoxAuth = document.getElementById('submitUpstoxAuth');
+    if (submitUpstoxAuth) {
+        submitUpstoxAuth.addEventListener('click', () => {
+            const input = document.getElementById('upstoxAuthInput');
             if (input && input.value) {
-                submitFyersCode(input.value);
-                document.getElementById('fyersAuthModal').style.display = 'none';
-                input.value = ''; // Clear for next time
+                submitUpstoxCode(input.value);
+                const modal = document.getElementById('upstoxAuthModal');
+                if (modal) modal.style.display = 'none';
+                input.value = '';
             } else {
-                showToast('Please paste the URL first', 'warning');
+                showToast('Please paste URL, Auth Code, or Token', 'warning');
             }
         });
     }
 
-    const retryFyersLogin = document.getElementById('retryFyersLogin');
-    if (retryFyersLogin) {
-        retryFyersLogin.addEventListener('click', () => {
-            document.getElementById('fyersAuthModal').style.display = 'none';
-            startFyersAuthFlow(); // Re-trigger flow
+    const retryUpstoxLogin = document.getElementById('retryUpstoxLogin');
+    if (retryUpstoxLogin) {
+        retryUpstoxLogin.addEventListener('click', () => {
+            startUpstoxAuthFlow();
         });
     }
 
-    // ═══ AUTO MODE SWITCH (Top Bar) ═══
-    const fyersBadge = document.getElementById('gw_fyers');
-    if (fyersBadge) {
-        fyersBadge.onclick = startFyersAuthFlow;
-        fyersBadge.title = 'Fyers Data Status. Click to refresh login.';
+    const upstoxBadge = document.getElementById('gw_upstox');
+    if (upstoxBadge) {
+        upstoxBadge.style.cursor = 'pointer';
+        upstoxBadge.onclick = startUpstoxAuthFlow;
+        upstoxBadge.title = 'Upstox Primary Broker. Click to log in / refresh.';
     }
 
-    // The Kite access token dies every morning, so the badge doubles as the login
-    // button — a red KITE badge means no order can reach the exchange.
+    // Hidden legacy stubs
+    const closeFyersAuth = document.getElementById('closeFyersAuth');
+    const submitFyersAuth = document.getElementById('submitFyersAuth');
+    const retryFyersLogin = document.getElementById('retryFyersLogin');
+    const fyersBadge = document.getElementById('gw_fyers');
     const kiteBadge = document.getElementById('gw_kite');
-    if (kiteBadge) {
-        kiteBadge.style.cursor = 'pointer';
-        kiteBadge.onclick = startKiteAuthFlow;
-        kiteBadge.title = 'Zerodha Kite session. Click to log in (token expires daily).';
-    }
 
     const autoSwitch = document.getElementById('autoModeSwitch');
     if (autoSwitch) {
@@ -2461,133 +2460,107 @@ function showToast(message, type = 'info') {
     setTimeout(() => { if(toast.parentElement) dismiss(); }, 5000);
 }
 
-async function completeFyersRedirectIfPresent() {
+async function completeUpstoxRedirectIfPresent() {
     const params = new URLSearchParams(window.location.search);
-    const authCode = params.get('auth_code') || params.get('code');
+    const authCode = params.get('code') || params.get('auth_code');
     if (!authCode) return;
 
     try {
-        showToast('Completing Fyers login...', 'info');
-        await submitFyersCode(authCode);
+        showToast('Completing Upstox login...', 'info');
+        await submitUpstoxCode(authCode);
     } finally {
         window.history.replaceState({}, document.title, window.location.pathname);
     }
 }
 
-async function startKiteAuthFlow() {
-    // The login URL is fetched over an AUTHENTICATED XHR, then opened. Navigating
-    // straight to a server route cannot work: a new tab sends no x-dashboard-token
-    // header, so the request is rejected as Unauthorized. Same shape as Fyers below.
+async function startUpstoxAuthFlow() {
     let loginWindow = null;
     try {
-        loginWindow = window.open('about:blank', '_blank');   // opened on the click, or popups block it
-        if (loginWindow) {
-            loginWindow.opener = null;
-            loginWindow.document.write('<!doctype html><title>Kite Login</title><body style="font-family:sans-serif;background:#070a0f;color:#e7edf6;padding:24px">Preparing Zerodha Kite login...</body>');
-        }
-        const res = await authFetch('/api/kite_auth_url', { cache: 'no-store' });
-        const data = await res.json();
-        if (data.status !== 'ok' || !data.auth_url) {
-            if (loginWindow && !loginWindow.closed) loginWindow.close();
-            showToast(data.message || 'Unable to start the Kite login', 'error');
-            return;
-        }
-        if (loginWindow && !loginWindow.closed) {
-            loginWindow.location.href = data.auth_url;
-        } else {
-            window.open(data.auth_url, '_blank');
-        }
-        showToast('Complete the Kite login in the new tab. The token lasts until tomorrow morning.', 'info');
-    } catch (err) {
-        if (loginWindow && !loginWindow.closed) loginWindow.close();
-        showToast('Kite login failed to start: ' + err.message, 'error');
-    }
-}
-
-async function startFyersAuthFlow() {
-    let loginWindow = null;
-    try {
-        // Open synchronously from the click event, then replace the URL after
-        // the backend generates it. This avoids popup blocking while still
-        // letting the modal show errors and a reusable login link.
         loginWindow = window.open('about:blank', '_blank');
         if (loginWindow) {
             loginWindow.opener = null;
-            loginWindow.document.write('<!doctype html><title>Fyers Login</title><body style="font-family:sans-serif;background:#070a0f;color:#e7edf6;padding:24px">Preparing Fyers login...</body>');
+            loginWindow.document.write('<!doctype html><title>Upstox Login</title><body style="font-family:sans-serif;background:#070a0f;color:#e7edf6;padding:24px">Preparing Upstox login...</body>');
         }
-        const res = await authFetch('/api/fyers_auth', { cache: 'no-store' });
+        const res = await authFetch('/api/upstox_auth_url', { cache: 'no-store' });
         const data = await res.json();
         if (data.status !== 'ok' || !data.auth_url) {
             if (loginWindow && !loginWindow.closed) loginWindow.close();
-            showToast(data.message || 'Unable to start Fyers login', 'error');
+            showToast(data.message || 'Unable to start Upstox login', 'error');
             return;
         }
 
-        const loginLink = document.getElementById('openFyersLogin');
+        const loginLink = document.getElementById('openUpstoxLogin');
         if (loginLink) {
             loginLink.href = data.auth_url;
-            loginLink.classList.remove('disabled');
         }
 
         if (loginWindow && !loginWindow.closed) {
             loginWindow.location.href = data.auth_url;
         } else {
-            showToast('Popup blocked. Use the Open Login button in the Fyers modal.', 'warning');
+            showToast('Popup blocked. Use Open Login button in Upstox modal.', 'warning');
         }
-        
-        // Show dedicated UI Modal
-        const modal = document.getElementById('fyersAuthModal');
+
+        const modal = document.getElementById('upstoxAuthModal');
         if (modal) {
             modal.style.display = 'flex';
-            const input = document.getElementById('fyersAuthInput');
+            const input = document.getElementById('upstoxAuthInput');
             if (input) input.focus();
         }
+        showToast('Complete login in new tab (token valid for 24h).', 'info');
     } catch (err) {
         if (loginWindow && !loginWindow.closed) loginWindow.close();
-        showToast('Fyers login flow failed: ' + err.message, 'error');
+        showToast('Upstox login failed to start: ' + err.message, 'error');
     }
 }
 
-async function submitFyersCode(authCode) {
+async function submitUpstoxCode(inputVal) {
     try {
-        const submit = await authFetch('/api/fyers_auth', {
+        let code = String(inputVal || '').trim();
+        if (code.includes('code=')) {
+            try {
+                const urlObj = new URL(code.startsWith('http') ? code : 'http://dummy/' + code);
+                code = urlObj.searchParams.get('code') || code;
+            } catch (e) {}
+        }
+        const isJwt = code.startsWith('eyJ');
+        const submit = await authFetch('/api/upstox_auth', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ auth_code: authCode })
+            body: JSON.stringify(isJwt ? { token: code } : { code: code })
         });
         const result = await submit.json();
         if (result.status === 'ok') {
-            showToast('Fyers token updated. Live Fyers data restored.', 'success');
-            window.sendCommand({ cmd: 'get_state' });
+            showToast('Upstox token updated. Primary broker connected.', 'success');
+            if (window.sendCommand) window.sendCommand({ cmd: 'get_state' });
         } else {
-            showToast(result.message || 'Fyers token update failed', 'error');
+            showToast(result.message || 'Upstox auth update failed', 'error');
         }
     } catch (err) {
         showToast('Submission failed: ' + err.message, 'error');
     }
 }
 
+// Backward compatibility aliases
+async function startKiteAuthFlow() { return startUpstoxAuthFlow(); }
+async function startFyersAuthFlow() { return startUpstoxAuthFlow(); }
+async function submitFyersCode(code) { return submitUpstoxCode(code); }
+async function completeFyersRedirectIfPresent() { return completeUpstoxRedirectIfPresent(); }
+
 function updateGatewayStatus(status) {
     status = status || {};
-    const replacement = status.market_data_replacement || {};
-    const candidateRoute = replacement.route === 'kite_angel';
-    const threeProviderRoute = replacement.route === 'angel_fyers';
-    const angelSupplementary = candidateRoute || threeProviderRoute;
-    const kiteSessionKnown = Object.prototype.hasOwnProperty.call(status || {}, 'kite_session_live');
-    const kiteOnline = kiteSessionKnown
-        ? status.kite_session_live === true && status.kite_data_fresh !== false
-        : status.kite === true;
-    const angel = status.angelone_index_quotes || {};
-    const angelAge = Number(angelSupplementary ? status.angelone_tick_age_seconds : angel.last_success_age_seconds);
-    const angelOnline = angelSupplementary ? status.angelone === true : (angel.connected === true
-        && (!Number.isFinite(angelAge) || angelAge <= 15));
-    const angelStandby = angel.configured === true && !angelOnline;
+    const upstox = status.upstox || {};
+    const upstoxOnline = status.upstox_healthy === true || status.upstox_session_live === true || upstox.healthy === true;
+    const brokerStatus = status.broker_status || {};
+    const failoverActive = brokerStatus.failover_active === true;
+    const angelOnline = status.angelone === true || failoverActive;
+
     const gateways = {
-        'gw_kite': kiteOnline,
-        'gw_fyers': status.fyers,
+        'gw_upstox': upstoxOnline,
         'gw_angelone': angelOnline,
+        'gw_kite': false,
+        'gw_fyers': false,
     };
-    
+
     for (const [id, isOnline] of Object.entries(gateways)) {
         const el = document.getElementById(id);
         if (el) {
@@ -2601,53 +2574,24 @@ function updateGatewayStatus(status) {
             }
         }
     }
+
+    const upstoxEl = document.getElementById('gw_upstox');
+    if (upstoxEl) {
+        upstoxEl.title = upstoxOnline
+            ? 'Upstox Primary Broker LIVE & Ready. Click to view/refresh.'
+            : 'Upstox Primary Broker offline / unauthenticated. Click to log in.';
+    }
+
     const angelEl = document.getElementById('gw_angelone');
     if (angelEl) {
-        angelEl.classList.toggle('standby', angelStandby);
-        angelEl.classList.toggle('offline', !angelOnline && !angelStandby);
-        angelEl.classList.toggle('online', angelOnline);
-        const ageText = Number.isFinite(angelAge)
-            ? `${formatQuoteAge(angelAge)} since last AngelOne quote`
-            : 'no AngelOne quote used this session';
-        angelEl.title = angelOnline
-            ? `AngelOne price-only index fallback active; ${ageText}. Spot-index volume is unavailable by design.`
-            : (angelStandby
-                ? 'AngelOne price-only index fallback configured and standing by. It authenticates only when Kite and Fyers price sources need fallback.'
-                : `AngelOne index fallback unavailable: ${angel.last_error || 'credentials not configured'}.`);
-        if (angelSupplementary) {
-            angelEl.title = `AngelOne supplementary feed ${angelOnline ? 'active' : 'unavailable'}; ${ageText}. `
-                + (threeProviderRoute
-                    ? 'Kite retains execution authority. FYERS remains backup, including cash-index volume.'
-                    : 'Kite retains execution authority. Two broker sources; feature parity pending validation.');
-        }
-    }
-    const kiteEl = document.getElementById('gw_kite');
-    if (kiteEl) {
-        const age = Number(status.kite_tick_age_seconds);
-        const ageText = Number.isFinite(age) ? `${formatQuoteAge(age)} since last tick` : 'tick age unavailable';
-        kiteEl.title = kiteOnline
-            ? `Kite order session live; ${ageText}. Click to inspect/login.`
-            : `Kite order session or data feed unavailable; ${ageText}. Click to log in.`;
-    }
-    const fyersEl = document.getElementById('gw_fyers');
-    if (fyersEl) {
-        fyersEl.style.display = candidateRoute ? 'none' : '';
-        const authRequired = !!status.fyers_auth_required;
-        const refreshDisabled = !!status.fyers_refresh_disabled;
-        fyersEl.classList.toggle('auth-required', authRequired || refreshDisabled || !status.fyers);
-        fyersEl.title = authRequired
-            ? `Fyers login required: ${status.fyers_auth_reason || 'manual authorization needed'}. Click to reconnect.`
-            : (refreshDisabled ? 'Fyers refresh requires manual login. Click to reconnect.' : 'Fyers Data Status. Click to refresh login.');
-        fyersEl.onclick = startFyersAuthFlow;
-        if (threeProviderRoute && !authRequired && !refreshDisabled) {
-            fyersEl.title = 'FYERS backup for feed failures and capabilities requiring cash-index volume. Click to refresh login.';
-        }
-        if (authRequired && !state.fyersAuthToastShown) {
-            state.fyersAuthToastShown = true;
-            showToast('Fyers login required. Click FYERS badge to reconnect.', 'warning');
-        }
-        if (!authRequired) {
-            state.fyersAuthToastShown = false;
+        if (failoverActive) {
+            angelEl.classList.remove('standby', 'offline');
+            angelEl.classList.add('online');
+            angelEl.title = '⚠️ ANGEL ONE ACTIVE (Failover from Upstox > 30s)';
+        } else {
+            angelEl.classList.remove('online', 'offline');
+            angelEl.classList.add('standby');
+            angelEl.title = 'Angel One Backup Broker (Standby - triggers if Upstox fails > 30s)';
         }
     }
 }

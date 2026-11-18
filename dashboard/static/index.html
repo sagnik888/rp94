@@ -241,15 +241,14 @@
                 </div>
 
                 <div class="gateway-status-panel">
-                    <div class="gateway-badge" id="gw_kite" title="Zerodha Kite Status. Click to log in.">
-                        <span class="gw-dot"></span> KITE
+                    <div class="gateway-badge" id="gw_upstox" title="Upstox Primary Broker. Click to log in.">
+                        <span class="gw-dot"></span> UPSTOX
                     </div>
-                    <div class="gateway-badge" id="gw_fyers" title="Fyers Data Status">
-                        <span class="gw-dot"></span> FYERS
+                    <div class="gateway-badge" id="gw_angelone" title="AngelOne 30s Fallback Broker">
+                        <span class="gw-dot"></span> ANGEL (BACKUP)
                     </div>
-                    <div class="gateway-badge" id="gw_angelone" title="AngelOne price-only index fallback status">
-                        <span class="gw-dot"></span> ANGEL
-                    </div>
+                    <div class="gateway-badge" id="gw_kite" style="display:none;"></div>
+                    <div class="gateway-badge" id="gw_fyers" style="display:none;"></div>
                 </div>
             </div>
             <div class="chart-container" id="mainChart">
@@ -823,29 +822,32 @@
         </div>
     </div>
 
-    <!-- ═══ FYERS AUTH MODAL ═══ -->
-    <div class="modal-overlay" id="fyersAuthModal" style="display:none">
+    <!-- ═══ UPSTOX AUTH MODAL ═══ -->
+    <div class="modal-overlay" id="upstoxAuthModal" style="display:none">
         <div class="modal" style="max-width: 500px;">
             <div class="modal-header">
-                <h3>🔌 Fyers Authentication</h3>
-                <button class="modal-close" id="closeFyersAuth">✕</button>
+                <h3>🔌 Upstox Authentication</h3>
+                <button class="modal-close" id="closeUpstoxAuth">✕</button>
             </div>
             <div class="modal-body">
                 <p style="font-size: 0.85rem; margin-bottom: 15px; color: var(--text-secondary);">
-                    Fyers login opened in a new tab. Complete the login, then paste the final Redirect URL below.
+                    Upstox login opens in a new tab. Complete login or paste Auth Code / Token below.
                 </p>
                 <div class="setting-group">
-                    <label>Fyers Redirect URL / Auth Code</label>
-                    <input type="text" id="fyersAuthInput" placeholder="http://127.0.0.1:8001/?s=ok&auth_code=..." style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary); border-radius: 4px;">
+                    <label>Upstox Auth Code / Access Token / Redirect URL</label>
+                    <input type="text" id="upstoxAuthInput" placeholder="Paste code=... or JWT access token..." style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary); border-radius: 4px;">
                 </div>
                 <div style="margin-top: 20px; display: flex; gap: 10px;">
-                    <a class="settings-btn" id="openFyersLogin" href="/api/fyers_login" target="_blank" rel="noopener noreferrer" style="flex: 0.7; padding: 10px; border-radius: 6px; text-align: center; text-decoration: none;">Open Login</a>
-                    <button class="btn-primary" id="submitFyersAuth" style="flex: 1;">Connect Fyers</button>
-                    <button class="settings-btn" id="retryFyersLogin" style="flex: 0.5; padding: 10px; border-radius: 6px;">Retry Login</button>
+                    <a class="settings-btn" id="openUpstoxLogin" href="/api/upstox_login" target="_blank" rel="noopener noreferrer" style="flex: 0.7; padding: 10px; border-radius: 6px; text-align: center; text-decoration: none;">Open Login</a>
+                    <button class="btn-primary" id="submitUpstoxAuth" style="flex: 1;">Connect Upstox</button>
+                    <button class="settings-btn" id="retryUpstoxLogin" style="flex: 0.5; padding: 10px; border-radius: 6px;">Refresh</button>
                 </div>
+                <div id="upstoxAuthStatusMsg" style="margin-top: 10px; font-size: 12px; color: var(--text-secondary);"></div>
             </div>
         </div>
     </div>
+    <!-- Hidden legacy stubs -->
+    <div id="fyersAuthModal" style="display:none"><button id="closeFyersAuth"></button><input id="fyersAuthInput" /><button id="submitFyersAuth"></button><button id="retryFyersLogin"></button><a id="openFyersLogin"></a></div>
 
     <!-- ═══ TOAST NOTIFICATION ═══ -->
     <div class="toast-container" id="toastContainer"></div>

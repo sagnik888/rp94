@@ -51,6 +51,8 @@ def timeframe_entry_timeframes(value: Any) -> frozenset[str]:
 
 
 PROTECTED_SECRET_ENV_KEYS = {
+    "UPSTOX_API_SECRET",
+    "UPSTOX_PASSWORD",
     "ANGELONE_API_KEY",
     "ANGELONE_PASSWORD",
     "ANGELONE_PIN",
@@ -95,7 +97,19 @@ def _clean_env_secret(value: Any) -> str:
 class Settings(BaseSettings):
     """Main application settings loaded from .env"""
 
-    # ─── AngelOne API ────────────────────────────────────────
+    # ─── Upstox API v2 (Primary Broker) ──────────────────────
+    upstox_user_id: str = "7JATYL"
+    upstox_password: str = "173089"
+    upstox_api_name: str = "ut1"
+    upstox_api_key: str = "65a99933-034f-4d67-8061-aaec628a07ea"
+    upstox_api_secret: str = "a8311dytif"
+    upstox_redirect_uri: str = "http://127.0.0.1:8500/api/upstox/callback"
+    upstox_public_ip: str = "122.176.31.168"
+    upstox_token_file: str = "upstox_token.json"
+    upstox_http_timeout_seconds: float = 7.0
+    upstox_failover_threshold_seconds: float = 30.0
+
+    # ─── AngelOne API (Backup / Fallback Broker) ─────────────
     # ── Zerodha Kite Connect (primary broker) ────────────────────────────────
     # Kite has no password login: the account password is never stored or used by
     # this system. A browser login issues a request_token, which is exchanged for an
@@ -189,7 +203,7 @@ class Settings(BaseSettings):
     # Kite owns execution. Angel One supplements it; FYERS remains a capability
     # backup, including constituent volume until replacement parity is proven.
     # The earlier two-provider candidate and legacy route remain selectable.
-    supplementary_market_data: Literal["fyers", "kite_angel", "angel_fyers"] = "angel_fyers"
+    supplementary_market_data: Literal["upstox", "upstox_angel", "fyers", "kite_angel", "angel_fyers"] = "upstox_angel"
     replacement_chain_strikes_each_side: int = 30
     constituent_membership_file: str = "data_store/index_constituents.json"
     constituent_history_refresh_seconds: float = 60.0

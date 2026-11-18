@@ -3482,33 +3482,126 @@ async def api_recalibrate(request: Request):
     return {"status": "ok", "message": "System recalibration initiated"}
 
 
-@app.get("/api/fyers_auth")
-async def api_fyers_auth_start(request: Request):
+@app.get("/api/upstox_auth_url")
+async def api_upstox_auth_url(request: Request):
+    """Return the OAuth login URL for Upstox."""
     if not _request_authorized(request):
         return {"status": "error", "message": "Unauthorized"}
-    if not scanner_ref:
-        return {"status": "error", "message": "Scanner is still starting. Try again in a few seconds."}
+    from data.upstox_auth import get_upstox_auth_url
+    try:
+        return {"status": "ok", "auth_url": get_upstox_auth_url()}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/api/upstox_login")
+@app.get("/api/upstox/callback")
+async def api_upstox_login(request: Request):
+    """Handle Upstox browser login or OAuth code callback."""
+    code = str(request.query_params.get("code") or "").strip()
+    from data.upstox_auth import get_upstox_auth_url, exchange_code_for_token
+    if not code:
+        try:
+            return RedirectResponse(get_upstox_auth_url())
+        except Exception as exc:
+            return HTMLResponse(f"Cannot start Upstox login: {exc}", status_code=500)
 
     try:
-        auth = scanner_ref.data.get_fyers_auth_status()
-        auth_url = scanner_ref.data.get_fyers_auth_url()
-        return {"status": "ok", "auth": auth, "auth_url": auth_url}
+        res = exchange_code_for_token(code)
+        if res.get("status") == "success":
+            return HTMLResponse(
+                f"<h3>✅ Upstox Login Successful</h3><p>Connected as {res.get('user_id', 'User')}. Token refreshed for 24h.</p>"
+                f"<script>window.opener && window.opener.postMessage('upstox_auth_complete', '*'); setTimeout(() => window.close(), 2500);</script>"
+            )
+        else:
+            return HTMLResponse(
+                f"<h3>❌ Upstox Login Failed</h3><p>{res.get('message')}</p>",
+                status_code=400,
+            )
     except Exception as exc:
-        logger.exception(f"Unable to start Fyers login: {exc}")
-        return {"status": "error", "message": f"Unable to start Fyers login: {exc}"}
+        logger.exception(f"Upstox login callback failed: {exc}")
+        return HTMLResponse(f"<h3>Upstox login failed</h3><p>{exc}</p>", status_code=500)
+
+
+@app.post("/api/upstox_auth")
+async def api_upstox_auth(request: Request):
+    """Update or exchange Upstox token manually or via code."""
+    if not _request_authorized(request):
+        return {"status": "error", "message": "Unauthorized"}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    code = str(payload.get("code") or payload.get("auth_code") or "").strip()
+    token = str(payload.get("token") or payload.get("access_token") or "").strip()
+    from data.upstox_auth import exchange_code_for_token, save_upstox_token, get_upstox_auth_status
+    if token:
+        save_upstox_token(token)
+        return {"status": "ok", "message": "Upstox token saved", "auth": get_upstox_auth_status()}
+    if code:
+        try:
+            res = exchange_code_for_token(code)
+            return {"status": "ok", "data": res, "auth": get_upstox_auth_status()}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+    return {"status": "error", "message": "No code or token provided"}
+
+
+@app.get("/api/upstox_status")
+async def api_upstox_status(request: Request):
+    """Return Upstox session and token validity status."""
+    if not (_request_authorized(request) or _is_loopback_client(request)):
+        return {"status": "error", "message": "Unauthorized"}
+    from data.upstox_auth import get_upstox_auth_status
+    return make_serializable(get_upstox_auth_status())
+
+
+@app.get("/api/broker_status")
+async def api_broker_status(request: Request):
+    """Return failover state (Upstox primary, Angel One fallback)."""
+    if not (_request_authorized(request) or _is_loopback_client(request)):
+        return {"status": "error", "message": "Unauthorized"}
+    failover_status = {}
+    if scanner_ref and hasattr(scanner_ref, "trades") and hasattr(scanner_ref.trades, "real_broker"):
+        broker = scanner_ref.trades.real_broker
+        if hasattr(broker, "get_failover_status"):
+            failover_status = broker.get_failover_status()
+    from data.upstox_auth import get_upstox_auth_status
+    return {
+        "status": "ok",
+        "failover": failover_status,
+        "upstox_auth": get_upstox_auth_status(),
+    }
+
+
+@app.post("/api/upstox_postback")
+async def api_upstox_postback(request: Request):
+    """Receive Upstox webhook order postback and relay to TradeManager."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "message": "malformed payload"}
+    if not isinstance(payload, dict):
+        return {"status": "error", "message": "malformed payload"}
+    logger.info(f"Upstox postback received: {payload}")
+    try:
+        if scanner_ref is not None:
+            handler = getattr(getattr(scanner_ref, "trades", None), "on_broker_postback", None)
+            if callable(handler):
+                handler(dict(payload))
+    except Exception as exc:
+        logger.exception(f"Upstox postback handling failed: {exc}")
+    return {"status": "ok"}
+
+
+@app.get("/api/fyers_auth")
+async def api_fyers_auth_start(request: Request):
+    return {"status": "deprecated", "message": "Fyers removed; use /api/upstox_auth"}
 
 
 @app.get("/api/fyers_login")
 async def api_fyers_login_redirect(request: Request):
-    if not _request_authorized(request):
-        return HTMLResponse("Unauthorized", status_code=401)
-    if not scanner_ref:
-        return HTMLResponse("System not ready", status_code=503)
-    try:
-        auth_url = scanner_ref.data.get_fyers_auth_url()
-        return RedirectResponse(auth_url)
-    except Exception as exc:
-        return HTMLResponse(f"Error generating Fyers URL: {exc}", status_code=500)
+    return RedirectResponse("/api/upstox_login")
 
 def _is_loopback_client(request: Request) -> bool:
     """True when the request came from this machine.
