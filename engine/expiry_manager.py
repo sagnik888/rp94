@@ -120,11 +120,7 @@ class ExpiryManager:
             blocked_until = float(getattr(self, "_master_failure_until", 0.0) or 0.0)
             if not force and time.monotonic() < blocked_until:
                 return False
-            # Kite is the primary broker, so its contract master is the only source of
-            # truth for what can actually be traded. There is deliberately NO AngelOne
-            # fallback: that path resolved AngelOne tradingsymbols (NIFTY04AUG2624350CE,
-            # strikes x100) which Kite cannot trade, and it did so silently — the log
-            # said "Resolved NIFTY: Weekly=04AUG2026" and looked entirely healthy.
+            # Check Kite master if available; otherwise fallback to AngelOne ScripMaster
             frame = self._kite_master_frame()
             if frame is not None and not frame.empty:
                 self._master_failure_until = 0.0     # a live session clears the cooldown
@@ -138,8 +134,12 @@ class ExpiryManager:
                     logger.debug(f"Could not cache the Kite master: {exc}")
                 return True
 
-            # Same-day Kite cache only. Contracts expire, so a stale file is refused
-            # rather than used to resolve a contract that no longer exists.
+            # Fallback to AngelOne ScripMaster (backup broker and public master)
+            if self._retired_angelone_download(force=force):
+                self._master_failure_until = 0.0
+                return True
+
+            # Same-day Kite cache only
             if self.KITE_CACHE_FILE.exists():
                 cached_on = datetime.fromtimestamp(
                     self.KITE_CACHE_FILE.stat().st_mtime
@@ -165,9 +165,7 @@ class ExpiryManager:
 
             self._master_failure_until = time.monotonic() + self.MASTER_RETRY_COOLDOWN_SECONDS
             logger.critical(
-                "No Kite contract master available — contract resolution is DISABLED "
-                "until you complete the daily login at /api/kite_login. No AngelOne "
-                f"fallback exists: its symbols are not tradeable on Kite. "
+                "No contract master available (Kite session missing and AngelOne fallback failed). "
                 f"(retrying at most every {self.MASTER_RETRY_COOLDOWN_SECONDS:.0f}s)"
             )
             return False
