@@ -241,7 +241,7 @@
                 </div>
 
                 <div class="gateway-status-panel">
-                    <div class="gateway-badge" id="gw_upstox" title="Upstox Primary Broker. Click to log in.">
+                    <div class="gateway-badge" id="gw_upstox" style="cursor: pointer;" onclick="window.startUpstoxAuthFlow && window.startUpstoxAuthFlow()" title="Upstox Primary Broker. Click to log in / refresh.">
                         <span class="gw-dot"></span> UPSTOX
                     </div>
                     <div class="gateway-badge" id="gw_angelone" title="AngelOne 30s Fallback Broker">
@@ -827,7 +827,7 @@
         <div class="modal" style="max-width: 500px;">
             <div class="modal-header">
                 <h3>🔌 Upstox Authentication</h3>
-                <button class="modal-close" id="closeUpstoxAuth">✕</button>
+                <button class="modal-close" id="closeUpstoxAuth" onclick="document.getElementById('upstoxAuthModal').style.display='none'">✕</button>
             </div>
             <div class="modal-body">
                 <p style="font-size: 0.85rem; margin-bottom: 15px; color: var(--text-secondary);">

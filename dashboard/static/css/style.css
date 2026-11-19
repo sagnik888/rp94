@@ -971,7 +971,12 @@ html, body {
     padding: 2px 5px; border-radius: 4px;
     font-size: 8px; font-weight: 800; font-family: var(--mono);
     background: rgba(255,255,255,0.03); border: 1px solid var(--border);
-    color: var(--text-muted); transition: all 0.3s;
+    color: var(--text-muted); transition: all 0.2s;
+    cursor: pointer; user-select: none;
+}
+.gateway-badge:hover {
+    filter: brightness(1.25);
+    box-shadow: 0 0 6px rgba(255,255,255,0.08);
 }
 .gateway-badge.online { color: var(--green); border-color: var(--green-dim); background: var(--green-dim); }
 .gateway-badge.offline { color: var(--red); border-color: var(--red-dim); background: var(--red-dim); }

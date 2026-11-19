@@ -2156,6 +2156,13 @@ function setupEventListeners() {
         });
     }
 
+    const upstoxModal = document.getElementById('upstoxAuthModal');
+    if (upstoxModal) {
+        upstoxModal.addEventListener('click', (e) => {
+            if (e.target === upstoxModal) upstoxModal.style.display = 'none';
+        });
+    }
+
     const submitUpstoxAuth = document.getElementById('submitUpstoxAuth');
     if (submitUpstoxAuth) {
         submitUpstoxAuth.addEventListener('click', () => {
@@ -2173,8 +2180,26 @@ function setupEventListeners() {
 
     const retryUpstoxLogin = document.getElementById('retryUpstoxLogin');
     if (retryUpstoxLogin) {
-        retryUpstoxLogin.addEventListener('click', () => {
-            startUpstoxAuthFlow();
+        retryUpstoxLogin.addEventListener('click', async () => {
+            const statusMsg = document.getElementById('upstoxAuthStatusMsg');
+            if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--text-secondary)">Checking...</span>';
+            try {
+                const res = await authFetch('/api/upstox_status', { cache: 'no-store' });
+                const st = await res.json();
+                if (statusMsg) {
+                    if (st.connected || st.authenticated) {
+                        statusMsg.innerHTML = `<span style="color:var(--green)">✅ Session ACTIVE (${st.user_id || '7JATYL'}). Expires: ${st.expires_at || '24h'} (${st.hours_remaining || 0}h left)</span>`;
+                        showToast('Upstox session is live and connected!', 'success');
+                        if (window.sendCommand) window.sendCommand({ cmd: 'get_state' });
+                        refreshDashboardSnapshot('upstox_refresh');
+                    } else {
+                        statusMsg.innerHTML = `<span style="color:var(--red)">⚠️ Status: ${st.status || 'OFFLINE'} — ${st.reason || 'Auth needed'}</span>`;
+                        showToast('Upstox: ' + (st.reason || 'Authentication required'), 'warning');
+                    }
+                }
+            } catch (e) {
+                if (statusMsg) statusMsg.innerHTML = `<span style="color:var(--red)">Probe error: ${e.message}</span>`;
+            }
         });
     }
 
@@ -2484,46 +2509,60 @@ async function completeUpstoxRedirectIfPresent() {
 }
 
 async function startUpstoxAuthFlow() {
-    let loginWindow = null;
-    try {
-        loginWindow = window.open('about:blank', '_blank');
-        if (loginWindow) {
-            loginWindow.opener = null;
-            loginWindow.document.write('<!doctype html><title>Upstox Login</title><body style="font-family:sans-serif;background:#070a0f;color:#e7edf6;padding:24px">Preparing Upstox login...</body>');
-        }
-        const res = await authFetch('/api/upstox_auth_url', { cache: 'no-store' });
-        const data = await res.json();
-        if (data.status !== 'ok' || !data.auth_url) {
-            if (loginWindow && !loginWindow.closed) loginWindow.close();
-            showToast(data.message || 'Unable to start Upstox login', 'error');
-            return;
-        }
+    // 1. Immediately open modal so badge click is responsive instantly
+    const modal = document.getElementById('upstoxAuthModal');
+    if (modal) {
+        modal.style.display = 'flex';
+        const input = document.getElementById('upstoxAuthInput');
+        if (input) input.focus();
+    }
+    const statusMsg = document.getElementById('upstoxAuthStatusMsg');
+    if (statusMsg) {
+        statusMsg.innerHTML = '<span style="color:var(--text-secondary)">Checking Upstox session...</span>';
+    }
 
+    try {
+        const [statusRes, urlRes] = await Promise.allSettled([
+            authFetch('/api/upstox_status', { cache: 'no-store' }),
+            authFetch('/api/upstox_auth_url', { cache: 'no-store' })
+        ]);
+
+        let authUrl = '/api/upstox_login';
+        if (urlRes.status === 'fulfilled') {
+            try {
+                const uData = await urlRes.value.json();
+                if (uData.status === 'ok' && uData.auth_url) {
+                    authUrl = uData.auth_url;
+                }
+            } catch (e) {}
+        }
         const loginLink = document.getElementById('openUpstoxLogin');
         if (loginLink) {
-            loginLink.href = data.auth_url;
+            loginLink.href = authUrl;
         }
 
-        if (loginWindow && !loginWindow.closed) {
-            loginWindow.location.href = data.auth_url;
-        } else {
-            showToast('Popup blocked. Use Open Login button in Upstox modal.', 'warning');
+        if (statusRes.status === 'fulfilled') {
+            try {
+                const sData = await statusRes.value.json();
+                if (statusMsg) {
+                    if (sData.authenticated || sData.connected) {
+                        statusMsg.innerHTML = `<span style="color:var(--green)">✅ Session ACTIVE (${sData.user_id || '7JATYL'}). Expires: ${sData.expires_at || '24h'} (${sData.hours_remaining || 0}h left)</span>`;
+                    } else {
+                        statusMsg.innerHTML = `<span style="color:var(--red)">⚠️ Status: ${sData.status || 'OFFLINE'} — ${sData.reason || 'Login required'}. Click "Open Login" or paste token below.</span>`;
+                    }
+                }
+            } catch (e) {}
         }
-
-        const modal = document.getElementById('upstoxAuthModal');
-        if (modal) {
-            modal.style.display = 'flex';
-            const input = document.getElementById('upstoxAuthInput');
-            if (input) input.focus();
-        }
-        showToast('Complete login in new tab (token valid for 24h).', 'info');
     } catch (err) {
-        if (loginWindow && !loginWindow.closed) loginWindow.close();
-        showToast('Upstox login failed to start: ' + err.message, 'error');
+        if (statusMsg) {
+            statusMsg.innerHTML = `<span style="color:var(--red)">⚠️ Error checking status: ${err.message}</span>`;
+        }
     }
 }
+window.startUpstoxAuthFlow = startUpstoxAuthFlow;
 
 async function submitUpstoxCode(inputVal) {
+    const statusMsg = document.getElementById('upstoxAuthStatusMsg');
     try {
         let code = String(inputVal || '').trim();
         if (code.includes('code=')) {
@@ -2533,6 +2572,7 @@ async function submitUpstoxCode(inputVal) {
             } catch (e) {}
         }
         const isJwt = code.startsWith('eyJ');
+        if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--text-secondary)">Validating with Upstox...</span>';
         const submit = await authFetch('/api/upstox_auth', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2541,14 +2581,25 @@ async function submitUpstoxCode(inputVal) {
         const result = await submit.json();
         if (result.status === 'ok') {
             showToast('Upstox token updated. Primary broker connected.', 'success');
+            const modal = document.getElementById('upstoxAuthModal');
+            if (modal) modal.style.display = 'none';
             if (window.sendCommand) window.sendCommand({ cmd: 'get_state' });
+            refreshDashboardSnapshot('upstox_auth');
         } else {
-            showToast(result.message || 'Upstox auth update failed', 'error');
+            const errText = result.message || 'Upstox auth update failed';
+            showToast(errText, 'error');
+            if (statusMsg) {
+                statusMsg.innerHTML = `<span style="color:var(--red)">❌ ${errText}</span>`;
+            }
         }
     } catch (err) {
         showToast('Submission failed: ' + err.message, 'error');
+        if (statusMsg) {
+            statusMsg.innerHTML = `<span style="color:var(--red)">❌ Network error: ${err.message}</span>`;
+        }
     }
 }
+window.submitUpstoxCode = submitUpstoxCode;
 
 // Backward compatibility aliases
 async function startKiteAuthFlow() { return startUpstoxAuthFlow(); }
@@ -2587,9 +2638,11 @@ function updateGatewayStatus(status) {
 
     const upstoxEl = document.getElementById('gw_upstox');
     if (upstoxEl) {
+        upstoxEl.style.cursor = 'pointer';
+        upstoxEl.onclick = startUpstoxAuthFlow;
         upstoxEl.title = upstoxOnline
             ? 'Upstox Primary Broker LIVE & Ready. Click to view/refresh.'
-            : 'Upstox Primary Broker offline / unauthenticated. Click to log in.';
+            : 'Upstox Primary Broker offline / unauthenticated. Click to log in / refresh.';
     }
 
     const angelEl = document.getElementById('gw_angelone');
