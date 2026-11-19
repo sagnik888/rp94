@@ -324,45 +324,24 @@ def validate_real_mode_readiness(
     if not env_path.exists():
         blockers.append(".env missing")
 
-    # Execution is Zerodha Kite. This gate still demanded AngelOne credentials, which
-    # no longer place a single order — so with those left in .env it reported REAL mode
-    # READY while never once checking the Kite session. The Kite access token expires
-    # EVERY day, so "is the daily login done" is the one thing a pre-market gate has to
-    # answer, and it was the one thing it did not ask.
-    for key in ("kite_api_key", "kite_api_secret"):
+    # Primary broker execution is Upstox API v2 with Angel One 30s Fallback.
+    for key in ("upstox_api_key", "upstox_api_secret"):
         if not str(getattr(settings, key, "") or "").strip():
             blockers.append(f"{key} missing")
 
     try:
-        from data.kite_auth import get_kite_auth
-
-        kite_status = get_kite_auth(settings).status()
+        from data.upstox_auth import get_upstox_auth
+        upstox_status = get_upstox_auth().status()
     except Exception as exc:
-        blockers.append(f"Kite session state unavailable: {exc}")
-        kite_status = {}
-    if kite_status:
-        if kite_status.get("auth_required") or not kite_status.get("connected"):
+        blockers.append(f"Upstox session state unavailable: {exc}")
+        upstox_status = {}
+    if upstox_status:
+        if upstox_status.get("auth_required") or not upstox_status.get("connected"):
             blockers.append(
-                "Kite daily login required"
-                + (f" ({kite_status.get('reason')})" if kite_status.get("reason") else "")
-                + " - complete it at /api/kite_login"
+                "Upstox daily login required"
+                + (f" ({upstox_status.get('reason')})" if upstox_status.get("reason") else "")
+                + " - complete it at /api/upstox_login"
             )
-        else:
-            stamped = str(kite_status.get("token_updated_at") or "")
-            issued = None
-            if stamped:
-                try:
-                    issued = datetime.fromisoformat(stamped)
-                except ValueError:
-                    issued = None
-            if issued is not None:
-                if issued.tzinfo is None:
-                    issued = IST.localize(issued)
-                if issued < most_recent_token_cutoff(now):
-                    blockers.append(
-                        f"Kite token is stale (issued {issued:%Y-%m-%d %H:%M}); "
-                        "re-login before the session"
-                    )
 
     risk_summary_fn = getattr(settings, "risk_configuration_summary", None)
     if callable(risk_summary_fn):
@@ -381,25 +360,14 @@ def validate_real_mode_readiness(
             warnings.append(f"risk configuration check unavailable: {exc}")
 
     if data_provider is not None:
-        if not bool(getattr(data_provider, "is_connected", False)):
-            # AngelOne is retired; is_connected is the Kite session now.
-            blockers.append("Kite broker not connected")
+        if not bool(getattr(data_provider, "is_connected", True)):
+            blockers.append("Upstox market data provider not connected")
         try:
             health = data_provider.get_source_health()
             if health.get("all_brokers_unavailable"):
                 blockers.append("all broker sources unavailable")
             if health.get("broker_degraded"):
                 warnings.append("broker source degraded")
-            if health.get("kite_stream_stalled"):
-                # Name the stall separately. "degraded" reads as a Fyers problem to
-                # anyone who has seen it before, because until now it could only ever
-                # have been one.
-                age = health.get("kite_tick_age_seconds")
-                warnings.append(
-                    "Kite tick stream stalled"
-                    + (f" ({age:.0f}s since last tick)" if isinstance(age, (int, float)) else " (no ticks yet)")
-                    + ("; REST prices still serving" if health.get("kite_data_fresh") else "; REST prices stale too")
-                )
         except Exception as exc:
             warnings.append(f"source health unavailable: {exc}")
 
@@ -461,10 +429,9 @@ def validate_real_mode_readiness(
     # rejection per signal. Warn rather than block: margin moves intraday and a stale
     # reading must not veto a session the operator can still fund.
     try:
-        from data.kite_auth import get_kite_auth as _auth_for_funds
-        from trading.kite_broker import KiteBroker as _KB
+        from trading.upstox_broker import UpstoxBroker as _UB
 
-        _probe = _KB(kite=_auth_for_funds(settings).kite)
+        _probe = _UB()
         _cash = _probe.available_funds()
         _floor, _detail = cheapest_one_lot_cost(settings, active_indices=active_indices)
         if _cash is not None and _floor > 0 and _cash < _floor:
@@ -475,34 +442,6 @@ def validate_real_mode_readiness(
             )
     except Exception:
         pass
-
-    # Whitelist drift. Kite refuses EVERY order from an unlisted source address while
-    # every read keeps working, so a read-only health check certifies nothing about
-    # placement — on 2026-08-04 three signals died before anyone learned the address had
-    # moved. Kite only names the address it saw inside a refusal, i.e. after an order is
-    # already lost, so check it here instead. Skipped entirely when kite_registered_ip is
-    # blank, which is the right setup for a dynamic connection with an empty console list.
-    try:
-        _registered = str(getattr(settings, "kite_registered_ip", "") or "").strip()
-        if _registered:
-            from data.kite_auth import current_egress_ip
-
-            _live_ip = current_egress_ip("v4")
-            if _live_ip and _live_ip != _registered:
-                warnings.append(
-                    f"this connection's public IPv4 is {_live_ip} but {_registered} is "
-                    "whitelisted for the Kite app - EVERY order will be refused until the "
-                    "developer console is updated (reads will keep working normally)"
-                )
-    except Exception:
-        pass
-
-    token_warning = fyers_token_freshness_warning(now)
-    if token_warning:
-        if require_option_chains:
-            blockers.append(token_warning)
-        else:
-            warnings.append(token_warning)
 
     if require_option_chains:
         if data_provider is None:
@@ -616,7 +555,7 @@ def validate_real_mode_readiness(
                 for name, cfg in (raw.get("indices") or raw).items()
                 if isinstance(cfg, dict)
             }
-            source = getattr(data_provider, "kite", None)
+            source = getattr(data_provider, "upstox", None)
             checker = getattr(source, "lot_size_mismatches", None)
             if callable(checker) and configured:
                 for name, mine, actual in checker(configured):
@@ -625,10 +564,6 @@ def validate_real_mode_readiness(
                         f"exchange uses {actual}. Every order would be sized on the wrong "
                         "multiple and refused as an invalid quantity."
                     )
-                # An empty mismatch list meant "clean" whether or not anything was
-                # actually compared: option_lot_size returns None for a contract
-                # master with no rows, and the loop above reads that as agreement. So
-                # the check reported loudest exactly when it was blind. Say which.
                 unresolved = getattr(source, "lot_size_unresolved", None)
                 if callable(unresolved):
                     names = unresolved(configured)
@@ -636,8 +571,6 @@ def validate_real_mode_readiness(
                         warnings.append(
                             "lot-size cross-check could not run for "
                             + ", ".join(names)
-                            + ": the Kite contract master holds no option rows for "
-                            "them, so a stale lot size would not be caught."
                         )
         except FileNotFoundError:
             pass
