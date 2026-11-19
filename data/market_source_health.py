@@ -21,9 +21,22 @@ def build_source_health(
     # Kite health is session-based FIRST: a valid access token is what determines
     # whether orders work, and the stream being quiet must never read as "broker
     # down". Tick age is reported alongside so a stalled socket is still visible.
+    # Upstox Primary Broker Health
+    upstox_client = getattr(provider, "upstox", None)
+    upstox_healthy = False
+    upstox_session_live = False
+    if upstox_client is not None:
+        try:
+            from data.upstox_auth import get_upstox_auth_status
+            upstox_st = get_upstox_auth_status()
+            upstox_healthy = bool(upstox_st.get("authenticated")) and upstox_client.is_healthy()
+            upstox_session_live = bool(upstox_st.get("authenticated"))
+        except Exception:
+            pass
+
     kite_tick = float(getattr(provider, "_last_kite_ws_tick", 0.0) or 0.0)
     kite_age = None if kite_tick <= 0 else max(0.0, now - kite_tick)
-    kite_health = bool(provider.is_connected)
+    kite_health = bool(provider.is_connected) or upstox_healthy
     # provider.is_connected is a plain attribute assigned at connect()/rebind_kite() and
     # never revoked, so a token invalidated mid-session leaves it True forever.
     # KiteDataSource.is_connected is a live property (`auth.kite is not None`) and
@@ -86,7 +99,7 @@ def build_source_health(
         or (kite_rest_age is not None and kite_rest_age < freshness_threshold)
     )
     all_brokers_unavailable = bool(
-        is_live and not (kite_health and kite_data_fresh) and not supplementary_health
+        is_live and not (upstox_healthy or (kite_health and kite_data_fresh)) and not supplementary_health
     )
     yahoo_mode = (
         "emergency_used"
@@ -141,7 +154,11 @@ def build_source_health(
         "backup_provider": "fyers" if backup_enabled else ("angelone" if not replacement else None),
         "backup_degraded": bool(is_live and backup_enabled and not fyers_health),
         "broker_degraded": bool(
-            is_live and not (kite_health and kite_data_fresh and (angel_fresh if replacement else fyers_health))
+            is_live and (
+                (not upstox_healthy)
+                if upstox_client is not None
+                else not (kite_health and kite_data_fresh and (angel_fresh if replacement else fyers_health))
+            )
         ),
         "all_brokers_unavailable": all_brokers_unavailable,
         "fyers_auth_required": provider._fyers_auth_required,
@@ -216,7 +233,7 @@ def _source_record(
     # Order authority means "this feed comes from the broker we actually trade
     # through", which is Kite now. Leaving it matching "angel" marked every source as
     # non-authoritative once AngelOne was retired.
-    has_order_authority = str(name or "").startswith("kite")
+    has_order_authority = str(name or "").startswith("upstox") or str(name or "").startswith("kite")
     return {
         "source": name,
         "latency_class": latency_class,
@@ -291,11 +308,11 @@ def build_market_source_snapshot(
         source = str(cached_ltp.get("source") or "unknown")
         if source == "yahoo":
             records.append(_source_record("yahoo", cached_ltp, "DELAYED", False, now))
-        elif source in {"kite", "fyers", "angel_rest"}:
+        elif source in {"upstox", "kite", "fyers", "angel_rest"}:
             age = _age_seconds(cached_ltp, now)
             records.append(
                 _source_record(
-                    source if source == "angel_rest" else f"{source}_rest",
+                    source if source in {"angel_rest", "upstox"} else f"{source}_rest",
                     cached_ltp,
                     "NEAR_REALTIME",
                     age is not None and age <= 15.0,

@@ -33,7 +33,7 @@ class KiteAngelMigration:
         self._constituent_volume = ConstituentVolumeService(settings.constituent_membership_file) if self._replacement_enabled() else None
 
     def _replacement_enabled(self):
-        return getattr(self, "_market_data_route", "fyers") in {"kite_angel", "angel_fyers"}
+        return getattr(self, "_market_data_route", "fyers") in {"upstox", "upstox_angel", "kite_angel", "angel_fyers"}
 
     def _fyers_backup_enabled(self):
         return getattr(self, "_market_data_route", "fyers") == "angel_fyers"

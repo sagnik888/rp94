@@ -368,6 +368,13 @@ def validate_real_mode_readiness(
                 blockers.append("all broker sources unavailable")
             if health.get("broker_degraded"):
                 warnings.append("broker source degraded")
+            if health.get("kite_stream_stalled"):
+                age = health.get("kite_tick_age_seconds")
+                warnings.append(
+                    "Kite tick stream stalled"
+                    + (f" ({age:.0f}s since last tick)" if isinstance(age, (int, float)) else " (no ticks yet)")
+                    + ("; REST prices still serving" if health.get("kite_data_fresh") else "; REST prices stale too")
+                )
         except Exception as exc:
             warnings.append(f"source health unavailable: {exc}")
 

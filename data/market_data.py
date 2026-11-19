@@ -329,7 +329,7 @@ class MarketDataProvider(KiteAngelMigration):
         self._angel_prewarm_started = False
         self.kite = KiteDataSource(auth=None)
         self.on_kite_reauth = None
-        self.is_connected = False
+        self._is_connected_override = None
         self.kws = None                       # KiteTicker
         # Callable taking one Kite order-update payload. Wired by whoever owns the
         # TradeManager; when unset the feed only logs, so the socket is never coupled
@@ -1862,50 +1862,51 @@ class MarketDataProvider(KiteAngelMigration):
             return session
         return "REF"
 
+    @property
+    def is_connected(self) -> bool:
+        if getattr(self, "_is_connected_override", None) is not None:
+            return bool(self._is_connected_override)
+        upstox = getattr(self, "upstox", None)
+        if upstox is not None and upstox.is_healthy():
+            return True
+        try:
+            from data.upstox_auth import get_upstox_auth
+            return bool(get_upstox_auth().has_valid_token())
+        except Exception:
+            return False
+
+    @is_connected.setter
+    def is_connected(self, value):
+        self._is_connected_override = bool(value) if value is not None else None
+
     @retry_on_exception(retries=3, delay=1.0)
     def connect(self) -> bool:
-        """Bind market data to the shared Kite session.
+        """Bind market data to Upstox primary session with Angel One fallback.
 
-        There is nothing to retry here, unlike the AngelOne password+TOTP login this
-        replaces: a Kite session exists only if the operator completed the browser
-        login, and no amount of retrying creates one. Returning False with a clear
-        reason is the whole contract.
+        Primary execution and market data is Upstox API v2.
+        Angel One SmartAPI acts as the 30-second fallback if Upstox fails.
         """
         try:
-            from data.kite_auth import get_kite_auth
-
-            auth = get_kite_auth()
-            if auth.kite is None:
-                auth.load_cached_session()
-            self.kite = KiteDataSource(auth=auth)
-            self.is_connected = auth.kite is not None
-            if self.is_connected:
+            from data.upstox_auth import get_upstox_auth
+            auth = get_upstox_auth()
+            if auth.has_valid_token():
+                self.is_connected = True
+                status = auth.status()
                 logger.success(
-                    f"Kite market data connected ({auth.status().get('user_id') or 'user'})"
+                    f"Upstox market data connected ({status.get('user_name') or status.get('user_id') or 'user'})"
                 )
-                try:
-                    self.kite.load_instruments(("NFO", "BFO", "NSE", "BSE"))
-                    self._load_kite_index_tokens()
-                    # Index spot must stream from the open, before any option is
-                    # resolved, or the first candles of the session are REST-only.
-                    self._active_kite_tokens.update(self._kite_index_names)
-                    if self.start_streams:
-                        self.start_kite_ticker()
-                    else:
-                        logger.info("Kite WebSocket skipped for history-only provider.")
-                except Exception as exc:
-                    logger.warning(f"Kite contract master / ticker startup failed: {exc}")
+                if hasattr(self, "upstox") and self.upstox:
+                    self.upstox.reset_health()
             else:
-                logger.error(
-                    f"Kite market data unavailable: {auth.status().get('reason')}. "
-                    "Complete the daily login at /api/kite_login."
+                self.is_connected = False
+                logger.warning(
+                    "Upstox market data unavailable: daily login required. "
+                    "Complete login at /api/upstox_login"
                 )
-            # Remove first-hit fallback authentication latency without delaying Kite
-            # startup. AngelOne remains read-only and never changes execution state.
             self._prewarm_angelone_fallback()
-            return self.is_connected
+            return bool(self.is_connected)
         except Exception as e:
-            logger.error(f"Kite connection failed: {e}")
+            logger.error(f"Upstox connection failed: {e}")
             self.is_connected = False
             self._prewarm_angelone_fallback()
             return False
@@ -2608,6 +2609,9 @@ class MarketDataProvider(KiteAngelMigration):
         health["upstox_healthy"] = upstox_healthy
         health["upstox_session_live"] = upstox_healthy
         health["upstox_auth"] = upstox_auth
+        if upstox_healthy:
+            health["all_brokers_unavailable"] = False
+            health["broker_degraded"] = False
         remaining = max(
             0.0,
             float(getattr(self, "_angel_rest_backoff_until", 0.0) or 0.0) - time.time(),

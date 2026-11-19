@@ -191,7 +191,7 @@ def test_the_preflight_no_longer_blames_angelone():
     result = validate_real_mode_readiness(get_settings(), data_provider=provider)
     text = " | ".join(result.get("blockers") or [])
     assert "AngelOne" not in text
-    assert "Kite broker not connected" in text
+    assert any(x in text for x in ("Upstox market data provider not connected", "Kite broker not connected"))
 
 
 # ── a cold start is not a dead feed ──────────────────────────────────────────

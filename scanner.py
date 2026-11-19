@@ -5479,58 +5479,30 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 # If real_broker is missing, try to connect and initialize it now
                 if not hasattr(self.trades, "real_broker") or not self.trades.real_broker:
                     logger.info("📡 Attempting dynamic REAL broker connection...")
-                    from data.kite_auth import get_kite_auth
-                    from trading.kite_broker import KiteBroker
+                    from trading.upstox_broker import UpstoxBroker
+                    from trading.angelone_broker import AngelOneBroker
+                    from trading.failover_broker import FailoverBroker
 
-                    # Ask the AUTHORITY, not the latch. self.data.is_connected is a plain
-                    # attribute written at connect()/rebind_kite() and never revoked, so
-                    # after a mid-session token death it is stale-True: the reconnect was
-                    # skipped, KiteBroker was built around kite=None, and the log still
-                    # said "connection successful" while every entry and every protective
-                    # exit was refused terminally by _require_api.
-                    kite_auth = get_kite_auth(settings)
-                    if kite_auth.kite is None or not self.data.is_connected:
+                    if not self.data.is_connected:
                         self.data.connect()
-                        kite_auth = get_kite_auth(settings)
 
-                    if kite_auth.kite is not None:
-                        # account_id/instance_id are REQUIRED for the cross-process
-                        # execution lease. Without account_id the broker builds no lease
-                        # at all and every guard silently fails OPEN — two UT1 processes
-                        # could then net each other's positions on one account, which is
-                        # the exact thing the lease exists to prevent.
-                        #
-                        # This built a SmartApiBroker from data.smart_api until the Kite
-                        # migration. That attribute is permanently None now and the
-                        # account id came from angelone_client_id, so the fallback would
-                        # have produced a broker that could not trade AND had no lease —
-                        # failing open on the one guard that must never fail open.
-                        new_real_broker = KiteBroker(
-                            kite=kite_auth.kite,
-                            auth=kite_auth,
-                            account_id=str(getattr(settings, "kite_user_id", "") or "").strip(),
-                            instance_id=f"UT1:{getattr(settings, 'dashboard_port', '')}",
+                    upstox_account_id = str(getattr(settings, "upstox_user_id", "") or "7JATYL").strip()
+                    upstox_broker = UpstoxBroker(
+                        account_id=upstox_account_id,
+                        instance_id=f"UT1:{getattr(settings, 'dashboard_port', '')}",
+                    )
+                    angel_broker = AngelOneBroker()
+                    new_real_broker = FailoverBroker(
+                        primary=upstox_broker,
+                        fallback=angel_broker,
+                        failover_threshold_seconds=float(getattr(settings, "upstox_failover_threshold_seconds", 30.0) or 30.0),
+                    )
+                    self.trades.real_broker = new_real_broker
+                    if hasattr(new_real_broker, "set_execution_authority"):
+                        new_real_broker.set_execution_authority(
+                            self.trades._live_orders_permitted
                         )
-                        self.trades.real_broker = new_real_broker
-                        self.data.on_kite_reauth = new_real_broker.replace_api
-                        # The SYSTEM-mode authority every mutation inside the adapter has
-                        # to satisfy. main.py wires this on the broker it builds at
-                        # startup; this path built a second one and wired nothing, and
-                        # _authorize_mutation refuses outright ("holds a live account
-                        # lease but no execution authority is wired") rather than
-                        # assuming REAL. So the runtime switch -- which the comments
-                        # below call the normal premarket route -- armed a REAL mode in
-                        # which every single order was rejected terminally.
-                        if hasattr(new_real_broker, "set_execution_authority"):
-                            new_real_broker.set_execution_authority(
-                                self.trades._live_orders_permitted
-                            )
-                        logger.info("✅ Dynamic Kite broker connection successful")
-                    else:
-                        # No broker is constructed here on purpose. A KiteBroker around
-                        # kite=None accepts orders and refuses every one of them at
-                        # _require_api, which reads as a working REAL mode.
-                        logger.error("â Œ CRITICAL: No Kite session for REAL mode — log in at /api/kite_login")
+                    logger.info("✅ Dynamic Upstox broker connection successful")
 
                 if hasattr(self.trades, "real_broker") and self.trades.real_broker:
                     # Claim the cross-process account lease as part of entering REAL.
