@@ -6379,18 +6379,9 @@ class MarketDataProvider(KiteAngelMigration):
             except Exception as exc:
                 logger.warning(f"Upstox option chain fetch failed for {index_symbol}: {exc}")
 
-        # 2. Fallback: Angel One option chain if Upstox fails > 30s
-        logger.info(f"Using Angel One option chain fallback for {index_symbol}")
-        try:
-            fallback_chain = self._get_replacement_option_chain(index_symbol, now)
-            if fallback_chain is not None and not fallback_chain.empty:
-                self._opt_chain_cache[cache_key] = fallback_chain
-                self._last_opt_chain_fetch[cache_key] = now
-                return fallback_chain
-        except Exception as exc:
-            logger.warning(f"Angel One option chain fallback failed for {index_symbol}: {exc}")
-
+        # 2. Fallback: cached option chain if Upstox fails > 30s
         if cached_chain is not None and not cached_chain.empty:
+            logger.info(f"Using cached option chain fallback for {index_symbol}")
             return cached_chain
         return pd.DataFrame()
 

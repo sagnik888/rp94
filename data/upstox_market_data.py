@@ -75,12 +75,23 @@ class UpstoxMarketDataClient:
             self._consecutive_failures += 1
             self._last_error_reason = str(error)
 
+    def reset_health(self) -> None:
+        """Manually clear error state upon fresh login."""
+        with self._lock:
+            self._last_error_time = None
+            self._consecutive_failures = 0
+            self._last_error_reason = ""
+
     def is_healthy(self, threshold_seconds: float = 30.0) -> bool:
         """Return True if Upstox has not been continuously failing for > threshold_seconds."""
         with self._lock:
             if self._last_error_time is None:
                 return True
             failure_duration = time.monotonic() - self._last_error_time
+            # After 30s of failure, allow periodic probe retries every 10s to recover
+            if failure_duration >= threshold_seconds and time.monotonic() - getattr(self, "_last_retry_probe", 0) > 10.0:
+                self._last_retry_probe = time.monotonic()
+                return True
             return failure_duration < threshold_seconds
 
     def failure_duration(self) -> float:

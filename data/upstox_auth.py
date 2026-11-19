@@ -272,10 +272,30 @@ class UpstoxAuth:
                 last_error = str(e)
 
         if not result or not result.get("access_token"):
+            # If session is already authenticated and active, do not fail on duplicate/replayed code
+            if self.has_valid_token():
+                logger.info(
+                    f"Upstox auth code already redeemed or expired, but session is ALREADY ACTIVE for {self._user_id}."
+                )
+                return {
+                    "status": "success",
+                    "user_id": self._user_id,
+                    "user_name": self._user_name,
+                    "access_token": self._access_token,
+                    "expires_at": self._token_expires_at.isoformat() if self._token_expires_at else None,
+                    "connected": True,
+                    "note": "Authorization code already redeemed; active session retained.",
+                }
+
             detail = first_error or last_error
             hint = ""
             low = detail.lower()
-            if "udapi100016" in low:
+            if "udapi100057" in low:
+                hint = (
+                    " [UDAPI100057: Invalid Auth code. The authorization code expired (~2m) or was already redeemed. "
+                    "If already logged in, click Refresh in Upstox modal to sync session.]"
+                )
+            elif "udapi100016" in low:
                 hint = (
                     " [UDAPI100016: Invalid Credentials. The authorization code expired (~2m) or was already used. "
                     "Open Incognito window, visit /api/upstox_login, do NOT scan QR code: enter Phone -> OTP -> PIN (173089).]"
