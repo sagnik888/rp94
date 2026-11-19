@@ -274,11 +274,11 @@ class ScannerChartMixin:
                 timestamps = [chart_epoch_seconds(ts) for ts in df.index]
             else:
                 timestamps = (df.index.astype('int64') // 10**9).tolist() if hasattr(df.index, 'astype') else list(range(len(df)))
-            opens = df['open'].round(2).tolist()
-            highs = df['high'].round(2).tolist()
-            lows = df['low'].round(2).tolist()
-            closes = df['close'].round(2).tolist()
-            volumes = df['volume'].astype(int).tolist()
+            opens = df['open'].fillna(0.0).round(2).tolist() if 'open' in df.columns else [0.0] * len(df)
+            highs = df['high'].fillna(0.0).round(2).tolist() if 'high' in df.columns else [0.0] * len(df)
+            lows = df['low'].fillna(0.0).round(2).tolist() if 'low' in df.columns else [0.0] * len(df)
+            closes = df['close'].fillna(0.0).round(2).tolist() if 'close' in df.columns else [0.0] * len(df)
+            volumes = df['volume'].fillna(0).round().astype(int).tolist() if 'volume' in df.columns else [0] * len(df)
 
             candles_list = [
                 {"time": int(t), "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": int(v)}

@@ -5525,7 +5525,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     if callable(established) and not established():
                         reason = (
                             "REAL refused: broker has no account execution lease "
-                            "(kite_user_id is blank)"
+                            "(broker user_id is blank)"
                         )
                         logger.critical(f"❌ {reason}")
                         self._last_configure_block_reason = reason
@@ -5569,10 +5569,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             self.on_notification(f"REAL mode refused: {reason}", "error")
                         return False
                     self.trades.broker = self.trades.real_broker
-                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (Zerodha Kite)")
+                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (Upstox API v2 / Angel One Fallback)")
                 else:
                     logger.error("❌ CRITICAL: Attempted REAL mode without Broker connection!")
-                    self._last_configure_block_reason = "Kite broker not connected"
+                    self._last_configure_block_reason = "Upstox broker not connected"
                     self.mode = "HISTORICAL" # Safety fallback
                     self.runtime_mode = RuntimeMode.REPLAY.value
                     self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
@@ -5580,7 +5580,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self.trades.mode = self.mode
                     settings.trading_mode = replay_fallback_mode
                     if self.on_notification:
-                        self.on_notification("Failed to switch to REAL mode! Kite not connected.", "error")
+                        self.on_notification("Failed to switch to REAL mode! Upstox not connected.", "error")
             else:
                 # Historical Mode: Signals analysed from Real Historical Data
                 self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
@@ -14400,7 +14400,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             elif not source_ok:
                 why = f"index price is not from the primary broker feed ({source or 'no source'})"
             else:
-                why = "Kite index price is older than the freshness limit"
+                why = "Upstox/AngelOne index price is older than the freshness limit"
             self._note_index_quote_refusal(instrument, why)
             return 0.0, "", ""
         (getattr(self, "_index_quote_refusals", None) or {}).pop(str(instrument or "").upper(), None)
@@ -16065,14 +16065,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # hunting a feed outage that is not happening. Name the missing authority.
             logger.warning(
                 f"Blocked live entry for {instrument} {getattr(candidate, 'timeframe', '')} "
-                f"{getattr(candidate, 'direction', '')}: no order-authority (Kite) source "
+                f"{getattr(candidate, 'direction', '')}: no order-authority (Upstox) source "
                 f"is fresh; other feeds may be live but remain context-only and cannot "
                 f"authorise an entry. Sources seen: {observed}"
             )
             self._rtracker_record_candidate(
                 candidate,
                 decision="REJECTED",
-                reason="No order-authority (Kite) source is fresh",
+                reason="No order-authority (Upstox) source is fresh",
                 source="source_freshness_gate",
             )
         return allowed
@@ -34893,8 +34893,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         self._last_vix_unavailable_warning = now
         logger.warning(
             "India VIX has no live quote; volatility percentile falls back to a neutral "
-            "50 and data_store/vix_history.json stops growing. Check that the Fyers "
-            "quote for NSE:INDIAVIX-INDEX is reachable."
+            "50 and data_store/vix_history.json stops growing. Check that the Upstox "
+            "quote for NSE_INDEX|India VIX is reachable."
         )
 
     def _persist_vix_history(self) -> None:

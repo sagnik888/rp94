@@ -23,6 +23,8 @@ UPSTOX_INDEX_KEYS = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
     "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
     "SENSEX": "BSE_INDEX|SENSEX",
+    "INDIAVIX": "NSE_INDEX|India VIX",
+    "INDIA VIX": "NSE_INDEX|India VIX",
 }
 
 # Reverse mapping

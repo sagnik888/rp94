@@ -1188,6 +1188,21 @@ class MarketDataProvider(KiteAngelMigration):
         self._prewarm_angelone_fallback()
         started = []
 
+        # Check Upstox primary streaming / market data
+        try:
+            upstox = getattr(self, "upstox", None)
+            if upstox is not None and getattr(upstox, "is_healthy", lambda: False)():
+                started.append("Upstox")
+        except Exception as exc:
+            logger.error(f"Upstox activation after live-mode switch failed: {exc}")
+
+        try:
+            angel = getattr(self, "angel", None)
+            if angel is not None and getattr(angel, "is_healthy", lambda: False)():
+                started.append("AngelOne")
+        except Exception:
+            pass
+
         # Primary streaming cannot depend on FYERS' aggregate connection flag
         # or wait behind backup socket initialization.
         try:
@@ -4093,16 +4108,25 @@ class MarketDataProvider(KiteAngelMigration):
             self._last_ltp_time = time.time()
             return val
 
-        if self._replacement_enabled() and symbol == "INDIAVIX":
-            auxiliary = self._freshest_cached_index_quote(("angel:INDIAVIX",),
-                20.0 if self.is_market_open() else 86400.0, time.time())
-            if auxiliary is not None:
-                return _remember_ltp_time(auxiliary[1])
-            auxiliary_quote = self._replacement_auxiliary_quote()
-            if auxiliary_quote is not None:
-                with self._index_quote_guard():
-                    self._ws_cache["angel:INDIAVIX"] = auxiliary_quote
-                return _remember_ltp_time(auxiliary_quote)
+        if symbol == "INDIAVIX":
+            upstox_client = getattr(self, "upstox", None)
+            if upstox_client is not None:
+                try:
+                    vix_val = float(upstox_client.get_index_ltp("INDIAVIX") or 0.0)
+                    if vix_val > 0:
+                        return _remember_ltp_time(vix_val)
+                except Exception:
+                    pass
+            if self._replacement_enabled():
+                auxiliary = self._freshest_cached_index_quote(("angel:INDIAVIX",),
+                    20.0 if self.is_market_open() else 86400.0, time.time())
+                if auxiliary is not None:
+                    return _remember_ltp_time(auxiliary[1])
+                auxiliary_quote = self._replacement_auxiliary_quote()
+                if auxiliary_quote is not None:
+                    with self._index_quote_guard():
+                        self._ws_cache["angel:INDIAVIX"] = auxiliary_quote
+                    return _remember_ltp_time(auxiliary_quote)
 
         if symbol in INDEX_SPOT_TOKENS:
             now_ts = time.time()

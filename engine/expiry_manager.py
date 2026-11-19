@@ -52,6 +52,15 @@ class ExpiryManager:
             float(strike) * 100 and the closest-strike fallback divides by 100.
         """
         try:
+            from config import get_settings
+            cfg = get_settings()
+            kite_key = str(getattr(cfg, "kite_api_key", "") or "").strip()
+            if not kite_key:
+                return None
+        except Exception:
+            return None
+
+        try:
             from data.kite_auth import get_kite_auth
             from data.kite_market_data import KiteDataSource
         except Exception as exc:
